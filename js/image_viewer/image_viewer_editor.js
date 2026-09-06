@@ -28,6 +28,7 @@ function _controlTypeLabel(id) {
 // Catégories des contrôles d'édition (rangement « dossier » du picker).
 // Ajouter une catégorie = entrée ici + champ `category` sur les contrôles.
 const CONTROL_CATEGORIES = [
+    { id: 'geometry', labelKey: 'iv.catGeometry', icon: '📐' },
     { id: 'basic',   labelKey: 'iv.catBasic',   icon: '⚙️' },
     { id: 'color',   labelKey: 'iv.catColor',   icon: '🎨' },
     { id: 'effects', labelKey: 'iv.catEffects', icon: '✨' },
@@ -113,7 +114,8 @@ const DEFAULT_EDIT_STATE = () => ({
     controls: [],
     targetFps: null,
     playbackRate: 1.0,
-    interpolate: false
+    interpolate: false,
+    crop: null
 });
 
 let _ctrlIdCounter = 0;
@@ -235,6 +237,7 @@ export class ImageEditor {
 
     _hide() {
         if (this._maskTransformObserver) { this._maskTransformObserver.disconnect(); this._maskTransformObserver = null; }
+        if (this._cropTransformObserver) { this._cropTransformObserver.disconnect(); this._cropTransformObserver = null; }
         if (this.panelEl) this.panelEl.style.display = 'none';
         this._dispatchVideoOverride(null);
         this._getPreviewElements().forEach(el => { if (el) el.style.filter = 'none'; });
@@ -247,6 +250,15 @@ export class ImageEditor {
         this._maskOverlay = null;
         this._maskCanvases = {};
         this._activeOverlayMaskId = null;
+        // Nettoyage crop (overlay + toolbar)
+        const cov = document.getElementById('holaf-crop-overlay');
+        if (cov) cov.remove();
+        if (this._cropBar) { this._cropBar.remove(); this._cropBar = null; }
+        this._cropOverlay = null;
+        this._cropRect = null;
+        this._cropStart = null;
+        this._cropDrawing = false;
+        this._cropPrev = null;
         this.activeImage = null;
     }
 
@@ -405,6 +417,7 @@ export class ImageEditor {
         } else {
             this._applyCssFilter(els, rate);
         }
+        this._showCropOverlay();
         this._compareRefresh();
     }
 
@@ -446,7 +459,8 @@ export class ImageEditor {
         return (this.currentState.controls || []).some(c => c.range && c.range !== 'all');
     }
 
-    // Effets qui ne peuvent pas passer par les CSS filters (spatiaux) ou mask
+    // Effets qui ne peuvent pas passer par les CSS filters (spatiaux) ou mask,
+    // ou un crop (recadrage) qui ne peut pas être rendu par les CSS filters.
     _requiresCanvasPreview() {
         if (this.nativeFps > 0) return false;
         const spatial = ['blur', 'pixelate', 'vignette', 'sharpen'];
@@ -464,8 +478,12 @@ export class ImageEditor {
                 const loadImg = new Image();
                 loadImg.crossOrigin = 'anonymous';
                 await new Promise((res, rej) => { loadImg.onload = res; loadImg.onerror = rej; loadImg.src = originalUrl; });
+                const natW = loadImg.naturalWidth, natH = loadImg.naturalHeight;
+                // MAX_PREVIEW_DIM s'applique aux dims de l'image COMPLÈTE (le
+                // crop est désormais affichage-only côté client, appliqué en
+                // dernier par le serveur).
                 const MAX_PREVIEW_DIM = 1920;
-                let pw = loadImg.naturalWidth, ph = loadImg.naturalHeight;
+                let pw = natW, ph = natH;
                 if (pw > MAX_PREVIEW_DIM || ph > MAX_PREVIEW_DIM) {
                     const scale = MAX_PREVIEW_DIM / Math.max(pw, ph);
                     pw = Math.round(pw * scale);
@@ -751,8 +769,9 @@ export class ImageEditor {
         const container = this.panelEl?.querySelector('#holaf-editor-controls-list');
         if (!container) return;
         const controls = this.currentState.controls || [];
+        const hasCrop = !!this.currentState.crop;
 
-        if (controls.length === 0) {
+        if (controls.length === 0 && !hasCrop) {
             container.innerHTML = `<p style="opacity:0.5;font-size:12px;text-align:center;padding:12px 0;">${t('iv.noControlsYet')}</p>`;
             return;
         }
@@ -761,6 +780,7 @@ export class ImageEditor {
             `<button class="holaf-editor-remove-ctrl" ${attrs} style="background:none;border:none;cursor:pointer;padding:0 2px;font-size:14px;line-height:1;${extraStyle}">${glyph}</button>`;
 
         let html = '';
+
         controls.forEach((c, idx) => {
             const dimUp = idx === 0, dimDown = idx === controls.length - 1;
             const upBtn = iconBtn(`data-ctrl-up title="${t('iv.moveUp')}"${dimUp ? ' disabled' : ''}`, '↑', dimUp ? 'opacity:.3;cursor:default;' : '');
@@ -821,6 +841,27 @@ export class ImageEditor {
                     </div>`;
             }
         });
+
+        // ── Ligne « Crop » (EN DERNIER, après les mask rows et les effets) ──
+        // Le crop est une décision de cadrage FINALE appliquée en dernier : il
+        // n'est pas dans la chaîne réordonnable → pas de boutons ↑/↓.
+        if (hasCrop) {
+            const img = this._maskImageEl();
+            const nw = (img && img.naturalWidth) || 0;
+            const nh = (img && img.naturalHeight) || 0;
+            const c = this.currentState.crop;
+            const cw = Math.round(c.w * nw);
+            const ch = Math.round(c.h * nh);
+            html += `
+                <div class="holaf-editor-slider-container" data-crop-row style="display:flex;align-items:center;gap:6px;">
+                    <label style="text-align:left;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">📐 ${t('iv.cropLabel')}</label>
+                    <span style="font-size:10px;opacity:0.5;flex-shrink:0;">${t('iv.cropAppliedLast')}</span>
+                    <span class="holaf-editor-range-label" style="font-size:11px;flex-shrink:0;opacity:0.6;">${cw}×${ch}px</span>
+                    <button class="holaf-editor-remove-ctrl" data-crop-edit title="${t('iv.cropEditTitle')}" style="background:none;border:none;cursor:pointer;color:var(--holaf-accent-color,#4682B4);padding:0 2px;font-size:14px;line-height:1;">✏️</button>
+                    <button class="holaf-editor-remove-ctrl" data-crop-clear title="${t('iv.clearMask')}" style="background:none;border:none;cursor:pointer;color:var(--holaf-error-color,#c44);padding:0 2px;font-size:14px;line-height:1;">🗑</button>
+                </div>
+                <div style="height:4px;"></div>`;
+        }
 
         container.innerHTML = html;
     }
@@ -902,6 +943,50 @@ export class ImageEditor {
         ctx.drawImage(this._maskTinted(maskCanvas, overlay.width, overlay.height), 0, 0);
         this._activeOverlayMaskId = maskId;
         this._observeMaskTransform(img);
+    }
+
+    // ── Crop overlay passif (affichage du cadrage final) ──
+    // Le crop est désormais une décision de cadrage FINALE appliquée en dernier
+    // par le serveur. Côté client, la préview n'applique plus le crop : on
+    // affiche simplement un overlay passif (extérieur assombri, intérieur
+    // normal, pointer-events:none) sur l'image complète. Positionné/dimensionné
+    // comme le mask overlay (rect letterboxé + transform copié de l'img).
+    _showCropOverlay() {
+        const zoomView = document.getElementById('holaf-viewer-zoom-view');
+        const img = this._maskImageEl();
+        const crop = this.currentState.crop;
+        if (!crop) {
+            const ov = document.getElementById('holaf-crop-overlay');
+            if (ov) ov.remove();
+            return;
+        }
+        if (!zoomView || !img) return;
+        // Ne pas interférer avec l'éditeur de crop ouvert (il gère son propre overlay)
+        if (this._cropOverlay) return;
+        let overlay = document.getElementById('holaf-crop-overlay');
+        if (!overlay) {
+            overlay = document.createElement('canvas');
+            overlay.id = 'holaf-crop-overlay';
+            zoomView.appendChild(overlay);
+        }
+        const r = this._maskImageRect(img);
+        overlay.width = r.width; overlay.height = r.height;
+        overlay.style.cssText = `position:absolute;left:${(img.offsetLeft || 0) + r.dx}px;top:${(img.offsetTop || 0) + r.dy}px;z-index:60;pointer-events:none;transition:none;`;
+        overlay.style.transform = img.style.transform || 'none';
+        overlay.style.transformOrigin = '0 0';
+        const ctx = overlay.getContext('2d');
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+        const rect = { x: crop.x * r.width, y: crop.y * r.height, w: crop.w * r.width, h: crop.h * r.height };
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        // haut
+        ctx.fillRect(0, 0, overlay.width, rect.y);
+        // bas
+        ctx.fillRect(0, rect.y + rect.h, overlay.width, overlay.height - (rect.y + rect.h));
+        // gauche
+        ctx.fillRect(0, rect.y, rect.x, rect.h);
+        // droite
+        ctx.fillRect(rect.x + rect.w, rect.y, overlay.width - (rect.x + rect.w), rect.h);
+        this._observeCropTransform(img);
     }
 
     _openMaskEditor(maskId) {
@@ -1126,6 +1211,191 @@ export class ImageEditor {
         this._updateUIFromState();
     }
 
+    // ── Crop editor (recadrage basique : sélection rectangle) ──
+
+    // Maintient la synchro du transform de l'overlay crop avec celui de l'img
+    // (pan/zoom) via un MutationObserver sur l'attribut style de l'img.
+    _observeCropTransform(img) {
+        if (this._cropTransformObserver) this._cropTransformObserver.disconnect();
+        this._cropTransformObserver = new MutationObserver(() => {
+            const ov = document.getElementById('holaf-crop-overlay');
+            const im = this._maskImageEl();
+            if (ov && im) {
+                ov.style.transform = im.style.transform || 'none';
+                ov.style.transition = im.style.transition || getComputedStyle(im).transition || 'none';
+            }
+        });
+        if (img) this._cropTransformObserver.observe(img, { attributes: true, attributeFilter: ['style'] });
+    }
+
+    _openCropEditor() {
+        if (!this.activeImage) return;
+        const zoomView = document.getElementById('holaf-viewer-zoom-view');
+        const img = this._maskImageEl();
+        if (!zoomView || !img) { this._showToast(t('iv.maskNoImage'), 'error'); return; }
+
+        this._cleanupCropEditor(); // nettoie un éditeur déjà ouvert
+
+        // ── Forcer le zoom à l'échelle 1 : le crop vit dans le repère image ──
+        if (this.viewer && this.viewer.zoomViewState) {
+            resetTransform(this.viewer.zoomViewState, img);
+        }
+
+        const overlay = document.getElementById('holaf-crop-overlay') || document.createElement('canvas');
+        overlay.id = 'holaf-crop-overlay';
+        if (!overlay.parentNode) zoomView.appendChild(overlay);
+        const r = this._maskImageRect(img);
+        overlay.width = r.width; overlay.height = r.height;
+        overlay.style.cssText = `position:absolute;left:${(img.offsetLeft || 0) + r.dx}px;top:${(img.offsetTop || 0) + r.dy}px;z-index:60;cursor:crosshair;transition:none;`;
+        overlay.style.transform = 'none';
+        overlay.style.transformOrigin = '0 0';
+
+        // Pré-dessine le crop existant si présent
+        this._cropRect = null;
+        if (this.currentState.crop) {
+            const c = this.currentState.crop;
+            this._cropRect = { x: c.x * r.width, y: c.y * r.height, w: c.w * r.width, h: c.h * r.height };
+        }
+        this._drawCropOverlay();
+
+        const bar = document.createElement('div');
+        bar.id = 'holaf-crop-toolbar';
+        bar.style.cssText = 'position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:70;display:flex;align-items:center;gap:6px;padding:6px 10px;background:rgba(20,20,28,0.92);border:1px solid var(--holaf-border-color,#444);border-radius:8px;color:var(--holaf-text-primary,#eee);font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.4);';
+        bar.innerHTML = `
+            <button data-crop-reset class="comfy-button" style="padding:3px 8px;">🗑 ${t('iv.cropReset')}</button>
+            <button data-crop-ok class="comfy-button" style="padding:3px 10px;background:var(--holaf-accent-color,#4682B4);color:#fff;">${t('iv.cropValidate')}</button>
+            <button data-crop-cancel class="comfy-button" style="padding:3px 10px;">${t('iv.cancel')}</button>
+        `;
+        zoomView.appendChild(bar);
+
+        this._cropOverlay = overlay;
+        this._cropBar = bar;
+        this._cropDrawing = false;
+        this._cropStart = null;
+        this._cropPrev = this.currentState.crop ? { ...this.currentState.crop } : null;
+
+        bar.addEventListener('click', (e) => {
+            if (e.target.closest('[data-crop-reset]')) { this._resetCropRect(); return; }
+            if (e.target.closest('[data-crop-ok]')) { this._finishCropEditor(true); return; }
+            if (e.target.closest('[data-crop-cancel]')) { this._finishCropEditor(false); return; }
+        });
+
+        overlay.addEventListener('pointerdown', (e) => {
+            this._cropOnDown(e);
+            try { overlay.setPointerCapture(e.pointerId); } catch (err) {}
+        });
+        overlay.addEventListener('pointermove', (e) => this._cropOnMove(e));
+        overlay.addEventListener('pointerup', (e) => this._cropOnUp(e));
+        overlay.addEventListener('pointercancel', (e) => this._cropOnUp(e));
+        this._observeCropTransform(img);
+    }
+
+    _cropLocal(e) {
+        const r = this._cropOverlay.getBoundingClientRect();
+        return {
+            x: (e.clientX - r.left) * (this._cropOverlay.width / Math.max(1, r.width)),
+            y: (e.clientY - r.top) * (this._cropOverlay.height / Math.max(1, r.height)),
+        };
+    }
+
+    _cropOnDown(e) {
+        if (!this._cropOverlay) return;
+        e.preventDefault();
+        this._cropDrawing = true;
+        const p = this._cropLocal(e);
+        this._cropStart = p;
+        this._cropPrev = this._cropRect ? { ...this._cropRect } : null;
+        this._cropRect = { x: p.x, y: p.y, w: 0, h: 0 };
+    }
+
+    _cropOnMove(e) {
+        if (!this._cropDrawing || !this._cropOverlay) return;
+        const p = this._cropLocal(e);
+        const s = this._cropStart;
+        this._cropRect = {
+            x: Math.min(s.x, p.x),
+            y: Math.min(s.y, p.y),
+            w: Math.abs(p.x - s.x),
+            h: Math.abs(p.y - s.y),
+        };
+        this._drawCropOverlay();
+    }
+
+    _cropOnUp() {
+        if (!this._cropDrawing || !this._cropOverlay) return;
+        this._cropDrawing = false;
+        // Sélection trop petite → on restaure le rect précédent
+        if (this._cropRect && (this._cropRect.w < 2 || this._cropRect.h < 2)) {
+            this._cropRect = this._cropPrev ? { ...this._cropPrev } : null;
+            this._drawCropOverlay();
+        }
+    }
+
+    _resetCropRect() {
+        const r = this._maskImageRect(this._maskImageEl());
+        this._cropRect = { x: 0, y: 0, w: r.width, h: r.height };
+        this._drawCropOverlay();
+    }
+
+    // Dessine la sélection : l'INTÉRIEUR normal, l'EXTÉRIEUR assombri
+    // (4 rects sombres autour de la sélection) + bordure.
+    _drawCropOverlay() {
+        if (!this._cropOverlay) return;
+        const ctx = this._cropOverlay.getContext('2d');
+        const w = this._cropOverlay.width, h = this._cropOverlay.height;
+        ctx.clearRect(0, 0, w, h);
+        const rect = this._cropRect;
+        if (!rect) return;
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        // haut
+        ctx.fillRect(0, 0, w, rect.y);
+        // bas
+        ctx.fillRect(0, rect.y + rect.h, w, h - (rect.y + rect.h));
+        // gauche
+        ctx.fillRect(0, rect.y, rect.x, rect.h);
+        // droite
+        ctx.fillRect(rect.x + rect.w, rect.y, w - (rect.x + rect.w), rect.h);
+        // bordure de la sélection
+        ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    }
+
+    _finishCropEditor(commit) {
+        if (commit && this._cropRect) {
+            const r = this._maskImageRect(this._maskImageEl());
+            const rect = this._cropRect;
+            // Normalise 0-1 relatif à l'ORIGINAL (image complète affichée)
+            const newCrop = {
+                x: Math.max(0, Math.min(1, rect.x / r.width)),
+                y: Math.max(0, Math.min(1, rect.y / r.height)),
+                w: Math.max(0, Math.min(1, rect.w / r.width)),
+                h: Math.max(0, Math.min(1, rect.h / r.height)),
+            };
+            // Le mask vit sur l'image COMPLÈTE : ajuster le crop ne l'invalide
+            // plus → aucune confirmation de reset des masques.
+            this.currentState.crop = newCrop;
+            this._scheduleAutoSave();
+            this.applyPreview();
+            this._updateUIFromState();
+        }
+        this._cleanupCropEditor();
+    }
+
+    _cleanupCropEditor() {
+        if (this._cropTransformObserver) { this._cropTransformObserver.disconnect(); this._cropTransformObserver = null; }
+        const ov = document.getElementById('holaf-crop-overlay');
+        if (ov) ov.remove();
+        if (this._cropBar) { this._cropBar.remove(); this._cropBar = null; }
+        this._cropOverlay = null;
+        this._cropRect = null;
+        this._cropStart = null;
+        this._cropDrawing = false;
+        this._cropPrev = null;
+        this.applyPreview();
+        this._updateUIFromState();
+    }
+
     // ── UI sync ──
 
     _updateUIFromState() {
@@ -1146,6 +1416,7 @@ export class ImageEditor {
                 if (ic) ic.checked = !!this.currentState.interpolate;
             } else vs.style.display = 'none';
         }
+        this._showCropOverlay();
     }
 
     // ── Event listeners ──
@@ -1157,12 +1428,16 @@ export class ImageEditor {
         if (addBtn) {
             addBtn.onclick = async () => {
                 // Liste structurée par catégories (évolutive) : clic sélectionne
-                const groups = CONTROL_CATEGORIES.map((cat) => ({
-                    label: t(cat.labelKey),
-                    items: CONTROL_TYPES
+                const groups = CONTROL_CATEGORIES.map((cat) => {
+                    const items = CONTROL_TYPES
                         .filter((ct) => ct.category === cat.id)
-                        .map((ct) => ({ id: ct.id, label: _controlTypeLabel(ct.id) })),
-                })).filter((g) => g.items.length > 0);
+                        .map((ct) => ({ id: ct.id, label: _controlTypeLabel(ct.id) }));
+                    // Item spécial « Crop » dans la catégorie Géométrie
+                    if (cat.id === 'geometry') {
+                        items.push({ id: 'crop', label: t('iv.cropItem') });
+                    }
+                    return { label: t(cat.labelKey), items };
+                }).filter((g) => g.items.length > 0);
                 // Item spécial « Masque » : crée toujours un NOUVEAU layer mask
                 groups.push({
                     label: t('iv.maskGroup'),
@@ -1170,6 +1445,12 @@ export class ImageEditor {
                 });
                 const chosenType = await _pickFromList(t('iv.addControlTitle'), groups);
                 if (!chosenType) return;
+
+                // Crop : ouvre l'éditeur de recadrage (comme le mask)
+                if (chosenType === 'crop') {
+                    this._openCropEditor();
+                    return;
+                }
 
                 // Masque : crée un nouveau layer mask et ouvre son éditeur
                 if (chosenType === 'mask') {
@@ -1239,6 +1520,17 @@ export class ImageEditor {
             list.addEventListener('click', (e) => {
                 const btn = e.target.closest('.holaf-editor-remove-ctrl');
                 if (btn) {
+                    if (btn.hasAttribute('data-crop-edit')) {
+                        this._openCropEditor();
+                        return;
+                    }
+                    if (btn.hasAttribute('data-crop-clear')) {
+                        this.currentState.crop = null;
+                        this._updateUIFromState();
+                        this.applyPreview();
+                        this._scheduleAutoSave();
+                        return;
+                    }
                     if (btn.hasAttribute('data-mask-edit')) {
                         const row = btn.closest('[data-mask-id]');
                         this._openMaskEditor(row?.dataset.maskId);

@@ -1028,7 +1028,9 @@ def apply_edits_to_image(image, edit_data, mask_images=None):
     edit_data = _migrate_edit_data(edit_data)
 
     controls = edit_data.get('controls', [])
-    if not controls:
+    crop = edit_data.get('crop')
+
+    if not controls and not crop:
         return image
 
     # Rétro-compat : ancien paramètre mask_image (image 'L' unique) → dict
@@ -1159,6 +1161,22 @@ def apply_edits_to_image(image, edit_data, mask_images=None):
             result = Image.composite(result, image, legacy_mask)
         except Exception as e:
             print(f"🟡 [Holaf-Logic] Failed to apply legacy edit mask: {e}")
+
+    # ── Crop : recadrage appliqué EN DERNIER (décision de cadrage final) ──
+    # Le crop est normalisé 0-1 relatif à l'ORIGINAL. On le convertit en
+    # coordonnées pixels et on recadre le RÉSULTAT final (après contrôles et
+    # composite mask). Le mask vit sur l'image COMPLÈTE : ajuster le crop ne
+    # l'invalide plus.
+    if crop:
+        try:
+            iw, ih = image.size
+            x = max(0, min(1, float(crop['x']))) * iw
+            y = max(0, min(1, float(crop['y']))) * ih
+            w = min(iw - x, max(1, float(crop['w']) * iw))
+            h = min(ih - y, max(1, float(crop['h']) * ih))
+            result = result.crop((int(x), int(y), int(x + w), int(y + h)))
+        except Exception as e:
+            print(f"🟡 [Holaf-Logic] Crop failed: {e}")
 
     return result
 
@@ -1299,6 +1317,18 @@ def build_ffmpeg_filter_string(edit_data):
                 filters.append(f"vignette=angle={0.2 + v * 0.6}")
         except ValueError:
             pass
+
+    # Crop : recadrage appliqué EN DERNIER (décision de cadrage final)
+    crop = edit_data.get('crop')
+    if crop:
+        try:
+            x = max(0, min(1, float(crop['x'])))
+            y = max(0, min(1, float(crop['y'])))
+            w = max(0.0001, min(1, float(crop['w'])))
+            h = max(0.0001, min(1, float(crop['h'])))
+            filters.append(f"crop=w=iw*{w:.4f}:h=ih*{h:.4f}:x=iw*{x:.4f}:y=ih*{y:.4f}")
+        except Exception as e:
+            print(f"🟡 [Holaf-Logic] Crop filter failed: {e}")
 
     return ",".join(filters)
 
