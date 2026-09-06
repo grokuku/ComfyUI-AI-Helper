@@ -483,4 +483,23 @@ assert.ok(/--aih-accent/.test(cssText), "fallback : variables --aih-* présentes
 assert.ok(/\.aih-dialog-overlay/.test(cssText), "fallback : classe .aih-dialog-overlay");
 assert.ok(/\.aih-dialog-header/.test(cssText) && /\.aih-dialog-body/.test(cssText) && /\.aih-dialog-footer/.test(cssText), "fallback : header/body/footer");
 
+/* ── 9. Anti-doublon : fenêtre à id stable déjà ouverte → bringToFront ── */
+const dupId = "aih-test-dup-window";
+const dup1 = D.open({ id: dupId, title: "Dup", width: "300px" });
+assert.ok(dup1.el.id === dupId, "première ouverture : id posé");
+const dupZ1 = parseInt(dup1.el.style.zIndex, 10);
+
+// Deuxième ouverture avec le même id → on réutilise la même fenêtre.
+const dup2 = D.open({ id: dupId, title: "Dup", width: "300px" });
+assert.strictEqual(dup2, dup1, "même id → même contrôleur réutilisé (pas de doublon)");
+const dupCount = fakeDocument.body._allDescendants([]).filter((n) => n.id === dupId).length;
+assert.strictEqual(dupCount, 1, "une seule fenêtre avec cet id dans le DOM");
+assert.ok(parseInt(dup1.el.style.zIndex, 10) >= dupZ1, "fenêtre réutilisée ramenée au premier plan");
+
+// Sans id → pas de garde (deux fenêtres distinctes autorisées).
+const noId1 = D.open({ title: "Sans id A" });
+const noId2 = D.open({ title: "Sans id B" });
+assert.notStrictEqual(noId1, noId2, "sans id → deux fenêtres distinctes (pas de garde)");
+noId1.close(); noId2.close(); dup1.close();
+
 console.log("✅ Simulation AIH.Dialog : TOUS LES TESTS PASSENT");

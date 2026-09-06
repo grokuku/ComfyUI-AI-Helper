@@ -10,7 +10,7 @@
 import { app } from "./holaf_api_compat.js";
 import { HOLAF_THEMES } from "./holaf_themes.js";
 import { initializeSettings, saveSettings } from "./model_manager/model_manager_settings.js";
-import { createPanel, createUploadDialog, applyZoom, setTheme } from "./model_manager/model_manager_ui.js";
+import { createPanel, createUploadDialog, applyZoom, setTheme, applySettingsToPanel } from "./model_manager/model_manager_ui.js";
 import { renderModels, filterAndSortModels, updateActionButtonsState, updateStatusBarText } from "./model_manager/model_manager_view.js";
 import { addFilesToUploadQueue, addSelectedToDownloadQueue, addSelectedToScanQueue, performDelete, processDownloadQueue, processScanQueue, processUploadQueue } from "./model_manager/model_manager_actions.js";
 
@@ -83,6 +83,7 @@ const holafModelManager = {
     createUploadDialog: function() { return createUploadDialog(this); },
     setTheme: function(themeName) { return setTheme(this, themeName); },
     applyZoom: function() { return applyZoom(this); },
+    applySettingsToPanel: function() { return applySettingsToPanel(this); },
     increaseZoom: function() {
         const newZoom = parseFloat((this.settings.zoom_level + this.ZOOM_STEP).toFixed(2));
         if (newZoom <= this.MAX_ZOOM) {
@@ -121,12 +122,21 @@ const holafModelManager = {
     },
     
     // Main show/hide toggle
+    // FIX lenteur + anti-doublon : on crée le panneau IMMÉDIATEMENT (avec les
+    // réglages par défaut) puis on charge les réglages serveur en async et on
+    // les ré-applique une fois prêts (pattern skeleton). Avant, on attendait le
+    // fetch réseau AVANT d'afficher la fenêtre, et un multi-clic pendant
+    // l'attente créait plusieurs panneaux en double (panelElements encore null).
     show: async function() {
         if (!this.panelElements || !this.panelElements.panelEl) {
-            if (!this.areSettingsLoaded) {
-                await this.loadModelConfigAndSettings();
-            }
             this.createPanel();
+            if (!this.areSettingsLoaded) {
+                this.loadModelConfigAndSettings().then(() => {
+                    if (this.panelElements && this.panelElements.panelEl) {
+                        this.applySettingsToPanel();
+                    }
+                });
+            }
         }
 
         const panelIsVisible = this.panelElements.panelEl.style.display === "flex";

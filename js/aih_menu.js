@@ -129,6 +129,7 @@ import "./aih_strings.js";
         const apiKey = cfg.apiKey || "";
 
         const modal = window.aihOpenModalV2({
+            id: "aih-modal-members",
             title: t("menu.membersTitle"),
             content: "<p style='color:#888;font-size:12px;'>" + t('menu.loading') + "</p>",
             width: "560px",
@@ -729,6 +730,7 @@ import "./aih_strings.js";
     async function openUpdate() {
         // Modale d'attente
         const modal = window.aihOpenModalV2({
+            id: "aih-aih-update",
             title: t("menu.updateTitle"),
             content: `
             <div style="padding:8px 0;">

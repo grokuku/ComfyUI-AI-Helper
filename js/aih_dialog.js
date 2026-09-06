@@ -407,6 +407,21 @@ import {
     function open(opts) {
         opts = opts || {};
 
+        // ── Anti-doublon générique (fenêtres non-modales à id stable) ────────
+        // Si une fenêtre portant le même id est déjà ouverte, on la ramène au
+        // premier plan (bringToFront) au lieu d'en créer une nouvelle. Évite
+        // les fenêtres de config/paramètres en double après un multi-clic.
+        if (opts.id) {
+            const existing = document.getElementById(opts.id);
+            if (existing && existing.classList && existing.classList.contains("aih-dialog-root")) {
+                windowManager.bringToFront(existing);
+                if (typeof opts.onOpen === "function") {
+                    try { opts.onOpen(existing._aihController); } catch (e) { /* silencieux */ }
+                }
+                return existing._aihController;
+            }
+        }
+
         // Auto-injection de la feuille de style au premier open() (idempotent).
         ensureDialogCss();
 
@@ -823,6 +838,10 @@ import {
         if (typeof opts.onOpen === "function") {
             try { opts.onOpen(_controller); } catch (e) { /* silencieux */ }
         }
+
+        // Référence le contrôleur sur l'élément pour le garde anti-doublon
+        // (reuse d'une fenêtre déjà ouverte par son id).
+        el._aihController = _controller;
 
         return _controller;
     }

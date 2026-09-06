@@ -287,7 +287,7 @@ function previewSelectedFiles(manager) {
  * Applies current settings (theme, zoom, size, position) to the panel.
  * @param {object} manager - The main model manager instance.
  */
-function applySettingsToPanel(manager) {
+export function applySettingsToPanel(manager) {
     if (manager.panelElements && manager.panelElements.panelEl) {
         setTheme(manager, manager.settings.theme);
         applyZoom(manager);

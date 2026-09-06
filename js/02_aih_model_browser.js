@@ -602,6 +602,7 @@ import "./aih_strings.js";
         _mbInjectCSS();
 
         var m = aihOpenModalV2({
+            id: "aih-modal-model-browser",
             title: t("mb.title"),
             width: "920px",
             height: "620px",
