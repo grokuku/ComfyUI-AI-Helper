@@ -53,12 +53,25 @@ class AIHOpenAISettingsNode:
             try:
                 import os, json
                 # Utiliser folder_paths pour trouver le dossier utilisateur
+                keys_path = None
                 try:
                     import folder_paths
                     user_dir = folder_paths.get_user_directory()
+                    if user_dir:
+                        keys_path = os.path.join(user_dir, "default", "aih", "openai_keys.json")
                 except Exception:
-                    user_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "user")
-                keys_path = os.path.join(user_dir, "default", "aih", "openai_keys.json")
+                    pass
+                if keys_path is None:
+                    # Fallback sûr : la racine ComfyUI (folder_paths.base_path), JAMAIS custom_nodes
+                    try:
+                        comfy_base = getattr(folder_paths, "base_path", None)
+                        if comfy_base:
+                            keys_path = os.path.join(comfy_base, "user", "default", "aih", "openai_keys.json")
+                    except Exception:
+                        pass
+                if keys_path is None:
+                    # Dernier recours : DANS le pack lui-même (jamais custom_nodes/)
+                    keys_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data", "aih", "openai_keys.json")
                 if os.path.isfile(keys_path):
                     with open(keys_path, "r", encoding="utf-8") as f:
                         data = json.load(f)

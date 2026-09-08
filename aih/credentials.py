@@ -77,16 +77,15 @@ def get_credentials_path():
     except Exception:
         pass
 
-    # Fallback hors runtime ComfyUI : ce fichier vit dans <pack>/aih/ —
-    # remonter depuis là vers la racine ComfyUI pour retrouver user/.
+    # Fallback hors runtime ComfyUI : la racine ComfyUI via
+    # folder_paths.base_path (JAMAIS custom_nodes/).
     try:
-        cur = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for _ in range(6):
-            cur = os.path.dirname(cur)
-            cand = os.path.join(cur, "user", "default", "aih", "credentials.json")
+        import folder_paths
+        base = getattr(folder_paths, "base_path", None)
+        if base:
+            cand = os.path.join(base, "user", "default", "aih", "credentials.json")
             if os.path.isdir(os.path.dirname(cand)):
                 candidates.append(cand)
-                break
     except Exception:
         pass
 

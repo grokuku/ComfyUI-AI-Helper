@@ -69,28 +69,32 @@ def _get_aih_user_dir():
     """Dossier user/default/aih de ComfyUI.
 
     En runtime ComfyUI, passe par folder_paths.get_user_directory(). Hors
-    runtime (tests), ce fichier vit dans <pack>/aih/store.py : on remonte
-    depuis là jusqu'à trouver un dossier ``user`` contenant ``default``
-    (= racine ComfyUI) ; dernier recours : ``./user`` relatif au CWD.
+    runtime (tests), on retombe sur la racine ComfyUI via
+    folder_paths.base_path ; dernier recours : un dossier user_data/aih
+    DANS le pack (jamais custom_nodes/).
 
     Retourne:
         str: Chemin absolu vers user/default/aih.
     """
+    # 1) Source canonique : ComfyUI user directory
     try:
         import folder_paths
         user_dir = folder_paths.get_user_directory()
+        if user_dir:
+            return os.path.join(user_dir, "default", "aih")
     except Exception:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        user_dir = None
-        for _ in range(6):
-            cand = os.path.join(cur, "user")
-            if os.path.isdir(os.path.join(cand, "default")):
-                user_dir = cand
-                break
-            cur = os.path.dirname(cur)
-        if user_dir is None:
-            user_dir = os.path.join(os.getcwd(), "user")
-    return os.path.join(user_dir, "default", "aih")
+        pass
+    # 2) Fallback sûr : la racine ComfyUI (folder_paths.base_path), JAMAIS custom_nodes
+    try:
+        base = getattr(folder_paths, "base_path", None)
+        if base:
+            d = os.path.join(base, "user", "default", "aih")
+            os.makedirs(d, exist_ok=True)
+            return d
+    except Exception:
+        pass
+    # 3) Dernier recours : DANS le pack lui-même (jamais custom_nodes/)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data", "aih")
 
 
 def get_store_path():

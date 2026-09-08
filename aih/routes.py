@@ -106,12 +106,25 @@ def _get_aih_user_dir():
     ⚠️ Chemin conservé À L'IDENTIQUE (presets, clés OpenAI, blobby.json...)
     pour ne pas perdre les données des utilisateurs d'AI-Helper.
     """
+    # 1) Source canonique : ComfyUI user directory
     try:
         import folder_paths
         user_dir = folder_paths.get_user_directory()
+        if user_dir:
+            return os.path.join(user_dir, "default", "aih")
     except Exception:
-        user_dir = os.path.join(os.path.dirname(_PACK_ROOT), "user")
-    return os.path.join(user_dir, "default", "aih")
+        pass
+    # 2) Fallback sûr : la racine ComfyUI (folder_paths.base_path), JAMAIS custom_nodes
+    try:
+        base = getattr(folder_paths, "base_path", None)
+        if base:
+            d = os.path.join(base, "user", "default", "aih")
+            os.makedirs(d, exist_ok=True)
+            return d
+    except Exception:
+        pass
+    # 3) Dernier recours : DANS le pack lui-même (jamais custom_nodes/)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data", "aih")
 
 
 def _get_presets_path():
