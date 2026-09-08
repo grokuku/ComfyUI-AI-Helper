@@ -14,6 +14,19 @@
 import os
 import sys
 
+# ── MIME : les conteneurs minimaux n'ont pas /etc/mime.types → les .js de
+# /extensions/ sont servis en application/octet-stream et les imports
+# dynamiques sont bloqués par les navigateurs (module MIME interdit).
+# L'enregistrement est global au process : ça répare aussi les autres
+# extensions et les fichiers core (ex: /extensions/core/clipspace.js).
+import mimetypes as _holaf_mimetypes
+_holaf_mimetypes.add_type("text/javascript", ".js")
+_holaf_mimetypes.add_type("text/javascript", ".mjs")
+_holaf_mimetypes.add_type("text/css", ".css")
+_holaf_mimetypes.add_type("application/json", ".json")
+_holaf_mimetypes.add_type("image/svg+xml", ".svg")
+_holaf_mimetypes.add_type("image/webp", ".webp")
+
 # Prevent Python from writing __pycache__ / .pyc files in the source tree
 os.environ.setdefault('PYTHONDONTWRITEBYTECODE', '1')
 
