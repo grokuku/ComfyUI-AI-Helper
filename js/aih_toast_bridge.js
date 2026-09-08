@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2026 Holaf
- * AIH Toast Bridge — pont vers la brique HolafToast (vendor/holaf/holaf-toast.js).
+ * AIH Toast Bridge — pont vers la brique HolafToast (js/vendor/holaf/holaf-toast.js).
  *
  * Point d'entrée UNIQUE pour toutes les notifications de l'extension. Il :
  *   - importe la brique HolafToast (auto-injecte son CSS, zéro dépendance) ;
@@ -14,7 +14,7 @@
  * fonctionnent (même en mode standalone, sans holaf_main.js).
  */
 
-import { HolafToast } from "../vendor/holaf/holaf-toast.js";
+import { HolafToast } from "./vendor/holaf/holaf-toast.js";
 
 const THEME_NAME = "aih";
 
