@@ -9,6 +9,7 @@
 // Uses the compatibility layer via holaf_api_compat.js
 import "./aih_strings.js";
 import { app as comfyApp, api as comfyApi } from "./holaf_api_compat.js";
+import { showToast, updateToast, hideToast } from "./aih_toast_bridge.js";
 let app = comfyApp;
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
@@ -79,60 +80,9 @@ const holafImageViewer = {
         }
 
         if (!window.holaf) window.holaf = {};
-        if (!window.holaf.toastManager) {
-            console.log("[Holaf] Initializing standalone ToastManager polyfill.");
-            window.holaf.toastManager = {
-                show: (opts) => {
-                    const id = opts.id || 'holaf-toast-' + Date.now();
-                    let toast = document.getElementById(id);
-                    if (!toast) {
-                        toast = document.createElement('div');
-                        toast.id = id;
-                        toast.style.cssText = `
-                            position: fixed; bottom: 20px; right: 20px;
-                            background: var(--holaf-accent-color, #9c27b0);
-                            color: white; padding: 12px 20px;
-                            border-radius: 4px; z-index: 10000;
-                            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-                            font-family: sans-serif; font-size: 14px;
-                            opacity: 0; transition: opacity 0.3s;
-                            max-width: 300px;
-                        `;
-                        if (opts.type === 'error') toast.style.backgroundColor = 'var(--holaf-error-color, #d32f2f)';
-                        if (opts.type === 'success') toast.style.backgroundColor = 'var(--holaf-success-color, #2e7d32)';
-
-                        document.body.appendChild(toast);
-                        void toast.offsetWidth;
-                        toast.style.opacity = '1';
-                    }
-                    toast.innerHTML = opts.message || t("iv.operationProcessed");
-
-                    if (!opts.duration || opts.duration > 0) {
-                        setTimeout(() => {
-                            if (toast.parentNode) {
-                                toast.style.opacity = '0';
-                                setTimeout(() => { if (toast.parentNode) toast.remove(); }, 300);
-                            }
-                        }, opts.duration || 3000);
-                    }
-                },
-                update: (id, opts) => {
-                    const toast = document.getElementById(id);
-                    if (toast) {
-                        toast.innerHTML = opts.message;
-                        if (opts.type === 'error') toast.style.backgroundColor = 'var(--holaf-error-color, #d32f2f)';
-                        if (opts.type === 'success') toast.style.backgroundColor = 'var(--holaf-success-color, #2e7d32)';
-                    }
-                },
-                hide: (id) => {
-                    const toast = document.getElementById(id);
-                    if (toast) {
-                        toast.style.opacity = '0';
-                        setTimeout(() => { if (toast.parentNode) toast.remove(); }, 300);
-                    }
-                }
-            };
-        }
+        // Toasts : la brique HolafToast (via aih_toast_bridge.js) est
+        // self-contained (auto-injecte son CSS) et fonctionne aussi en mode
+        // standalone — plus besoin du polyfill inline.
 
         document.addEventListener("keydown", (e) => this._handleKeyDown(e));
         const cssId = "holaf-image-viewer-css";
@@ -546,9 +496,7 @@ const holafImageViewer = {
                     }, 1200);
                 } else {
                     imageViewerState.setState({ status: { pendingNewImages: true } });
-                    if (window.holaf?.toastManager) {
-                        window.holaf.toastManager.show({ message: t("iv.newImagesDetected"), type: "info" });
-                    }
+                    showToast({ message: t("iv.newImagesDetected"), type: "info" });
                 }
             } else if (delta && delta.total_db_count !== undefined) {
                 // Nothing changed for the current filter — just keep the counter fresh.
@@ -1000,14 +948,15 @@ const holafImageViewer = {
             });
 
             if (state.exporting.activeToastId && state.exporting.stats.completedFiles > 0) {
-                window.holaf.toastManager.update(state.exporting.activeToastId, {
+                updateToast(state.exporting.activeToastId, {
                     message: t("iv.exportQueueComplete", { count: state.exporting.stats.completedFiles }),
                     type: 'success',
-                    progress: 100
+                    progress: 100,
+                    html: true
                 });
-                setTimeout(() => window.holaf.toastManager.hide(state.exporting.activeToastId), 5000);
+                setTimeout(() => hideToast(state.exporting.activeToastId), 5000);
             } else if (state.exporting.activeToastId) {
-                window.holaf.toastManager.hide(state.exporting.activeToastId);
+                hideToast(state.exporting.activeToastId);
             }
             this.updateStatusBar();
             return;
@@ -1080,10 +1029,11 @@ const holafImageViewer = {
             console.error(`[Holaf ImageViewer] Failed to download file ${filename}:`, error);
             const activeToastId = imageViewerState.getState().exporting.activeToastId;
             if (activeToastId) {
-                window.holaf.toastManager.update(activeToastId, {
+                updateToast(activeToastId, {
                     message: t("iv.downloadFailed", { filename, error: error.message }),
                     type: 'error',
-                    progress: 100
+                    progress: 100,
+                    html: true
                 });
             }
             this._stopStatusAnimation();
@@ -1134,7 +1084,7 @@ const holafImageViewer = {
             statusBarEl.textContent = `${text} [${progress}%]`;
 
             if (state.exporting.activeToastId) {
-                window.holaf.toastManager.update(state.exporting.activeToastId, {
+                updateToast(state.exporting.activeToastId, {
                     message: text,
                     progress: state.exporting.stats.currentFileProgress
                 });
@@ -1269,9 +1219,7 @@ const holafImageViewer = {
                             console.log("[Holaf Bridge] Received workflow from standalone gallery.");
                             try {
                                 app.loadGraphData(data.payload);
-                                if (window.holaf && window.holaf.toastManager) {
-                                    window.holaf.toastManager.show({ message: t("iv.workflowLoadedFromGallery"), type: "success" });
-                                }
+                                showToast({ message: t("iv.workflowLoadedFromGallery"), type: "success" });
                             } catch (e) {
                                 console.error("Failed to load workflow from bridge:", e);
                             }

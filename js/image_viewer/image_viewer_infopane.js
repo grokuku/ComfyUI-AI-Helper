@@ -11,6 +11,7 @@ import { imageViewerState } from './image_viewer_state.js';
 import { holafBridge } from "../holaf_comfy_bridge.js";
 import { app as comfyApp } from "../holaf_api_compat.js";
 import { escapeHtml } from "../holaf_dom_utils.js";
+import { showToast } from "../aih_toast_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -226,9 +227,7 @@ async function displayInfoForImage(image) {
                         // We are in standalone/deported mode, send via bridge
                         holafBridge.send('LOAD_WORKFLOW', data.workflow);
                         
-                        if (window.holaf && window.holaf.toastManager) {
-                            window.holaf.toastManager.show({ message: t('iv.workflowSentToMain'), type: "success" });
-                        }
+                        showToast({ message: t('iv.workflowSentToMain'), type: "success" });
                     }
                 }
         }, !data.workflow || !!data.workflow.error));

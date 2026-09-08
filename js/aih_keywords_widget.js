@@ -1,6 +1,6 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
-import { HolafToastManager } from "./holaf_toast_manager.js";
+import { showToast as bridgeShowToast } from "./aih_toast_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -124,12 +124,6 @@ function formatKeywordsList(keywords, format) {
 // Helpers UI
 // ========================
 
-let _holafToast = null;
-function _getToast() {
-    if (!_holafToast) _holafToast = new HolafToastManager();
-    return _holafToast;
-}
-
 /** Escaping HTML pour injection sécurisée dans innerHTML */
 function esc(str) {
     if (typeof str !== "string") return "";
@@ -139,7 +133,7 @@ function esc(str) {
 }
 
 function showToast(type, msg) {
-    _getToast().show({ message: msg, type: type, duration: 4000 });
+    bridgeShowToast({ message: msg, type: type, duration: 4000 });
 }
 
 // ========================

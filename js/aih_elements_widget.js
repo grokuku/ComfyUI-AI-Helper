@@ -1,6 +1,6 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
-import { HolafToastManager } from "./holaf_toast_manager.js";
+import { showToast as bridgeShowToast } from "./aih_toast_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -1826,7 +1826,5 @@ function showPrompt(title, msg, placeholder, cb) {
 }
 
 function showToast(type, msg) {
-    let toast = window.holaf && window.holaf.toastManager;
-    if (!toast) toast = new HolafToastManager();
-    toast.show({ message: msg, type: type, duration: 4000 });
+    bridgeShowToast({ message: msg, type: type, duration: 4000 });
 }

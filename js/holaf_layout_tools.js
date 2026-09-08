@@ -1,6 +1,7 @@
 /* holaf_layout_tools.js */
     import { app } from "./holaf_api_compat.js";
     import { makeDraggable, makeContentZoomable, aihWindowManager } from "./holaf_window_utils.js";
+    import { showToast } from "./aih_toast_bridge.js";
 
     // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
     const t = (key, params) => {
@@ -246,9 +247,7 @@
                 app.canvas.setDirty(true, true);
             }
     
-            if (window.holaf?.toastManager) {
-                window.holaf.toastManager.show({ message: t("lt.recentered", { count: allEntities.length }), type: "success" });
-            }
+            showToast({ message: t("lt.recentered", { count: allEntities.length }), type: "success" });
         }
     };
     

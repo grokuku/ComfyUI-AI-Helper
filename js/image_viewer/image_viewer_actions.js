@@ -14,6 +14,7 @@
 import "../aih_strings.js";
 import { HolafPanelManager, dialogState } from "../holaf_panel_manager.js";
 import { imageViewerState } from "./image_viewer_state.js";
+import { showToast, updateToast, hideToast } from "../aih_toast_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -157,7 +158,7 @@ export async function handleDeletion(viewer, permanent = false, imagesToProcess 
             // If files were successfully deleted, show a success toast.
             // If some failed, the dialog above will still show the errors.
             if (result.deleted_count > 0) {
-                window.holaf.toastManager.show({
+                showToast({
                     message: t('iv.movedToTrash', { count: result.deleted_count }),
                     type: 'success'
                 });
@@ -835,9 +836,9 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
         const toastId = `export-${Date.now()}`;
         
         if (!imageViewerState.getState().status.isExporting) {
-            window.holaf.toastManager.show({
+            showToast({
                 id: toastId, message: t('iv.preparingExport', { count: imageCount }),
-                type: 'info', duration: 0, progress: true
+                type: 'info', duration: 0, progress: 'manual'
             });
             imageViewerState.setState({ exporting: { activeToastId: toastId } });
         }
@@ -869,7 +870,7 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
             
             if (result.errors && result.errors.length > 0) {
                  const errorMessage = t('iv.someFilesNotPrepared', { list: result.errors.map(e => `- ${e.path.split('/').pop()}: ${e.error}`).join('<br>') });
-                 window.holaf.toastManager.show({ message: errorMessage, type: 'error', duration: 0 });
+                 showToast({ message: errorMessage, type: 'error', duration: 0, html: true });
             }
 
             const manifestUrl = `/holaf/images/export-chunk?export_id=${result.export_id}&file_path=manifest.json&chunk_index=0&chunk_size=1000000`;
@@ -886,7 +887,7 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
 
                 const activeToastId = imageViewerState.getState().exporting.activeToastId;
                 if (activeToastId) {
-                    window.holaf.toastManager.update(activeToastId, {
+                    updateToast(activeToastId, {
                         message: t('iv.addedToQueue', { count: newFiles.length }),
                         type: 'info'
                     });
@@ -902,11 +903,11 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
             } else {
                  const activeToastId = imageViewerState.getState().exporting.activeToastId;
                  if (activeToastId) {
-                     window.holaf.toastManager.update(activeToastId, {
+                     updateToast(activeToastId, {
                         message: t('iv.noNewFiles'),
                         type: 'info', progress: 100
                      });
-                     setTimeout(() => window.holaf.toastManager.hide(activeToastId), 5000);
+                     setTimeout(() => hideToast(activeToastId), 5000);
                  }
                  if (!imageViewerState.getState().status.isExporting) viewer.updateStatusBar();
             }
@@ -914,12 +915,12 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
             console.error('[Holaf ImageViewer] Export preparation failed:', error);
             const activeToastId = imageViewerState.getState().exporting.activeToastId;
             if (activeToastId) {
-                window.holaf.toastManager.update(activeToastId, {
+                updateToast(activeToastId, {
                     message: t('iv.exportFailedStrong', { message: error.message }),
-                    type: 'error', progress: 100
+                    type: 'error', progress: 100, html: true
                 });
             } else {
-                window.holaf.toastManager.show({ message: t('iv.exportFailed', { message: error.message }), type: 'error', duration: 0 });
+                showToast({ message: t('iv.exportFailed', { message: error.message }), type: 'error', duration: 0 });
             }
         }
     });

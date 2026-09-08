@@ -20,6 +20,7 @@
 
 import "../aih_strings.js";
 import { imageViewerState } from "./image_viewer_state.js";
+import { showToast } from "../aih_toast_bridge.js";
 import { showFullscreenView, getFullImageUrl } from './image_viewer_navigation.js';
 import {
     PAGE_SIZE, getWindowStart, isWindowLoaded, isWindowLoading,
@@ -221,12 +222,11 @@ function checkBenchmarkCompletion() {
             isBenchmarking = false;
             benchmarkCacheBuster = '';
 
-            if (window.holaf.toastManager) {
-                window.holaf.toastManager.show({
-                    message: t('iv.benchmarkResult', { threads: currentConcurrencyLimit, speed, time: duration.toFixed(2) }),
-                    type: 'success'
-                });
-            }
+            showToast({
+                message: t('iv.benchmarkResult', { threads: currentConcurrencyLimit, speed, time: duration.toFixed(2) }),
+                type: 'success',
+                html: true
+            });
         }
     }
 }

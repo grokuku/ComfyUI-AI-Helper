@@ -7,7 +7,7 @@ import "../aih_strings.js";
 import { HOLAF_THEMES } from '../holaf_themes.js';
 import { imageViewerState } from './image_viewer_state.js';
 import * as Navigation from './image_viewer_navigation.js';
-import { HolafToastManager } from '../holaf_toast_manager.js';
+import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -327,9 +327,7 @@ class ImageViewerUI {
 
             const originalLabel = regenThumbsBtn.textContent;
             const showToast = (message, type) => {
-                if (window.holaf && window.holaf.toastManager) {
-                    window.holaf.toastManager.show({ message, type });
-                }
+                bridgeShowToast({ message, type });
             };
 
             try {

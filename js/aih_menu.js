@@ -42,6 +42,7 @@
  */
 import "./aih_dialog.js";
 import "./aih_strings.js";
+import { showToast } from "./aih_toast_bridge.js";
 (function () {
     "use strict";
 
@@ -74,11 +75,7 @@ import "./aih_strings.js";
         const baseUrl = (getConfig().serverUrl || "").replace(/\/+$/, "");
         if (!baseUrl) {
             const msg = t("menu.urlNotConfiguredMsg");
-            if (window.holaf?.toastManager) {
-                window.holaf.toastManager.show({ message: msg, type: "info", duration: 8000 });
-            } else if (window.aihShowAlert) {
-                window.aihShowAlert(t("aih.notConfiguredTitle"), msg, "info");
-            }
+            showToast({ message: msg, type: "info", duration: 8000 });
             return;
         }
         window.open(baseUrl, "_blank");
@@ -304,11 +301,7 @@ import "./aih_strings.js";
         // Fallback : le panneau Settings AIH n'est pas disponible
         // (holaf_settings_manager.js pas encore chargé).
         const msg = t("aih.settingsUnavailable");
-        if (window.holaf?.toastManager) {
-            window.holaf.toastManager.show({ message: msg, type: "info", duration: 6000 });
-        } else if (window.aihShowAlert) {
-            window.aihShowAlert(t("aih.info"), msg, "info");
-        }
+        showToast({ message: msg, type: "info", duration: 6000 });
     }
 
     // ── Helpers partagés ─────────────────────────────────────────────────
@@ -795,16 +788,13 @@ import "./aih_strings.js";
                     // Fallback propre : flux commun indisponible (module aih_menu
                     // chargé avant holaf_main). Toast + lien de reload manuel —
                     // on ne recrée PAS de polling/reload local.
-                    if (window.holaf && window.holaf.toastManager) {
-                        window.holaf.toastManager.show({
-                            message: t("menu.restartUnavailable") + " " +
-                                "<a href='#' onclick='event.preventDefault(); location.reload(); " +
-                                "return false;' style='color:inherit;'>Recharger manuellement</a>",
-                            type: "error"
-                        });
-                    } else {
-                        location.reload();
-                    }
+                    showToast({
+                        message: t("menu.restartUnavailable") + " " +
+                            "<a href='#' onclick='event.preventDefault(); location.reload(); " +
+                            "return false;' style='color:inherit;'>Recharger manuellement</a>",
+                        type: "error",
+                        html: true
+                    });
                 };
             } else if (data.status === "ok" && !data.updated) {
                 // Déjà à jour

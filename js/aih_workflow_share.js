@@ -1,7 +1,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { makeDraggable } from "./holaf_window_utils.js";
-import { HolafToastManager } from "./holaf_toast_manager.js";
+import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToast as bridgeHideToast } from "./aih_toast_bridge.js";
 
 /**
  * AIH Workflow Manager — Modale unique avec 2 onglets.
@@ -193,38 +193,33 @@ import { HolafToastManager } from "./holaf_toast_manager.js";
   }
 
   // ── Toast / progress ──
-  // Utilise HolafToastManager (module ES) : les toasts vont dans le conteneur
-  // partagé #holaf-toast-container. La progression native du manager (option
-  // `progress` de show + `progress` de update) couvre le flux progress des
-  // toasts "progress". aihToast renvoie désormais l'ID (string) du toast.
-
-  var _holafToast = null;
-  function _toastMgr() {
-    if (!_holafToast) _holafToast = new HolafToastManager();
-    return _holafToast;
-  }
+  // Délègue à la brique HolafToast via aih_toast_bridge.js (self-contained,
+  // auto-injecte son CSS). La progression native de la brique (option
+  // `progress: 'manual'` de show + `progress` de update) couvre le flux
+  // progress des toasts "progress". aihToast renvoie l'id (string) du toast.
+  // NB : plus d'échappement manuel — la brique utilise textContent par défaut.
 
   function aihToast(message, type) {
     // type: "info" | "success" | "error" | "progress"
     if (type === "progress") {
       // Toast persistant avec barre de progression (mis à jour via aihToastProgress)
-      return _toastMgr().show({ message: esc(message), type: "info", duration: 0, progress: true });
+      return bridgeShowToast({ message: message, type: "info", duration: 0, progress: "manual" });
     }
     var t = type === "success" ? "success" : type === "error" ? "error" : "info";
-    return _toastMgr().show({ message: esc(message), type: t, duration: 4000 });
+    return bridgeShowToast({ message: message, type: t, duration: 4000 });
   }
 
   function aihToastProgress(id, percent, message) {
     var opts = { progress: Math.max(0, Math.min(100, Math.round(percent))) };
-    if (message) opts.message = esc(message);
-    _toastMgr().update(id, opts);
+    if (message) opts.message = message;
+    bridgeUpdateToast(id, opts);
   }
 
   function aihToastDone(id, type, message) {
     var t = type === "success" ? "success" : "error";
-    _toastMgr().update(id, { type: t, message: esc(message) });
+    bridgeUpdateToast(id, { type: t, message: message });
     // Garder les toasts 8s pour avoir le temps de lire
-    setTimeout(function() { _toastMgr().hide(id); }, 8000);
+    setTimeout(function() { bridgeHideToast(id); }, 8000);
   }
 
   // ── Types ComfyUI natifs ──

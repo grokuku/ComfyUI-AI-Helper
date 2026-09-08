@@ -5,7 +5,7 @@
 
 import { app } from "./holaf_api_compat.js";
 import { holafExtUrl } from "./holaf_ext_base.js";
-import { HolafToastManager } from "./holaf_toast_manager.js";
+import { showToast, updateToast, hideToast } from "./aih_toast_bridge.js";
 import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { applyPersistedTheme } from "./holaf_themes.js";
 
@@ -139,7 +139,10 @@ const HolafUtilitiesMenu = {
             if (!window.holaf) {
                 window.holaf = {};
             }
-            window.holaf.toastManager = new HolafToastManager();
+            // Pont toasts : la brique HolafToast (via aih_toast_bridge.js) est
+            // désormais la source unique. On garde window.holaf.toastManager
+            // comme shim de rétrocompatibilité qui délègue au pont.
+            window.holaf.toastManager = { show: showToast, update: updateToast, hide: hideToast };
 
             window.holaf.rebuildMenu = () => this.buildMenu();
             // Expose le flux de redémarrage partagé (compteur à rebours) pour que
@@ -605,12 +608,11 @@ const HolafUtilitiesMenu = {
     // (never restarts by itself). When something changed, propose the restart
     // via the shared Utils mechanism POST /holaf/utilities/restart.
     checkForAIHUpdate() {
-        const toast = window.holaf?.toastManager;
-        const waitId = toast ? toast.show({ message: t("main.checkingUpdate"), type: "info", duration: 0 }) : null;
+        const waitId = showToast({ message: t("main.checkingUpdate"), type: "info", duration: 0 });
         fetch("/aih/update", { method: 'POST' })
             .then(res => res.json())
             .then(data => {
-                if (waitId && toast) toast.hide(waitId);
+                if (waitId) hideToast(waitId);
                 if (data.updated) {
                     HolafModal.show(
                         t("main.updateTitle"),
@@ -620,14 +622,14 @@ const HolafUtilitiesMenu = {
                         t("main.later")
                     );
                 } else if (data.status === "error") {
-                    if (toast) toast.show({ message: t("main.updateFailed") + (data.message || "unknown error"), type: "error" });
+                    showToast({ message: t("main.updateFailed") + (data.message || "unknown error"), type: "error" });
                 } else {
-                    if (toast) toast.show({ message: t("main.alreadyUpToDate"), type: "success" });
+                    showToast({ message: t("main.alreadyUpToDate"), type: "success" });
                 }
             })
             .catch(err => {
-                if (waitId && toast) toast.hide(waitId);
-                if (toast) toast.show({ message: t("main.updateCheckFailed") + (err.message || "network error"), type: "error" });
+                if (waitId) hideToast(waitId);
+                showToast({ message: t("main.updateCheckFailed") + (err.message || "network error"), type: "error" });
             });
     },
 
@@ -867,9 +869,9 @@ const HolafUtilitiesMenu = {
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(visualGraph)
                     });
-                    window.holaf.toastManager.show({ message: t("main.workflowSynced"), type: "success" });
+                    showToast({ message: t("main.workflowSynced"), type: "success" });
                 } catch (e) {
-                    window.holaf.toastManager.show({ message: t("main.workflowSyncError"), type: "error" });
+                    showToast({ message: t("main.workflowSyncError"), type: "error" });
                 }
             }
         };

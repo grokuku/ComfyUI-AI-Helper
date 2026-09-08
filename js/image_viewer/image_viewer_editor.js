@@ -13,6 +13,7 @@ import { escapeHtml } from "../holaf_dom_utils.js";
 import { imageViewerState } from './image_viewer_state.js';
 import { getThumbnailUrl } from './image_viewer_gallery.js';
 import { resetTransform } from './image_viewer_navigation.js';
+import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -148,10 +149,7 @@ export class ImageEditor {
     hasUnsavedChanges() { return this.saveInProgress; }
 
     _showToast(message, type = 'info', duration = 3000) {
-        if (window.holaf && window.holaf.toastManager)
-            return window.holaf.toastManager.show({ message, type, duration });
-        console.log(`[Holaf Toast] ${type}: ${message}`);
-        return null;
+        return bridgeShowToast({ message, type, duration });
     }
 
     _handleStateChange(state) {
