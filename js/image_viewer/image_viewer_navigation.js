@@ -689,10 +689,17 @@ export async function handleKeyDown(viewer, e) {
 // VAGUE 5 : le mask vit dans un WRAPPER follower (boîte de repos = boîte de
 // l'élément img, letterbox À L'INTÉRIEUR). C'est le WRAPPER qui suit le
 // viewport, PAS le canvas (sinon double transform).
-function _syncMaskOverlay(element) {
+// VAGUE 7 : le viewport est PASSÉ en argument (au lieu de la ref lecture
+// `state.viewport` non résolue ici) — l'overlay passif du mask doit être
+// ré-enregistré comme follower de l'INSTANCE qui pilote réellement l'img
+// (celle de `viewer.zoomViewState`, fournie par setupZoomAndPan). L'ancienne
+// ref pointait une variable hors portée → ReferenceError silencieusement
+// avalée par la brique → le passif ne se re-synchronisait jamais au zoom.
+// addFollower est idempotent (Set) : rappelé à chaque onChange, sans effet
+// si l'overlay suit déjà.
+function _syncMaskOverlay(element, vp) {
     const maskOv = document.getElementById('holaf-mask-overlay');
     if (!maskOv) return;
-    const vp = state.viewport;
     if (!vp) return;
     const wrapper = (maskOv.parentNode && maskOv.parentNode.id === 'holaf-mask-overlay-wrap')
         ? maskOv.parentNode : maskOv;
@@ -753,7 +760,7 @@ export function setupZoomAndPan(state, container, element) {
                 e.target.closest('#holaf-crop-overlay-wrap, #holaf-mask-overlay-wrap')),
             onChange: () => {
                 // (e) overlay mask synchronisé sur la brique (ex-updateTransform).
-                _syncMaskOverlay(element);
+                _syncMaskOverlay(element, state.viewport);
                 // Miroir compat des champs legacy {scale,tx,ty} (l'éditeur y
                 // accède encore jusqu'à sa migration) — la vérité vit dans la brique.
                 const tr = state.viewport ? state.viewport.getTransform() : null;
