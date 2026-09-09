@@ -87,6 +87,7 @@
     --aih-danger-hover: #E53935;
     --aih-danger-text: #FFFFFF;
     --aih-success: #4CAF50;
+    --aih-warning: #FF9800;             /* dark (light : #E65100 dans .aih-mode-light) */
 
     /* ───────────── Typographie ───────────── */
     --aih-font-size: 13px;
@@ -233,6 +234,10 @@
     --holaf-box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
     --holaf-success-color: #2E7D32;
     --holaf-error-color: #C62828;
+
+    /* Warning sémantique déclinée en mode light (material orange 900) —
+       lue sur le <body> par aih_toast_bridge.js pour teinter les toasts. */
+    --aih-warning: #E65100;
 }
 
 /* ════════════════════════════════════════════════════════════════════════

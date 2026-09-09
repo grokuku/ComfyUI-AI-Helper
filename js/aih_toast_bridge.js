@@ -30,6 +30,32 @@ function cssVar(name, fallback) {
     }
 }
 
+// Mélange un fond avec un accent (lerp RGB à `ratio`, ~15 %) → hex #rrggbb.
+// Tolère #rgb / #rrggbb. Retourne null si l'accent (ou le fond) est absent ou
+// illisible : dans ce cas la clé n'est PAS émise et la brique retombe sur
+// --ht-bg (rétrocompatibilité).
+function mixBg(bg, accent, ratio) {
+    const parse = (hex) => {
+        if (typeof hex !== "string") return null;
+        let h = hex.trim().replace(/^#/, "");
+        if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+        if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
+        return [
+            parseInt(h.slice(0, 2), 16),
+            parseInt(h.slice(2, 4), 16),
+            parseInt(h.slice(4, 6), 16),
+        ];
+    };
+    const b = parse(bg);
+    const a = parse(accent);
+    if (!b || !a) return null;
+    const to2 = (n) => n.toString(16).padStart(2, "0");
+    const r = Math.round(b[0] + (a[0] - b[0]) * ratio);
+    const g = Math.round(b[1] + (a[1] - b[1]) * ratio);
+    const bl = Math.round(b[2] + (a[2] - b[2]) * ratio);
+    return "#" + to2(r) + to2(g) + to2(bl);
+}
+
 // Calcule les variables --ht-* de la brique depuis les vars du thème AIH.
 function computeThemeVars() {
     const accent = cssVar("--aih-accent", cssVar("--holaf-accent-color", "#4682B4"));
@@ -38,9 +64,11 @@ function computeThemeVars() {
     const border = cssVar("--aih-border", cssVar("--holaf-border-color", "#36404A"));
     const success = cssVar("--aih-success", cssVar("--holaf-success-color", "#4CAF50"));
     const danger = cssVar("--aih-danger", cssVar("--holaf-error-color", "#F44336"));
+    const warning = cssVar("--aih-warning", cssVar("--holaf-warning-color", ""));
     const shadow = cssVar("--aih-shadow", cssVar("--holaf-box-shadow", "0 6px 24px rgba(0, 0, 0, 0.5)"));
     const radius = cssVar("--aih-radius", "10px");
-    return {
+
+    const vars = {
         "--ht-bg": bg,
         "--ht-fg": fg,
         "--ht-border": border,
@@ -51,6 +79,24 @@ function computeThemeVars() {
         "--ht-shadow": shadow,
         "--ht-radius": radius,
     };
+
+    // Fonds teintés PAR TYPE (brique v0.4.0) : ~15 % de l'accent du type
+    // mélangé dans --ht-bg. Source des teintes : vars sémantiques du pack
+    // (--aih-success / --aih-danger / --aih-warning, définies par mode dark/
+    // light dans holaf_themes.css). PAS de --ht-bg-info : le type info reste
+    // neutre (fond --ht-bg via le fallback du CSS). Échappatoire : un hôte
+    // peut overrider par toast via theme.vars (--ht-bg-<type> posé en inline
+    // gagne sur tout dans la chaîne de fallback de la brique).
+    const tint = (accentColor) => mixBg(bg, accentColor, 0.15);
+    const tinted = {
+        "--ht-bg-success": tint(success),
+        "--ht-bg-error": tint(danger),
+        "--ht-bg-warning": tint(warning),
+    };
+    for (const key in tinted) {
+        if (tinted[key]) vars[key] = tinted[key];
+    }
+    return vars;
 }
 
 // Enregistre / met à jour le thème 'aih' dans le registre de la brique.

@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafToast · version 0.3.0
+ * Holaf UI — Brique HolafToast · version 0.4.0
  * ─────────────────────────────────────────────────────────────────────────────
  * Notifications flottantes (toasts) autonomes, zéro dépendance runtime :
  * 4 types (info/success/warning/error) avec icône, empilement par position
@@ -7,6 +7,19 @@
  * avec barre de progression animée en temps réel, PAUSE au survol (timer ET
  * barre), bouton ✕, actions cliquables, aria-live (polite / assertive pour
  * error), mobile pleine largeur en bas, prefers-reduced-motion respecté.
+ *
+ * v0.4.0 — fond teinté PAR TYPE (info/success/warning/error) avec fallback :
+ * nouvelles variables de thème OPTIONNELLES --ht-bg-info, --ht-bg-success,
+ * --ht-bg-warning, --ht-bg-error. Chaque type a sa règle CSS, ex. :
+ *   .holaf-toast--success { background: var(--ht-bg-success, var(--ht-bg)); }
+ * Var de type absente (thèmes existants, hôtes anciens) → fond global
+ * --ht-bg (rétrocompatibilité totale) ; --ht-bg posé en inline (override par
+ * toast) l'emporte dans la chaîne de fallback ; --ht-bg-<type> posé en inline
+ * (par toast ou via theme.vars) gagne sur tout. Les presets dark/light/
+ * midnight/slate définissent des teintes harmonisées (~15 % de l'accent du
+ * type mélangé dans --ht-bg, hex calculés à la main) pour success/warning/
+ * error ; le type info reste neutre (aucune var --ht-bg-info dans les
+ * presets). Rétrocompatible.
  *
  * v0.2.1 — correction barre de progression : elle reste désormais ANIMÉE en
  * temps réel (la durée est calée sur le timer d'auto-dismiss), au lieu d'un
@@ -29,7 +42,7 @@
 const HolafToast = (function () {
     "use strict";
 
-    const VERSION = "0.3.0";
+    const VERSION = "0.4.0";
 
     // ─── Constantes du module ────────────────────────────────────────────────
     const CSS_ID = "holaf-toast-style";
@@ -194,10 +207,19 @@ const HolafToast = (function () {
     // Contraste des textes ≥ 4.5:1. PAS de --ht-width dans un preset : la
     // largeur reste gouvernée par la brique (un thème ne doit pas pouvoir
     // casser le responsive mobile).
-    // dark : STRICTEMENT les valeurs par défaut du CSS injecté ci-dessous —
-    // theme:"dark" ≡ aucune option theme (rétrocompatibilité à l'identique).
+    // v0.4.0 : chaque preset définit aussi des fonds teintés PAR TYPE
+    // (--ht-bg-success/warning/error : ~15 % de l'accent du type mélangé dans
+    // --ht-bg, hex calculés à la main — pas de color-mix(), compat maximum).
+    // PAS de --ht-bg-info : le type info reste neutre (fond --ht-bg via le
+    // fallback du CSS). SANS thème, les défauts CSS restent sans teinte.
+    // dark : reprend les valeurs par défaut du CSS injecté pour les vars
+    // communes (theme:"dark" ≡ défauts historiques) — il y ajoute les teintes
+    // par type ci-dessous.
     themesRegister("dark", {
         "--ht-bg": "#2b2b2b",
+        "--ht-bg-success": "#303f35",
+        "--ht-bg-warning": "#463d2c",
+        "--ht-bg-error": "#463131",
         "--ht-fg": "#f0f0f0",
         "--ht-border": "#4a4a4a",
         "--ht-accent-info": "#4aa3ff",
@@ -210,6 +232,9 @@ const HolafToast = (function () {
     // light : clair zinc, accents plus foncés pour garder le contraste ≥ 4.5:1.
     themesRegister("light", {
         "--ht-bg": "#ffffff",
+        "--ht-bg-success": "#dcece2",
+        "--ht-bg-warning": "#f4e5da",
+        "--ht-bg-error": "#fadede",
         "--ht-fg": "#18181b",
         "--ht-border": "#d4d4d8",
         "--ht-accent-info": "#2563eb",
@@ -222,6 +247,9 @@ const HolafToast = (function () {
     // midnight : bleu nuit profond « layered », accents doux et lumineux.
     themesRegister("midnight", {
         "--ht-bg": "#10111d",
+        "--ht-bg-success": "#152e30",
+        "--ht-bg-warning": "#332b1e",
+        "--ht-bg-error": "#331f2a",
         "--ht-fg": "#e2e4f0",
         "--ht-border": "#272a44",
         "--ht-accent-info": "#60a5fa",
@@ -234,6 +262,9 @@ const HolafToast = (function () {
     // slate : gris ardoise neutre, accents gris-bleu doux — le plus polyvalent.
     themesRegister("slate", {
         "--ht-bg": "#1f232b",
+        "--ht-bg-success": "#2b4040",
+        "--ht-bg-warning": "#403d30",
+        "--ht-bg-error": "#40373d",
         "--ht-fg": "#e6e9ee",
         "--ht-border": "#3a4150",
         "--ht-accent-info": "#93c5fd",
@@ -366,10 +397,17 @@ const HolafToast = (function () {
     cursor: default;
     animation: holaf-toast-slide-in 0.25s ease-out;
 }
-.holaf-toast--info    { --ht-accent: var(--ht-accent-info); }
-.holaf-toast--success { --ht-accent: var(--ht-accent-success); }
-.holaf-toast--warning { --ht-accent: var(--ht-accent-warning); }
-.holaf-toast--error   { --ht-accent: var(--ht-accent-error); }
+/* v0.4.0 : fond teinté PAR TYPE avec fallback rétro-compatible. La règle de
+ * base ci-dessus pose background:var(--ht-bg) ; chaque type la raffine avec
+ * SA var optionnelle : si --ht-bg-<type> n'est pas définie (thèmes existants,
+ * hôtes anciens), le fond global --ht-bg s'applique. La substitution des
+ * custom properties se fait sur l'élément lui-même : un --ht-bg posé en
+ * inline (override par toast) l'emporte dans la chaîne de fallback, et un
+ * --ht-bg-<type> en inline (par toast ou via theme.vars) gagne sur tout. */
+.holaf-toast--info    { --ht-accent: var(--ht-accent-info);    background: var(--ht-bg-info, var(--ht-bg)); }
+.holaf-toast--success { --ht-accent: var(--ht-accent-success); background: var(--ht-bg-success, var(--ht-bg)); }
+.holaf-toast--warning { --ht-accent: var(--ht-accent-warning); background: var(--ht-bg-warning, var(--ht-bg)); }
+.holaf-toast--error   { --ht-accent: var(--ht-accent-error);   background: var(--ht-bg-error, var(--ht-bg)); }
 
 .holaf-toast--closing {
     animation: holaf-toast-fade-out 0.2s ease-in forwards;
