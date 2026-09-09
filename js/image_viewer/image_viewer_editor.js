@@ -235,8 +235,7 @@ export class ImageEditor {
     }
 
     _hide() {
-        if (this._maskTransformObserver) { this._maskTransformObserver.disconnect(); this._maskTransformObserver = null; }
-        if (this._cropTransformObserver) { this._cropTransformObserver.disconnect(); this._cropTransformObserver = null; }
+        this._unsubscribeViewport();
         if (this.panelEl) this.panelEl.style.display = 'none';
         this._dispatchVideoOverride(null);
         this._getPreviewElements().forEach(el => { if (el) el.style.filter = 'none'; });
@@ -754,6 +753,7 @@ export class ImageEditor {
             this._activeOverlayMaskId = null;
             const ov = document.getElementById('holaf-mask-overlay');
             if (ov) ov.remove();
+            this._syncViewportSubscription();
         }
         this._updateUIFromState();
         this.applyPreview();
@@ -882,6 +882,101 @@ export class ImageEditor {
         };
     }
 
+    // ── Viewport (holaf-viewport) : positionnement transform-aware des overlays ──
+
+    // State viewport actif pour l'éditeur. L'éditeur est lié à la vue zoom
+    // (overlays posés dans #holaf-viewer-zoom-view) → on résout le state via la
+    // vue liée, pas une référence en dur dispersée. Si l'éditeur était un jour
+    // lié à la vue fullscreen, seul ce helper changerait.
+    _activeViewState() {
+        return (this.viewer && this.viewer.zoomViewState) || null;
+    }
+
+    _activeViewport() {
+        const st = this._activeViewState();
+        return (st && st.viewport) || null;
+    }
+
+    // Positionne un overlay (canvas) sur le rect écran du contenu image via
+    // viewport.getImageRect() (transform-aware). left/top/width/height CSS
+    // suivent le rect ; transform:none (PLUS AUCUNE copie du transform de l'img).
+    // La résolution canvas (overlay.width/height) reste inchangée → indépendante
+    // du zoom. Retourne false si aucun viewport (fallback positionnement manuel).
+    _positionOverlayFromViewport(overlay) {
+        const vp = this._activeViewport();
+        if (!vp) return false;
+        const rect = vp.getImageRect();
+        overlay.style.left = rect.x + 'px';
+        overlay.style.top = rect.y + 'px';
+        overlay.style.width = rect.width + 'px';
+        overlay.style.height = rect.height + 'px';
+        overlay.style.transform = 'none';
+        overlay.style.transformOrigin = '0 0';
+        return true;
+    }
+
+    // Abonnement au viewport actif tant qu'un overlay est affiché : sur
+    // changement de transform → repositionne + redessine le contenu existant.
+    _subscribeViewport() {
+        const vp = this._activeViewport();
+        if (!vp || this._viewportSubscribed === vp) return;
+        this._unsubscribeViewport();
+        this._viewportSubscribed = vp;
+        this._viewportCb = () => this._onViewportChange();
+        vp.on(this._viewportCb);
+    }
+
+    _unsubscribeViewport() {
+        if (this._viewportSubscribed && this._viewportCb) {
+            this._viewportSubscribed.off(this._viewportCb);
+        }
+        this._viewportSubscribed = null;
+        this._viewportCb = null;
+    }
+
+    // Abonne si un overlay est affiché, désabonne sinon (anti-fuite).
+    _syncViewportSubscription() {
+        const hasOverlay = !!document.getElementById('holaf-mask-overlay')
+            || !!document.getElementById('holaf-crop-overlay');
+        if (hasOverlay) this._subscribeViewport();
+        else this._unsubscribeViewport();
+    }
+
+    _onViewportChange() {
+        this._repositionMaskOverlay();
+        this._repositionCropOverlay();
+    }
+
+    _repositionMaskOverlay() {
+        const ov = document.getElementById('holaf-mask-overlay');
+        if (!ov) return;
+        if (!this._positionOverlayFromViewport(ov)) return;
+        // Édition en cours : le contenu est le dessin live (résolution canvas
+        // fixe) → le repositionnement CSS suffit, rien à redessiner.
+        if (this._maskOverlay === ov) return;
+        // Overlay passif : redessine le mask tinté courant.
+        const maskId = this._activeOverlayMaskId;
+        const maskCanvas = maskId && this._maskCanvases[maskId];
+        if (maskCanvas) {
+            const ctx = ov.getContext('2d');
+            ctx.clearRect(0, 0, ov.width, ov.height);
+            ctx.drawImage(this._maskTinted(maskCanvas, ov.width, ov.height), 0, 0);
+        }
+    }
+
+    _repositionCropOverlay() {
+        const ov = document.getElementById('holaf-crop-overlay');
+        if (!ov) return;
+        if (!this._positionOverlayFromViewport(ov)) return;
+        if (this._cropOverlay === ov) {
+            // Édition en cours : redessine la sélection courante.
+            this._drawCropOverlay();
+        } else {
+            // Overlay passif : redessine depuis currentState.crop.
+            this._drawPassiveCropOverlay(ov);
+        }
+    }
+
     // Convertit un canvas de mask (niveaux de gris ou tracés rouges) en
     // rendu rouge-alpha (R=255, G=0, B=0, A=valeur du mask) pour l'overlay.
     _maskTinted(maskCanvas, w, h) {
@@ -900,23 +995,6 @@ export class ImageEditor {
         return out;
     }
 
-    // Maintient la synchro du transform de l'overlay avec celui de l'img
-    // (pan/zoom) via un MutationObserver sur l'attribut style de l'img.
-    _observeMaskTransform(img) {
-        if (this._maskTransformObserver) this._maskTransformObserver.disconnect();
-        this._maskTransformObserver = new MutationObserver(() => {
-            const ov = document.getElementById('holaf-mask-overlay');
-            const im = this._maskImageEl();
-            if (ov && im) {
-                ov.style.transform = im.style.transform || 'none';
-                // FIX: reflète aussi la transition effective de l'img (inline ou CSS)
-                // pour rester en phase avec elle pendant zoom/pan.
-                ov.style.transition = im.style.transition || getComputedStyle(im).transition || 'none';
-            }
-        });
-        if (img) this._maskTransformObserver.observe(img, { attributes: true, attributeFilter: ['style'] });
-    }
-
     _showMaskOverlay(maskId) {
         const zoomView = document.getElementById('holaf-viewer-zoom-view');
         const img = this._maskImageEl();
@@ -928,16 +1006,24 @@ export class ImageEditor {
             overlay.id = 'holaf-mask-overlay';
             zoomView.appendChild(overlay);
         }
+        // Résolution canvas : taille letterbox à l'échelle 1 (indépendante du zoom).
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
-        overlay.style.cssText = `position:absolute;left:${(img.offsetLeft || 0) + r.dx}px;top:${(img.offsetTop || 0) + r.dy}px;z-index:60;pointer-events:none;opacity:0.45;transition:none;`;
-        overlay.style.transform = img.style.transform || 'none';
+        overlay.style.cssText = 'position:absolute;z-index:60;pointer-events:none;opacity:0.45;transition:none;';
         overlay.style.transformOrigin = '0 0';
+        // Position/dimensions CSS : suivent le rect écran du contenu (transform-aware).
+        if (!this._positionOverlayFromViewport(overlay)) {
+            // Fallback (pas de viewport encore) : positionnement manuel à l'échelle 1.
+            overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
+            overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
+            overlay.style.width = r.width + 'px';
+            overlay.style.height = r.height + 'px';
+        }
         const ctx = overlay.getContext('2d');
         ctx.clearRect(0, 0, overlay.width, overlay.height);
         ctx.drawImage(this._maskTinted(maskCanvas, overlay.width, overlay.height), 0, 0);
         this._activeOverlayMaskId = maskId;
-        this._observeMaskTransform(img);
+        this._syncViewportSubscription();
     }
 
     // ── Crop overlay passif (affichage du cadrage final) ──
@@ -945,7 +1031,7 @@ export class ImageEditor {
     // par le serveur. Côté client, la préview n'applique plus le crop : on
     // affiche simplement un overlay passif (extérieur assombri, intérieur
     // normal, pointer-events:none) sur l'image complète. Positionné/dimensionné
-    // comme le mask overlay (rect letterboxé + transform copié de l'img).
+    // via viewport.getImageRect() (transform-aware, aligné à tout zoom).
     _showCropOverlay() {
         const zoomView = document.getElementById('holaf-viewer-zoom-view');
         const img = this._maskImageEl();
@@ -953,6 +1039,7 @@ export class ImageEditor {
         if (!crop) {
             const ov = document.getElementById('holaf-crop-overlay');
             if (ov) ov.remove();
+            this._syncViewportSubscription();
             return;
         }
         if (!zoomView || !img) return;
@@ -966,12 +1053,25 @@ export class ImageEditor {
         }
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
-        overlay.style.cssText = `position:absolute;left:${(img.offsetLeft || 0) + r.dx}px;top:${(img.offsetTop || 0) + r.dy}px;z-index:60;pointer-events:none;transition:none;`;
-        overlay.style.transform = img.style.transform || 'none';
+        overlay.style.cssText = 'position:absolute;z-index:60;pointer-events:none;transition:none;';
         overlay.style.transformOrigin = '0 0';
+        if (!this._positionOverlayFromViewport(overlay)) {
+            overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
+            overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
+            overlay.style.width = r.width + 'px';
+            overlay.style.height = r.height + 'px';
+        }
+        this._drawPassiveCropOverlay(overlay);
+        this._syncViewportSubscription();
+    }
+
+    // Dessine l'overlay crop passif (extérieur assombri) depuis currentState.crop.
+    _drawPassiveCropOverlay(overlay) {
+        const crop = this.currentState.crop;
+        if (!crop) return;
         const ctx = overlay.getContext('2d');
         ctx.clearRect(0, 0, overlay.width, overlay.height);
-        const rect = { x: crop.x * r.width, y: crop.y * r.height, w: crop.w * r.width, h: crop.h * r.height };
+        const rect = { x: crop.x * overlay.width, y: crop.y * overlay.height, w: crop.w * overlay.width, h: crop.h * overlay.height };
         ctx.fillStyle = 'rgba(0,0,0,0.55)';
         // haut
         ctx.fillRect(0, 0, overlay.width, rect.y);
@@ -981,7 +1081,6 @@ export class ImageEditor {
         ctx.fillRect(0, rect.y, rect.x, rect.h);
         // droite
         ctx.fillRect(rect.x + rect.w, rect.y, overlay.width - (rect.x + rect.w), rect.h);
-        this._observeCropTransform(img);
     }
 
     _openMaskEditor(maskId) {
@@ -996,18 +1095,22 @@ export class ImageEditor {
         this._maskHidden = false;
 
         // ── Forcer le zoom à l'échelle 1 : le mask vit dans le repère image ──
-        if (this.viewer && this.viewer.zoomViewState) {
-            resetTransform(this.viewer.zoomViewState, img);
-        }
+        const st = this._activeViewState();
+        if (st) resetTransform(st, img);
 
         const overlay = document.getElementById('holaf-mask-overlay') || document.createElement('canvas');
         overlay.id = 'holaf-mask-overlay';
         if (!overlay.parentNode) zoomView.appendChild(overlay);
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
-        overlay.style.cssText = `position:absolute;left:${(img.offsetLeft || 0) + r.dx}px;top:${(img.offsetTop || 0) + r.dy}px;z-index:60;cursor:crosshair;opacity:0.5;transition:none;`;
-        overlay.style.transform = img.style.transform || 'none';
+        overlay.style.cssText = 'position:absolute;z-index:60;cursor:crosshair;opacity:0.5;transition:none;';
         overlay.style.transformOrigin = '0 0';
+        if (!this._positionOverlayFromViewport(overlay)) {
+            overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
+            overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
+            overlay.style.width = r.width + 'px';
+            overlay.style.height = r.height + 'px';
+        }
         const octx = overlay.getContext('2d');
         octx.clearRect(0, 0, overlay.width, overlay.height);
         if (this._maskCanvases[maskId]) octx.drawImage(this._maskTinted(this._maskCanvases[maskId], overlay.width, overlay.height), 0, 0);
@@ -1057,7 +1160,7 @@ export class ImageEditor {
         overlay.addEventListener('pointermove', (e) => this._maskOnMove(e));
         overlay.addEventListener('pointerup', (e) => this._maskOnUp(e));
         overlay.addEventListener('pointercancel', (e) => this._maskOnUp(e));
-        this._observeMaskTransform(img);
+        this._syncViewportSubscription();
     }
 
     _cloneCanvas(c) {
@@ -1139,7 +1242,6 @@ export class ImageEditor {
     }
 
     _clearMaskOverlay() {
-        if (this._maskTransformObserver) { this._maskTransformObserver.disconnect(); this._maskTransformObserver = null; }
         if (!this._maskOverlay) return;
         this._maskOverlay.getContext('2d').clearRect(0, 0, this._maskOverlay.width, this._maskOverlay.height);
     }
@@ -1170,7 +1272,6 @@ export class ImageEditor {
     }
 
     _finishMaskEditor(commit) {
-        if (this._maskTransformObserver) { this._maskTransformObserver.disconnect(); this._maskTransformObserver = null; }
         if (commit && this._maskOverlay && this._activeMaskId) {
             this._maskCanvases[this._activeMaskId] = this._bakeMaskToFull();
             const maskCtrl = this.currentState.controls.find(c => c.id === this._activeMaskId);
@@ -1204,24 +1305,10 @@ export class ImageEditor {
             this._showMaskOverlay(this._activeOverlayMaskId);
         this.applyPreview();
         this._updateUIFromState();
+        this._syncViewportSubscription();
     }
 
     // ── Crop editor (recadrage basique : sélection rectangle) ──
-
-    // Maintient la synchro du transform de l'overlay crop avec celui de l'img
-    // (pan/zoom) via un MutationObserver sur l'attribut style de l'img.
-    _observeCropTransform(img) {
-        if (this._cropTransformObserver) this._cropTransformObserver.disconnect();
-        this._cropTransformObserver = new MutationObserver(() => {
-            const ov = document.getElementById('holaf-crop-overlay');
-            const im = this._maskImageEl();
-            if (ov && im) {
-                ov.style.transform = im.style.transform || 'none';
-                ov.style.transition = im.style.transition || getComputedStyle(im).transition || 'none';
-            }
-        });
-        if (img) this._cropTransformObserver.observe(img, { attributes: true, attributeFilter: ['style'] });
-    }
 
     _openCropEditor() {
         if (!this.activeImage) return;
@@ -1232,18 +1319,22 @@ export class ImageEditor {
         this._cleanupCropEditor(); // nettoie un éditeur déjà ouvert
 
         // ── Forcer le zoom à l'échelle 1 : le crop vit dans le repère image ──
-        if (this.viewer && this.viewer.zoomViewState) {
-            resetTransform(this.viewer.zoomViewState, img);
-        }
+        const st = this._activeViewState();
+        if (st) resetTransform(st, img);
 
         const overlay = document.getElementById('holaf-crop-overlay') || document.createElement('canvas');
         overlay.id = 'holaf-crop-overlay';
         if (!overlay.parentNode) zoomView.appendChild(overlay);
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
-        overlay.style.cssText = `position:absolute;left:${(img.offsetLeft || 0) + r.dx}px;top:${(img.offsetTop || 0) + r.dy}px;z-index:60;cursor:crosshair;transition:none;`;
-        overlay.style.transform = 'none';
+        overlay.style.cssText = 'position:absolute;z-index:60;cursor:crosshair;transition:none;';
         overlay.style.transformOrigin = '0 0';
+        if (!this._positionOverlayFromViewport(overlay)) {
+            overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
+            overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
+            overlay.style.width = r.width + 'px';
+            overlay.style.height = r.height + 'px';
+        }
 
         // Pré-dessine le crop existant si présent
         this._cropRect = null;
@@ -1282,7 +1373,7 @@ export class ImageEditor {
         overlay.addEventListener('pointermove', (e) => this._cropOnMove(e));
         overlay.addEventListener('pointerup', (e) => this._cropOnUp(e));
         overlay.addEventListener('pointercancel', (e) => this._cropOnUp(e));
-        this._observeCropTransform(img);
+        this._syncViewportSubscription();
     }
 
     _cropLocal(e) {
@@ -1378,7 +1469,6 @@ export class ImageEditor {
     }
 
     _cleanupCropEditor() {
-        if (this._cropTransformObserver) { this._cropTransformObserver.disconnect(); this._cropTransformObserver = null; }
         const ov = document.getElementById('holaf-crop-overlay');
         if (ov) ov.remove();
         if (this._cropBar) { this._cropBar.remove(); this._cropBar = null; }
@@ -1389,6 +1479,7 @@ export class ImageEditor {
         this._cropPrev = null;
         this.applyPreview();
         this._updateUIFromState();
+        this._syncViewportSubscription();
     }
 
     // ── UI sync ──
@@ -1666,6 +1757,7 @@ export class ImageEditor {
             this._activeOverlayMaskId = null;
             const ov = document.getElementById('holaf-mask-overlay');
             if (ov) ov.remove();
+            this._syncViewportSubscription();
             this.processedVideoUrl = null;
             this._dispatchVideoOverride(null);
             this._clearCanvasCache();
@@ -1804,18 +1896,17 @@ export class ImageEditor {
 
             ctx.clearRect(0, 0, w, h);
 
-            const editedEl2 = zoomView.querySelector('img');
-            let zScale = 1, zTx = 0, zTy = 0;
-            if (editedEl2) {
-                const matrix = new DOMMatrix(getComputedStyle(editedEl2).transform);
-                zScale = matrix.a; zTx = matrix.e; zTy = matrix.f;
+            // Transform + fit contain : source unique = le viewport actif
+            // (getTransform/getImageRect, transform-aware) — plus de lecture
+            // DOMMatrix(getComputedStyle) ni de fit contain calculé localement.
+            const vp = this._activeViewport();
+            let zScale = 1, zTx = 0, zTy = 0, ox = 0, oy = 0, dw = w, dh = h;
+            if (vp) {
+                const tr = vp.getTransform();
+                zScale = tr.scale; zTx = tr.tx; zTy = tr.ty;
+                const rect = vp.getImageRect();
+                ox = rect.x; oy = rect.y; dw = rect.width; dh = rect.height;
             }
-
-            const imgAspect = origImg.naturalWidth / origImg.naturalHeight;
-            const canvasAspect = w / h;
-            let dw, dh, ox = 0, oy = 0;
-            if (imgAspect > canvasAspect) { dw = w; dh = w / imgAspect; oy = (h - dh) / 2; }
-            else { dh = h; dw = h * imgAspect; ox = (w - dw) / 2; }
 
             ctx.save();
             ctx.translate(zTx, zTy);

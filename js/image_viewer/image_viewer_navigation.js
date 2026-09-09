@@ -13,6 +13,10 @@ import { handleDeletion } from './image_viewer_actions.js';
 import { HolafPanelManager, dialogState } from '../holaf_panel_manager.js';
 import { getThumbnailUrl } from './image_viewer_gallery.js';
 import { getImageAt } from './image_viewer_data.js';
+// VAGUE 2 : la géométrie + les interactions zoom/pan sont déléguées à la brique
+// HolafViewport (vendored). L'hôte ne garde que le branchement, la synchro de
+// l'overlay mask de l'éditeur et le feedback curseur.
+import { HolafViewport } from '../vendor/holaf/holaf-viewport.js';
 
 function _applyEditorPreview(viewer, element) {
     if (viewer && viewer.editor && typeof viewer.editor.applyPreview === 'function') {
@@ -43,6 +47,17 @@ async function _handleUnsavedChanges(viewer) {
 
 export function resetTransform(state, element) {
     if (!element) return;
+    if (state.viewport) {
+        // VAGUE 2 : délégation à la brique. En mode content, le fit = scale 1
+        // (l'object-fit:contain a déjà cadré) → reset() reproduit exactement
+        // l'ancien translate(0,0) scale(1). Signature conservée : l'éditeur
+        // (image_viewer_editor.js — migration vague suivante) l'appelle encore.
+        state.viewport.reset();
+        element.style.cursor = 'grab';
+        return;
+    }
+    // Fallback legacy : aucune instance viewport encore créée. Ancien code,
+    // conservé tel quel par sécurité.
     state.scale = 1;
     state.tx = 0;
     state.ty = 0;
@@ -221,7 +236,11 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
             videoEl.style.margin = 'auto';
             videoEl.style.border = '1px solid var(--holaf-border-color)';
             videoEl.style.borderRadius = 'var(--holaf-border-radius)';
-            
+
+            // VAGUE 2 : le lecteur audio n'est pas une surface zoomable — force
+            // l'identité exacte (l'ancien resetTransform écrivait ce transform).
+            videoEl.style.transform = 'translate(0px, 0px) scale(1)';
+
             videoEl.play().catch(() => {});
         }
         
@@ -250,6 +269,17 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
 
         // Re-attach pan/zoom logic to the video element
         setupZoomAndPan(transformState, container, videoEl);
+
+        // VAGUE 2 : pose les dimensions de la vidéo sur la brique dès que la
+        // metadata est décodée (letterbox/clamp/getImageRect précis) —
+        // setImageSize() refait le fit, ce qui reproduit le reset d'ouverture.
+        const vp = transformState.viewport || null;
+        videoEl.onloadedmetadata = () => {
+            if (serial !== _loadSerial) return; // Chargement périmé — ignore
+            if (!vp || transformState.viewport !== vp) return; // Instance remplacée depuis
+            vp.setImageSize(videoEl.videoWidth, videoEl.videoHeight);
+        };
+
         _applyEditorPreview(viewer, videoEl);
 
         // Attempt autoplay
@@ -292,6 +322,12 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
                     imgEl.src = url;
                     imgEl.style.filter = '';
                     setupZoomAndPan(transformState, container, imgEl);
+                    // VAGUE 2 : pose les dimensions naturelles de l'image sur la
+                    // brique (letterbox/clamp/getImageRect précis) — setImageSize()
+                    // refait le fit, ce qui reproduit le resetTransform d'ouverture.
+                    if (transformState.viewport) {
+                        transformState.viewport.setImageSize(loader.naturalWidth, loader.naturalHeight);
+                    }
                     _applyEditorPreview(viewer, imgEl);
                 };
                 loader.onerror = () => {
@@ -630,75 +666,100 @@ export async function handleKeyDown(viewer, e) {
     }
 }
 
+// ── VAGUE 2 : délégation à la brique HolafViewport ──────────────────────
+// Toute la logique wheel→zoom (zoom-to-cursor ×1.1 clamp [1,30]), drag→pan,
+// clamps et transitions (none pendant le drag / .2s ease-out après) vit
+// désormais dans js/vendor/holaf/holaf-viewport.js. L'hôte ne conserve que :
+//   - la création/réutilisation de l'instance (un state = une instance,
+//     exposée sur state.viewport pour l'éditeur — migration vague suivante) ;
+//   - la synchro de l'overlay mask de l'éditeur (via onChange) ;
+//   - le feedback curseur et l'anti-ghost <img> (dragstart), que la brique
+//     ne gère pas.
+
+// Synchronise l'overlay mask (posé par l'éditeur dans le zoom view) sur le
+// transform courant de l'élément média. Même sémantique que l'ancien
+// updateTransform : miroir du transform + de la transition effective.
+// NB positionnement : l'overlay est posé À LA MAIN par l'éditeur (left =
+// offsetLeft + letterbox calculé à scale 1, cf. _showMaskOverlay /
+// _maskImageRect) puis reçoit une copie du transform de l'img → il dérive de
+// dx·(1−scale) au zoom. La correction (repositionner via
+// viewport.getImageRect(), transform-aware) se fera côté éditeur — vague
+// suivante, ce fichier ne fait que maintenir la synchro existante.
+function _syncMaskOverlay(element) {
+    const maskOv = document.getElementById('holaf-mask-overlay');
+    if (!maskOv) return;
+    maskOv.style.transform = element.style.transform || 'none';
+    // FIX: reflète aussi la transition de l'img (inline 'none' pendant le
+    // drag, 'transform .2s ease-out' au relâchement — la brique pose toujours
+    // la valeur inline) pour que l'overlay anime exactement en phase avec
+    // l'image.
+    maskOv.style.transition = element.style.transition || getComputedStyle(element).transition || 'none';
+}
+
+// Parité UX : la brique ne gère pas le curseur. grabbing pendant un drag
+// effectif (scale > fit), grab sinon. Display-only : aucune logique de pan ici.
+const _cursorBoundElements = new WeakSet();
+function _bindCursorFeedback(state, element) {
+    if (_cursorBoundElements.has(element)) return;
+    _cursorBoundElements.add(element);
+    element.addEventListener('mousedown', () => {
+        const vp = state.viewport;
+        if (vp && vp.getScale() > vp.getFitScale() + 1e-9) element.style.cursor = 'grabbing';
+    });
+    window.addEventListener('mouseup', () => {
+        if (element.style.cursor === 'grabbing') element.style.cursor = 'grab';
+    });
+}
+
+// Contenu (élément média) porté par l'instance viewport de chaque state.
+const _viewportContents = new WeakMap();
+
 export function setupZoomAndPan(state, container, element) {
     if (!element || !container) return;
 
-    // CORRECTION : Nous n'utilisons PLUS de clonage. 
-    // Nous écrasons directement les propriétés onwheel/onmousedown.
-    // Cela préserve l'élément DOM original et ses références.
+    // Un state = une instance. Si l'élément média change (bascule img ↔ vidéo),
+    // l'instance précédente est détruite (elle restaure les styles inline de
+    // son contenu et décroche ses listeners) puis recrée sur le nouvel élément.
+    if (state.viewport && _viewportContents.get(state) !== element) {
+        state.viewport.destroy();
+        state.viewport = null;
+        _viewportContents.delete(state);
+    }
 
-    // Set origin to top-left to make math easier
-    element.style.transformOrigin = '0 0';
+    if (!state.viewport) {
+        state.viewport = HolafViewport.create(container, {
+            content: element,   // mode content : <img>/<video> object-fit:contain remplissant la vue
+            minZoom: 'fit',     // ↔ ancien clamp bas : 1 (en mode content, fit = scale 1)
+            maxZoom: 30,        // ↔ ancien clamp haut
+            zoomFactor: 1.1,    // ↔ ancien pas de wheel
+            panClamp: true,     // l'image ne quitte jamais la vue (l'ancien drag pan était libre)
+            // Pas de zoom dblclick sur la vue zoomée : l'img y porte déjà
+            // ondblclick → fullscreen (image_viewer_ui.js, hors périmètre) —
+            // déclencher AUSSI le zoom brique serait une régression. La vue
+            // fullscreen n'a pas de handler dblclick → zoom brique activé.
+            doubleClickZoom: container.id !== 'holaf-viewer-zoom-view',
+            drag: true,
+            dragButton: 0,      // ↔ ancien : clic gauche uniquement
+            dragTarget: element, // ↔ ancien : drag posé sur l'élément, pas le container
+            onChange: () => {
+                // (e) overlay mask synchronisé sur la brique (ex-updateTransform).
+                _syncMaskOverlay(element);
+                // Miroir compat des champs legacy {scale,tx,ty} (l'éditeur y
+                // accède encore jusqu'à sa migration) — la vérité vit dans la brique.
+                const tr = state.viewport ? state.viewport.getTransform() : null;
+                if (tr) {
+                    state.scale = tr.scale;
+                    state.tx = tr.tx;
+                    state.ty = tr.ty;
+                }
+            },
+        });
+        _viewportContents.set(state, element);
+        element.style.transformOrigin = '0 0'; // la brique le ré-applique à chaque applyTransform
+        _bindCursorFeedback(state, element);
+    }
 
-    const updateTransform = () => {
-        element.style.transform = `translate(${state.tx}px,${state.ty}px) scale(${state.scale})`;
-        const maskOv = document.getElementById('holaf-mask-overlay');
-        if (maskOv) {
-            maskOv.style.transform = element.style.transform;
-            // FIX: reflète aussi la transition de l'img (inline 'none' pendant le
-            // drag, 'transform .2s ease-out' au relâchement, sinon la valeur CSS
-            // calculée) pour que l'overlay anime exactement en phase avec l'image.
-            maskOv.style.transition = element.style.transition || getComputedStyle(element).transition || 'none';
-        }
-    };
-
-    // Attach wheel event to the container (the viewport)
-    container.onwheel = (e) => {
-        if (container.style.display === 'none') return;
-        e.preventDefault();
-        const oldScale = state.scale;
-        const newScale = e.deltaY < 0 ? oldScale * 1.1 : oldScale / 1.1;
-        state.scale = Math.max(1, Math.min(newScale, 30));
-        if (state.scale === oldScale) return;
-
-        const rect = container.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-
-        state.tx = mouseX - (mouseX - state.tx) * (state.scale / oldScale);
-        state.ty = mouseY - (mouseY - state.ty) * (state.scale / oldScale);
-
-        if (state.scale <= 1) resetTransform(state, element);
-        else element.style.cursor = 'grab';
-        updateTransform();
-    };
-
-    // Attach drag event to the element itself
-    element.onmousedown = (e) => {
-        if (e.button !== 0) return; // Only left click
-        e.preventDefault();
-        if (state.scale <= 1) return;
-
-        let startX = e.clientX - state.tx;
-        let startY = e.clientY - state.ty;
-        element.style.cursor = 'grabbing';
-        element.style.transition = 'none';
-
-        const onMouseMove = (moveEvent) => {
-            state.tx = moveEvent.clientX - startX;
-            state.ty = moveEvent.clientY - startY;
-            updateTransform();
-        };
-        const onMouseUp = () => {
-            element.style.cursor = 'grab';
-            element.style.transition = 'transform .2s ease-out';
-            document.removeEventListener('mousemove', onMouseMove);
-            document.removeEventListener('mouseup', onMouseUp);
-        };
-        document.addEventListener('mousemove', onMouseMove);
-        document.addEventListener('mouseup', onMouseUp);
-    };
-
-    // Prevent default drag behavior (ghost image)
+    // Anti-ghost : la brique ne neutralise pas le dragstart natif des <img> —
+    // conservé côté hôte (parité avec l'ancien code).
     element.ondragstart = (e) => e.preventDefault();
 }
