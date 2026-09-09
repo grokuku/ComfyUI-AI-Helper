@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafViewport · version 0.1.1
+ * Holaf UI — Brique HolafViewport · version 0.1.2
  * ─────────────────────────────────────────────────────────────────────────────
  * Géométrie + interactions de viewport image, SANS rendu. La brique calcule
  * le zoom / le pan / le fit et, en mode « content », applique le CSS transform
@@ -59,7 +59,7 @@
 const HolafViewport = (function () {
     "use strict";
 
-    const VERSION = "0.1.1";
+    const VERSION = "0.1.2";
 
     const TRANSITION_REST = "transform .2s ease-out";
 
@@ -82,6 +82,10 @@ const HolafViewport = (function () {
         // Abonnés supplémentaires (multi-subscription) : appelés avec l'instance
         // après chaque changement de transform, EN PLUS de opts.onChange.
         const subscribers = new Set();
+        // Followers : éléments qui reçoivent EXACTEMENT le même transform inline
+        // que le content (même string, même moment, même transition). Utilisés
+        // pour des overlays (canvas) qui doivent suivre l'image au pixel près.
+        const followers = new Set();
 
         // ── État ──
         let iw = opts.imageWidth || 0;
@@ -113,9 +117,11 @@ const HolafViewport = (function () {
             cw = r.width;
             ch = r.height;
             if (content) {
-                const cr = content.getBoundingClientRect();
-                contentW = cr.width;
-                contentH = cr.height;
+                // Taille de LAYOUT (offsetWidth/Height), PAS getBoundingClientRect :
+                // ce dernier est transform-aware et renverrait la taille déjà zoomée
+                // après un zoom → un refit (resize) corromprait la géométrie.
+                contentW = content.offsetWidth;
+                contentH = content.offsetHeight;
                 originX = content.offsetLeft;
                 originY = content.offsetTop;
             } else {
@@ -180,15 +186,24 @@ const HolafViewport = (function () {
             }
         }
 
+        function applyTransformTo(el, transition) {
+            const t = transition === "none" ? "none" : TRANSITION_REST;
+            el.style.transition = t;
+            el.style.transformOrigin = "0 0";
+            el.style.transform = "translate(" + tx + "px, " + ty + "px) scale(" + scale + ")";
+        }
+
         function applyTransform(transition) {
             if (!content) return;
-            content.style.transition = transition === "none" ? "none" : TRANSITION_REST;
-            content.style.transformOrigin = "0 0";
-            content.style.transform = "translate(" + tx + "px, " + ty + "px) scale(" + scale + ")";
+            applyTransformTo(content, transition);
+            // Followers : même passage, même string, même transition que le content.
+            followers.forEach((el) => applyTransformTo(el, transition));
         }
 
         function notify() {
-            if (onChange) onChange(instance);
+            if (onChange) {
+                try { onChange(instance); } catch (e) { /* un callback ne doit pas casser la brique */ }
+            }
             subscribers.forEach((cb) => {
                 try { cb(instance); } catch (e) { /* un abonné ne doit pas casser la brique */ }
             });
@@ -373,6 +388,23 @@ const HolafViewport = (function () {
                 return instance;
             },
 
+            // Followers : éléments qui reçoivent le même transform que le content.
+            // addFollower protège contre les non-éléments et les doublons (Set).
+            addFollower(el) {
+                if (el && typeof el === "object" && el.nodeType === 1) {
+                    followers.add(el);
+                    // Applique immédiatement le transform courant (même string que
+                    // le content) pour que le follower soit synchro dès l'ajout.
+                    applyTransformTo(el);
+                }
+                return instance;
+            },
+
+            removeFollower(el) {
+                followers.delete(el);
+                return instance;
+            },
+
             reset() {
                 fit();
             },
@@ -390,6 +422,8 @@ const HolafViewport = (function () {
                     content.style.transition = origTransition;
                     content.style.transformOrigin = origTransformOrigin;
                 }
+                // Retire les refs followers (les éléments restent dans leur état).
+                followers.clear();
             },
 
             refit() {

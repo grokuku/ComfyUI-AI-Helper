@@ -235,7 +235,11 @@ export class ImageEditor {
     }
 
     _hide() {
-        this._unsubscribeViewport();
+        // Détache les overlays du viewport (followers) avant de les retirer.
+        const maskOv = document.getElementById('holaf-mask-overlay');
+        if (maskOv) this._unfollowOverlay(maskOv);
+        const cropOv = document.getElementById('holaf-crop-overlay');
+        if (cropOv) this._unfollowOverlay(cropOv);
         if (this.panelEl) this.panelEl.style.display = 'none';
         this._dispatchVideoOverride(null);
         this._getPreviewElements().forEach(el => { if (el) el.style.filter = 'none'; });
@@ -752,8 +756,7 @@ export class ImageEditor {
         if (this._activeOverlayMaskId === ctrlId) {
             this._activeOverlayMaskId = null;
             const ov = document.getElementById('holaf-mask-overlay');
-            if (ov) ov.remove();
-            this._syncViewportSubscription();
+            if (ov) { this._unfollowOverlay(ov); ov.remove(); }
         }
         this._updateUIFromState();
         this.applyPreview();
@@ -897,84 +900,29 @@ export class ImageEditor {
         return (st && st.viewport) || null;
     }
 
-    // Positionne un overlay (canvas) sur le rect écran du contenu image via
-    // viewport.getImageRect() (transform-aware). left/top/width/height CSS
-    // suivent le rect ; transform:none (PLUS AUCUNE copie du transform de l'img).
-    // La résolution canvas (overlay.width/height) reste inchangée → indépendante
-    // du zoom. Retourne false si aucun viewport (fallback positionnement manuel).
-    _positionOverlayFromViewport(overlay) {
-        const vp = this._activeViewport();
-        if (!vp) return false;
-        const rect = vp.getImageRect();
-        overlay.style.left = rect.x + 'px';
-        overlay.style.top = rect.y + 'px';
-        overlay.style.width = rect.width + 'px';
-        overlay.style.height = rect.height + 'px';
-        overlay.style.transform = 'none';
+    // Positionne un overlay (canvas) au rect de repos (échelle 1) puis le fait
+    // suivre le viewport via addFollower : la brique lui applique le MÊME
+    // transform inline que l'img (même string, même moment, même transition) →
+    // latence zéro, plus de repositionnement getImageRect sur onChange.
+    // left/top/width/height restent CONSTANTS (rect de repos) ; seul le
+    // transform bouge. La résolution canvas (overlay.width/height) reste
+    // inchangée → indépendante du zoom.
+    _followOverlay(overlay) {
+        const img = this._maskImageEl();
+        const r = this._maskImageRect(img);
+        overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
+        overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
+        overlay.style.width = r.width + 'px';
+        overlay.style.height = r.height + 'px';
         overlay.style.transformOrigin = '0 0';
-        return true;
-    }
-
-    // Abonnement au viewport actif tant qu'un overlay est affiché : sur
-    // changement de transform → repositionne + redessine le contenu existant.
-    _subscribeViewport() {
         const vp = this._activeViewport();
-        if (!vp || this._viewportSubscribed === vp) return;
-        this._unsubscribeViewport();
-        this._viewportSubscribed = vp;
-        this._viewportCb = () => this._onViewportChange();
-        vp.on(this._viewportCb);
+        if (vp) vp.addFollower(overlay);
     }
 
-    _unsubscribeViewport() {
-        if (this._viewportSubscribed && this._viewportCb) {
-            this._viewportSubscribed.off(this._viewportCb);
-        }
-        this._viewportSubscribed = null;
-        this._viewportCb = null;
-    }
-
-    // Abonne si un overlay est affiché, désabonne sinon (anti-fuite).
-    _syncViewportSubscription() {
-        const hasOverlay = !!document.getElementById('holaf-mask-overlay')
-            || !!document.getElementById('holaf-crop-overlay');
-        if (hasOverlay) this._subscribeViewport();
-        else this._unsubscribeViewport();
-    }
-
-    _onViewportChange() {
-        this._repositionMaskOverlay();
-        this._repositionCropOverlay();
-    }
-
-    _repositionMaskOverlay() {
-        const ov = document.getElementById('holaf-mask-overlay');
-        if (!ov) return;
-        if (!this._positionOverlayFromViewport(ov)) return;
-        // Édition en cours : le contenu est le dessin live (résolution canvas
-        // fixe) → le repositionnement CSS suffit, rien à redessiner.
-        if (this._maskOverlay === ov) return;
-        // Overlay passif : redessine le mask tinté courant.
-        const maskId = this._activeOverlayMaskId;
-        const maskCanvas = maskId && this._maskCanvases[maskId];
-        if (maskCanvas) {
-            const ctx = ov.getContext('2d');
-            ctx.clearRect(0, 0, ov.width, ov.height);
-            ctx.drawImage(this._maskTinted(maskCanvas, ov.width, ov.height), 0, 0);
-        }
-    }
-
-    _repositionCropOverlay() {
-        const ov = document.getElementById('holaf-crop-overlay');
-        if (!ov) return;
-        if (!this._positionOverlayFromViewport(ov)) return;
-        if (this._cropOverlay === ov) {
-            // Édition en cours : redessine la sélection courante.
-            this._drawCropOverlay();
-        } else {
-            // Overlay passif : redessine depuis currentState.crop.
-            this._drawPassiveCropOverlay(ov);
-        }
+    // Détache un overlay du viewport (removeFollower) — l'élément reste en place.
+    _unfollowOverlay(overlay) {
+        const vp = this._activeViewport();
+        if (vp) vp.removeFollower(overlay);
     }
 
     // Convertit un canvas de mask (niveaux de gris ou tracés rouges) en
@@ -1010,20 +958,13 @@ export class ImageEditor {
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
         overlay.style.cssText = 'position:absolute;z-index:60;pointer-events:none;opacity:0.45;transition:none;';
-        overlay.style.transformOrigin = '0 0';
-        // Position/dimensions CSS : suivent le rect écran du contenu (transform-aware).
-        if (!this._positionOverlayFromViewport(overlay)) {
-            // Fallback (pas de viewport encore) : positionnement manuel à l'échelle 1.
-            overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
-            overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
-            overlay.style.width = r.width + 'px';
-            overlay.style.height = r.height + 'px';
-        }
+        // Position/dimensions CSS : rect de repos (échelle 1), CONSTANT — le
+        // follower applique le transform de l'img (même string, même transition).
+        this._followOverlay(overlay);
         const ctx = overlay.getContext('2d');
         ctx.clearRect(0, 0, overlay.width, overlay.height);
         ctx.drawImage(this._maskTinted(maskCanvas, overlay.width, overlay.height), 0, 0);
         this._activeOverlayMaskId = maskId;
-        this._syncViewportSubscription();
     }
 
     // ── Crop overlay passif (affichage du cadrage final) ──
@@ -1038,8 +979,7 @@ export class ImageEditor {
         const crop = this.currentState.crop;
         if (!crop) {
             const ov = document.getElementById('holaf-crop-overlay');
-            if (ov) ov.remove();
-            this._syncViewportSubscription();
+            if (ov) { this._unfollowOverlay(ov); ov.remove(); }
             return;
         }
         if (!zoomView || !img) return;
@@ -1054,15 +994,10 @@ export class ImageEditor {
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
         overlay.style.cssText = 'position:absolute;z-index:60;pointer-events:none;transition:none;';
-        overlay.style.transformOrigin = '0 0';
-        if (!this._positionOverlayFromViewport(overlay)) {
-            overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
-            overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
-            overlay.style.width = r.width + 'px';
-            overlay.style.height = r.height + 'px';
-        }
+        // Position/dimensions CSS : rect de repos (échelle 1), CONSTANT — le
+        // follower applique le transform de l'img (même string, même transition).
+        this._followOverlay(overlay);
         this._drawPassiveCropOverlay(overlay);
-        this._syncViewportSubscription();
     }
 
     // Dessine l'overlay crop passif (extérieur assombri) depuis currentState.crop.
@@ -1104,13 +1039,9 @@ export class ImageEditor {
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
         overlay.style.cssText = 'position:absolute;z-index:60;cursor:crosshair;opacity:0.5;transition:none;';
-        overlay.style.transformOrigin = '0 0';
-        if (!this._positionOverlayFromViewport(overlay)) {
-            overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
-            overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
-            overlay.style.width = r.width + 'px';
-            overlay.style.height = r.height + 'px';
-        }
+        // Position/dimensions CSS : rect de repos (échelle 1), CONSTANT — le
+        // follower applique le transform de l'img (même string, même transition).
+        this._followOverlay(overlay);
         const octx = overlay.getContext('2d');
         octx.clearRect(0, 0, overlay.width, overlay.height);
         if (this._maskCanvases[maskId]) octx.drawImage(this._maskTinted(this._maskCanvases[maskId], overlay.width, overlay.height), 0, 0);
@@ -1160,7 +1091,6 @@ export class ImageEditor {
         overlay.addEventListener('pointermove', (e) => this._maskOnMove(e));
         overlay.addEventListener('pointerup', (e) => this._maskOnUp(e));
         overlay.addEventListener('pointercancel', (e) => this._maskOnUp(e));
-        this._syncViewportSubscription();
     }
 
     _cloneCanvas(c) {
@@ -1291,7 +1221,7 @@ export class ImageEditor {
                 const maskCtrl = this.currentState.controls.find(c => c.id === this._activeMaskId);
                 if (maskCtrl && this._maskPrev) maskCtrl.value = this._maskPrev.value;
             }
-            if (this._maskOverlay) { this._maskOverlay.remove(); }
+            if (this._maskOverlay) { this._unfollowOverlay(this._maskOverlay); this._maskOverlay.remove(); }
         }
         if (this._maskBar) { this._maskBar.remove(); this._maskBar = null; }
         this._maskOverlay = null;
@@ -1305,7 +1235,6 @@ export class ImageEditor {
             this._showMaskOverlay(this._activeOverlayMaskId);
         this.applyPreview();
         this._updateUIFromState();
-        this._syncViewportSubscription();
     }
 
     // ── Crop editor (recadrage basique : sélection rectangle) ──
@@ -1328,13 +1257,9 @@ export class ImageEditor {
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
         overlay.style.cssText = 'position:absolute;z-index:60;cursor:crosshair;transition:none;';
-        overlay.style.transformOrigin = '0 0';
-        if (!this._positionOverlayFromViewport(overlay)) {
-            overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
-            overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
-            overlay.style.width = r.width + 'px';
-            overlay.style.height = r.height + 'px';
-        }
+        // Position/dimensions CSS : rect de repos (échelle 1), CONSTANT — le
+        // follower applique le transform de l'img (même string, même transition).
+        this._followOverlay(overlay);
 
         // Pré-dessine le crop existant si présent
         this._cropRect = null;
@@ -1373,7 +1298,6 @@ export class ImageEditor {
         overlay.addEventListener('pointermove', (e) => this._cropOnMove(e));
         overlay.addEventListener('pointerup', (e) => this._cropOnUp(e));
         overlay.addEventListener('pointercancel', (e) => this._cropOnUp(e));
-        this._syncViewportSubscription();
     }
 
     _cropLocal(e) {
@@ -1470,7 +1394,7 @@ export class ImageEditor {
 
     _cleanupCropEditor() {
         const ov = document.getElementById('holaf-crop-overlay');
-        if (ov) ov.remove();
+        if (ov) { this._unfollowOverlay(ov); ov.remove(); }
         if (this._cropBar) { this._cropBar.remove(); this._cropBar = null; }
         this._cropOverlay = null;
         this._cropRect = null;
@@ -1479,7 +1403,6 @@ export class ImageEditor {
         this._cropPrev = null;
         this.applyPreview();
         this._updateUIFromState();
-        this._syncViewportSubscription();
     }
 
     // ── UI sync ──
@@ -1756,8 +1679,7 @@ export class ImageEditor {
             this._maskCanvases = {};
             this._activeOverlayMaskId = null;
             const ov = document.getElementById('holaf-mask-overlay');
-            if (ov) ov.remove();
-            this._syncViewportSubscription();
+            if (ov) { this._unfollowOverlay(ov); ov.remove(); }
             this.processedVideoUrl = null;
             this._dispatchVideoOverride(null);
             this._clearCanvasCache();

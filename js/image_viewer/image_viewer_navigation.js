@@ -677,23 +677,16 @@ export async function handleKeyDown(viewer, e) {
 //     ne gère pas.
 
 // Synchronise l'overlay mask (posé par l'éditeur dans le zoom view) sur le
-// transform courant de l'élément média. Même sémantique que l'ancien
-// updateTransform : miroir du transform + de la transition effective.
-// NB positionnement : l'overlay est posé À LA MAIN par l'éditeur (left =
-// offsetLeft + letterbox calculé à scale 1, cf. _showMaskOverlay /
-// _maskImageRect) puis reçoit une copie du transform de l'img → il dérive de
-// dx·(1−scale) au zoom. La correction (repositionner via
-// viewport.getImageRect(), transform-aware) se fera côté éditeur — vague
-// suivante, ce fichier ne fait que maintenir la synchro existante.
+// transform courant de l'élément média. VAGUE 4 : l'overlay est désormais un
+// FOLLOWER de la brique (addFollower) — il reçoit le même transform inline que
+// l'img (même string, même moment, même transition) → latence zéro, plus de
+// copie manuelle du transform. addFollower est idempotent (Set) : appelé à
+// chaque onChange, il ne fait rien si l'overlay suit déjà.
 function _syncMaskOverlay(element) {
     const maskOv = document.getElementById('holaf-mask-overlay');
     if (!maskOv) return;
-    maskOv.style.transform = element.style.transform || 'none';
-    // FIX: reflète aussi la transition de l'img (inline 'none' pendant le
-    // drag, 'transform .2s ease-out' au relâchement — la brique pose toujours
-    // la valeur inline) pour que l'overlay anime exactement en phase avec
-    // l'image.
-    maskOv.style.transition = element.style.transition || getComputedStyle(element).transition || 'none';
+    const vp = state.viewport;
+    if (vp) vp.addFollower(maskOv);
 }
 
 // Parité UX : la brique ne gère pas le curseur. grabbing pendant un drag

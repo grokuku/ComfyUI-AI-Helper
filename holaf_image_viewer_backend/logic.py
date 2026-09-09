@@ -1603,18 +1603,14 @@ def _create_thumbnail_blocking(original_path_abs, thumb_path_abs, image_path_can
             target_dim_w, target_dim_h = holaf_utils.THUMBNAIL_SIZE if isinstance(holaf_utils.THUMBNAIL_SIZE, tuple) else (holaf_utils.THUMBNAIL_SIZE, holaf_utils.THUMBNAIL_SIZE)
             original_width, original_height = img.size
             if original_width == 0 or original_height == 0: raise ValueError("Image dimensions cannot be zero.")
-            
-            ratio = min(target_dim_w / original_width, target_dim_h / original_height)
-            new_width, new_height = int(original_width * ratio), int(original_height * ratio)
-            if new_width <= 0: new_width = 1
-            if new_height <= 0: new_height = 1
 
             # JPEG : décodage à résolution réduite dès le décodeur (gros gain sur les
             # grosses photos). Sans effet sur PNG. draft() lève une exception pour
-            # les modes incompatibles -> ignorée.
+            # les modes incompatibles -> ignorée. Le hint est basé sur les dims
+            # ORIGINALES (le crop éventuel ne change pas le coût du décodage).
             if img.format == 'JPEG':
                 try:
-                    img.draft('RGB', (new_width * 2, new_height * 2))
+                    img.draft('RGB', (int(original_width * 0.5), int(original_height * 0.5)))
                 except Exception:
                     pass
 
@@ -1625,6 +1621,16 @@ def _create_thumbnail_blocking(original_path_abs, thumb_path_abs, image_path_can
                 img_copy = apply_edits_to_image(img_copy, edit_data, _load_edit_mask(edit_data, original_path_abs))
             else:
                 img_copy = img
+
+            # Cible de resize : on préserve le ratio de l'image FINALE (post-édition),
+            # PAS celui de l'original. Un crop change le ratio → resize sur le ratio
+            # original étirerait la miniature (bug « miniature cropée étirée »).
+            final_width, final_height = img_copy.size
+            if final_width == 0 or final_height == 0: raise ValueError("Edited image dimensions cannot be zero.")
+            ratio = min(target_dim_w / final_width, target_dim_h / final_height)
+            new_width, new_height = int(final_width * ratio), int(final_height * ratio)
+            if new_width <= 0: new_width = 1
+            if new_height <= 0: new_height = 1
 
             # BILINEAR ~2-3x plus rapide que LANCZOS pour une cible 200x200,
             # qualité visuellement quasi identique à cette taille.
