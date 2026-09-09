@@ -237,9 +237,9 @@ export class ImageEditor {
     _hide() {
         // Détache les overlays du viewport (followers) avant de les retirer.
         const maskOv = document.getElementById('holaf-mask-overlay');
-        if (maskOv) this._unfollowOverlay(maskOv);
+        if (maskOv) this._removeOverlayWrapper(maskOv);
         const cropOv = document.getElementById('holaf-crop-overlay');
-        if (cropOv) this._unfollowOverlay(cropOv);
+        if (cropOv) this._removeOverlayWrapper(cropOv);
         if (this.panelEl) this.panelEl.style.display = 'none';
         this._dispatchVideoOverride(null);
         this._getPreviewElements().forEach(el => { if (el) el.style.filter = 'none'; });
@@ -756,7 +756,7 @@ export class ImageEditor {
         if (this._activeOverlayMaskId === ctrlId) {
             this._activeOverlayMaskId = null;
             const ov = document.getElementById('holaf-mask-overlay');
-            if (ov) { this._unfollowOverlay(ov); ov.remove(); }
+            if (ov) this._removeOverlayWrapper(ov);
         }
         this._updateUIFromState();
         this.applyPreview();
@@ -900,29 +900,63 @@ export class ImageEditor {
         return (st && st.viewport) || null;
     }
 
-    // Positionne un overlay (canvas) au rect de repos (échelle 1) puis le fait
-    // suivre le viewport via addFollower : la brique lui applique le MÊME
-    // transform inline que l'img (même string, même moment, même transition) →
-    // latence zéro, plus de repositionnement getImageRect sur onChange.
-    // left/top/width/height restent CONSTANTS (rect de repos) ; seul le
-    // transform bouge. La résolution canvas (overlay.width/height) reste
+    // VAGUE 5 : un follower doit avoir la MÊME BOÎTE DE REPOS que le content =
+    // la boîte de l'ÉLÉMENT img ENTIER (offsetLeft/Top/Width/Height). Le
+    // letterbox (dx, dy, dispW, dispH) est rendu À L'INTÉRIEUR : le canvas
+    // (résolution inchangée = letterbox échelle 1, peinture inchangée) est
+    // positionné à (dx, dy) DANS le wrapper, taille CSS dispW×dispH. Ainsi :
+    // même boîte + même transform = tracking parfait à tout zoom (plus de
+    // dérive dx×(1−s)). Le wrapper est STATIQUE (boîte constante) ; seul le
+    // transform bouge. La résolution canvas (canvas.width/height) reste
     // inchangée → indépendante du zoom.
-    _followOverlay(overlay) {
+    _followOverlay(wrapper, canvas) {
         const img = this._maskImageEl();
         const r = this._maskImageRect(img);
-        overlay.style.left = (img.offsetLeft || 0) + r.dx + 'px';
-        overlay.style.top = (img.offsetTop || 0) + r.dy + 'px';
-        overlay.style.width = r.width + 'px';
-        overlay.style.height = r.height + 'px';
-        overlay.style.transformOrigin = '0 0';
+        // Wrapper : boîte de repos = boîte ÉLÉMENT de l'img (constante).
+        wrapper.style.left = (img.offsetLeft || 0) + 'px';
+        wrapper.style.top = (img.offsetTop || 0) + 'px';
+        wrapper.style.width = (img.offsetWidth || 0) + 'px';
+        wrapper.style.height = (img.offsetHeight || 0) + 'px';
+        wrapper.style.transformOrigin = '0 0';
+        // Canvas : letterbox À L'INTÉRIEUR du wrapper (échelle 1 — le wrapper
+        // le scalera via le transform du viewport).
+        canvas.style.left = r.dx + 'px';
+        canvas.style.top = r.dy + 'px';
+        canvas.style.width = r.width + 'px';
+        canvas.style.height = r.height + 'px';
         const vp = this._activeViewport();
-        if (vp) vp.addFollower(overlay);
+        if (vp) vp.addFollower(wrapper);
     }
 
-    // Détache un overlay du viewport (removeFollower) — l'élément reste en place.
-    _unfollowOverlay(overlay) {
-        const vp = this._activeViewport();
-        if (vp) vp.removeFollower(overlay);
+    // Crée (ou récupère) le wrapper div follower d'un overlay canvas. Le wrapper
+    // a pointer-events:none (ne vole pas les événements aux bandes letterbox →
+    // le drag pan sur l'img continue de fonctionner) ; le canvas garde
+    // pointer-events:auto (cible des événements de dessin : _cropOnDown/
+    // _maskOnDown etc. restent bindés au canvas, non au wrapper). z-index
+    // identique à l'ancien overlay.
+    _ensureOverlayWrapper(canvas, zIndex) {
+        const zoomView = document.getElementById('holaf-viewer-zoom-view');
+        let wrapper = document.getElementById(canvas.id + '-wrap');
+        if (!wrapper) {
+            wrapper = document.createElement('div');
+            wrapper.id = canvas.id + '-wrap';
+            wrapper.style.cssText = 'position:absolute;z-index:' + zIndex + ';pointer-events:none;transition:none;';
+            zoomView.appendChild(wrapper);
+        }
+        if (canvas.parentNode !== wrapper) wrapper.appendChild(canvas);
+        return wrapper;
+    }
+
+    // Détache le wrapper du viewport (removeFollower) et le retire du DOM
+    // (le canvas, enfant, est retiré avec lui). Ne retire que si le parent est
+    // bien un wrapper (id finissant par '-wrap') — jamais le conteneur.
+    _removeOverlayWrapper(canvas) {
+        const wrapper = canvas && canvas.parentNode;
+        if (wrapper && wrapper.id && wrapper.id.endsWith('-wrap')) {
+            const vp = this._activeViewport();
+            if (vp) vp.removeFollower(wrapper);
+            wrapper.remove();
+        }
     }
 
     // Convertit un canvas de mask (niveaux de gris ou tracés rouges) en
@@ -952,15 +986,15 @@ export class ImageEditor {
         if (!overlay) {
             overlay = document.createElement('canvas');
             overlay.id = 'holaf-mask-overlay';
-            zoomView.appendChild(overlay);
         }
         // Résolution canvas : taille letterbox à l'échelle 1 (indépendante du zoom).
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
         overlay.style.cssText = 'position:absolute;z-index:60;pointer-events:none;opacity:0.45;transition:none;';
-        // Position/dimensions CSS : rect de repos (échelle 1), CONSTANT — le
-        // follower applique le transform de l'img (même string, même transition).
-        this._followOverlay(overlay);
+        // Wrapper follower (boîte = boîte de l'img) + canvas letterbox dedans :
+        // le wrapper est STATIQUE, le transform du viewport fait tout.
+        const wrapper = this._ensureOverlayWrapper(overlay, 60);
+        this._followOverlay(wrapper, overlay);
         const ctx = overlay.getContext('2d');
         ctx.clearRect(0, 0, overlay.width, overlay.height);
         ctx.drawImage(this._maskTinted(maskCanvas, overlay.width, overlay.height), 0, 0);
@@ -979,7 +1013,7 @@ export class ImageEditor {
         const crop = this.currentState.crop;
         if (!crop) {
             const ov = document.getElementById('holaf-crop-overlay');
-            if (ov) { this._unfollowOverlay(ov); ov.remove(); }
+            if (ov) this._removeOverlayWrapper(ov);
             return;
         }
         if (!zoomView || !img) return;
@@ -989,14 +1023,13 @@ export class ImageEditor {
         if (!overlay) {
             overlay = document.createElement('canvas');
             overlay.id = 'holaf-crop-overlay';
-            zoomView.appendChild(overlay);
         }
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
         overlay.style.cssText = 'position:absolute;z-index:60;pointer-events:none;transition:none;';
-        // Position/dimensions CSS : rect de repos (échelle 1), CONSTANT — le
-        // follower applique le transform de l'img (même string, même transition).
-        this._followOverlay(overlay);
+        // Wrapper follower (boîte = boîte de l'img) + canvas letterbox dedans.
+        const wrapper = this._ensureOverlayWrapper(overlay, 60);
+        this._followOverlay(wrapper, overlay);
         this._drawPassiveCropOverlay(overlay);
     }
 
@@ -1035,13 +1068,12 @@ export class ImageEditor {
 
         const overlay = document.getElementById('holaf-mask-overlay') || document.createElement('canvas');
         overlay.id = 'holaf-mask-overlay';
-        if (!overlay.parentNode) zoomView.appendChild(overlay);
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
         overlay.style.cssText = 'position:absolute;z-index:60;cursor:crosshair;opacity:0.5;transition:none;';
-        // Position/dimensions CSS : rect de repos (échelle 1), CONSTANT — le
-        // follower applique le transform de l'img (même string, même transition).
-        this._followOverlay(overlay);
+        // Wrapper follower (boîte = boîte de l'img) + canvas letterbox dedans.
+        const wrapper = this._ensureOverlayWrapper(overlay, 60);
+        this._followOverlay(wrapper, overlay);
         const octx = overlay.getContext('2d');
         octx.clearRect(0, 0, overlay.width, overlay.height);
         if (this._maskCanvases[maskId]) octx.drawImage(this._maskTinted(this._maskCanvases[maskId], overlay.width, overlay.height), 0, 0);
@@ -1221,7 +1253,7 @@ export class ImageEditor {
                 const maskCtrl = this.currentState.controls.find(c => c.id === this._activeMaskId);
                 if (maskCtrl && this._maskPrev) maskCtrl.value = this._maskPrev.value;
             }
-            if (this._maskOverlay) { this._unfollowOverlay(this._maskOverlay); this._maskOverlay.remove(); }
+            if (this._maskOverlay) this._removeOverlayWrapper(this._maskOverlay);
         }
         if (this._maskBar) { this._maskBar.remove(); this._maskBar = null; }
         this._maskOverlay = null;
@@ -1253,13 +1285,12 @@ export class ImageEditor {
 
         const overlay = document.getElementById('holaf-crop-overlay') || document.createElement('canvas');
         overlay.id = 'holaf-crop-overlay';
-        if (!overlay.parentNode) zoomView.appendChild(overlay);
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
         overlay.style.cssText = 'position:absolute;z-index:60;cursor:crosshair;transition:none;';
-        // Position/dimensions CSS : rect de repos (échelle 1), CONSTANT — le
-        // follower applique le transform de l'img (même string, même transition).
-        this._followOverlay(overlay);
+        // Wrapper follower (boîte = boîte de l'img) + canvas letterbox dedans.
+        const wrapper = this._ensureOverlayWrapper(overlay, 60);
+        this._followOverlay(wrapper, overlay);
 
         // Pré-dessine le crop existant si présent
         this._cropRect = null;
@@ -1394,7 +1425,7 @@ export class ImageEditor {
 
     _cleanupCropEditor() {
         const ov = document.getElementById('holaf-crop-overlay');
-        if (ov) { this._unfollowOverlay(ov); ov.remove(); }
+        if (ov) this._removeOverlayWrapper(ov);
         if (this._cropBar) { this._cropBar.remove(); this._cropBar = null; }
         this._cropOverlay = null;
         this._cropRect = null;
@@ -1679,7 +1710,7 @@ export class ImageEditor {
             this._maskCanvases = {};
             this._activeOverlayMaskId = null;
             const ov = document.getElementById('holaf-mask-overlay');
-            if (ov) { this._unfollowOverlay(ov); ov.remove(); }
+            if (ov) this._removeOverlayWrapper(ov);
             this.processedVideoUrl = null;
             this._dispatchVideoOverride(null);
             this._clearCanvasCache();

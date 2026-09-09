@@ -54,6 +54,19 @@
  * la vue).
  *
  * Cohérence : screenToImage(imageToScreen(p)) === p (à rect.left=0 près).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CONTRAT DES FOLLOWERS (addFollower/removeFollower)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Un follower reçoit EXACTEMENT le même transform inline que le content
+ * (même string, même moment, même transition). Pour un tracking parfait à tout
+ * zoom, la BOÎTE DE REPOS du follower doit être IDENTIQUE à celle du content :
+ * même origine (offsetLeft/offsetTop) et même taille (offsetWidth/offsetHeight).
+ * Le letterbox / l'offset (dx, dy, dispW, dispH) se gère À L'INTÉRIEUR du
+ * follower (ex. un canvas enfant positionné à (dx, dy), taille dispW×dispH) —
+ * jamais dans la position du follower lui-même. Sinon, à l'échelle s, le
+ * letterbox (dans la boîte du content, donc multiplié par s au rendu) mais
+ * positionné dans la position du follower (non scalé) dérive de dx×(1−s).
  * ═════════════════════════════════════════════════════════════════════════ */
 
 const HolafViewport = (function () {

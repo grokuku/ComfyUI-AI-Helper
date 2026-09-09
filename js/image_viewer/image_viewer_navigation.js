@@ -66,13 +66,17 @@ export function resetTransform(state, element) {
     element.style.transformOrigin = '0 0'; // Ensure origin is consistent
     const maskOv = document.getElementById('holaf-mask-overlay');
     if (maskOv) {
-        maskOv.style.transform = element.style.transform;
+        // VAGUE 5 : le mask vit dans un wrapper follower → c'est le wrapper qui
+        // porte le transform (le canvas, letterbox, est À L'INTÉRIEUR).
+        const target = (maskOv.parentNode && maskOv.parentNode.id === 'holaf-mask-overlay-wrap')
+            ? maskOv.parentNode : maskOv;
+        target.style.transform = element.style.transform;
         // FIX: synchronise aussi la transition, sinon l'img glisse (transform .2s)
         // pendant que l'overlay saute instantanément → décalage visible au zoom/pan.
         // Fallback sur la valeur calculée : l'img a une transition CSS par défaut
         // (`#holaf-viewer-zoom-view img { transition: transform .2s ease-out }`) qui
         // n'apparaît PAS dans le style inline.
-        maskOv.style.transition = element.style.transition || getComputedStyle(element).transition || 'none';
+        target.style.transition = element.style.transition || getComputedStyle(element).transition || 'none';
     }
 }
 
@@ -682,11 +686,17 @@ export async function handleKeyDown(viewer, e) {
 // l'img (même string, même moment, même transition) → latence zéro, plus de
 // copie manuelle du transform. addFollower est idempotent (Set) : appelé à
 // chaque onChange, il ne fait rien si l'overlay suit déjà.
+// VAGUE 5 : le mask vit dans un WRAPPER follower (boîte de repos = boîte de
+// l'élément img, letterbox À L'INTÉRIEUR). C'est le WRAPPER qui suit le
+// viewport, PAS le canvas (sinon double transform).
 function _syncMaskOverlay(element) {
     const maskOv = document.getElementById('holaf-mask-overlay');
     if (!maskOv) return;
     const vp = state.viewport;
-    if (vp) vp.addFollower(maskOv);
+    if (!vp) return;
+    const wrapper = (maskOv.parentNode && maskOv.parentNode.id === 'holaf-mask-overlay-wrap')
+        ? maskOv.parentNode : maskOv;
+    vp.addFollower(wrapper);
 }
 
 // Parité UX : la brique ne gère pas le curseur. grabbing pendant un drag
