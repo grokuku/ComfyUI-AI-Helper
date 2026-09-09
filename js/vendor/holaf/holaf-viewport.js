@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafViewport · version 0.1.2
+ * Holaf UI — Brique HolafViewport · version 0.1.3
  * ─────────────────────────────────────────────────────────────────────────────
  * Géométrie + interactions de viewport image, SANS rendu. La brique calcule
  * le zoom / le pan / le fit et, en mode « content », applique le CSS transform
@@ -72,7 +72,7 @@
 const HolafViewport = (function () {
     "use strict";
 
-    const VERSION = "0.1.2";
+    const VERSION = "0.1.3";
 
     const TRANSITION_REST = "transform .2s ease-out";
 
@@ -91,6 +91,10 @@ const HolafViewport = (function () {
         const drag = opts.drag !== false;
         const dragButton = opts.dragButton === undefined ? 0 : opts.dragButton;
         const dragTarget = opts.dragTarget || (content || container);
+        // canDrag(e) : garde-fou par événement, consulté AVANT d'amorcer un drag.
+        // Défaut () => true (aucun filtre). L'hôte peut l'utiliser pour interdire
+        // le pan depuis certaines cibles (ex. un overlay de dessin crop/masque).
+        const canDrag = typeof opts.canDrag === 'function' ? opts.canDrag : () => true;
         const onChange = typeof opts.onChange === "function" ? opts.onChange : null;
         // Abonnés supplémentaires (multi-subscription) : appelés avec l'instance
         // après chaque changement de transform, EN PLUS de opts.onChange.
@@ -289,6 +293,19 @@ const HolafViewport = (function () {
         function onMouseDown(e) {
             if (!drag) return;
             if (e.button !== dragButton) return;
+            // Garde-fou par événement : si l'hôte refuse le drag depuis cette
+            // cible (ex. pointerdown sur un overlay de dessin), on n'amorce PAS
+            // le pan — le dessin (ou autre) garde la main.
+            // Un canDrag qui jette est traité comme `true` (on autorise le pan,
+            // comportement par défaut) : la brique ne doit jamais casser sur un
+            // callback hôte défaillant.
+            let allowed = true;
+            try {
+                allowed = canDrag(e);
+            } catch (err) {
+                allowed = true;
+            }
+            if (!allowed) return;
             dragging = true;
             dragStartX = e.clientX;
             dragStartY = e.clientY;

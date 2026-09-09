@@ -744,6 +744,13 @@ export function setupZoomAndPan(state, container, element) {
             drag: true,
             dragButton: 0,      // ↔ ancien : clic gauche uniquement
             dragTarget: element, // ↔ ancien : drag posé sur l'élément, pas le container
+            // VAGUE 6 : le pan ne démarre JAMAIS depuis un overlay de dessin
+            // (crop/masque). Le canvas d'édition (pointer-events:auto) est au-dessus
+            // de l'img → il intercepte le pointerdown pour le dessin ; ce garde-fou
+            // garantit qu'un pointerdown sur l'overlay (canvas OU wrapper) ne déclenche
+            // jamais le pan du viewport, sur les DEUX vues (zoom + fullscreen).
+            canDrag: (e) => !(e.target && e.target.closest &&
+                e.target.closest('#holaf-crop-overlay-wrap, #holaf-mask-overlay-wrap')),
             onChange: () => {
                 // (e) overlay mask synchronisé sur la brique (ex-updateTransform).
                 _syncMaskOverlay(element);

@@ -1070,7 +1070,12 @@ export class ImageEditor {
         overlay.id = 'holaf-mask-overlay';
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
-        overlay.style.cssText = 'position:absolute;z-index:60;cursor:crosshair;opacity:0.5;transition:none;';
+        // VAGUE 6 : pointer-events:auto OBLIGATOIRE — le wrapper follower a
+        // pointer-events:none (hérité par défaut) ; sans ceci le canvas ne
+        // reçoit AUCUN événement et le pointerdown traverse jusqu'à l'img →
+        // le pan du viewport démarre (curseur grab) et le dessin ne se fait
+        // jamais. Le canvas est au-dessus de l'img → il intercepte le dessin.
+        overlay.style.cssText = 'position:absolute;z-index:60;pointer-events:auto;cursor:crosshair;opacity:0.5;transition:none;';
         // Wrapper follower (boîte = boîte de l'img) + canvas letterbox dedans.
         const wrapper = this._ensureOverlayWrapper(overlay, 60);
         this._followOverlay(wrapper, overlay);
@@ -1287,7 +1292,10 @@ export class ImageEditor {
         overlay.id = 'holaf-crop-overlay';
         const r = this._maskImageRect(img);
         overlay.width = r.width; overlay.height = r.height;
-        overlay.style.cssText = 'position:absolute;z-index:60;cursor:crosshair;transition:none;';
+        // VAGUE 6 : pointer-events:auto OBLIGATOIRE (cf. _openMaskEditor) — sans
+        // ceci le canvas hérite de pointer-events:none du wrapper follower et le
+        // pointerdown traverse jusqu'à l'img → pan du viewport au lieu du dessin.
+        overlay.style.cssText = 'position:absolute;z-index:60;pointer-events:auto;cursor:crosshair;transition:none;';
         // Wrapper follower (boîte = boîte de l'img) + canvas letterbox dedans.
         const wrapper = this._ensureOverlayWrapper(overlay, 60);
         this._followOverlay(wrapper, overlay);
