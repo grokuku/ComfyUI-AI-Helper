@@ -8,6 +8,7 @@
 
 import { HolafPanelManager } from "../holaf_panel_manager.js";
 import { HOLAF_THEMES } from "../holaf_themes.js";
+import { HolafFetch } from "../vendor/holaf/holaf-fetch.js";
 import { imageViewerState } from "./image_viewer_state.js";
 
 let saveTimeout;
@@ -33,11 +34,9 @@ function _debouncedSave() {
             panel_is_fullscreen: state.panel_is_fullscreen,
         };
 
-        fetch("/holaf/image-viewer/save-settings", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(settingsToSave),
-        }).catch(error => console.error("[Holaf ImageViewer] Error saving settings:", error));
+        // Fire-and-forget : la brique lève sur non-2xx → .catch() (trace console).
+        HolafFetch.post("/holaf/image-viewer/save-settings", { body: settingsToSave })
+            .catch(error => console.error("[Holaf ImageViewer] Error saving settings:", error));
     }, DEBOUNCE_DELAY);
 }
 
@@ -47,10 +46,9 @@ function _debouncedSave() {
  */
 export async function loadSettings(viewer) {
     try {
-        const response = await fetch('/holaf/utilities/settings');
-        if (!response.ok) return;
-
-        const allSettings = await response.json();
+        // La brique lève sur non-2xx/non-JSON → catch : réglages par défaut,
+        // areSettingsLoaded positionné (comportement inchangé).
+        const allSettings = await HolafFetch.get('/holaf/utilities/settings');
         const fetchedSettings = allSettings.ImageViewerUI || {};
 
         // Fonctions de validation

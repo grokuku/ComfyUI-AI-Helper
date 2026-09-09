@@ -1,5 +1,6 @@
 import { app } from "../holaf_api_compat.js";
 import { holafBridge } from "../holaf_comfy_bridge.js";
+import { HolafFetch } from "../vendor/holaf/holaf-fetch.js";
 
 /*
  * Listener for Holaf Profiler
@@ -62,11 +63,8 @@ app.registerExtension({
                 // --- 4. SYNC WITH BACKEND ---
                 try {
                     const workflow = app.graph.serialize();
-                    await fetch('/holaf/profiler/context', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(workflow)
-                    });
+                    // HolafFetch lève sur non-2xx (→ catch : log existant).
+                    await HolafFetch.post('/holaf/profiler/context', { body: workflow });
                     console.log("[Holaf Profiler] Context sent to backend.");
                 } catch (e) {
                     console.error("[Holaf Profiler] Backend sync failed:", e);

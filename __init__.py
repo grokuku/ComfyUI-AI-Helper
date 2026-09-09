@@ -225,7 +225,6 @@ GALLERY_HTML = _subst_ext_base("""
     <link rel="stylesheet" href="@@HOLAF_EXT_BASE@@/css/holaf_themes.css">
     <link rel="stylesheet" href="@@HOLAF_EXT_BASE@@/css/holaf_shared_panel.css">
     <link rel="stylesheet" href="@@HOLAF_EXT_BASE@@/css/holaf_image_viewer.css">
-    <link rel="stylesheet" href="@@HOLAF_EXT_BASE@@/css/holaf_toasts.css">
     <style>
         /* Shim for ComfyUI variables to maintain dark theme */
         :root {

@@ -15,6 +15,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { saveWindowRect, loadWindowRect } from "./holaf_window_utils.js";
+import { remoteGet, remotePost, HolafFetch } from "./aih_fetch_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -40,11 +41,7 @@ function _blobbyLoadFromServer() {
     var baseUrl = _blobbyGetBackendUrl();
     if (!baseUrl) return; // Serveur non configuré : sync silencieusement ignorée
     try {
-        var headers = { 'Content-Type': 'application/json' };
-        var apiKey = _blobbyGetApiKey();
-        if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-        fetch(baseUrl + '/api/settings', { method: 'GET', headers: headers })
-            .then(function(r) { return r.json().catch(function(){ return {}; }); })
+        remoteGet(baseUrl + '/api/settings')
             .then(function(serverSettings) {
                 if (serverSettings && serverSettings.blobbyData) {
                     // Le serveur est prioritaire : on ecrase le localStorage
@@ -69,16 +66,10 @@ function _blobbyScheduleSync(data) {
         var baseUrl = _blobbyGetBackendUrl();
         if (!baseUrl) return; // Serveur non configuré : sync silencieusement ignorée
         try {
-            var cfg = JSON.parse(localStorage.getItem('AIH_config')) || {};
-            var headers = { 'Content-Type': 'application/json' };
-            if (cfg.apiKey) headers['Authorization'] = 'Bearer ' + cfg.apiKey;
-            fetch(baseUrl + '/api/settings', { method: 'GET', headers: headers })
-                .then(function(r) { return r.json().catch(function(){ return {}; }); })
+            remoteGet(baseUrl + '/api/settings')
                 .then(function(existing) {
                     existing.blobbyData = data;
-                    return fetch(baseUrl + '/api/settings', {
-                        method: 'POST', headers: headers, body: JSON.stringify(existing)
-                    });
+                    return remotePost(baseUrl + '/api/settings', existing);
                 })
                 .then(function() {
                     _blobbySyncStatus = 'synced';
@@ -201,13 +192,9 @@ function _blobbyGetApiKey() {
 async function _blobbySearchMemories(query, limit) {
     limit = limit || 5;
     var url = _blobbyGetBackendUrl() + '/api/blobby/memory/search?q=' + encodeURIComponent(query) + '&limit=' + limit;
-    var headers = { 'Content-Type': 'application/json' };
-    var apiKey = _blobbyGetApiKey();
-    if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
     try {
-        var res = await fetch(url, { headers: headers, signal: AbortSignal.timeout(3000) });
-        if (!res.ok) { _blobbyBackendAvailable = false; return _blobbyLocalSearch(query, limit); }
-        var data = await res.json();
+        // Timeout historique 3000 ms → opts.timeout de la brique (même valeur).
+        var data = await remoteGet(url, { timeout: 3000 });
         _blobbyBackendAvailable = true;
         return data.results || [];
     } catch(e) {
@@ -240,15 +227,8 @@ async function _blobbySaveMemory(content, memType, importance) {
     // Backend save (fire-and-forget)
     if (!_blobbyBackendAvailable) return;
     var url = _blobbyGetBackendUrl() + '/api/blobby/memory';
-    var headers = { 'Content-Type': 'application/json' };
-    var apiKey = _blobbyGetApiKey();
-    if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
     try {
-        await fetch(url, {
-            method: 'POST',
-            headers: headers,
-            body: JSON.stringify({ content: content, type: memType, importance: importance })
-        });
+        await remotePost(url, { content: content, type: memType, importance: importance });
     } catch(e) { /* silent fail */ }
 }
 
@@ -258,10 +238,7 @@ async function _blobbyForgetAll() {
     try { localStorage.removeItem('blobbyLocalMemories'); } catch {}
     // Backend
     var url = _blobbyGetBackendUrl() + '/api/blobby/memory/forget';
-    var headers = { 'Content-Type': 'application/json' };
-    var apiKey = _blobbyGetApiKey();
-    if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-    try { await fetch(url, { method: 'POST', headers: headers }); } catch {}
+    try { await remotePost(url, {}); } catch {}
 }
 
 // Charger les souvenirs locaux au démarrage
@@ -1256,12 +1233,14 @@ const Blobby = {
                     select.innerHTML = '<option value="">' + t("bl.serverNotConfigured") + '</option>';
                     return;
                 }
-                var headers = { 'Content-Type': 'application/json' };
-                if (cfg.apiKey) headers['Authorization'] = 'Bearer ' + cfg.apiKey;
-                var res = await fetch(baseUrl + '/api/presets', { headers });
-                if (!res.ok) { select.innerHTML = '<option value="">' + t("bl.loadError") + '</option>'; return; }
-                var presets = await res.json();
                 var savedPreset = cfg.blobbyPreset || '';
+                var presets;
+                try {
+                    presets = await remoteGet(baseUrl + '/api/presets');
+                } catch (err) {
+                    select.innerHTML = '<option value="">' + t("bl.loadError") + '</option>';
+                    return;
+                }
                 select.innerHTML = '<option value="">' + t("bl.providerLLMPlaceholder") + '</option>';
                 presets.forEach(function(p) {
                     var opt = document.createElement('option');
@@ -1985,20 +1964,16 @@ const Blobby = {
                         : t("bl.analyzing", { turn: turn });
                 }
 
-                var res = await fetch(baseUrl + '/api/keywords/llm-process', {
-                    method: 'POST',
-                    headers: headers,
-                    body: JSON.stringify({
+                var data;
+                try {
+                    data = await remotePost(baseUrl + '/api/keywords/llm-process', {
                         preset_id: parseInt(presetId),
                         instruction: currentInstruction
-                    })
-                });
-
-                var data = await res.json().catch(() => ({}));
-                if (!res.ok) {
+                    });
+                } catch (e) {
                     var th = container.querySelector('div:last-child');
                     if (th && th.textContent.indexOf('Blobby') >= 0) th.remove();
-                    this._addChatMessage(container, 'blobby', t("bl.sorry", { error: data.error || t("bl.errorStatus", { status: res.status }) }));
+                    this._addChatMessage(container, 'blobby', t("bl.sorry", { error: (e && e.data && e.data.error) || t("bl.errorStatus", { status: e.status }) }));
                     return;
                 }
 
@@ -2091,19 +2066,15 @@ const Blobby = {
                 // Demander au LLM de mettre à jour la personnalité (fire-and-forget)
                 var baseUrl = _blobbyGetBackendUrl();
                 if (!baseUrl) return; // Serveur non configuré : skip silencieux
-                var updateHeaders = { 'Content-Type': 'application/json' };
-                if (cfg.apiKey) updateHeaders['Authorization'] = 'Bearer ' + cfg.apiKey;
                 var updateInstruction = 'Tu es Blobby. Voici ta personnalite actuelle et la conversation recente. '
                     + 'Mets a jour ta personnalite en gardant 80% de l\'ancienne et en ajoutant max 20% de nouveau. '
                     + 'Reste concis (max 200 caracteres). Reponds UNIQUEMENT avec la nouvelle description de personnalite.\n\n'
                     + 'Personnalite actuelle: ' + character + '\n\n'
                     + 'Derniers echanges: ' + userText.substring(0, 200);
-                fetch(baseUrl + '/api/keywords/llm-process', {
-                    method: 'POST',
-                    headers: updateHeaders,
-                    body: JSON.stringify({ preset_id: parseInt(presetId), instruction: updateInstruction })
-                }).then(function(r) { return r.json(); })
-                .then(function(d) {
+                remotePost(baseUrl + '/api/keywords/llm-process', {
+                    preset_id: parseInt(presetId),
+                    instruction: updateInstruction
+                }).then(function(d) {
                     if (d.output) {
                         // Sauvegarder la nouvelle personnalite
                         _blobbySaveCharacter(d.output.trim().substring(0, 300));
@@ -2229,10 +2200,10 @@ const Blobby = {
         // Executer chaque commande sequentiellement
         for (var i = 0; i < commands.length; i++) {
             try {
-                var r = await fetch(localUrl + '/aih/blobby/exec', {
+                var r = await HolafFetch.request(localUrl + '/aih/blobby/exec', {
                     method: 'POST',
-                    headers: headers,
-                    body: JSON.stringify({ action: 'shell', command: commands[i] })
+                    raw: true,
+                    body: { action: 'shell', command: commands[i] }
                 });
                 // L'exec est protégé par l'auth terminal Holaf (cookie holaf_session).
                 // Un 401 doit se voir : on invite au login au lieu d'une erreur muette.
@@ -2333,10 +2304,10 @@ const Blobby = {
                 return;
             }
             var cmd = commands[idx];
-            fetch(localUrl + '/aih/blobby/exec', {
+            HolafFetch.request(localUrl + '/aih/blobby/exec', {
                 method: 'POST',
-                headers: headers,
-                body: JSON.stringify({ action: 'shell', command: cmd.command })
+                raw: true,
+                body: { action: 'shell', command: cmd.command }
             })
             .then(function(r) {
                 // L'exec est protégé par l'auth terminal Holaf (cookie holaf_session).

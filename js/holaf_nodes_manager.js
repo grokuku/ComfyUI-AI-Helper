@@ -35,6 +35,7 @@ import { app } from "./holaf_api_compat.js";
 import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { HOLAF_THEMES } from "./holaf_themes.js";
 import { escapeHtml, sanitizeMarkdownHtml, sanitizeUrl } from "./holaf_dom_utils.js";
+import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -87,8 +88,8 @@ const holafNodesManager = {
 
     async loadSettings() {
         try {
-            const response = await fetch('/holaf/utilities/settings');
-            const allSettings = await response.json();
+            // HolafFetch lève sur non-2xx (→ catch : log existant).
+            const allSettings = await HolafFetch.get('/holaf/utilities/settings');
             if (allSettings.NodesManagerUI) {
                 const fetchedSettings = allSettings.NodesManagerUI;
                 const validTheme = HOLAF_THEMES.find(t => t.name === fetchedSettings.theme);
@@ -122,11 +123,8 @@ const holafNodesManager = {
                 if (this.settings.panel_x === null && this.settings.x !== null) settingsToSave.x = this.settings.x;
                 if (this.settings.panel_y === null && this.settings.y !== null) settingsToSave.y = this.settings.y;
 
-                await fetch('/holaf/utilities/save-all-settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ NodesManagerUI: settingsToSave })
-                });
+                // HolafFetch lève sur non-2xx (→ catch : log existant).
+                await HolafFetch.post('/holaf/utilities/save-all-settings', { body: { NodesManagerUI: settingsToSave } });
             } catch (e) {
                 console.error("[Holaf NodesManager] Exception during saveSettings fetch:", e);
             }
@@ -334,12 +332,9 @@ const holafNodesManager = {
         const oldSelectedNodeName = this.currentlyDisplayedNode ? this.currentlyDisplayedNode.name : null;
 
         try {
-            const response = await fetch("/holaf/nodes/list");
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.error || `HTTP error ${response.status}`);
-            }
-            const data = await response.json();
+            // HolafFetch lève sur non-2xx avec le message serveur (body.error) →
+            // même gestion d'erreur que l'ancien throw explicite.
+            const data = await HolafFetch.get("/holaf/nodes/list");
             this.nodesList = data.nodes || [];
             this.renderNodesList();
 
@@ -406,13 +401,12 @@ const holafNodesManager = {
                     this.selectedNodes.add(nodeName);
                     if (nodeObj && !nodeObj.is_git_repo && !nodeObj.repo_url) {
                         try {
-                            const searchResponse = await fetch(`/holaf/nodes/search/github/${encodeURIComponent(nodeName)}`);
-                            if (searchResponse.ok) {
-                                const searchData = await searchResponse.json();
-                                if (searchData.url) {
-                                    nodeObj.repo_url = searchData.url;
-                                    this.rerenderNodeItemIcons(nodeName, nodeObj);
-                                }
+                            // Recherche d'arrière-plan : HolafFetch lève sur non-2xx
+                            // (→ catch : simple console.warn, comme avant).
+                            const searchData = await HolafFetch.get(`/holaf/nodes/search/github/${encodeURIComponent(nodeName)}`);
+                            if (searchData.url) {
+                                nodeObj.repo_url = searchData.url;
+                                this.rerenderNodeItemIcons(nodeName, nodeObj);
                             }
                         } catch (searchError) {
                             console.warn(`[Holaf NodesManager] Background GitHub search for ${nodeName} failed:`, searchError);
@@ -622,15 +616,13 @@ const holafNodesManager = {
         if (!node.is_git_repo && !effectiveRepoUrl) {
             contentEl.innerHTML = `<p class="holaf-manager-message">${t("nm.searchingGithub", { name: escapeHtml(node.name) })}</p>`;
             try {
-                const searchResponse = await fetch(`/holaf/nodes/search/github/${encodeURIComponent(node.name)}`);
-                if (searchResponse.ok) {
-                    const searchData = await searchResponse.json();
-                    if (searchData.url) {
-                        effectiveRepoUrl = searchData.url;
-                        repoUrlWasFoundThisCall = true;
-                        node.repo_url = effectiveRepoUrl;
-                        this.rerenderNodeItemIcons(node.name, node);
-                    }
+                // HolafFetch lève sur non-2xx (→ catch : console.warn, comme avant).
+                const searchData = await HolafFetch.get(`/holaf/nodes/search/github/${encodeURIComponent(node.name)}`);
+                if (searchData.url) {
+                    effectiveRepoUrl = searchData.url;
+                    repoUrlWasFoundThisCall = true;
+                    node.repo_url = effectiveRepoUrl;
+                    this.rerenderNodeItemIcons(node.name, node);
                 }
             } catch (e) {
                 console.warn(`[Holaf NodesManager] GitHub search failed for ${node.name}:`, e);
@@ -651,11 +643,10 @@ const holafNodesManager = {
                 const [owner, repoWithGit] = match[1].split('/');
                 const repo = repoWithGit.replace(/\.git$/, '');
                 try {
-                    const response = await fetch('/holaf/nodes/readme/github', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ owner, repo })
-                    });
+                    // README = texte brut (text/plain) → raw:true : la brique rend
+                    // la Response brute SANS throw sur non-2xx, la logique de
+                    // repli vers le README local reste identique.
+                    const response = await HolafFetch.post('/holaf/nodes/readme/github', { body: { owner, repo }, raw: true });
                     if (response.ok) {
                         readmeText = await response.text();
                         source = node.is_git_repo ? t("nm.sourceLocalGit") : t("nm.sourceFoundRemote");
@@ -676,7 +667,8 @@ const holafNodesManager = {
                 contentEl.innerHTML = `<p class="holaf-manager-message">${t("nm.noRepoChecking")}</p>`;
             }
             try {
-                const response = await fetch(`/holaf/nodes/readme/local/${encodeURIComponent(node.name)}`);
+                // README local = texte brut → raw:true (pas de throw sur non-2xx).
+                const response = await HolafFetch.get(`/holaf/nodes/readme/local/${encodeURIComponent(node.name)}`, { raw: true });
                 if (response.ok) {
                     readmeText = await response.text();
                     source = t("nm.sourceLocalFile");
@@ -724,12 +716,9 @@ const holafNodesManager = {
 
     async _checkAuthStatus() {
         try {
-            const response = await fetch('/holaf/auth/status', {
-                method: 'GET',
-                cache: 'no-store'
-            });
-            if (!response.ok) return { authenticated: false, passwordConfigured: false };
-            const data = await response.json().catch(() => ({}));
+            // HolafFetch lève sur non-2xx (→ catch : {false, false}, comme avant) ;
+            // `cache` est une option native, forwardée telle quelle.
+            const data = await HolafFetch.get('/holaf/auth/status', { cache: 'no-store' });
             return {
                 authenticated: data.authenticated === true,
                 passwordConfigured: data.password_configured === true
@@ -876,14 +865,10 @@ const holafNodesManager = {
 
                 try {
                     if (passwordNotConfigured) {
-                        const setupResponse = await fetch('/holaf/terminal/set-password', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ password })
-                        });
-                        const setupData = await setupResponse.json().catch(() => ({}));
+                        // HolafFetch lève sur non-2xx (→ catch partagé ci-dessous).
+                        const setupData = await HolafFetch.post('/holaf/terminal/set-password', { body: { password } });
 
-                        if (setupResponse.ok && setupData.status === "manual_required" && setupData.hash) {
+                        if (setupData.status === "manual_required" && setupData.hash) {
                             const hashInput = manualContainer.querySelector('input[readonly]');
                             if (hashInput) hashInput.value = `password_hash = ${setupData.hash}`;
                             manualContainer.style.display = "block";
@@ -893,35 +878,37 @@ const holafNodesManager = {
                             return;
                         }
 
-                        if (!(setupResponse.ok && setupData.status === "ok" && setupData.action === "reload")) {
+                        if (!(setupData.status === "ok" && setupData.action === "reload")) {
                             statusMessage.textContent = `Error: ${setupData.message || t("nm.couldNotSetPassword")}`;
                             return;
                         }
                     }
 
-                    const response = await fetch('/holaf/auth/login', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ password })
-                    });
-                    const data = await response.json().catch(() => ({}));
+                    // HolafFetch lève sur non-2xx (401 identifiée dans le catch).
+                    const data = await HolafFetch.post('/holaf/auth/login', { body: { password } });
 
-                    if (response.ok && data.success === true) {
+                    if (data.success === true) {
                         closeModal(true);
                         return;
                     }
 
-                    if (response.status === 401) {
+                    // 2xx mais pas authentifié : même message que l'ancien else.
+                    statusMessage.textContent = t("nm.passNotConfiguredOrWrong");
+                } catch (e) {
+                    console.error("[Holaf NodesManager] Login request failed:", e);
+                    if (e instanceof HolafFetchError && e.status === 0) {
+                        // Erreur réseau / timeout : le serveur n'a pas pu être joint.
+                        statusMessage.textContent = t("nm.cantReachServer");
+                    } else if (e instanceof HolafFetchError && e.status === 401) {
                         statusMessage.textContent = t("nm.passNotConfiguredOrWrong");
-                    } else {
-                        const serverMessage = data.message || data.error || "";
+                    } else if (e instanceof HolafFetchError) {
+                        const serverMessage = (e.data && (e.data.message || e.data.error)) || "";
                         statusMessage.textContent = serverMessage
                             ? `Error: ${serverMessage}`
                             : t("nm.passNotConfiguredOrWrong");
+                    } else {
+                        statusMessage.textContent = t("nm.cantReachServer");
                     }
-                } catch (e) {
-                    console.error("[Holaf NodesManager] Login request failed:", e);
-                    statusMessage.textContent = t("nm.cantReachServer");
                 } finally {
                     passwordInput.value = "";
                     if (confirmInput) confirmInput.value = "";
@@ -1038,34 +1025,49 @@ const holafNodesManager = {
 
         showInProgressDialog();
 
-        try {
-            let response = await fetch(actionPath, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ node_payloads: nodePayloads })
-            });
+        // Install/update/delete batch : git + pip côté serveur → potentiellement
+        // très long → timeout désactivé (l'ancien fetch natif n'en avait pas).
+        const postAction = () => HolafFetch.post(actionPath, { body: { node_payloads: nodePayloads }, timeout: 0 });
 
-            if (response.status === 401) {
-                removeInProgressDialog();
-                const reconnected = await this._showLoginModal(t("nm.sessionExpired"));
-                if (!reconnected) {
-                    AIH.ask({ title: t("nm.actionCancelled", { action: actionName }), message: t("nm.authRequiredForAction") });
-                    return;
-                }
-                showInProgressDialog();
-                response = await fetch(actionPath, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ node_payloads: nodePayloads })
-                });
-                if (response.status === 401) {
+        // Convertit une HolafFetchError non-2xx en « résultat » exploitable :
+        // 400 (tout a échoué) renvoie les détails par nœud en JSON ; le fetch
+        // natif ne levait pas sur ces réponses → le corps JSON reste LE résultat
+        // affiché à l'utilisateur. NB : le 207 (succès partiels) est un 2xx →
+        // la brique le renvoie directement parsé, sans throw. Hors JSON
+        // exploitable (réseau/timeout) → re-throw vers le catch générique.
+        const asResultOrThrow = (err) => {
+            if (err instanceof HolafFetchError && err.data) return err.data;
+            throw err;
+        };
+
+        try {
+            let result;
+            try {
+                result = await postAction();
+            } catch (err) {
+                if (err instanceof HolafFetchError && err.status === 401) {
+                    // Session expirée : ouverture du modal de login, puis UN retry.
                     removeInProgressDialog();
-                    AIH.ask({ title: t("nm.actionError", { action: actionName }), message: t("nm.authFailedNotExecuted") });
-                    return;
+                    const reconnected = await this._showLoginModal(t("nm.sessionExpired"));
+                    if (!reconnected) {
+                        AIH.ask({ title: t("nm.actionCancelled", { action: actionName }), message: t("nm.authRequiredForAction") });
+                        return;
+                    }
+                    showInProgressDialog();
+                    try {
+                        result = await postAction();
+                    } catch (retryErr) {
+                        if (retryErr instanceof HolafFetchError && retryErr.status === 401) {
+                            removeInProgressDialog();
+                            AIH.ask({ title: t("nm.actionError", { action: actionName }), message: t("nm.authFailedNotExecuted") });
+                            return;
+                        }
+                        result = asResultOrThrow(retryErr);
+                    }
+                } else {
+                    result = asResultOrThrow(err);
                 }
             }
-
-            const result = await response.json();
 
             removeInProgressDialog();
 
@@ -1271,14 +1273,9 @@ const holafNodesManager = {
             if (!query) return;
             resultsContainer.innerHTML = `<p>${t("nm.searching")}</p>`;
             try {
-                const res = await fetch("/holaf/nodes/search", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ query })
-                });
-                if (!res.ok) throw new Error("Search failed");
-                const data = await res.json();
-                
+                // HolafFetch lève sur non-2xx (→ catch : message serveur affiché).
+                const data = await HolafFetch.post("/holaf/nodes/search", { body: { query } });
+
                 resultsContainer.innerHTML = "";
                 if (data.results && data.results.length > 0) {
                     data.results.forEach(r => {
@@ -1374,14 +1371,17 @@ const holafNodesManager = {
 
         showInstallOverlay();
 
-        try {
-            let response = await fetch('/holaf/nodes/install', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: url })
-            });
+        // Install = git clone + pip côté serveur → potentiellement très long →
+        // timeout désactivé (l'ancien fetch natif n'en avait pas).
+        const postInstall = () => HolafFetch.post('/holaf/nodes/install', { body: { url: url }, timeout: 0 });
 
-            if (response.status === 401) {
+        try {
+            let result;
+            try {
+                result = await postInstall();
+            } catch (err) {
+                if (!(err instanceof HolafFetchError && err.status === 401)) throw err;
+                // Session expirée : ouverture du modal de login, puis UN retry.
                 removeInstallOverlay();
                 const reconnected = await this._showLoginModal(t("nm.sessionExpired"));
                 if (!reconnected) {
@@ -1389,23 +1389,22 @@ const holafNodesManager = {
                     return;
                 }
                 showInstallOverlay();
-                response = await fetch('/holaf/nodes/install', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: url })
-                });
-                if (response.status === 401) {
-                    removeInstallOverlay();
-                    AIH.ask({ title: t("nm.installFailed"), message: t("nm.authFailedNotInstalled") });
-                    return;
+                try {
+                    result = await postInstall();
+                } catch (retryErr) {
+                    if (retryErr instanceof HolafFetchError && retryErr.status === 401) {
+                        removeInstallOverlay();
+                        AIH.ask({ title: t("nm.installFailed"), message: t("nm.authFailedNotInstalled") });
+                        return;
+                    }
+                    throw retryErr;
                 }
             }
 
-            const result = await response.json();
-
             removeInstallOverlay();
 
-            if (response.ok && result.status === 'success') {
+            // 2xx uniquement ici (HolafFetch a levé sur les non-2xx → catch).
+            if (result.status === 'success') {
                 AIH.ask({ title: t("nm.installComplete"), message: t("nm.installCompleteMsg", { url }) });
                 this.refreshNodesList();
             } else {
@@ -1413,7 +1412,10 @@ const holafNodesManager = {
             }
         } catch (e) {
             removeInstallOverlay();
-            AIH.ask({ title: t("nm.installFailed"), message: t("nm.installErrorMsg", { message: e.message }) });
+            // Non-2xx : privilégie le champ `message` du corps JSON serveur
+            // (même message utilisateur que l'ancien `result.message`).
+            const msg = (e instanceof HolafFetchError && e.data && e.data.message) ? e.data.message : e.message;
+            AIH.ask({ title: t("nm.installFailed"), message: t("nm.installErrorMsg", { message: msg }) });
         } finally {
             removeInstallOverlay();
             this.isActionInProgress = false;

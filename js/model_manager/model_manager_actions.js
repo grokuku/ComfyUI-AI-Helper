@@ -8,6 +8,7 @@
 
 import "../aih_strings.js";
 import { HolafPanelManager } from "../holaf_panel_manager.js";
+import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -116,11 +117,11 @@ async function uploadFile(manager, job) {
                         formData.append("chunk_index", chunkIndex);
                         formData.append("file_chunk", chunk);
 
-                        const response = await fetch('/holaf/models/upload-chunk', { method: 'POST', body: formData });
-                        if (!response.ok) {
-                            const errorData = await response.json().catch(() => ({}));
-                            throw new Error(errorData.message || t("mma.chunkFailed", { chunk: chunkIndex }));
-                        }
+                        // FormData passé tel quel (corps brut auto, pas de raw
+                        // nécessaire). Chunks d'un gros modèle sur un lien lent
+                        // → timeout désactivé (l'ancien fetch natif n'en avait
+                        // pas). HolafFetch lève sur non-2xx (→ catch ci-dessous).
+                        await HolafFetch.post('/holaf/models/upload-chunk', { body: formData, timeout: 0 });
                         job.chunksSent++;
                         job.sentBytes += chunk.size;
                         job.progress = (job.chunksSent / job.totalChunks) * 100;
@@ -128,7 +129,13 @@ async function uploadFile(manager, job) {
                         calculateSpeed(manager.uploadStats);
                     } catch (err) {
                         job.status = 'error';
-                        job.errorMessage = err.message;
+                        // Même message utilisateur qu'avant : champ `message` du
+                        // corps JSON serveur, sinon fallback i18n (erreur HTTP)
+                        // ou message réseau.
+                        job.errorMessage = (err instanceof HolafFetchError && err.data && err.data.message)
+                            || (err instanceof HolafFetchError && err.status >= 400
+                                ? t("mma.chunkFailed", { chunk: chunkIndex })
+                                : err.message);
                         reject(err);
                         return; // Stop this worker
                     }
@@ -149,10 +156,11 @@ async function uploadFile(manager, job) {
 
 async function finalizeUpload(manager, job) {
     try {
-        const response = await fetch('/holaf/models/finalize-upload', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+        // HolafFetch lève sur non-2xx (→ catch : même message utilisateur).
+        // L'assemblage disque d'un gros modèle peut dépasser 30 s → timeout
+        // désactivé (l'ancien fetch natif n'en avait pas).
+        await HolafFetch.post('/holaf/models/finalize-upload', {
+            body: {
                 upload_id: job.id,
                 filename: job.file.name,
                 total_chunks: job.totalChunks,
@@ -160,15 +168,19 @@ async function finalizeUpload(manager, job) {
                 subfolder: job.subfolder,
                 expected_size: job.file.size,
                 // expected_sha256 removed from payload
-            })
+            },
+            timeout: 0,
         });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.message || t("mma.finalizationFailed"));
         job.status = 'done';
         manager.refreshAfterUpload = true;
     } catch (error) {
         job.status = 'error';
-        job.errorMessage = error.message;
+        // Même message utilisateur qu'avant : champ `message` du corps JSON
+        // serveur, sinon fallback i18n (erreur HTTP) ou message réseau.
+        job.errorMessage = (error instanceof HolafFetchError && error.data && error.data.message)
+            || (error instanceof HolafFetchError && error.status >= 400
+                ? t("mma.finalizationFailed")
+                : error.message);
     }
 }
 
@@ -239,14 +251,20 @@ async function downloadFile(manager, job) {
                     const chunkIndex = parallelQueue.shift();
                     if (chunkIndex === undefined) continue;
                     try {
-                        const response = await fetch('/holaf/models/download-chunk', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
+                        // Chunk binaire → raw:true : Response brute (blob), la
+                        // brique ne throw PAS sur non-2xx en raw → la gestion
+                        // d'erreur textuelle reste identique. Timeout désactivé :
+                        // gros chunks sur lien lent (en raw le timeout ne couvre
+                        // que les en-têtes ; on garde la parité avec l'ancien
+                        // fetch sans timeout).
+                        const response = await HolafFetch.post('/holaf/models/download-chunk', {
+                            body: {
                                 path: job.model.path,
                                 chunk_index: chunkIndex,
                                 chunk_size: manager.DOWNLOAD_CHUNK_SIZE,
-                            })
+                            },
+                            raw: true,
+                            timeout: 0,
                         });
                         if (!response.ok) throw new Error(await response.text());
                         
@@ -323,13 +341,13 @@ export async function processScanQueue(manager) {
 
     const pathsToScanInBatch = manager.scanQueue.splice(0, manager.scanQueue.length);
     try {
-        const response = await fetch('/holaf/models/deep-scan-local', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ paths: pathsToScanInBatch })
+        // Scan approfondi (lecture/hash des fichiers) : potentiellement long →
+        // timeout désactivé. HolafFetch lève sur non-2xx avec le message
+        // serveur (body.error) → même affichage d'erreur que l'ancien throw.
+        const result = await HolafFetch.post('/holaf/models/deep-scan-local', {
+            body: { paths: pathsToScanInBatch },
+            timeout: 0,
         });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.message || `HTTP error ${response.status}`);
         if (result.details?.errors?.length > 0) console.error("[Holaf MM] Deep Scan Errors:", result.details.errors);
     } catch (error) {
         AIH.ask({ title: t("mma.scanError"), message: t("mma.scanErrorMsg", { message: error.message }) });
@@ -354,13 +372,10 @@ export async function performDelete(manager) {
     manager.isLoading = true;
     manager.updateActionButtonsState();
     try {
-        const response = await fetch('/holaf/models/delete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ paths: pathsToDelete })
-        });
-        const result = await response.json();
-        if (!response.ok && response.status !== 207) throw new Error(result.message || `HTTP error ${response.status}`);
+        // La brique parse et renvoie tout 2xx (y compris le 207 Multi-Status
+        // de succès partiel, accepté par l'ancien code) ; les non-2xx lèvent
+        // une HolafFetchError → catch ci-dessous (message serveur affiché).
+        const result = await HolafFetch.post('/holaf/models/delete', { body: { paths: pathsToDelete } });
         let message = t("mma.deletedCount", { count: result.details?.deleted_count || 0 });
         if (result.details?.errors?.length > 0) {
             message += t("mma.errorsOccurred", { count: result.details.errors.length });

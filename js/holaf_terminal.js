@@ -33,6 +33,7 @@ import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { holafExtUrl } from "./holaf_ext_base.js";
 // CORRECTED IMPORT: No longer depends on panel_manager for themes.
 import { HOLAF_THEMES } from "./holaf_themes.js";
+import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -343,16 +344,12 @@ const holafTerminal = {
                     panel_width: this.settings.panel_width, panel_height: this.settings.panel_height,
                     panel_is_fullscreen: this.settings.panel_is_fullscreen
                 };
-                const response = await fetch('/holaf/terminal/save-settings', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(settingsToSave)
-                });
-                if (!response.ok) {
-                    const errorData = await response.json().catch(() => ({ message: "Unknown error" }));
-                    console.error("[Holaf Terminal] Failed to save settings. Status:", response.status, "Msg:", errorData.message);
-                }
+                // HolafFetch lève sur non-2xx (→ catch ci-dessous).
+                await HolafFetch.post('/holaf/terminal/save-settings', { body: settingsToSave });
             } catch (e) {
-                console.error("[Holaf Terminal] Exception during saveSettings fetch:", e);
+                const status = e instanceof HolafFetchError ? e.status : "network";
+                const msg = (e instanceof HolafFetchError && e.data && e.data.message) ? e.data.message : e.message;
+                console.error("[Holaf Terminal] Failed to save settings. Status:", status, "Msg:", msg);
             }
         }, 750);
     },
@@ -433,8 +430,8 @@ const holafTerminal = {
     async checkServerStatus() {
         this.showView('loading');
         try {
-            const r = await fetch("/holaf/utilities/settings");
-            const d = await r.json();
+            // HolafFetch lève sur non-2xx (→ catch : « cantContactServer »).
+            const d = await HolafFetch.get("/holaf/utilities/settings");
             if (d.TerminalUI) {
                 const validTheme = HOLAF_THEMES.find(t => t.name === d.TerminalUI.theme);
                 this.settings.theme = validTheme ? d.TerminalUI.theme : HOLAF_THEMES[0].name;
@@ -461,18 +458,24 @@ const holafTerminal = {
         if (newPass !== confirmPass) { this.setupStatusMessage.textContent = t("term.passMismatch"); return; }
         this.setupStatusMessage.textContent = t("term.settingPassword");
         try {
-            const r = await fetch('/holaf/terminal/set-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: newPass }) });
-            const d = await r.json();
-            if (r.ok && d.status === "ok" && d.action === "reload") {
+            // HolafFetch lève sur non-2xx (→ catch : message serveur ou « cantContactServer »).
+            const d = await HolafFetch.post('/holaf/terminal/set-password', { body: { password: newPass } });
+            if (d.status === "ok" && d.action === "reload") {
                 this.setupStatusMessage.textContent = ""; this.showView('login');
                 if (this.loginStatusMessage) this.loginStatusMessage.textContent = t("term.passwordSet");
-            } else if (r.ok && d.status === "manual_required") {
+            } else if (d.status === "manual_required") {
                 if (this.hashDisplay) this.hashDisplay.value = `password_hash = ${d.hash}`; this.showView('manual_setup');
             } else {
                 this.setupStatusMessage.textContent = `Error: ${d.message || t("term.unknownError")}`;
             }
         } catch (e) {
-            this.setupStatusMessage.textContent = t("term.cantContactServer"); console.error("[Holaf Terminal] Error setting password:", e);
+            // Non-2xx : le corps JSON serveur porte le message d'erreur (champ `message`).
+            if (e instanceof HolafFetchError && e.data) {
+                this.setupStatusMessage.textContent = `Error: ${e.data.message || t("term.unknownError")}`;
+            } else {
+                this.setupStatusMessage.textContent = t("term.cantContactServer");
+            }
+            console.error("[Holaf Terminal] Error setting password:", e);
         }
     },
     async authenticateAndConnect() {
@@ -481,19 +484,24 @@ const holafTerminal = {
         if (!password) { this.loginStatusMessage.textContent = t("term.passEmpty"); return; }
         this.loginStatusMessage.textContent = t("term.authenticating");
         try {
-            const r = await fetch('/holaf/terminal/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: password }) });
-            const d = await r.json();
-            if (r.ok && d.session_token) {
+            // HolafFetch lève sur non-2xx (→ catch : 503 = écran setup, sinon message serveur).
+            const d = await HolafFetch.post('/holaf/terminal/auth', { body: { password: password } });
+            if (d.session_token) {
                 this.connectWebSocket(d.session_token);
-            } else if (r.status === 503) {
-                // No password set on the server yet: offer the setup screen.
-                this.loginStatusMessage.textContent = "";
-                this.showView('setup');
             } else {
                 this.loginStatusMessage.textContent = `Error: ${d.message || t("term.authFailed")}`;
             }
         } catch (e) {
-            this.loginStatusMessage.textContent = t("term.cantReachServer"); console.error("[Holaf Terminal] Error authenticating:", e);
+            if (e instanceof HolafFetchError && e.status === 503) {
+                // No password set on the server yet: offer the setup screen.
+                this.loginStatusMessage.textContent = "";
+                this.showView('setup');
+            } else if (e instanceof HolafFetchError && e.data) {
+                this.loginStatusMessage.textContent = `Error: ${e.data.message || t("term.authFailed")}`;
+            } else {
+                this.loginStatusMessage.textContent = t("term.cantReachServer");
+            }
+            console.error("[Holaf Terminal] Error authenticating:", e);
         } finally {
             if (this.passwordInput) this.passwordInput.value = "";
         }

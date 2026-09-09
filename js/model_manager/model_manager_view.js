@@ -4,6 +4,7 @@
  * and updating status indicators.
  */
 import { HolafPanelManager } from "../holaf_panel_manager.js";
+import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 
 /**
  * Fetches the list of models from the server.
@@ -21,9 +22,9 @@ async function fetchModels(manager) {
     manager.modelCountsPerDisplayType = {};
     
     try {
-        const response = await fetch("/holaf/models", { cache: "no-store" });
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-        manager.models = await response.json();
+        // HolafFetch lève sur non-2xx (→ catch : message d'erreur existant) ;
+        // `cache` est une option native, forwardée telle quelle.
+        manager.models = await HolafFetch.get("/holaf/models", { cache: "no-store" });
 
         // Calculate counts for each display type for the filter dropdown
         manager.models.forEach(model => {

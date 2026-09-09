@@ -6,10 +6,12 @@
 import { app } from "./holaf_api_compat.js";
 import { holafExtUrl } from "./holaf_ext_base.js";
 import { showToast, updateToast, hideToast } from "./aih_toast_bridge.js";
+import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { applyPersistedTheme } from "./holaf_themes.js";
 
 import "./holaf_themes.js";
+import "./aih_dialog.js";
 import "./aih_strings.js";
 import "./holaf_terminal.js";
 import "./holaf_model_manager.js";
@@ -26,86 +28,6 @@ const t = (key, params) => {
     const I = window.AIH && window.AIH.I18n;
     return I && typeof I.t === "function" ? I.t(key, params) : key;
 };
-
-const HolafModal = {
-    show(title, messageOrElement, onConfirm, confirmText = t("dialog.confirm"), cancelText = t("dialog.cancel")) {
-        const existingModal = document.getElementById("holaf-modal-overlay");
-        if (existingModal) existingModal.remove();
-
-        const overlay = document.createElement("div");
-        overlay.id = "holaf-modal-overlay";
-
-        const currentTheme = document.body.className.match(/holaf-theme-\S+/)?.[0] || 'holaf-theme-graphite-orange';
-
-        const dialog = document.createElement("div");
-        dialog.id = "holaf-modal-dialog";
-        dialog.className = currentTheme;
-
-        // Build modal DOM safely (no innerHTML with user data)
-        const header = document.createElement("div");
-        header.className = "holaf-utility-header";
-        const titleSpan = document.createElement("span");
-        titleSpan.textContent = title;
-        header.appendChild(titleSpan);
-
-        const content = document.createElement("div");
-        content.className = "holaf-modal-content";
-        // Accept either a string (rendered as text) or a DOM element (appended directly)
-        if (typeof messageOrElement === "string") {
-            content.textContent = messageOrElement;
-        } else if (messageOrElement instanceof HTMLElement) {
-            content.appendChild(messageOrElement);
-        }
-
-        const footer = document.createElement("div");
-        footer.className = "holaf-modal-footer";
-        const cancelBtn = document.createElement("button");
-        cancelBtn.id = "holaf-modal-cancel";
-        cancelBtn.className = "comfy-button secondary";
-        cancelBtn.textContent = cancelText;
-        const confirmBtn = document.createElement("button");
-        confirmBtn.id = "holaf-modal-confirm";
-        confirmBtn.className = "comfy-button";
-        confirmBtn.textContent = confirmText;
-
-        if (!cancelText) {
-            cancelBtn.style.display = "none";
-        }
-
-        footer.appendChild(cancelBtn);
-        footer.appendChild(confirmBtn);
-        dialog.append(header, content, footer);
-
-        if (!cancelText) {
-            dialog.querySelector("#holaf-modal-cancel").style.display = "none";
-        }
-
-        overlay.appendChild(dialog);
-        document.body.appendChild(overlay);
-
-        const closeModal = () => {
-            if (window.holaf.restartMonitorInterval) clearInterval(window.holaf.restartMonitorInterval);
-            if (window.holaf.restartTimerInterval) clearInterval(window.holaf.restartTimerInterval);
-            delete window.holaf.restartMonitorInterval;
-            delete window.holaf.restartTimerInterval;
-            overlay.remove();
-        }
-
-        confirmBtn.onclick = () => {
-            if (onConfirm) {
-                if (onConfirm() === false) return;
-            }
-            closeModal();
-        };
-
-        cancelBtn.onclick = closeModal;
-
-        overlay.onclick = (e) => {
-            if (e.target === overlay) closeModal();
-        };
-    }
-};
-
 
 const HolafUtilitiesMenu = {
     dropdownMenuEl: null,
@@ -609,18 +531,18 @@ const HolafUtilitiesMenu = {
     // via the shared Utils mechanism POST /holaf/utilities/restart.
     checkForAIHUpdate() {
         const waitId = showToast({ message: t("main.checkingUpdate"), type: "info", duration: 0 });
-        fetch("/aih/update", { method: 'POST' })
-            .then(res => res.json())
+        // Update = git fetch + reset --hard côté serveur : potentiellement long
+        // → timeout désactivé (l'ancien fetch natif n'en avait pas).
+        HolafFetch.post("/aih/update", { timeout: 0 })
             .then(data => {
                 if (waitId) hideToast(waitId);
                 if (data.updated) {
-                    HolafModal.show(
-                        t("main.updateTitle"),
-                        t("main.updateInstalled"),
-                        () => { this.startRestartFlow(); return false; },
-                        t("main.restart"),
-                        t("main.later")
-                    );
+                    AIH.choose(t("main.updateTitle"), t("main.updateInstalled"), [
+                        { text: t("main.later"), value: "later", type: "cancel" },
+                        { text: t("main.restart"), value: "restart", type: "primary" }
+                    ]).then((choice) => {
+                        if (choice === "restart") this.startRestartFlow();
+                    });
                 } else if (data.status === "error") {
                     showToast({ message: t("main.updateFailed") + (data.message || "unknown error"), type: "error" });
                 } else {
@@ -629,7 +551,14 @@ const HolafUtilitiesMenu = {
             })
             .catch(err => {
                 if (waitId) hideToast(waitId);
-                showToast({ message: t("main.updateCheckFailed") + (err.message || "network error"), type: "error" });
+                // HolafFetch lève sur non-2xx : le backend renvoie alors
+                // {status: "error", message} → même message utilisateur que
+                // la branche 2xx d'avant la migration.
+                if (err instanceof HolafFetchError && err.data && err.data.status === "error") {
+                    showToast({ message: t("main.updateFailed") + (err.data.message || "unknown error"), type: "error" });
+                } else {
+                    showToast({ message: t("main.updateCheckFailed") + (err.message || "network error"), type: "error" });
+                }
             });
     },
 
@@ -653,44 +582,64 @@ const HolafUtilitiesMenu = {
         restartTimerLine.appendChild(document.createTextNode("s"));
         restartDiv.appendChild(restartTimerLine);
 
-        HolafModal.show(t("menu.restart"), restartDiv, () => {
-            const dialog = document.getElementById("holaf-modal-dialog");
-            if (!dialog) return;
+        // Pied de confirmation (délégué à AIH.Dialog.open — conservé ouvert
+        // pendant la phase de redémarrage pour afficher le suivi en direct).
+        const footerEl = document.createElement("div");
+        footerEl.className = "aih-dialog-footer";
+        const confirmCancelBtn = document.createElement("button");
+        confirmCancelBtn.className = "aih-dialog-btn aih-dialog-btn-cancel";
+        confirmCancelBtn.textContent = t("dialog.cancel");
+        const confirmGoBtn = document.createElement("button");
+        confirmGoBtn.className = "aih-dialog-btn aih-dialog-btn-primary";
+        confirmGoBtn.textContent = t("dialog.confirm");
+        footerEl.appendChild(confirmCancelBtn);
+        footerEl.appendChild(confirmGoBtn);
+        restartDiv.appendChild(footerEl);
 
+        // Nettoyage des timers quand le dialogue se ferme (bouton Fermer,
+        // fond, Échap) — même sémantique que l'ancienne modale locale.
+        const clearIntervals = () => {
+            if (window.holaf.restartMonitorInterval) clearInterval(window.holaf.restartMonitorInterval);
+            if (window.holaf.restartTimerInterval) clearInterval(window.holaf.restartTimerInterval);
+            delete window.holaf.restartMonitorInterval;
+            delete window.holaf.restartTimerInterval;
+        };
+
+        const dialog = AIH.Dialog.open({
+            title: t("menu.restart"),
+            modal: true,
+            resizable: false,
+            draggable: true,
+            content: restartDiv,
+            onClose: clearIntervals
+        });
+
+        confirmCancelBtn.addEventListener("click", () => dialog.close());
+
+        confirmGoBtn.addEventListener("click", () => {
             const messageEl = document.getElementById("holaf-restart-message");
             const timerLineEl = document.getElementById("holaf-restart-timer-line");
 
-            dialog.querySelector(".holaf-utility-header span").textContent = t("main.restartingTitle");
+            dialog.setTitle(t("main.restartingTitle"));
             messageEl.textContent = t("main.sendingRestart");
             timerLineEl.style.visibility = "visible";
 
-            const footerEl = dialog.querySelector(".holaf-modal-footer");
-            footerEl.replaceChildren();
             const restartCloseBtn = document.createElement("button");
             restartCloseBtn.id = "holaf-restart-close-btn";
-            restartCloseBtn.className = "comfy-button secondary";
+            restartCloseBtn.className = "aih-dialog-btn aih-dialog-btn-cancel";
             restartCloseBtn.textContent = t("main.close");
             const restartRefreshBtn = document.createElement("button");
             restartRefreshBtn.id = "holaf-restart-refresh-btn";
-            restartRefreshBtn.className = "comfy-button";
+            restartRefreshBtn.className = "aih-dialog-btn aih-dialog-btn-primary";
             restartRefreshBtn.disabled = true;
             restartRefreshBtn.textContent = t("main.refresh");
-            footerEl.appendChild(restartCloseBtn);
-            footerEl.appendChild(restartRefreshBtn);
+            footerEl.replaceChildren(restartCloseBtn, restartRefreshBtn);
+            restartCloseBtn.addEventListener("click", () => dialog.close());
 
-            const cleanupAndClose = () => {
-                const overlay = document.getElementById("holaf-modal-overlay");
-                if (overlay) overlay.remove();
-                if (window.holaf.restartMonitorInterval) clearInterval(window.holaf.restartMonitorInterval);
-                if (window.holaf.restartTimerInterval) clearInterval(window.holaf.restartTimerInterval);
-                delete window.holaf.restartMonitorInterval;
-                delete window.holaf.restartTimerInterval;
-            }
-
-            dialog.querySelector("#holaf-restart-close-btn").onclick = cleanupAndClose;
-
-            fetch("/holaf/utilities/restart", { method: 'POST' })
-                .then(res => res.json())
+            // POST migré vers HolafFetch (la route répond immédiatement — le
+            // redémarrage est planifié dans un thread) : timeout défaut conservé.
+            // Le suivi HEAD toutes les 2 s reste en fetch natif (health-check).
+            HolafFetch.post("/holaf/utilities/restart")
                 .then(data => {
                     if (data.status !== "ok") throw new Error(data.message || 'Unknown server error');
 
@@ -719,7 +668,7 @@ const HolafUtilitiesMenu = {
 
                                         if (!messageEl || !refreshBtn) return;
 
-                                        messageEl.textContent = t("main.serverRebooted", { seconds })
+                                        messageEl.textContent = t("main.serverRebooted", { seconds });
                                         if (timerLineEl) timerLineEl.style.visibility = "hidden";
                                         refreshBtn.textContent = t("main.refreshPage");
                                         refreshBtn.disabled = false;
@@ -745,13 +694,13 @@ const HolafUtilitiesMenu = {
                 })
                 .catch(err => {
                     const errorP = document.createElement('p');
-                    errorP.style.color = 'var(--holaf-error-color, #F44336)';
+                    errorP.style.color = 'var(--aih-danger, #F44336)';
                     errorP.textContent = t("main.restartFailed") + (err.message || "Unknown error") + ".";
-                    dialog.querySelector(".holaf-modal-content").replaceChildren(errorP);
-                    const rb = dialog.querySelector("#holaf-restart-refresh-btn");
+                    const rb = document.getElementById("holaf-restart-refresh-btn");
                     if (rb) rb.disabled = true;
+                    if (messageEl) messageEl.replaceChildren(errorP);
+                    if (timerLineEl) timerLineEl.style.display = "none";
                 });
-            return false;
         });
     },
 
@@ -864,11 +813,7 @@ const HolafUtilitiesMenu = {
             if (command === 'get_workflow_for_profiler') {
                 try {
                     const visualGraph = app.graph.serialize();
-                    await fetch('/holaf/profiler/context', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(visualGraph)
-                    });
+                    await HolafFetch.post('/holaf/profiler/context', { body: visualGraph });
                     showToast({ message: t("main.workflowSynced"), type: "success" });
                 } catch (e) {
                     showToast({ message: t("main.workflowSyncError"), type: "error" });
@@ -966,7 +911,6 @@ const HolafUtilitiesMenu = {
             "holaf_terminal_styles.css",
             "holaf_nodes_manager_styles.css",
             "holaf_settings_panel_styles.css",
-            "holaf_toasts.css",
             "holaf_profiler.css",
             "holaf_layout_tools.css",
             "holaf_remote_comparer_styles.css",

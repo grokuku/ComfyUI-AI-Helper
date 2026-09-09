@@ -2,6 +2,7 @@ import "./aih_dialog.js";
 import "./aih_strings.js";
 import { makeDraggable } from "./holaf_window_utils.js";
 import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToast as bridgeHideToast } from "./aih_toast_bridge.js";
+import { remoteGet, remotePost, remoteDelete, HolafFetch } from "./aih_fetch_bridge.js";
 
 /**
  * AIH Workflow Manager — Modale unique avec 2 onglets.
@@ -45,15 +46,6 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
       window.aihShowAlert(t("aih.notConfiguredTitle"), t("aih.notConfiguredMsg"), "info");
     }
     return false;
-  }
-
-  const getApiKey = () => window.AIH.getApiKey();
-
-  function apiHeaders() {
-    var h = { "Content-Type": "application/json" };
-    var key = getApiKey();
-    if (key) h["Authorization"] = "Bearer " + key;
-    return h;
   }
 
   function esc(str) {
@@ -134,8 +126,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
         var pollInterval = null;
         if (filepath) {
           pollInterval = setInterval(function() {
-            fetch('/api/aih/models/upload/progress?path=' + encodeURIComponent(filepath))
-              .then(function(r) { return r.json(); })
+            HolafFetch.request('/api/aih/models/upload/progress?path=' + encodeURIComponent(filepath))
               .then(function(p) {
                 if (!p || typeof p.percent !== 'number') return;
                 fill.style.width = p.percent + '%';
@@ -290,19 +281,17 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
 
   async function getInstalledCustomNodes() {
     try {
-      var resp = await fetch('/api/aih/custom-nodes');
-      if (!resp.ok) {
-        console.warn('[AIH] /aih/custom-nodes HTTP ' + resp.status + ' ' + resp.statusText + ' — route non enregistree ou erreur serveur');
-        return [];
-      }
-      var data = await resp.json();
+      var data = await HolafFetch.request('/api/aih/custom-nodes');
       if (!data.nodes || data.nodes.length === 0) {
         console.warn('[AIH] /aih/custom-nodes OK mais 0 packs trouves — verifier _CUSTOM_NODES_DIR et _extract_node_types');
       } else {
         console.log('[AIH] /aih/custom-nodes: ' + data.nodes.length + ' packs, ' + data.nodes.map(function(n){return n.name + "("+(n.node_types||[]).length+")";}).join(', '));
       }
       return data.nodes || [];
-    } catch(e) { console.error('[AIH] getInstalledCustomNodes error:', e); return []; }
+    } catch(e) {
+      console.warn('[AIH] /aih/custom-nodes HTTP ' + (e.status||'') + (e.body ? ' ' + (typeof e.body === 'string' ? e.body : '') : '') + ' — route non enregistree ou erreur serveur');
+      return [];
+    }
   }
 
   async function detectDependencies(workflowJSON) {
@@ -468,12 +457,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
   async function getLocalModelFiles() {
     // Interroge l'endpoint Python /aih/models/list qui retourne les chemins + tailles
     try {
-      var resp = await fetch('/api/aih/models/list');
-      if (!resp.ok) {
-        console.warn('[AIH] /aih/models/list HTTP ' + resp.status + ' ' + resp.statusText + ' — route non enregistree ou erreur serveur');
-        return {};
-      }
-      var data = await resp.json();
+      var data = await HolafFetch.request('/api/aih/models/list');
       var total = 0;
       for (var cat in data) { total += data[cat].length; }
       if (total === 0) {
@@ -482,18 +466,19 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
         console.log('[AIH] /aih/models/list: ' + total + ' fichiers dans ' + Object.keys(data).length + ' categories');
       }
       return data;
-    } catch(e) { console.error('[AIH] getLocalModelFiles error:', e); return {}; }
+    } catch(e) {
+      console.warn('[AIH] /aih/models/list HTTP ' + (e.status||'') + (e.body ? ' ' + (typeof e.body === 'string' ? e.body : '') : '') + ' — route non enregistree ou erreur serveur');
+      return {};
+    }
   }
 
   async function uploadModelToServer(filepath, fileType) {
     // Demande au Python d'uploader le fichier directement depuis le filesystem
     try {
-      var resp = await fetch('/api/aih/models/upload', {
+      return await HolafFetch.request('/api/aih/models/upload', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: filepath, type: fileType })
+        body: { path: filepath, type: fileType }
       });
-      return await resp.json();
     } catch (e) {
       return { success: false, error: e.message };
     }
@@ -504,12 +489,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
     try {
       var body = { upload_id: uploadId, filename: filename, type: fileType };
       if (destPath) body.dest_path = destPath;
-      var resp = await fetch('/api/aih/models/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      return await resp.json();
+      return await HolafFetch.request('/api/aih/models/download', { method: 'POST', body: body });
     } catch (e) {
       return { success: false, error: e.message };
     }
@@ -712,12 +692,10 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
 
       // Vérifier si un workflow du même nom existe déjà
       function checkExisting(name) {
-        fetch(getApiUrl() + "/workflows?q=" + encodeURIComponent(name) + "&limit=5", { headers: apiHeaders() })
-          .then(function (r) { return r.json(); })
+        remoteGet(getApiUrl() + "/workflows?q=" + encodeURIComponent(name) + "&limit=5")
           .then(function (data) {
             var items = data?.items || [];
-            fetch(getApiUrl() + "/auth/me", { headers: apiHeaders() })
-              .then(function (r) { return r.json(); })
+            return remoteGet(getApiUrl() + "/auth/me")
               .then(function (me) {
                 if (!me || typeof me.id !== 'string') return;
                 for (var i = 0; i < items.length; i++) {
@@ -734,7 +712,8 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
                 btn.textContent = t("wf.publish");
                 btn.style.background = "var(--aih-accent, #D8700D)";
               });
-          });
+          })
+          .catch(function(){});
       }
 
       container.querySelector("#wf-name").addEventListener("input", function () {
@@ -853,11 +832,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
         };
         if (existingId) payload.existing_id = existingId;
 
-        fetch(getApiUrl() + "/workflows", {
-          method: "POST", headers: apiHeaders(),
-          body: JSON.stringify(payload),
-        })
-          .then(function (r) { return r.json(); })
+        remotePost(getApiUrl() + "/workflows", payload)
           .then(function (data) {
             if (data.error) throw new Error(data.error);
             statusEl.style.color = "#34d399";
@@ -917,8 +892,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
         renderBrowseTab(container, ctx);
       });
 
-      fetch(url, { headers: apiHeaders() })
-        .then(function (r) { return r.json(); })
+      remoteGet(url)
         .then(async function (data) {
           var items = data?.items || [];
           var total = data?.total || 0;
@@ -982,8 +956,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
       if (!confirmed) return;
       btn.textContent = "⏳";
       try {
-        var resp = await fetch(getApiUrl() + "/workflows/" + id, { method: "DELETE", headers: apiHeaders() });
-        var data = await resp.json();
+        var data = await remoteDelete(getApiUrl() + "/workflows/" + id);
         if (data.error) throw new Error(data.error);
         var card = btn.closest('[class*="wf-card"]');
         if (card) { card.style.transition = "opacity 0.3s, transform 0.3s"; card.style.opacity = "0"; card.style.transform = "scale(0.9)"; setTimeout(function() { if (card) card.remove(); }, 300); }
@@ -1010,8 +983,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
       var detailBody = _dm.body;
       detailBody.innerHTML = '<p style="color:#888;font-size:13px;text-align:center;padding:30px 0;">' + t('wf.loading') + '</p>';
 
-      fetch(getApiUrl() + "/workflows/" + workflowId, { headers: apiHeaders() })
-        .then(function (r) { return r.json(); })
+      remoteGet(getApiUrl() + "/workflows/" + workflowId)
         .then(function (w) {
           var html =
             '<div style="margin-bottom:12px;">' +
@@ -1121,7 +1093,10 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
               depHtml += '</div>';
               depsEl.innerHTML = depHtml;
             });
-          }
+          })
+          .catch(function () {
+            detailBody.innerHTML = '<p style="color:#f87171;font-size:13px;text-align:center;padding:30px 0;">' + t('wf.loadError') + '</p>';
+          });
 
 // Install custom node (global for onclick)
           window._wfInstallNode = async function(gitUrl, nodeName, btn) {
@@ -1130,12 +1105,10 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
             btn.disabled = true;
             var toast = aihToast(t("wf.installing", { name: nodeName }), "progress");
             try {
-              var resp = await fetch("/api/aih/custom-nodes/install", {
+              var data = await HolafFetch.request("/api/aih/custom-nodes/install", {
                 method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({git_url: gitUrl, name: nodeName})
+                body: {git_url: gitUrl, name: nodeName}
               });
-              var data = await resp.json();
               if (data.success) {
                 btn.textContent = t("wf.installed");
                 btn.style.color = "#34d399";
@@ -1218,8 +1191,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
                 var pollInterval = null;
                 if (uploadId) {
                   pollInterval = setInterval(function() {
-                    fetch('/api/aih/models/download/progress?upload_id=' + encodeURIComponent(uploadId))
-                      .then(function(r) { return r.json(); })
+                    HolafFetch.request('/api/aih/models/download/progress?upload_id=' + encodeURIComponent(uploadId))
                       .then(function(p) {
                         if (!p || typeof p.percent !== 'number') return;
                         fill.style.width = p.percent + '%';
@@ -1389,9 +1361,15 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
             loadBtn.style.opacity = "0.6";
 
             try {
-              // 1. Download workflow JSON
+              // 1. Download workflow JSON (téléchargement → raw:true, lecture inchangée)
               statusEl.textContent = t("wf.downloadingWorkflow");
-              var resp = await fetch(getApiUrl() + "/workflows/" + workflowId + "/download", { headers: apiHeaders() });
+              var resp = await remoteGet(getApiUrl() + "/workflows/" + workflowId + "/download", { raw: true });
+              if (!resp.ok) {
+                const txt = await resp.text().catch(() => "");
+                let msg = "HTTP " + resp.status;
+                try { const j = JSON.parse(txt); if (j.error) msg = j.error; } catch {}
+                throw new Error(msg);
+              }
               var data = await resp.json();
               if (data.error) throw new Error(data.error);
               var wfJson = data.workflow_json;
@@ -1411,12 +1389,10 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
                 if (!nurl) continue;
                 statusEl.textContent = t("wf.installingNode", { i: (ni + 1), total: nodeCbs.length, name: esc(nname) });
                 try {
-                  var installResp = await fetch("/api/aih/custom-nodes/install", {
+                  var installData = await HolafFetch.request("/api/aih/custom-nodes/install", {
                     method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({git_url: nurl, name: nname})
+                    body: {git_url: nurl, name: nname}
                   });
-                  var installData = await installResp.json();
                   if (installData.success) newNodesInstalled++;
                 } catch(e) {
                   console.warn("[AIH] Node install failed: " + nname, e);
@@ -1443,13 +1419,10 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
               // Helper: compute fingerprint of a local file via Python
               async function getLocalFingerprint(path) {
                 try {
-                  var r = await fetch('/api/aih/models/fingerprint', {
+                  return await HolafFetch.request('/api/aih/models/fingerprint', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: path })
+                    body: { path: path }
                   });
-                  if (!r.ok) return null;
-                  return await r.json();
                 } catch(e) { return null; }
               }
               for (var i = 0; i < cbs.length; i++) {
@@ -1467,8 +1440,7 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
                 // Get server fingerprint + size for this upload
                 var serverFp = null;
                 try {
-                  var fpResp = await fetch(getApiUrl() + '/files/' + uploadId + '/fingerprint', { headers: apiHeaders() });
-                  if (fpResp.ok) serverFp = await fpResp.json();
+                  serverFp = await remoteGet(getApiUrl() + '/files/' + uploadId + '/fingerprint');
                 } catch(e) {}
                 var depSize = serverFp ? (serverFp.size || 0) : 0;
 
@@ -1557,26 +1529,20 @@ import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToa
                     var item = dlQueue.shift();
                     dlActive++;
                     (function(it) {
-                      fetch('/api/aih/models/download', {
+                      HolafFetch.request('/api/aih/models/download', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
+                        body: {
                           upload_id: it.upload_id,
                           filename: it.origName,
                           type: it.type,
                           dest_path: it.newName,
-                        })
-                      }).then(function(r) {
-                        return r.json().then(function(result) {
-                          if (!result.success && !result.error) {
-                            result.error = t('wf.unknownError');
-                          }
-                          dlPanel.setResult(it.newName, result.success, result.error);
-                          return result;
-                        }).catch(function() {
-                          dlPanel.setResult(it.newName, false, t('wf.nonJson'));
-                          return { success: false, error: t('wf.nonJson') };
-                        });
+                        }
+                      }).then(function(result) {
+                        if (!result.success && !result.error) {
+                          result.error = t('wf.unknownError');
+                        }
+                        dlPanel.setResult(it.newName, result.success, result.error);
+                        return result;
                       }).catch(function(e) {
                         dlPanel.setResult(it.newName, false, e.message);
                         return { success: false, error: e.message };

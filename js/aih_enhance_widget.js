@@ -1,4 +1,5 @@
 import "./aih_strings.js";
+import { remoteGet, remotePost } from "./aih_fetch_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -124,19 +125,14 @@ const t = (key, params) => {
                         return "";
                     }
                 };
-                const getApiKey = () => window.AIH.getApiKey();
-                const apiHeaders = () => {
-                    const h = { "Content-Type": "application/json" };
-                    const key = getApiKey();
-                    if (key) h["Authorization"] = `Bearer ${key}`;
-                    return h;
-                };
                 const apiGet = async (path) => {
                     const baseUrl = getApiUrl();
                     if (!baseUrl) return []; // Serveur non configuré : listes vides
-                    const resp = await fetch(`${baseUrl}/${path.replace(/^\//, "")}`, { headers: apiHeaders() });
-                    if (!resp.ok) return [];
-                    return resp.json().catch(() => []);
+                    try {
+                        return await remoteGet(`${baseUrl}/${path.replace(/^\//, "")}`);
+                    } catch {
+                        return [];
+                    }
                 };
 
                 const _cache = (window.__AIH_cache = window.__AIH_cache || { presets: 0, styles: 0, tmpl: 0 });
@@ -565,12 +561,10 @@ const t = (key, params) => {
                         return;
                     }
                     try {
-                        const resp = await fetch(`${getApiUrl()}/enhance`, {
-                            method: "POST", headers: apiHeaders(), body: JSON.stringify(payload),
-                        });
+                        const resp = await remotePost(`${getApiUrl()}/enhance`, payload, { raw: true });
                         if (!resp.ok) {
-                            const t = await resp.text().catch(() => "");
-                            throw new Error(`HTTP ${resp.status}: ${t.substring(0, 200)}`);
+                            const respText = await resp.text().catch(() => "");
+                            throw new Error(`HTTP ${resp.status}: ${respText.substring(0, 200)}`);
                         }
                         const text = await resp.text();
                         let output = "";

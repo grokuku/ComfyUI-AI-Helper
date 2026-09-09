@@ -20,6 +20,7 @@ const t = (key, params) => {
 
 import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { HolafComfyBridge, holafBridge } from "./holaf_comfy_bridge.js";
+import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { holafExtUrl } from './holaf_ext_base.js';
 import * as Settings from './image_viewer/image_viewer_settings.js';
 import { UI, createThemeMenu } from './image_viewer/image_viewer_ui.js';
@@ -348,33 +349,31 @@ const holafImageViewer = {
             ]
         })) {
             try {
-                const response = await fetch("/holaf/images/empty-trashcan", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                });
-                const result = await response.json();
+                // La brique lève sur non-2xx → catch (même écran que l'ancien else).
+                const result = await HolafFetch.post("/holaf/images/empty-trashcan");
 
-                if (response.ok) {
-                    AIH.ask({
-                        title: t("iv.trashEmptiedTitle"),
-                        message: result.message || t("iv.trashEmptiedMsg"),
-                        buttons: [{ text: t("iv.ok"), value: true }]
-                    });
-                    this.loadAndPopulateFilters();
-                } else {
+                AIH.ask({
+                    title: t("iv.trashEmptiedTitle"),
+                    message: result.message || t("iv.trashEmptiedMsg"),
+                    buttons: [{ text: t("iv.ok"), value: true }]
+                });
+                this.loadAndPopulateFilters();
+            } catch (error) {
+                console.error("[Holaf ImageViewer] Error calling empty-trashcan API:", error);
+                if (error instanceof HolafFetchError && error.status >= 400) {
+                    // Non-2xx : même écran que l'ancienne branche else.
                     AIH.ask({
                         title: t("iv.error"),
-                        message: t("iv.emptyTrashFailed", { message: result.message || t("iv.unknownServerError") }),
+                        message: t("iv.emptyTrashFailed", { message: error.data?.message || t("iv.unknownServerError") }),
+                        buttons: [{ text: t("iv.ok"), value: true }]
+                    });
+                } else {
+                    AIH.ask({
+                        title: t("iv.apiError"),
+                        message: t("iv.apiErrorMsg", { message: error.message }),
                         buttons: [{ text: t("iv.ok"), value: true }]
                     });
                 }
-            } catch (error) {
-                console.error("[Holaf ImageViewer] Error calling empty-trashcan API:", error);
-                AIH.ask({
-                    title: t("iv.apiError"),
-                    message: t("iv.apiErrorMsg", { message: error.message }),
-                    buttons: [{ text: t("iv.ok"), value: true }]
-                });
             }
         }
     },
@@ -425,9 +424,14 @@ const holafImageViewer = {
         }
         const tStart = performance.now();
         try {
-            const response = await fetch('/holaf/images/last-update-time', { cache: 'no-store' });
-            if (!response.ok) return;
-            const data = await response.json();
+            // La brique lève sur non-2xx/non-JSON. Poll toutes les 2 s : on
+            // garde l'ancien retour silencieux sur échec HTTP (pas de spam console).
+            const data = await HolafFetch.get('/holaf/images/last-update-time', { cache: 'no-store' })
+                .catch((e) => {
+                    if (e instanceof HolafFetchError && e.status >= 400) return null;
+                    throw e;
+                });
+            if (!data) return;
 
             const state = imageViewerState.getState();
             if (data.last_update <= state.status.lastDbUpdateTime) return;
@@ -448,15 +452,18 @@ const holafImageViewer = {
             // If the folder/format signature changed (new folder, new format, ...), fall
             // back to the original full refresh so the new folders/images are picked up.
             // Identical signatures skip the filter DOM rebuild entirely.
-            const filterResponse = await fetch('/holaf/images/filter-options', { cache: 'no-store' });
-            if (filterResponse.ok) {
-                const filterData = await filterResponse.json();
-                if (this._filterSignatureChanged(filterData)) {
-                    console.log("[Holaf ImageViewer] Folder/format signature changed — full refresh.");
-                    await this.loadAndPopulateFilters(false, true);
-                    await this.loadFilteredImages();
-                    return;
-                }
+            // Ancien comportement : !filterResponse.ok → vérification de signature
+            // simplement sautée (le poll continue) ; erreur réseau → catch global.
+            const filterData = await HolafFetch.get('/holaf/images/filter-options', { cache: 'no-store' })
+                .catch((e) => {
+                    if (e instanceof HolafFetchError && e.status >= 400) return null;
+                    throw e;
+                });
+            if (filterData && this._filterSignatureChanged(filterData)) {
+                console.log("[Holaf ImageViewer] Folder/format signature changed — full refresh.");
+                await this.loadAndPopulateFilters(false, true);
+                await this.loadFilteredImages();
+                return;
             }
 
             // Incremental refresh: only fetch images newer than the current top mtime.
@@ -601,9 +608,9 @@ const holafImageViewer = {
 
     async loadAndPopulateFilters(isInitialLoad = false, isUpdate = false) {
         try {
-            const response = await fetch('/holaf/images/filter-options', { cache: 'no-store' });
-            if (!response.ok) throw new Error(`HTTP error ${response.status}`);
-            const data = await response.json();
+            // La brique lève sur non-2xx/non-JSON → catch : message d'erreur
+            // dans le panneau des filtres (comportement inchangé).
+            const data = await HolafFetch.get('/holaf/images/filter-options', { cache: 'no-store' });
 
             const state = imageViewerState.getState();
             imageViewerState.setState({ status: { lastDbUpdateTime: data.last_update_time || state.status.lastDbUpdateTime } });
@@ -722,17 +729,17 @@ const holafImageViewer = {
             payload.offset = offset;
         }
 
-        const response = await fetch('/holaf/images/list', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
+        // POST JSON + parse gérés par la brique (lève sur non-2xx/non-JSON).
+        const data = await HolafFetch.post('/holaf/images/list', { body: payload })
+            .catch((e) => {
+                // Message historique conservé : « HTTP error <status> » est
+                // affiché dans la zone de chargement par loadFilteredImages().
+                if (e instanceof HolafFetchError && e.status >= 400) {
+                    throw new Error(`HTTP error ${e.status}`);
+                }
+                throw e;
+            });
 
-        if (!response.ok) throw new Error(`HTTP error ${response.status}`);
-
-        console.time('JSON Parsing');
-        const data = await response.json();
-        console.timeEnd('JSON Parsing');
         console.timeEnd('BE Fetch & Parse');
         return data;
     },
@@ -747,13 +754,9 @@ const holafImageViewer = {
         const payload = { ...filters };
         delete payload.locked_folders;
         payload.min_mtime = minMtime;
-        const response = await fetch('/holaf/images/list', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        if (!response.ok) throw new Error(`HTTP error ${response.status}`);
-        return response.json();
+        // POST JSON + parse gérés par la brique (lève sur non-2xx/non-JSON →
+        // catch de checkForUpdates, trace console inchangée).
+        return HolafFetch.post('/holaf/images/list', { body: payload });
     },
 
     /**
@@ -993,7 +996,9 @@ const holafImageViewer = {
                     chunk_size: DOWNLOAD_CHUNK_SIZE
                 });
 
-                const response = await fetch(url);
+                // raw:true → Response brute : lecture arrayBuffer() inchangée.
+                // (En mode brut la brique ne lève pas sur non-2xx → test .ok conservé.)
+                const response = await HolafFetch.get(url, { raw: true });
                 if (!response.ok) throw new Error(`HTTP error ${response.status} for chunk ${i}`);
 
                 const chunk = await response.arrayBuffer();
@@ -1052,9 +1057,8 @@ const holafImageViewer = {
             clearInterval(this.statsRefreshIntervalId); this.statsRefreshIntervalId = null; return;
         }
         try {
-            const response = await fetch('/holaf/images/thumbnail-stats');
-            if (!response.ok) return;
-            const stats = await response.json();
+            // La brique lève sur non-2xx → catch vide historique (poll silencieux).
+            const stats = await HolafFetch.get('/holaf/images/thumbnail-stats');
 
             const allGenerated = stats.generated_thumbnails_count >= stats.total_db_count;
             imageViewerState.setState({
@@ -1182,15 +1186,10 @@ const holafImageViewer = {
     },
 
     async _updateViewerActivity(isActive) {
-        try {
-            await fetch('/holaf/images/viewer-activity', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ active: isActive })
-            });
-        } catch (e) {
-            console.error("[Holaf ImageViewer] Error updating viewer activity:", e);
-        }
+        // Fire-and-forget (heartbeat) : la brique lève sur non-2xx → .catch()
+        // vide pour éviter toute unhandled rejection.
+        HolafFetch.post('/holaf/images/viewer-activity', { body: { active: isActive } })
+            .catch(() => {});
     },
 };
 

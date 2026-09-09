@@ -1,6 +1,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { showToast as bridgeShowToast } from "./aih_toast_bridge.js";
+import { remoteRequest } from "./aih_fetch_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -42,36 +43,23 @@ function getApiUrl() {
     }
 }
 
-function getApiKey() {
-    try {
-        return (window.AIH && window.AIH.getApiKey
-            ? window.AIH.getApiKey()
-            : "");
-    } catch {
-        return "";
-    }
-}
-
-function apiHeaders() {
-    const h = { "Content-Type": "application/json" };
-    const key = getApiKey();
-    if (key) h["Authorization"] = `Bearer ${key}`;
-    return h;
-}
-
 async function apiCall(method, path, body) {
     const baseUrl = getApiUrl();
     if (!baseUrl) {
         throw new Error(t("aih.notConfiguredError"));
     }
-    const opts = { method, headers: apiHeaders() };
-    if (body) opts.body = JSON.stringify(body);
-    const resp = await fetch(`${baseUrl}/${path.replace(/^\//, "")}`, opts);
-    if (!resp.ok) {
-        const txt = await resp.text().catch(() => "");
-        throw new Error(`HTTP ${resp.status}: ${txt.substring(0, 200)}`);
+    try {
+        return await remoteRequest(`${baseUrl}/${path.replace(/^\//, "")}`, {
+            method,
+            body,
+        });
+    } catch (e) {
+        // Reproduit le contrat historique : Error "HTTP <status>: <texte>".
+        const raw = e && e.body !== undefined && typeof e.body === "object"
+            ? JSON.stringify(e.body)
+            : (e && e.body) || "";
+        throw new Error(`HTTP ${e.status}: ${String(raw).substring(0, 200)}`);
     }
-    return resp.json();
 }
 
 // ========================

@@ -13,6 +13,7 @@ import { escapeHtml } from "../holaf_dom_utils.js";
 import { imageViewerState } from './image_viewer_state.js';
 import { getThumbnailUrl } from './image_viewer_gallery.js';
 import { resetTransform } from './image_viewer_navigation.js';
+import { HolafFetch, HolafFetchError } from '../vendor/holaf/holaf-fetch.js';
 import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
@@ -280,49 +281,48 @@ export class ImageEditor {
     async _loadEditsForCurrentImage() {
         if (!this.activeImage) return;
         try {
-            const r = await fetch(`/holaf/images/load-edits?path_canon=${encodeURIComponent(this.activeImage.path_canon)}`);
-            if (r.ok) {
-                const d = await r.json();
-                if (d.native_fps) this.nativeFps = Number(d.native_fps);
-                if (d.processed_video_url) { this.processedVideoUrl = d.processed_video_url; this._dispatchVideoOverride(this.processedVideoUrl); }
-                else this._dispatchVideoOverride(null);
-                if (d.status === 'ok') {
-                    this.currentState = { ...DEFAULT_EDIT_STATE(), ...d.edits };
-                    // Ensure controls array exists and is not shared by reference
-                    if (d.edits && Array.isArray(d.edits.controls)) {
-                        this.currentState.controls = d.edits.controls.map(c => ({ ...c }));
-                    }
+            // La brique lève sur non-2xx → catch identique (échec silencieux
+            // loggé, préview/UI réinitialisées) ; plus de test r.ok.
+            const d = await HolafFetch.get(`/holaf/images/load-edits?path_canon=${encodeURIComponent(this.activeImage.path_canon)}`);
+            if (d.native_fps) this.nativeFps = Number(d.native_fps);
+            if (d.processed_video_url) { this.processedVideoUrl = d.processed_video_url; this._dispatchVideoOverride(this.processedVideoUrl); }
+            else this._dispatchVideoOverride(null);
+            if (d.status === 'ok') {
+                this.currentState = { ...DEFAULT_EDIT_STATE(), ...d.edits };
+                // Ensure controls array exists and is not shared by reference
+                if (d.edits && Array.isArray(d.edits.controls)) {
+                    this.currentState.controls = d.edits.controls.map(c => ({ ...c }));
                 }
-                // ── Masks multiples : charger le PNG de CHAQUE contrôle type 'mask' ──
-                this._maskCanvases = {};
-                this._activeOverlayMaskId = null;
-                const maskControls = (this.currentState.controls || []).filter(c => c.type === 'mask');
-                if (maskControls.length) {
-                    let loaded = 0;
-                    maskControls.forEach((c) => {
-                        if (!c.mask_base64) { loaded++; return; }
-                        const img = new Image();
-                        img.onload = () => {
-                            const cv = document.createElement('canvas');
-                            cv.width = img.naturalWidth;
-                            cv.height = img.naturalHeight;
-                            cv.getContext('2d').drawImage(img, 0, 0);
-                            this._maskCanvases[c.id] = cv;
-                            // Affiche l'overlay du dernier mask actif
-                            this._activeOverlayMaskId = c.id;
-                            if (!this._maskHidden) this._showMaskOverlay(c.id);
-                            this.applyPreview();
-                        };
-                        img.onerror = () => { loaded++; if (loaded === maskControls.length) this.applyPreview(); };
-                        img.src = c.mask_base64;
-                    });
-                } else {
-                    const ov = document.getElementById('holaf-mask-overlay');
-                    if (ov) ov.remove();
-                }
-                if (this.nativeFps > 0 && this.currentState.targetFps == null)
-                    this.currentState.targetFps = Math.round(this.nativeFps * (this.currentState.playbackRate || 1.0));
             }
+            // ── Masks multiples : charger le PNG de CHAQUE contrôle type 'mask' ──
+            this._maskCanvases = {};
+            this._activeOverlayMaskId = null;
+            const maskControls = (this.currentState.controls || []).filter(c => c.type === 'mask');
+            if (maskControls.length) {
+                let loaded = 0;
+                maskControls.forEach((c) => {
+                    if (!c.mask_base64) { loaded++; return; }
+                    const img = new Image();
+                    img.onload = () => {
+                        const cv = document.createElement('canvas');
+                        cv.width = img.naturalWidth;
+                        cv.height = img.naturalHeight;
+                        cv.getContext('2d').drawImage(img, 0, 0);
+                        this._maskCanvases[c.id] = cv;
+                        // Affiche l'overlay du dernier mask actif
+                        this._activeOverlayMaskId = c.id;
+                        if (!this._maskHidden) this._showMaskOverlay(c.id);
+                        this.applyPreview();
+                    };
+                    img.onerror = () => { loaded++; if (loaded === maskControls.length) this.applyPreview(); };
+                    img.src = c.mask_base64;
+                });
+            } else {
+                const ov = document.getElementById('holaf-mask-overlay');
+                if (ov) ov.remove();
+            }
+            if (this.nativeFps > 0 && this.currentState.targetFps == null)
+                this.currentState.targetFps = Math.round(this.nativeFps * (this.currentState.playbackRate || 1.0));
         } catch (e) { console.error("[Holaf Editor] load edits:", e); }
         this._updateUIFromState();
         this.applyPreview();
@@ -371,18 +371,15 @@ export class ImageEditor {
                 }),
             };
             const payload = { path_canon: path, edits: editsPayload, mask_layers: maskLayers };
-            const r = await fetch('/holaf/images/save-edits', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            if (r.ok) {
-                this._updateGlobalImageState(path, true);
-                if (this.viewer?.gallery) this.viewer.gallery.refreshThumbnail(path);
-                if (this.nativeFps > 0) {
-                    const needs = this.currentState.interpolate || (this.currentState.targetFps && this.currentState.targetFps !== this.nativeFps);
-                    if (needs && this.activeImage?.path_canon === path) {
-                        this._triggerProcessVideoBackground(path);
-                    }
+            // La brique lève sur non-2xx → catch : auto-save raté (warning
+            // console, réessayé au prochain changement), comme avant.
+            await HolafFetch.post('/holaf/images/save-edits', { body: payload });
+            this._updateGlobalImageState(path, true);
+            if (this.viewer?.gallery) this.viewer.gallery.refreshThumbnail(path);
+            if (this.nativeFps > 0) {
+                const needs = this.currentState.interpolate || (this.currentState.targetFps && this.currentState.targetFps !== this.nativeFps);
+                if (needs && this.activeImage?.path_canon === path) {
+                    this._triggerProcessVideoBackground(path);
                 }
             }
         } catch (e) {
@@ -1651,10 +1648,17 @@ export class ImageEditor {
         })) return;
 
         const path = this.activeImage.path_canon;
+        // POST « tolérant » : les anciens fetch sans test .ok laissaient le
+        // reset local se poursuivre même sur une erreur HTTP serveur ; on
+        // conserve ce contrat (seules les erreurs réseau/timeout bloquent,
+        // via le catch ci-dessous).
+        const postLenient = (url, body) => HolafFetch.post(url, { body }).catch((e) => {
+            if (!(e instanceof HolafFetchError) || !(e.status >= 400)) throw e;
+        });
         try {
-            await fetch('/holaf/images/delete-edits', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path_canon: path }) });
+            await postLenient('/holaf/images/delete-edits', { path_canon: path });
             if (this.processedVideoUrl)
-                await fetch('/holaf/images/rollback-video', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path_canon: path }) });
+                await postLenient('/holaf/images/rollback-video', { path_canon: path });
 
             this.currentState = DEFAULT_EDIT_STATE();
             if (this.nativeFps > 0) this.currentState.targetFps = this.nativeFps;
@@ -1679,16 +1683,25 @@ export class ImageEditor {
     async _triggerProcessVideoBackground(path) {
         document.dispatchEvent(new Event('holaf-video-processing-start'));
         try {
-            const r = await fetch('/holaf/images/process-video', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path_canon: path, edits: this.currentState })
+            // Requête LONGE (transcodage FFmpeg côté serveur, plusieurs minutes) :
+            // timeout: 0 désactive TOUT timer côté brique (0 = aucun, mécanisme
+            // prévu par HolafFetch) — la réponse JSON n'arrive qu'à la fin du
+            // traitement, un timeout la couperait à tort. Pas de retry configuré
+            // (défaut de la brique) → jamais de double transcodage.
+            const d = await HolafFetch.post('/holaf/images/process-video', {
+                timeout: 0,
+                body: { path_canon: path, edits: this.currentState }
             });
-            const d = await r.json();
-            if (r.ok) {
-                this._showToast(d.stats ? t('iv.previewReady', { duration: d.stats.duration }) : t('iv.previewGenerated'), 'success');
-                if (this.activeImage?.path_canon === path) await this._loadEditsForCurrentImage();
-            } else AIH.ask({ title: t('iv.processError'), message: d.message });
-        } catch (e) { this._showToast(t('iv.processFailed', { message: e.message }), 'error'); }
+            this._showToast(d.stats ? t('iv.previewReady', { duration: d.stats.duration }) : t('iv.previewGenerated'), 'success');
+            if (this.activeImage?.path_canon === path) await this._loadEditsForCurrentImage();
+        } catch (e) {
+            if (e instanceof HolafFetchError && e.status >= 400) {
+                // Non-2xx : même écran que l'ancien else (!r.ok).
+                AIH.ask({ title: t('iv.processError'), message: e.data?.message || e.message });
+            } else {
+                this._showToast(t('iv.processFailed', { message: e.message }), 'error');
+            }
+        }
         finally { document.dispatchEvent(new Event('holaf-video-processing-end')); }
     }
 

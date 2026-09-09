@@ -7,6 +7,7 @@ import "../aih_strings.js";
 import { HOLAF_THEMES } from '../holaf_themes.js';
 import { imageViewerState } from './image_viewer_state.js';
 import * as Navigation from './image_viewer_navigation.js';
+import { HolafFetch } from '../vendor/holaf/holaf-fetch.js';
 import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
@@ -336,11 +337,8 @@ class ImageViewerUI {
                 regenThumbsBtn.textContent = t('iv.cleanupThumbs');
                 showToast(t('iv.cleanupThumbsToast'), 'info');
 
-                const cleanResponse = await fetch('/holaf/images/maintenance/clean-thumbnails', { method: 'POST' });
-                if (!cleanResponse.ok) {
-                    throw new Error(`clean-thumbnails failed with status ${cleanResponse.status}`);
-                }
-                const cleanData = await cleanResponse.json();
+                // La brique lève sur non-2xx → catch du bouton (même toast d'erreur).
+                const cleanData = await HolafFetch.post('/holaf/images/maintenance/clean-thumbnails');
 
                 // Step 2 (best-effort): reset permanent-failure thumbnails.
                 // If this step fails, keep going so the user still sees the
@@ -349,11 +347,8 @@ class ImageViewerUI {
                 let resetCount = 0;
                 let regenFailed = false;
                 try {
-                    const regenResponse = await fetch('/holaf/images/regenerate-failed', { method: 'POST' });
-                    if (!regenResponse.ok) {
-                        throw new Error(`regenerate-failed failed with status ${regenResponse.status}`);
-                    }
-                    const regenData = await regenResponse.json();
+                    // La brique lève sur non-2xx → catch interne (étape best-effort).
+                    const regenData = await HolafFetch.post('/holaf/images/regenerate-failed');
                     resetCount = (regenData && typeof regenData.reset_count === 'number') ? regenData.reset_count : 0;
                 } catch (regenError) {
                     regenFailed = true;

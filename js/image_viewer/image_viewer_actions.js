@@ -14,6 +14,7 @@
 import "../aih_strings.js";
 import { HolafPanelManager, dialogState } from "../holaf_panel_manager.js";
 import { imageViewerState } from "./image_viewer_state.js";
+import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 import { showToast, updateToast, hideToast } from "../aih_toast_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
@@ -135,70 +136,65 @@ export async function handleDeletion(viewer, permanent = false, imagesToProcess 
 
     try {
         const apiUrl = permanent ? "/holaf/images/delete-permanently" : "/holaf/images/delete";
-        const response = await fetch(apiUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ paths_canon: pathsToDelete })
-        });
-        const result = await response.json();
+        // HolafFetch lève sur non-2xx (→ catch ci-dessous) ; tous les 2xx
+        // (dont 207 multi-status) suivent le chemin de succès historique.
+        const result = await HolafFetch.post(apiUrl, { body: { paths_canon: pathsToDelete } });
 
-        if (response.ok || response.status === 207) {
-            let finalMessage = result.message || t('iv.operationProcessed');
-            let dialogTitle = t("iv.operationComplete");
-            let showDialog = false;
+        let finalMessage = result.message || t('iv.operationProcessed');
+        let dialogTitle = t("iv.operationComplete");
+        let showDialog = false;
 
-            // BUGFIX: Always check for details first and build a detailed message.
-            if (result.details && result.details.length > 0) {
-                const errorDetails = result.details.map(d => `• <strong>${d.path.split('/').pop()}</strong>:<br>  ${d.error}`).join('<br>');
-                finalMessage += `<br><br>${t('iv.errorDetails')}<br>${errorDetails}`;
-                dialogTitle = t("iv.deletionError");
-                showDialog = true;
-            }
+        // BUGFIX: Always check for details first and build a detailed message.
+        if (result.details && result.details.length > 0) {
+            const errorDetails = result.details.map(d => `• <strong>${d.path.split('/').pop()}</strong>:<br>  ${d.error}`).join('<br>');
+            finalMessage += `<br><br>${t('iv.errorDetails')}<br>${errorDetails}`;
+            dialogTitle = t("iv.deletionError");
+            showDialog = true;
+        }
 
-            // If files were successfully deleted, show a success toast.
-            // If some failed, the dialog above will still show the errors.
-            if (result.deleted_count > 0) {
-                showToast({
-                    message: t('iv.movedToTrash', { count: result.deleted_count }),
-                    type: 'success'
-                });
-            } else if (!showDialog) {
-                // If NO files were deleted AND there were NO errors, show the generic dialog.
-                showDialog = true;
-            }
+        // If files were successfully deleted, show a success toast.
+        // If some failed, the dialog above will still show the errors.
+        if (result.deleted_count > 0) {
+            showToast({
+                message: t('iv.movedToTrash', { count: result.deleted_count }),
+                type: 'success'
+            });
+        } else if (!showDialog) {
+            // If NO files were deleted AND there were NO errors, show the generic dialog.
+            showDialog = true;
+        }
 
-            if (showDialog) {
-                AIH.ask({
-                    title: dialogTitle,
-                    message: finalMessage,
-                    html: true,           // finalMessage contient <strong>/<br>
-                    maxWidth: 620,        // les détails d'erreurs ont besoin de place
-                    buttons: [{ text: t("iv.ok") }],
-                    parentElement: document.body
-                });
-            }
-            
-            // Refresh the UI only if at least one file was successfully deleted.
-            return result.deleted_count > 0;
-
-        } else {
-            // Handle fatal server errors (5xx, etc.)
+        if (showDialog) {
             AIH.ask({
-                title: t("iv.serverError"),
-                message: t('iv.deleteFailed', { message: result.message || t('iv.unknownServerError') }),
+                title: dialogTitle,
+                message: finalMessage,
+                html: true,           // finalMessage contient <strong>/<br>
+                maxWidth: 620,        // les détails d'erreurs ont besoin de place
                 buttons: [{ text: t("iv.ok") }],
                 parentElement: document.body
             });
-            return false;
         }
+
+        // Refresh the UI only if at least one file was successfully deleted.
+        return result.deleted_count > 0;
     } catch (error) {
         console.error("[Holaf ImageViewer] Error calling delete API:", error);
-        AIH.ask({
-            title: t("iv.apiError"),
-            message: t('iv.apiErrorDeleteMsg', { message: error.message }),
-            buttons: [{ text: t("iv.ok") }],
-            parentElement: document.body
-        });
+        if (error instanceof HolafFetchError && error.status >= 400) {
+            // Non-2xx : même écran que l'ancienne branche else (erreurs serveur).
+            AIH.ask({
+                title: t("iv.serverError"),
+                message: t('iv.deleteFailed', { message: error.data?.message || t('iv.unknownServerError') }),
+                buttons: [{ text: t("iv.ok") }],
+                parentElement: document.body
+            });
+        } else {
+            AIH.ask({
+                title: t("iv.apiError"),
+                message: t('iv.apiErrorDeleteMsg', { message: error.message }),
+                buttons: [{ text: t("iv.ok") }],
+                parentElement: document.body
+            });
+        }
         return false;
     }
 }
@@ -242,42 +238,40 @@ export async function handleRestore(viewer) {
         parentElement: document.body
     })) {
         try {
-            const response = await fetch("/holaf/images/restore", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ paths_canon: pathsToRestore })
-            });
-            const result = await response.json();
+            // HolafFetch lève sur non-2xx (→ catch ci-dessous) ; tous les 2xx
+            // (dont 207 multi-status) suivent le chemin de succès historique.
+            const result = await HolafFetch.post("/holaf/images/restore", { body: { paths_canon: pathsToRestore } });
 
-            if (response.ok || response.status === 207) {
+            AIH.ask({
+                title: t("iv.restoreOperation"),
+                message: result.message || t('iv.restoreProcessed'),
+                buttons: [{ text: t("iv.ok"), value: true }],
+                parentElement: document.body
+            });
+            imageViewerState.setState({
+                selectedImages: new Set(),
+                activeImage: null,
+                currentNavIndex: -1
+            });
+            viewer.loadFilteredImages();
+        } catch (error) {
+            console.error("[Holaf ImageViewer] Error calling restore API:", error);
+            if (error instanceof HolafFetchError && error.status >= 400) {
+                // Non-2xx : même écran que l'ancienne branche else.
                 AIH.ask({
-                    title: t("iv.restoreOperation"),
-                    message: result.message || t('iv.restoreProcessed'),
+                    title: t("iv.restoreError"),
+                    message: t('iv.restoreFailed', { message: error.data?.message || t('iv.unknownServerError') }),
                     buttons: [{ text: t("iv.ok"), value: true }],
                     parentElement: document.body
                 });
-                imageViewerState.setState({
-                    selectedImages: new Set(),
-                    activeImage: null,
-                    currentNavIndex: -1
-                });
-                viewer.loadFilteredImages();
             } else {
                 AIH.ask({
-                    title: t("iv.restoreError"),
-                    message: t('iv.restoreFailed', { message: result.message || t('iv.unknownServerError') }),
+                    title: t("iv.apiError"),
+                    message: t('iv.apiErrorRestoreMsg', { message: error.message }),
                     buttons: [{ text: t("iv.ok"), value: true }],
                     parentElement: document.body
                 });
             }
-        } catch (error) {
-            console.error("[Holaf ImageViewer] Error calling restore API:", error);
-            AIH.ask({
-                title: t("iv.apiError"),
-                message: t('iv.apiErrorRestoreMsg', { message: error.message }),
-                buttons: [{ text: t("iv.ok"), value: true }],
-                parentElement: document.body
-            });
         }
     }
 }
@@ -319,18 +313,19 @@ async function processNextConflict(viewer, operation) {
     if (choice === 'overwrite') {
         try {
             const apiUrl = `/holaf/images/${operation}-metadata`;
-            const response = await fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ paths_canon: [conflict.path], force: true })
-            });
-            const result = await response.json();
-            if (!response.ok || result.results?.failures?.length > 0) {
+            const result = await HolafFetch.post(apiUrl, { body: { paths_canon: [conflict.path], force: true } });
+            if (result.results?.failures?.length > 0) {
                 const errorMsg = result.results?.failures[0]?.error || result.message || t('iv.unknownErrorDuringOverwrite');
                 AIH.ask({ title: t('iv.errorOverwriting', { filename }), message: errorMsg, parentElement: document.body });
             }
         } catch (e) {
-             AIH.ask({ title: t('iv.apiError'), message: t('iv.overwriteFailed', { filename, message: e.message }), parentElement: document.body });
+             if (e instanceof HolafFetchError && e.status >= 400) {
+                 // Non-2xx : même boîte de dialogue que l'ancien test !response.ok.
+                 const errorMsg = e.data?.results?.failures?.[0]?.error || e.data?.message || t('iv.unknownErrorDuringOverwrite');
+                 AIH.ask({ title: t('iv.errorOverwriting', { filename }), message: errorMsg, parentElement: document.body });
+             } else {
+                 AIH.ask({ title: t('iv.apiError'), message: t('iv.overwriteFailed', { filename, message: e.message }), parentElement: document.body });
+             }
         }
     } else if (choice === 'cancel_all') {
         viewer.conflictQueue = [];
@@ -366,15 +361,10 @@ export async function handleExtractMetadata(viewer) {
     const pathsToProcess = pngImages.map(img => img.path_canon);
 
     try {
-        const response = await fetch('/holaf/images/extract-metadata', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ paths_canon: pathsToProcess, force: false })
-        });
-        const result = await response.json();
+        // La brique lève sur non-2xx → catch ci-dessous (même boîte de dialogue
+        // « API error », avec le message du corps JSON s'il existe).
+        const result = await HolafFetch.post('/holaf/images/extract-metadata', { body: { paths_canon: pathsToProcess, force: false } });
 
-        if (!response.ok) throw new Error(result.message || `Server returned status ${response.status}`);
-        
         viewer.conflictQueue = result.results?.conflicts || [];
         viewer.isProcessingConflicts = false;
 
@@ -404,9 +394,10 @@ export async function handleExtractMetadata(viewer) {
         }
     } catch (error) {
         console.error("[Holaf ImageViewer] Error calling extract API:", error);
+        const message = (error instanceof HolafFetchError && error.data?.message) ? error.data.message : error.message;
         AIH.ask({
             title: t("iv.apiError"),
-            message: t('iv.apiErrorExtractMsg', { message: error.message }),
+            message: t('iv.apiErrorExtractMsg', { message }),
             buttons: [{ text: t("iv.ok") }], parentElement: document.body
         });
     }
@@ -438,15 +429,10 @@ export async function handleInjectMetadata(viewer) {
     const pathsToProcess = pngImages.map(img => img.path_canon);
 
     try {
-        const response = await fetch('/holaf/images/inject-metadata', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ paths_canon: pathsToProcess, force: false })
-        });
-        const result = await response.json();
+        // La brique lève sur non-2xx → catch ci-dessous (même boîte de dialogue
+        // « API error », avec le message du corps JSON s'il existe).
+        const result = await HolafFetch.post('/holaf/images/inject-metadata', { body: { paths_canon: pathsToProcess, force: false } });
 
-        if (!response.ok) throw new Error(result.message || `Server returned status ${response.status}`);
-        
         viewer.conflictQueue = result.results?.conflicts || [];
         viewer.isProcessingConflicts = false;
 
@@ -477,9 +463,10 @@ export async function handleInjectMetadata(viewer) {
 
     } catch (error) {
         console.error("[Holaf ImageViewer] Error calling inject API:", error);
+        const message = (error instanceof HolafFetchError && error.data?.message) ? error.data.message : error.message;
         AIH.ask({
             title: t("iv.apiError"),
-            message: t('iv.apiErrorInjectMsg', { message: error.message }),
+            message: t('iv.apiErrorInjectMsg', { message }),
             buttons: [{ text: t("iv.ok") }], parentElement: document.body
         });
     }
@@ -858,13 +845,11 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
         };
         
         try {
-            const response = await fetch('/holaf/images/prepare-export', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const result = await response.json();
+            // La brique lève sur non-2xx (→ catch : mêmes toasts d'échec) ;
+            // on ne teste plus que le statut métier de la réponse.
+            const result = await HolafFetch.post('/holaf/images/prepare-export', { body: payload });
 
-            if (!response.ok || result.status !== 'ok') {
+            if (result.status !== 'ok') {
                 throw new Error(result.message || t('iv.failedToPrepareExport'));
             }
             
@@ -874,8 +859,9 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
             }
 
             const manifestUrl = `/holaf/images/export-chunk?export_id=${result.export_id}&file_path=manifest.json&chunk_index=0&chunk_size=1000000`;
-            const manifestResponse = await fetch(manifestUrl);
-            const manifest = await manifestResponse.json();
+            // La brique lève sur non-2xx/non-JSON → catch : toasts d'échec
+            // d'export (l'ancien code avalait une erreur HTTP en « noNewFiles »).
+            const manifest = await HolafFetch.get(manifestUrl);
 
             if (manifest && manifest.length > 0) {
                 const newFiles = manifest.map(file => ({ ...file, export_id: result.export_id }));
@@ -913,14 +899,19 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
             }
         } catch (error) {
             console.error('[Holaf ImageViewer] Export preparation failed:', error);
+            // Non-2xx : même message que l'ancien throw (result.message,
+            // sinon libellé i18n) ; autres erreurs : message brut.
+            const message = (error instanceof HolafFetchError && error.status >= 400)
+                ? (error.data?.message || t('iv.failedToPrepareExport'))
+                : error.message;
             const activeToastId = imageViewerState.getState().exporting.activeToastId;
             if (activeToastId) {
                 updateToast(activeToastId, {
-                    message: t('iv.exportFailedStrong', { message: error.message }),
+                    message: t('iv.exportFailedStrong', { message }),
                     type: 'error', progress: 100, html: true
                 });
             } else {
-                showToast({ message: t('iv.exportFailed', { message: error.message }), type: 'error', duration: 0 });
+                showToast({ message: t('iv.exportFailed', { message }), type: 'error', duration: 0 });
             }
         }
     });

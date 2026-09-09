@@ -4,6 +4,7 @@
  */
 
 import { HOLAF_THEMES } from "../holaf_themes.js";
+import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 
 /**
  * Loads the model type definitions and UI settings from the server.
@@ -13,9 +14,8 @@ export async function initializeSettings(manager) {
     // Load model type configurations (e.g., checkpoints, loras)
     if (manager.modelTypesConfig.length === 0) {
         try {
-            const response = await fetch("/holaf/models/config");
-            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-            manager.modelTypesConfig = await response.json();
+            // HolafFetch lève sur non-2xx (→ catch : log existant).
+            manager.modelTypesConfig = await HolafFetch.get("/holaf/models/config");
             manager.modelTypesConfig.sort((a, b) => a.type.localeCompare(b.type));
             console.log("[Holaf ModelManager] Model config definitions loaded:", manager.modelTypesConfig);
         } catch (e) {
@@ -26,10 +26,9 @@ export async function initializeSettings(manager) {
     // Load UI settings (panel position, size, theme, etc.)
     if (!manager.areSettingsLoaded) {
         try {
-            const response = await fetch("/holaf/utilities/settings");
-            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-            const allSettings = await response.json();
-            
+            // HolafFetch lève sur non-2xx (→ catch : fallback défauts existant).
+            const allSettings = await HolafFetch.get("/holaf/utilities/settings");
+
             if (allSettings.ModelManagerUI) {
                 const fetchedMMSettings = allSettings.ModelManagerUI;
                 const validTheme = HOLAF_THEMES.find(t => t.name === fetchedMMSettings.theme);
@@ -87,19 +86,13 @@ export function saveSettings(manager) {
         };
 
         try {
-            const response = await fetch('/holaf/model-manager/save-settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(settingsToSave)
-            });
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({ message: "Unknown error saving MM settings" }));
-                console.error("[Holaf ModelManager] Failed to save settings. Status:", response.status, "Msg:", errorData.message);
-            } else {
-                console.log("[Holaf ModelManager] Settings saved to server.");
-            }
+            // HolafFetch lève sur non-2xx (→ catch : log existant).
+            await HolafFetch.post('/holaf/model-manager/save-settings', { body: settingsToSave });
+            console.log("[Holaf ModelManager] Settings saved to server.");
         } catch (e) {
-            console.error("[Holaf ModelManager] Exception during saveSettings fetch for Model Manager:", e);
+            const status = e instanceof HolafFetchError ? e.status : "network";
+            const msg = (e instanceof HolafFetchError && e.data && e.data.message) ? e.data.message : e.message;
+            console.error("[Holaf ModelManager] Failed to save settings. Status:", status, "Msg:", msg);
         }
     }, 1000);
 }

@@ -10,6 +10,7 @@
 
 import { app, api } from "./holaf_api_compat.js";
 import { makeDraggable, makeResizable, makeContentZoomable, aihWindowManager } from "./holaf_window_utils.js";
+import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -205,7 +206,12 @@ const HolafRemoteComparer = {
         // Ne PAS extraire api.fetchApi dans une variable : c'est une méthode qui
         // utilise `this` (ex. this.user) → this serait perdu (undefined).
         // On l'appelle toujours en tant que méthode de `api` pour préserver le contexte.
-        const doFetch = (url, opts) => (api.fetchApi ? api.fetchApi(url, opts) : fetch(url, opts));
+        // Vague 4 : seule la branche de repli (fetch natif) migre vers HolafFetch
+        // (sérialisation/erreurs blindées) ; api.fetchApi reste prioritaire —
+        // c'est LA référence quand l'API ComfyUI est présente (contexte this.user).
+        // Le body stringifié passe tel quel dans les deux branches (corps brut
+        // pour HolafFetch, format natif pour api.fetchApi).
+        const doFetch = (url, opts) => (api.fetchApi ? api.fetchApi(url, opts) : HolafFetch.post(url, opts));
         doFetch("/holaf/comparer/settings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },

@@ -2,7 +2,7 @@
  * AIH Model Browser — Parcourir, uploader et télécharger des modèles.
  *
  * Dépend : 01_aih_modal_v2.js (aihOpenModalV2)
- *           aih_elements_widget.js (esc, getApiUrl, getApiKey, apiHeaders)
+ *           aih_elements_widget.js (esc, getApiUrl)
  *
  * Fonctions exportées sur window :
  *   - openModelBrowser()    → ouvre la fenêtre Model Browser
@@ -10,6 +10,8 @@
 
 import "./aih_dialog.js";
 import "./aih_strings.js";
+import { remoteRequest } from "./aih_fetch_bridge.js";
+import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
 (function () {
     "use strict";
@@ -307,6 +309,7 @@ import "./aih_strings.js";
     }
 
     // ─── Fetch vers l'API AIH (backend distant configuré) ───────────────────────────
+    // Retourne une Response (contrat inchangé : les appelants font r.json()).
     function _fetchAihApi(path, opts) {
         opts = opts || {};
         // Lire la config depuis localStorage (même clé que aih_menu.js)
@@ -316,11 +319,11 @@ import "./aih_strings.js";
         if (!baseUrl) {
             return Promise.reject(new Error(t('aih.notConfiguredError')));
         }
-        var headers = { 'Content-Type': 'application/json' };
-        if (cfg.apiKey) headers['Authorization'] = 'Bearer ' + cfg.apiKey;
         var cleanPath = path.replace(/^\/+/, '');
         var finalPath = cleanPath.startsWith('api/') ? cleanPath : 'api/' + cleanPath;
-        return fetch(baseUrl + '/' + finalPath, Object.assign({}, opts, { headers: Object.assign({}, opts.headers || {}, headers) }));
+        // raw:true → on rend la Response brute ; l'auth Bearer est injectée par
+        // la brique (même source : cfg.apiKey / AIH_config).
+        return remoteRequest(baseUrl + '/' + finalPath, Object.assign({}, opts, { raw: true }));
     }
 
     function getActiveTypeFilters() {
@@ -409,19 +412,13 @@ import "./aih_strings.js";
 
             var progressEl = showProgress(m, filename);
 
-            fetch('/api/aih/models/upload', {
-                method: 'POST',
-                body: JSON.stringify({
+            // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+            HolafFetch.post('/api/aih/models/upload', {
+                body: {
                     path: filepath,
                     type: fileType,
-                }),
+                },
             })
-                .then(function (r) {
-                    if (!r.ok) return r.json().then(function (d) {
-                        throw new Error(d.error || d.message || 'HTTP ' + r.status);
-                    });
-                    return r.json();
-                })
                 .then(function (data) {
                     if (data.status === 'ok' || data.success) {
                         updateProgress(progressEl, 100, t('mb.uploadDone'));
@@ -453,21 +450,15 @@ import "./aih_strings.js";
 
             var progressEl = showProgress(m, displayName);
 
-            fetch('/api/aih/models/download', {
-                method: 'POST',
-                body: JSON.stringify({
+            // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+            HolafFetch.post('/api/aih/models/download', {
+                body: {
                     upload_id: uploadId,
                     filename: displayName,
                     type: fileType,
                     dest_path: destSubdir,
-                }),
+                },
             })
-                .then(function (r) {
-                    if (!r.ok) return r.json().then(function (d) {
-                        throw new Error(d.error || d.message || 'HTTP ' + r.status);
-                    });
-                    return r.json();
-                })
                 .then(function (data) {
                     if (data.status === 'ok' || data.success) {
                         if (data.conflict) {
@@ -829,11 +820,8 @@ import "./aih_strings.js";
 
         m._localList.innerHTML = '<div class="mb-loading"><span class="mb-loading-spinner"></span> ' + t('mb.loading') + '</div>';
 
-        fetch(url)
-            .then(function (r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-            })
+        // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+        HolafFetch.get(url)
             .then(function (data) {
                 // data.items est un dictionnaire { catégorie: [modèles] }
                 // On l'aplatit en tableau en déduisant le type depuis la catégorie
@@ -898,11 +886,8 @@ import "./aih_strings.js";
             m._remoteList.innerHTML = '<div class="mb-loading"><span class="mb-loading-spinner"></span> ' + t('mb.loading') + '</div>';
         }
 
-        fetch(url)
-            .then(function (r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-            })
+        // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+        HolafFetch.get(url)
             .then(function (data) {
                 renderRemotePanel(m, data);
                 m._remoteLoading = false;
@@ -1350,19 +1335,13 @@ import "./aih_strings.js";
 
         var progressEl = showProgress(m, filename || filepath);
 
-        fetch('/api/aih/models/upload', {
-            method: 'POST',
-            body: JSON.stringify({
+        // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+        HolafFetch.post('/api/aih/models/upload', {
+            body: {
                 path: filepath,
                 type: fileType || 'model',
-            }),
+            },
         })
-            .then(function (r) {
-                if (!r.ok) return r.json().then(function (d) {
-                    throw new Error(d.error || d.message || 'HTTP ' + r.status);
-                });
-                return r.json();
-            })
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
                     updateProgress(progressEl, 100, t('mb.uploadDone'));
@@ -1389,21 +1368,15 @@ import "./aih_strings.js";
 
         var progressEl = showProgress(m, filename);
 
-        fetch('/api/aih/models/download', {
-            method: 'POST',
-            body: JSON.stringify({
+        // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+        HolafFetch.post('/api/aih/models/download', {
+            body: {
                 upload_id: uploadId,
                 filename: filename,
                 type: fileType || 'model',
                 dest_path: destSubdir || '',
-            }),
+            },
         })
-            .then(function (r) {
-                if (!r.ok) return r.json().then(function (d) {
-                    throw new Error(d.error || d.message || 'HTTP ' + r.status);
-                });
-                return r.json();
-            })
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
                     if (data.conflict) {
@@ -1464,16 +1437,10 @@ import "./aih_strings.js";
             conflict_resolution: resolution,
         };
 
-        fetch('/api/aih/models/download', {
-            method: 'POST',
-            body: JSON.stringify(body),
+        // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+        HolafFetch.post('/api/aih/models/download', {
+            body: body,
         })
-            .then(function (r) {
-                if (!r.ok) return r.json().then(function (d) {
-                    throw new Error(d.error || d.message || 'HTTP ' + r.status);
-                });
-                return r.json();
-            })
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
                     updateProgress(progressEl, 100, t('mb.downloadDone'));

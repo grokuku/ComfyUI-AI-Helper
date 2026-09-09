@@ -7,7 +7,7 @@
  *   - gestionnaire de réglages (js/holaf_settings_manager.js)
  *   - chrome des fenêtres (js/aih_dialog.js, js/holaf_panel_manager.js)
  *   - zoom des fenêtres (js/holaf_window_utils.js)
- *   - notifications toast (js/holaf_toast_manager.js)
+ *   - notifications toast (js/aih_toast_bridge.js → brique vendor/holaf/holaf-toast.js)
  *
  * Pattern : chaque module peut enregistrer ses propres clés via addDict ;
  * ce module centralise celles de l'Étape A. Défaut : FRANÇAIS.

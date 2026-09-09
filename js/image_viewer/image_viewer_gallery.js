@@ -20,6 +20,7 @@
 
 import "../aih_strings.js";
 import { imageViewerState } from "./image_viewer_state.js";
+import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 import { showToast } from "../aih_toast_bridge.js";
 import { showFullscreenView, getFullImageUrl } from './image_viewer_navigation.js';
 import {
@@ -603,7 +604,9 @@ async function fetchPrefetchThumbnail(image) {
     activeFetches.set(pathCanon, controller);
 
     try {
-        const response = await fetch(imageUrl.href, { signal: controller.signal, priority: 'low' });
+        // raw:true → Response brute : statut 202 et blob gérés ici comme avec
+        // l'ancien fetch ; signal + priority:'low' sont forwardés par la brique.
+        const response = await HolafFetch.get(imageUrl.href, { raw: true, signal: controller.signal, priority: 'low' });
         clearTimeout(timeoutId);
         if (response.status === 202) {
             // Backend busy generating — don't cache; it will be retried when visible.
@@ -668,16 +671,13 @@ async function fetchWindow(start) {
     const promise = (async () => {
         try {
             const tStart = performance.now();
-            const response = await fetch('/holaf/images/list', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...filters, limit: PAGE_SIZE, offset: start, skip_count: true }),
+            // POST JSON + parse gérés par la brique (lève sur non-2xx → catch).
+            const data = await HolafFetch.post('/holaf/images/list', {
+                body: { ...filters, limit: PAGE_SIZE, offset: start, skip_count: true },
                 signal: controller.signal
             });
             const tFetch = performance.now();
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const data = await response.json();
-            const tParse = performance.now();
+            const tParse = tFetch; // parse JSON inclus dans l'attente de la brique
             const totalMs = tParse - tStart;
             if (totalMs > 100) {
                 console.log("[Holaf Perf] fetchWindow offset=" + start + " fetch_ms=" + (tFetch - tStart).toFixed(1) + " parse_ms=" + (tParse - tFetch).toFixed(1) + " total_ms=" + totalMs.toFixed(1));
@@ -699,11 +699,8 @@ function _flushPrioritizeThumbnails() {
     const paths = [...pendingPrioritizePaths];
     pendingPrioritizePaths.clear();
     // Fire-and-forget: never block the gallery on this request.
-    fetch('/holaf/images/prioritize-thumbnails', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paths_canon: paths })
-    }).catch(() => {});
+    // (La brique lève sur non-2xx → .catch() obligatoire.)
+    HolafFetch.post('/holaf/images/prioritize-thumbnails', { body: { paths_canon: paths } }).catch(() => {});
 }
 
 function schedulePrioritizeVisibleThumbnails() {
@@ -778,10 +775,9 @@ async function fetchThumbnail(placeholder, image, forceReload = false) {
 
     try {
         const tStart = performance.now();
-        const response = await fetch(imageUrl.href, {
-            signal: controller.signal,
-            priority: 'high'
-        });
+        // raw:true → Response brute : statut 202 + Retry-After + blob gérés
+        // ici, comme avec l'ancien fetch ; signal + priority:'high' forwardés.
+        const response = await HolafFetch.get(imageUrl.href, { raw: true, signal: controller.signal, priority: 'high' });
         const tFetch = performance.now();
 
         clearTimeout(timeoutId);
@@ -843,12 +839,20 @@ async function fetchThumbnail(placeholder, image, forceReload = false) {
         clearTimeout(timeoutId);
 
         let isTimeout = false;
-        // Check if it's a timeout abort
+        // Check if it's a timeout abort : soit l'AbortController externe
+        // (raison 'timeout'), soit le timeout interne de HolafFetch
+        // (HolafFetchError "timeout", status 0).
         if (controller.signal.aborted && controller.signal.reason === 'timeout') {
             isTimeout = true;
+        } else if (err instanceof HolafFetchError && err.status === 0 && err.message === 'timeout') {
+            isTimeout = true;
         }
+        // HolafFetch encapsule les rejets du fetch (abandons compris) en
+        // HolafFetchError : une annulation externe (syncGallery) se détecte
+        // via le signal, pas via err.name.
+        const isAborted = !isTimeout && controller.signal.aborted;
 
-        if (isTimeout || err.name !== 'AbortError') {
+        if (isTimeout || (!isAborted && err.name !== 'AbortError')) {
             // Real error or timeout. A timeout is usually transient server-side
             // DB contention: retry a bounded number of times instead of showing
             // a permanent "Timeout" overlay.
@@ -1063,12 +1067,10 @@ function attachVideoHoverListeners(placeholder, image) {
         let editData = null;
         if (image.has_edit_file) {
             try {
-                const response = await fetch(`/holaf/images/load-edits?path_canon=${encodeURIComponent(image.path_canon)}`);
+                // La brique lève sur non-2xx → catch identique (warning console).
+                const result = await HolafFetch.get(`/holaf/images/load-edits?path_canon=${encodeURIComponent(image.path_canon)}`);
                 if (!placeholder.isConnected || placeholder._hoverGeneration !== generation) return;
-                if (response.ok) {
-                    const result = await response.json();
-                    if (result.status === 'ok') editData = result.edits;
-                }
+                if (result.status === 'ok') editData = result.edits;
             } catch (e) {
                 if (!placeholder.isConnected || placeholder._hoverGeneration !== generation) return;
                 console.warn("Failed to load hover edits", e);

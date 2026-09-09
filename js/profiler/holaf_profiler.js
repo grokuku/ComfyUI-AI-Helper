@@ -102,6 +102,23 @@ export async function initProfiler() {
     // path before anything can call window.AIH.confirm/prompt.
     const aihLoaded = await loadAihFoundation();
 
+    // ── Brique HolafFetch — import DYNAMIQUE obligatoire ──
+    // Ce module est servi via l'alias /holaf/profiler/app.js : un import
+    // statique relatif ("../vendor/…") résoudrait sous /holaf/ (MIME interdit
+    // → page blanche), exactement comme pour aih_dialog / holaf_comfy_bridge
+    // ci-dessus (voir la note d'imports en tête de fichier).
+    let HolafFetch = null;
+    let HolafFetchError = null;
+    try {
+        const fetchMod = await import(holafPackUrl("vendor/holaf/holaf-fetch.js"));
+        HolafFetch = fetchMod.HolafFetch;
+        HolafFetchError = fetchMod.HolafFetchError;
+    } catch (err) {
+        console.warn("[Holaf Profiler] Could not load holaf-fetch.js; network calls unavailable.", err);
+    }
+    // instanceof sûr même si la brique n'a pas pu être chargée.
+    const isFetchError = (e) => !!(HolafFetchError && e instanceof HolafFetchError);
+
     const HolafComfyBridge = await loadHolafComfyBridge();
     const bridge = new HolafComfyBridge();
     const comfyBridgeActive = !(HolafComfyBridge.isInert === true);
@@ -559,7 +576,8 @@ export async function initProfiler() {
             if (!(await aihConfirm(t('pr.deleteRunConfirm', { count: ids.length })))) return;
             for (const id of ids) {
                 try {
-                    await fetch(`/holaf/profiler/run/${id}`, { method: 'DELETE' });
+                    // HolafFetch lève sur non-2xx (→ catch : log existant).
+                    await HolafFetch.delete(`/holaf/profiler/run/${id}`);
                 } catch (e) {
                     console.error(`Failed to delete run ${id}:`, e);
                 }
@@ -609,11 +627,14 @@ export async function initProfiler() {
             const runId = Number(cell.dataset.runId);
             const comment = cell.textContent.trim();
             cell.contentEditable = 'false';
-            fetch(`/holaf/profiler/run/${runId}/comment`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ comment })
-            }).catch(err => console.error('Comment update failed:', err));
+            // Fire-and-forget conservé (+ .catch, même log qu'avant) ; le try
+            // protège uniquement le cas (théorique) brique non chargée.
+            try {
+                HolafFetch.patch(`/holaf/profiler/run/${runId}/comment`, { body: { comment } })
+                    .catch(err => console.error('Comment update failed:', err));
+            } catch (err) {
+                console.error('Comment update failed:', err);
+            }
         });
 
         // Enter to save, Escape to cancel editing
@@ -898,11 +919,10 @@ export async function initProfiler() {
             const saved = localStorage.getItem('holaf_profiler_groups');
             if (saved) groupMapping = JSON.parse(saved);
 
-            const resp = await fetch('/holaf/profiler/context');
-            if (!resp.ok) throw new Error("Context fetch failed");
-            
-            const data = await resp.json();
-            
+            // HolafFetch lève sur non-2xx (→ catch : log existant, comme
+            // l'ancien throw « Context fetch failed »).
+            const data = await HolafFetch.get('/holaf/profiler/context');
+
             if (data.nodes && Array.isArray(data.nodes)) {
                 nodesMap.clear();
 
@@ -969,10 +989,8 @@ export async function initProfiler() {
     async function pollRunData() {
         if (!currentRunId) return;
         try {
-            const resp = await fetch(`/holaf/profiler/run/${currentRunId}`);
-            if (!resp.ok) return;
-
-            const data = await resp.json();
+            // HolafFetch lève sur non-2xx (→ catch ci-dessous, même sémantique).
+            const data = await HolafFetch.get(`/holaf/profiler/run/${currentRunId}`);
             let newNodesAdded = 0;
 
             if (data.steps && Array.isArray(data.steps)) {
@@ -995,11 +1013,9 @@ export async function initProfiler() {
             // Fetch run metadata for total_time (authoritative finish signal)
             let totalTime = null;
             try {
-                const metaResp = await fetch(`/holaf/profiler/run/${currentRunId}/meta`);
-                if (metaResp.ok) {
-                    const metaData = await metaResp.json();
-                    if (metaData.run) totalTime = metaData.run.total_time;
-                }
+                // HolafFetch lève sur non-2xx (→ catch : ignore, comme avant).
+                const metaData = await HolafFetch.get(`/holaf/profiler/run/${currentRunId}/meta`);
+                if (metaData.run) totalTime = metaData.run.total_time;
             } catch (e) {}
 
             updateSummaryBar(totalTime);
@@ -1023,7 +1039,13 @@ export async function initProfiler() {
                 console.warn("Run polling timeout (no progress for 10 min) — run may still be active; check History.");
                 stopPolling(totalTime);
             }
-        } catch (e) { console.error("Polling error:", e); }
+        } catch (e) {
+            // Ancien « if (!resp.ok) return; » : un non-2xx (run pas encore
+            // visible…) était ignoré silencieusement ; seule l'erreur réseau
+            // loggait.
+            if (isFetchError(e) && e.status > 0) return;
+            console.error("Polling error:", e);
+        }
     }
 
     function stopPolling(finalTotal) {
@@ -1089,11 +1111,8 @@ export async function initProfiler() {
             updateSummaryBar(null);
 
             try {
-                const resp = await fetch('/holaf/profiler/run-start', {
-                    method: 'POST',
-                    body: JSON.stringify({ name: runName })
-                });
-                const data = await resp.json();
+                // HolafFetch lève sur non-2xx (→ catch : log existant).
+                const data = await HolafFetch.post('/holaf/profiler/run-start', { body: { name: runName } });
                 if (data.status === 'ok') {
                     currentRunId = data.run_id;
                     bridge.send('queue_prompt');
@@ -1123,9 +1142,8 @@ export async function initProfiler() {
     async function viewRun(runId) {
         if (!runId) return;
         try {
-            const resp = await fetch(`/holaf/profiler/run/${runId}`);
-            if (!resp.ok) throw new Error(t('pr.failedToLoadRun'));
-            const data = await resp.json();
+            // HolafFetch lève sur non-2xx (→ catch : log existant).
+            const data = await HolafFetch.get(`/holaf/profiler/run/${runId}`);
 
             // Reset order/metrics so the historical run renders faithfully, but keep
             // nodesMap entries (context names) so breadcrumbs still resolve for
@@ -1145,11 +1163,9 @@ export async function initProfiler() {
             // Fetch total_time from meta (same endpoint pollRunData uses)
             let totalTime = null;
             try {
-                const metaResp = await fetch(`/holaf/profiler/run/${runId}/meta`);
-                if (metaResp.ok) {
-                    const metaData = await metaResp.json();
-                    if (metaData.run) totalTime = metaData.run.total_time;
-                }
+                // HolafFetch lève sur non-2xx (→ catch : ignore, comme avant).
+                const metaData = await HolafFetch.get(`/holaf/profiler/run/${runId}/meta`);
+                if (metaData.run) totalTime = metaData.run.total_time;
             } catch (e) {}
 
             switchTab('live');
@@ -1167,13 +1183,15 @@ export async function initProfiler() {
         if (btnRefresh) btnRefresh.disabled = true;
         tbody.innerHTML = '<tr><td colspan="6" class="empty-state">' + t('pr.loading') + '</td></tr>';
         try {
-            const resp = await fetch('/holaf/profiler/runs?limit=50&offset=0');
-            if (!resp.ok) throw new Error(t('pr.failedLoadRuns', { message: '' }));
-            const data = await resp.json();
+            // HolafFetch lève sur non-2xx (→ catch : message i18n existant).
+            const data = await HolafFetch.get('/holaf/profiler/runs?limit=50&offset=0');
             historyRuns = data.runs || [];
             renderHistory();
         } catch (e) {
-            tbody.innerHTML = `<tr><td colspan="6" class="empty-state">${t('pr.failedLoadRuns', { message: esc(e.message) })}</td></tr>`;
+            // Ancien comportement conservé : échec HTTP → message i18n seul ;
+            // erreur réseau → détail technique affiché.
+            const detail = isFetchError(e) ? '' : esc(e.message);
+            tbody.innerHTML = `<tr><td colspan="6" class="empty-state">${t('pr.failedLoadRuns', { message: detail })}</td></tr>`;
         } finally {
             if (btnRefresh) btnRefresh.disabled = false;
         }
@@ -1225,17 +1243,15 @@ export async function initProfiler() {
         container.innerHTML = '<div class="empty-state">' + t('pr.loadingComparison') + '</div>';
 
         try {
-            const resp = await fetch('/holaf/profiler/compare', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ run_ids: comparisonRunIds })
-            });
-            if (!resp.ok) throw new Error(t('pr.compareRequestFailed'));
-            const data = await resp.json();
+            // HolafFetch lève sur non-2xx (→ catch : message i18n existant).
+            const data = await HolafFetch.post('/holaf/profiler/compare', { body: { run_ids: comparisonRunIds } });
             compareData = data;
             renderComparison();
         } catch (e) {
-            container.innerHTML = `<div class="empty-state">${t('pr.compareFailed', { message: esc(e.message) })}</div>`;
+            // Ancien comportement conservé : échec HTTP → message i18n dédié ;
+            // erreur réseau → détail technique affiché.
+            const msg = isFetchError(e) ? t('pr.compareRequestFailed') : e.message;
+            container.innerHTML = `<div class="empty-state">${t('pr.compareFailed', { message: esc(msg) })}</div>`;
         }
     }
 

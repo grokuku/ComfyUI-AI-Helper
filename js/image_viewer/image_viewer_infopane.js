@@ -11,6 +11,7 @@ import { imageViewerState } from './image_viewer_state.js';
 import { holafBridge } from "../holaf_comfy_bridge.js";
 import { app as comfyApp } from "../holaf_api_compat.js";
 import { escapeHtml } from "../holaf_dom_utils.js";
+import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 import { showToast } from "../aih_toast_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
@@ -131,23 +132,11 @@ async function displayInfoForImage(image) {
         metadataUrl.pathname = '/holaf/images/metadata';
         metadataUrl.search = new URLSearchParams({ filename: image.filename, subfolder: image.subfolder || '' });
 
-        const response = await fetch(metadataUrl.href, { signal, cache: 'no-store' });
+        // HolafFetch : GET JSON parsé ; lève sur non-2xx/non-JSON → mappé sur
+        // l'affichage d'erreur historique dans le catch ci-dessous.
+        const data = await HolafFetch.get(metadataUrl.href, { signal, cache: 'no-store' });
         if (signal.aborted) return;
 
-        const metadataContainer = document.getElementById('holaf-metadata-container');
-        if (!metadataContainer) return;
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({ error: t('iv.httpError', { status: response.status }) }));
-            // FIX: Re-check abort after inner await
-            if (signal.aborted) return;
-            metadataContainer.innerHTML = `<p class="holaf-viewer-message error"><strong>${t('iv.errorLabel')}</strong> ${escapeHtml(errorData.error || t('iv.unknownError'))}</p>`;
-            return;
-        }
-
-        const data = await response.json();
-        if (signal.aborted) return;
-        
         const finalMetadataContainer = document.getElementById('holaf-metadata-container');
         if (!finalMetadataContainer) return;
 
@@ -267,6 +256,16 @@ async function displayInfoForImage(image) {
             finalMetadataContainer.insertAdjacentHTML('beforeend', `<p class="holaf-viewer-message"><em>${t('iv.noWorkflowFound')}</em></p>`);
         }
     } catch (err) {
+        // Annulation (nouvelle image affichée) : silencieux, comme avant.
+        // (HolafFetch encapsule l'AbortError → on teste le signal, pas err.name.)
+        if (signal.aborted) return;
+        if (err instanceof HolafFetchError && err.status >= 400) {
+            // Non-2xx : même rendu que l'ancien test !response.ok
+            // (message du corps JSON s'il existe).
+            const m = document.getElementById('holaf-metadata-container');
+            if (m) m.innerHTML = `<p class="holaf-viewer-message error"><strong>${t('iv.errorLabel')}</strong> ${escapeHtml(err.data?.error || t('iv.unknownError'))}</p>`;
+            return;
+        }
         if (err.name !== 'AbortError') {
             console.error("Metadata fetch error:", err);
             const m = document.getElementById('holaf-metadata-container');

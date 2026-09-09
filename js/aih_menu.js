@@ -43,6 +43,8 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { showToast } from "./aih_toast_bridge.js";
+import { remoteGet, remoteRequest } from "./aih_fetch_bridge.js";
+import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 (function () {
     "use strict";
 
@@ -145,11 +147,9 @@ import { showToast } from "./aih_toast_bridge.js";
         }
 
         try {
-            const headers = {};
-            if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-            const resp = await fetch(`${baseUrl}/api/members`, { method: "GET", headers });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const members = await resp.json();
+            const members = await remoteGet(`${baseUrl}/api/members`).catch((e) => {
+                throw new Error(`HTTP ${e.status}`);
+            });
 
             // Trier : admin en premier, puis kw_editor, puis par nom
             members.sort((a, b) => {
@@ -215,30 +215,17 @@ import { showToast } from "./aih_toast_bridge.js";
         }
 
         try {
-            const headers = {};
-            if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-
-            // Compat : AbortSignal.timeout() n'existe pas dans tous les navigateurs
-            const makeTimeoutSignal = (ms) => {
-                if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) {
-                    return AbortSignal.timeout(ms);
-                }
-                const ctrl = new AbortController();
-                setTimeout(() => ctrl.abort(), ms);
-                return ctrl.signal;
-            };
-            const timeoutSignal = makeTimeoutSignal(5000);
-
+            // Compat timeout → opts.timeout de la brique (même valeur 5000 ms).
             const [statsResp, meResp] = await Promise.all([
-                fetch(`${baseUrl}/api/stats`, { method: "GET", headers, signal: timeoutSignal }).catch(() => null),
-                fetch(`${baseUrl}/api/auth/me`, { method: "GET", headers, signal: timeoutSignal }).catch(() => null),
+                remoteGet(`${baseUrl}/api/stats`, { timeout: 5000 }).catch(() => null),
+                remoteGet(`${baseUrl}/api/auth/me`, { timeout: 5000 }).catch((e) => (e && e.status ? e : null)),
             ]);
 
-            const serverOk = statsResp && statsResp.ok;
+            // Succès = réponse parsée (pas de .status) ; non-2xx = HolafFetchError
+            // (avec .status) ; erreur réseau/timeout = null.
+            const serverOk = !!(statsResp && !statsResp.status);
             let user = null;
-            if (meResp && meResp.ok) {
-                try { user = await meResp.json(); } catch {}
-            }
+            if (meResp && !meResp.status) user = meResp;
 
             el.innerHTML = "";
             el.style.display = "flex";
@@ -323,23 +310,22 @@ import { showToast } from "./aih_toast_bridge.js";
         if (!baseUrl) {
             throw new Error(t("aih.notConfiguredError"));
         }
-        const headers = { "Content-Type": "application/json" };
-        if (cfg.apiKey) headers["Authorization"] = `Bearer ${cfg.apiKey}`;
         // path peut deja commencer par /api/ (auquel cas on l'utilise tel quel) ou non
         const cleanPath = path.replace(/^\/+/, "");
         const finalPath = cleanPath.startsWith("api/") ? cleanPath : "api/" + cleanPath;
-        const resp = await fetch(`${baseUrl}/${finalPath}`, {
-            ...opts,
-            headers: { ...headers, ...(opts.headers || {}) },
-            body: opts.body ? JSON.stringify(opts.body) : undefined,
-        });
-        if (!resp.ok) {
-            const t = await resp.text().catch(() => "");
-            let msg = `HTTP ${resp.status}`;
-            try { const j = JSON.parse(t); if (j.error) msg = j.error; } catch {}
+        try {
+            return await remoteRequest(`${baseUrl}/${finalPath}`, opts);
+        } catch (e) {
+            // Reproduit le message historique : "HTTP <status>" ou body.error.
+            let msg = `HTTP ${e.status}`;
+            if (e && e.body) {
+                try {
+                    const j = typeof e.body === "string" ? JSON.parse(e.body) : e.body;
+                    if (j.error) msg = j.error;
+                } catch {}
+            }
             throw new Error(msg);
         }
-        return resp.json().catch(() => ({}));
     }
 
     function mkBtn(text, css, onClick) {
@@ -402,15 +388,13 @@ import { showToast } from "./aih_toast_bridge.js";
             saveBtn.disabled = true;
             saveBtn.textContent = "...";
             try {
-                const resp = await fetch("/aih/credentials", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
+                // Route locale /aih/* → HolafFetch SANS auth (same-origin transparente).
+                const data = await HolafFetch.post("/aih/credentials", {
+                    body: {
                         api_key: inputKey.value.trim(),
                         server_url: inputUrl.value.trim(),
-                    }),
+                    },
                 });
-                const data = await resp.json();
                 if (data.status === "ok") {
                     // Mettre a jour aussi localStorage pour le cache UI
                     setConfig({
@@ -438,8 +422,7 @@ import { showToast } from "./aih_toast_bridge.js";
         container.appendChild(section);
 
         // Charger les credentials depuis le fichier (au cas ou localStorage est vide)
-        fetch("/aih/credentials")
-            .then(r => r.json())
+        HolafFetch.get("/aih/credentials")
             .then(data => {
                 if (data.status === "ok") {
                     if (data.server_url) inputUrl.value = data.server_url;
@@ -453,14 +436,12 @@ import { showToast } from "./aih_toast_bridge.js";
                     if (!data.exists && cfg.apiKey) {
                         status.textContent = t("menu.migrating");
                         status.style.color = "#facc15";
-                        return fetch("/aih/credentials", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({
+                        return HolafFetch.post("/aih/credentials", {
+                            body: {
                                 api_key: cfg.apiKey || "",
                                 server_url: cfg.serverUrl || "",
-                            }),
-                        }).then(r => r.json()).then(saveData => {
+                            },
+                        }).then(saveData => {
                             if (saveData.status === "ok") {
                                 status.textContent = t("menu.migrated", { path: saveData.path });
                                 status.style.color = "#4ade80";
@@ -613,13 +594,17 @@ import { showToast } from "./aih_toast_bridge.js";
                 let models;
                 const isClient = fClientInput.checked;
                 if (isClient) {
-                    // Appel direct navigateur → serveur LLM
-                    const headers = { "Content-Type": "application/json" };
+                    // Appel direct navigateur → serveur LLM (cible tierce :
+                    // HolafFetch.request SANS auth AIH, le Bearer est la clé LLM).
                     const k = fKey.input.value.trim();
+                    const headers = { "Content-Type": "application/json" };
                     if (k) headers["Authorization"] = "Bearer " + k;
-                    const r = await fetch(url.replace(/\/+$/, "") + "/models", { headers });
-                    if (!r.ok) throw new Error("HTTP " + r.status);
-                    const data = await r.json();
+                    let data;
+                    try {
+                        data = await HolafFetch.request(url.replace(/\/+$/, "") + "/models", { headers });
+                    } catch (e) {
+                        throw new Error("HTTP " + e.status);
+                    }
                     const raw = (data && data.data) || (data && data.models) || [];
                     models = raw.map(m => typeof m === "string" ? { id: m } : { id: m.id || m.name || "" });
                 } else {
@@ -749,8 +734,8 @@ import { showToast } from "./aih_toast_bridge.js";
         const spinnerEl = modal.body.querySelector("#aih-update-spinner");
 
         try {
-            const resp = await fetch("/aih/update", { method: "POST" });
-            const data = await resp.json();
+            // Route locale /aih/* → HolafFetch SANS auth (same-origin transparente).
+            const data = await HolafFetch.post("/aih/update");
             spinnerEl.style.display = "none";
             logEl.style.display = "block";
             logEl.textContent = data.log || t("menu.noLog");

@@ -1,6 +1,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { showToast as bridgeShowToast } from "./aih_toast_bridge.js";
+import { remoteRequest, HolafFetch } from "./aih_fetch_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -45,28 +46,23 @@ function getApiUrl() {
     }
 }
 
-function getApiKey() { return window.AIH.getApiKey(); }
-
-function apiHeaders() {
-    const h = { "Content-Type": "application/json" };
-    const key = getApiKey();
-    if (key) h["Authorization"] = `Bearer ${key}`;
-    return h;
-}
-
 async function apiCall(method, path, body) {
     const baseUrl = getApiUrl();
     if (!baseUrl) {
         throw new Error(t("aih.notConfiguredError"));
     }
-    const opts = { method, headers: apiHeaders() };
-    if (body) opts.body = JSON.stringify(body);
-    const resp = await fetch(`${baseUrl}/${path.replace(/^\//, "")}`, opts);
-    if (!resp.ok) {
-        const txt = await resp.text().catch(() => "");
-        throw new Error(`HTTP ${resp.status}: ${txt.substring(0, 200)}`);
+    try {
+        return await remoteRequest(`${baseUrl}/${path.replace(/^\//, "")}`, {
+            method,
+            body,
+        });
+    } catch (e) {
+        // Reproduit le contrat historique : Error "HTTP <status>: <texte>".
+        const raw = e && e.body !== undefined && typeof e.body === "object"
+            ? JSON.stringify(e.body)
+            : (e && e.body) || "";
+        throw new Error(`HTTP ${e.status}: ${String(raw).substring(0, 200)}`);
     }
-    return resp.json();
 }
 
 // Cacher un widget ComfyUI : reste dans node.widgets (sérialisé) mais invisible dans l'UI.
@@ -350,13 +346,16 @@ function _parseConceptSyntax(text, defaultCount) {
                     if (localStorage.getItem("AIH_elements_presets_migrated") === "1") return;
                     try {
                         // Vérifier si l'ancienne route locale répond (= fichier local existe)
-                        var resp = await fetch("/aih/elements/presets");
-                        if (!resp.ok) {
-                            // Route absente → rien à migrer, marquer comme fait
+                        var data;
+                        try {
+                            data = await HolafFetch.request("/aih/elements/presets");
+                        } catch (e) {
+                            // Erreur réseau → différer (catch externe), comme l'original.
+                            if (!e || e.status === 0) throw e;
+                            // Route absente (non-2xx) → rien à migrer, marquer comme fait
                             localStorage.setItem("AIH_elements_presets_migrated", "1");
                             return;
                         }
-                        var data = await resp.json();
                         var localPresets = (data && data.presets) ? data.presets : [];
                         if (!Array.isArray(localPresets) || localPresets.length === 0) {
                             // Fichier vide ou inexistant → marquer comme fait
@@ -390,10 +389,9 @@ function _parseConceptSyntax(text, defaultCount) {
                         //    les presets qui n'ont pas pu être envoyés au backend.
                         if (failed === 0) {
                             try {
-                                await fetch("/aih/elements/presets", {
+                                await HolafFetch.request("/aih/elements/presets", {
                                     method: "POST",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ action: "cleanup" })
+                                    body: { action: "cleanup" }
                                 });
                             } catch (e) {
                                 /* non bloquant */
