@@ -12,7 +12,7 @@
  */
 
 import "../aih_strings.js";
-import { HolafPanelManager, dialogState } from "../holaf_panel_manager.js";
+import { dialogState } from "../holaf_panel_manager.js";
 import { imageViewerState } from "./image_viewer_state.js";
 import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 import { showToast, updateToast, hideToast } from "../aih_toast_bridge.js";

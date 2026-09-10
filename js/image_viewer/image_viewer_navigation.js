@@ -10,7 +10,7 @@
 
 import { imageViewerState } from './image_viewer_state.js';
 import { handleDeletion } from './image_viewer_actions.js';
-import { HolafPanelManager, dialogState } from '../holaf_panel_manager.js';
+import { dialogState } from '../holaf_panel_manager.js';
 import { getThumbnailUrl } from './image_viewer_gallery.js';
 import { getImageAt } from './image_viewer_data.js';
 // VAGUE 2 : la géométrie + les interactions zoom/pan sont déléguées à la brique
@@ -46,38 +46,17 @@ async function _handleUnsavedChanges(viewer) {
 
 
 export function resetTransform(state, element) {
-    if (!element) return;
-    if (state.viewport) {
-        // VAGUE 2 : délégation à la brique. En mode content, le fit = scale 1
-        // (l'object-fit:contain a déjà cadré) → reset() reproduit exactement
-        // l'ancien translate(0,0) scale(1). Signature conservée : l'éditeur
-        // (image_viewer_editor.js — migration vague suivante) l'appelle encore.
-        state.viewport.reset();
-        element.style.cursor = 'grab';
-        return;
-    }
-    // Fallback legacy : aucune instance viewport encore créée. Ancien code,
-    // conservé tel quel par sécurité.
-    state.scale = 1;
-    state.tx = 0;
-    state.ty = 0;
-    element.style.transform = `translate(${state.tx}px, ${state.ty}px) scale(${state.scale})`;
+    if (!element || !state.viewport) return;
+    // VAGUE 2 : délégation à la brique. En mode content, le fit = scale 1
+    // (l'object-fit:contain a déjà cadré) → reset() reproduit exactement
+    // l'ancien translate(0,0) scale(1). Signature conservée : l'éditeur
+    // (image_viewer_editor.js) l'appelle encore (ouverture mask/crop).
+    // VAGUE 9 : le fallback legacy « state.viewport inexistant » est supprimé —
+    // l'instance est créée de façon synchrone à l'init du viewer pour les deux
+    // states (UI._setupEventListeners → zoom, _createFullscreenOverlay →
+    // fullscreen), donc AVANT tout appel à resetTransform.
+    state.viewport.reset();
     element.style.cursor = 'grab';
-    element.style.transformOrigin = '0 0'; // Ensure origin is consistent
-    const maskOv = document.getElementById('holaf-mask-overlay');
-    if (maskOv) {
-        // VAGUE 5 : le mask vit dans un wrapper follower → c'est le wrapper qui
-        // porte le transform (le canvas, letterbox, est À L'INTÉRIEUR).
-        const target = (maskOv.parentNode && maskOv.parentNode.id === 'holaf-mask-overlay-wrap')
-            ? maskOv.parentNode : maskOv;
-        target.style.transform = element.style.transform;
-        // FIX: synchronise aussi la transition, sinon l'img glisse (transform .2s)
-        // pendant que l'overlay saute instantanément → décalage visible au zoom/pan.
-        // Fallback sur la valeur calculée : l'img a une transition CSS par défaut
-        // (`#holaf-viewer-zoom-view img { transition: transform .2s ease-out }`) qui
-        // n'apparaît PAS dans le style inline.
-        target.style.transition = element.style.transition || getComputedStyle(element).transition || 'none';
-    }
 }
 
 // --- Batch preload: load N images ahead when user stops navigating ---
@@ -287,9 +266,7 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
         _applyEditorPreview(viewer, videoEl);
 
         // Attempt autoplay
-        videoEl.play().catch(e => {
-            // console.warn("Autoplay blocked or interrupted:", e);
-        });
+        videoEl.play().catch(() => {});
 
     } else {
         // Reset any audio-specific styling on video element
@@ -675,7 +652,7 @@ export async function handleKeyDown(viewer, e) {
 // clamps et transitions (none pendant le drag / .2s ease-out après) vit
 // désormais dans js/vendor/holaf/holaf-viewport.js. L'hôte ne conserve que :
 //   - la création/réutilisation de l'instance (un state = une instance,
-//     exposée sur state.viewport pour l'éditeur — migration vague suivante) ;
+//     exposée sur state.viewport pour l'éditeur, image_viewer_editor.js) ;
 //   - la synchro de l'overlay mask de l'éditeur (via onChange) ;
 //   - le feedback curseur et l'anti-ghost <img> (dragstart), que la brique
 //     ne gère pas.
@@ -759,16 +736,9 @@ export function setupZoomAndPan(state, container, element) {
             canDrag: (e) => !(e.target && e.target.closest &&
                 e.target.closest('#holaf-crop-overlay-wrap, #holaf-mask-overlay-wrap')),
             onChange: () => {
-                // (e) overlay mask synchronisé sur la brique (ex-updateTransform).
+                // Overlay mask de l'éditeur : ré-enregistré comme follower à
+                // chaque changement (idempotent — cf. _syncMaskOverlay).
                 _syncMaskOverlay(element, state.viewport);
-                // Miroir compat des champs legacy {scale,tx,ty} (l'éditeur y
-                // accède encore jusqu'à sa migration) — la vérité vit dans la brique.
-                const tr = state.viewport ? state.viewport.getTransform() : null;
-                if (tr) {
-                    state.scale = tr.scale;
-                    state.tx = tr.tx;
-                    state.ty = tr.ty;
-                }
             },
         });
         _viewportContents.set(state, element);

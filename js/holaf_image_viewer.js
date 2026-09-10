@@ -19,7 +19,7 @@ const t = (key, params) => {
 };
 
 import { HolafPanelManager } from "./holaf_panel_manager.js";
-import { HolafComfyBridge, holafBridge } from "./holaf_comfy_bridge.js";
+import { holafBridge } from "./holaf_comfy_bridge.js";
 import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { holafExtUrl } from './holaf_ext_base.js';
 import * as Settings from './image_viewer/image_viewer_settings.js';
@@ -57,8 +57,12 @@ const holafImageViewer = {
     _lastFolderFilterState: null,
     _lastFilterSignature: null,
     filterRefreshIntervalId: null,
-    zoomViewState: { scale: 1, tx: 0, ty: 0 },
-    fullscreenViewState: { scale: 1, tx: 0, ty: 0 },
+    // VAGUE 9 : les champs miroirs legacy {scale,tx,ty} sont supprimés (plus
+    // aucun lecteur : l'éditeur et le comparer lisent la brique via
+    // getTransform()). Le state ne porte plus que l'instance viewport,
+    // créée par setupZoomAndPan (image_viewer_navigation.js).
+    zoomViewState: {},
+    fullscreenViewState: {},
     statsRefreshIntervalId: null,
     exportStatusRaf: null,
     _showCheckTimer: null,
@@ -422,7 +426,6 @@ const holafImageViewer = {
         if (this._isGalleryScrolling) {
             return;
         }
-        const tStart = performance.now();
         try {
             // La brique lève sur non-2xx/non-JSON. Poll toutes les 2 s : on
             // garde l'ancien retour silencieux sur échec HTTP (pas de spam console).
@@ -436,7 +439,6 @@ const holafImageViewer = {
             const state = imageViewerState.getState();
             if (data.last_update <= state.status.lastDbUpdateTime) return;
 
-            console.log("[Holaf ImageViewer] New data detected on server.");
             imageViewerState.setState({ status: { lastDbUpdateTime: data.last_update } });
 
             // Keep the existing empty-folder_filters early-return behavior exactly as-is:
@@ -460,7 +462,6 @@ const holafImageViewer = {
                     throw e;
                 });
             if (filterData && this._filterSignatureChanged(filterData)) {
-                console.log("[Holaf ImageViewer] Folder/format signature changed — full refresh.");
                 await this.loadAndPopulateFilters(false, true);
                 await this.loadFilteredImages();
                 return;
@@ -511,11 +512,6 @@ const holafImageViewer = {
             }
         } catch (e) {
             console.error("[Holaf ImageViewer] Error checking for updates:", e);
-        } finally {
-            const totalMs = performance.now() - tStart;
-            if (totalMs > 100) {
-                console.log("[Holaf Perf] checkForUpdates total_ms=" + totalMs.toFixed(1));
-            }
         }
     },
 
@@ -719,7 +715,6 @@ const holafImageViewer = {
     },
 
     async _fetchFilteredImages(limit = null, offset = 0) {
-        console.time('BE Fetch & Parse');
         const { filters } = imageViewerState.getState();
         const payload = { ...filters };
         delete payload.locked_folders;
@@ -740,7 +735,6 @@ const holafImageViewer = {
                 throw e;
             });
 
-        console.timeEnd('BE Fetch & Parse');
         return data;
     },
 
@@ -780,9 +774,6 @@ const holafImageViewer = {
         
         this.isLoading = true;
         this._loadingMore = false;
-        
-        console.log("%c[Holaf Perf] Starting filter process...", "color: lightblue; font-weight: bold;");
-        console.time('Total Filter to Render Time');
 
         try {
             const { filters } = imageViewerState.getState();
@@ -803,7 +794,6 @@ const holafImageViewer = {
                 this.updateStatusBar(0, imageViewerState.getState().status.totalImageCount);
                 this._updateActionButtonsState();
                 this.isLoading = false;
-                console.timeEnd('Total Filter to Render Time');
                 if (this.isDirty) { this._executeLoad(); }
                 return;
             }
@@ -843,7 +833,6 @@ const holafImageViewer = {
                 }
             }
 
-            console.time('State Update & Gallery Sync');
             const currentStatus = imageViewerState.getState().status;
             imageViewerState.setState({
                 images: sparse,
@@ -857,7 +846,6 @@ const holafImageViewer = {
             setWindowLoaded(imageViewerState.getState(), 0, windowImages);
 
             this.syncGallery(sparse);
-            console.timeEnd('State Update & Gallery Sync');
 
             this.updateStatusBar(totalCount, data.total_db_count);
 
@@ -896,7 +884,6 @@ const holafImageViewer = {
                 setTimeout(() => this._executeLoad(), 0);
             }
             this._updateActionButtonsState();
-            console.timeEnd('Total Filter to Render Time');
         }
     },
 
@@ -1215,7 +1202,6 @@ const holafImageViewer = {
 
                     holafBridge.listen((data) => {
                         if (data.type === 'LOAD_WORKFLOW') {
-                            console.log("[Holaf Bridge] Received workflow from standalone gallery.");
                             try {
                                 app.loadGraphData(data.payload);
                                 showToast({ message: t("iv.workflowLoadedFromGallery"), type: "success" });

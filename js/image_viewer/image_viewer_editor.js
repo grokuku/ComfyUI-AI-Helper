@@ -8,10 +8,8 @@
  */
 
 import "../aih_strings.js";
-import { HolafPanelManager } from "../holaf_panel_manager.js";
 import { escapeHtml } from "../holaf_dom_utils.js";
 import { imageViewerState } from './image_viewer_state.js';
-import { getThumbnailUrl } from './image_viewer_gallery.js';
 import { resetTransform } from './image_viewer_navigation.js';
 import { HolafFetch, HolafFetchError } from '../vendor/holaf/holaf-fetch.js';
 import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
@@ -405,12 +403,9 @@ export class ImageEditor {
         else rate = this.currentState.playbackRate || 1.0;
         if (this.processedVideoUrl) rate = 1.0;
 
-        if (this._rangedPreviewPending) { this._rangedPreviewPending = false; }
-
         // Préview canvas : rangés OU effets spatiaux (blur/pixelate/vignette/
         // sharpen) OU mask — sinon CSS filters (rapide).
         if (this._hasRangedAdjustments() || this._requiresCanvasPreview()) {
-            this._rangedPreviewPending = true;
             this._processRangedPreviewOnCanvas(els);
         } else {
             this._applyCssFilter(els, rate);
@@ -542,8 +537,6 @@ export class ImageEditor {
         } catch (e) {
             console.warn('[Holaf Editor] Ranged preview fallback:', e);
             this._applyCssFilter(els, 1.0);
-        } finally {
-            this._rangedPreviewPending = false;
         }
     }
 
@@ -1857,25 +1850,23 @@ export class ImageEditor {
 
             ctx.clearRect(0, 0, w, h);
 
-            // Transform + fit contain : source unique = le viewport actif
-            // (getTransform/getImageRect, transform-aware) — plus de lecture
-            // DOMMatrix(getComputedStyle) ni de fit contain calculé localement.
+            // Espace ÉCRAN : getImageRect() est déjà transform-aware (coords
+            // écran du contenu image, incluant tx/ty/scale). On dessine SANS
+            // ctx.translate/scale pour ne PAS compter le transform deux fois
+            // (bug double-transform : getImageRect + ctx transform). La souris
+            // (mouseX, coords écran du canvas) vit dans le MÊME espace.
             const vp = this._activeViewport();
-            let zScale = 1, zTx = 0, zTy = 0, ox = 0, oy = 0, dw = w, dh = h;
+            let ox = 0, oy = 0, dw = w, dh = h;
             if (vp) {
-                const tr = vp.getTransform();
-                zScale = tr.scale; zTx = tr.tx; zTy = tr.ty;
                 const rect = vp.getImageRect();
                 ox = rect.x; oy = rect.y; dw = rect.width; dh = rect.height;
             }
 
             ctx.save();
-            ctx.translate(zTx, zTy);
-            ctx.scale(zScale, zScale);
             ctx.drawImage(origImg, ox, oy, dw, dh);
 
             if (isOver && mouseX !== null) {
-                const localMouseX = (mouseX - zTx) / zScale;
+                const localMouseX = mouseX; // coords écran (même espace que le dessin)
                 ctx.save();
                 ctx.beginPath();
                 ctx.rect(ox, oy, Math.max(0, localMouseX - ox), dh);
@@ -1890,7 +1881,7 @@ export class ImageEditor {
                     ctx.moveTo(localMouseX, oy);
                     ctx.lineTo(localMouseX, oy + dh);
                     ctx.strokeStyle = 'rgba(255,255,255,0.8)';
-                    ctx.lineWidth = 2 / zScale;
+                    ctx.lineWidth = 2;
                     ctx.globalCompositeOperation = 'difference';
                     ctx.stroke();
                     ctx.globalCompositeOperation = 'source-over';

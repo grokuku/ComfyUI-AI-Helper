@@ -11,6 +11,7 @@
 import { app, api } from "./holaf_api_compat.js";
 import { makeDraggable, makeResizable, makeContentZoomable, aihWindowManager } from "./holaf_window_utils.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
+import { HolafViewport } from "./vendor/holaf/holaf-viewport.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -89,7 +90,9 @@ const HolafRemoteComparer = {
     },
 
     // --- Pan & Zoom State ---
-    zoomState: { scale: 1, tx: 0, ty: 0 },
+    // VAGUE 8 : la géométrie (fit/zoom/pan) vit dans la brique HolafViewport
+    // (mode headless). `vp` est l'instance ; `zoomState` maison est supprimé.
+    vp: null,
     isPanning: false,
 
     // --- Window State ---
@@ -376,6 +379,29 @@ const HolafRemoteComparer = {
 
         document.body.appendChild(this.rootElement);
 
+        // VAGUE 8 : délégation à la brique HolafViewport (mode HEADLESS).
+        // Le canvas est le conteneur (PAS de content) : la brique ne fait que la
+        // géométrie (fit/zoom/pan), l'hôte dessine via getTransform(). Le fit est
+        // DANS le transform (scale absolu = containScale). La taille image est posée
+        // par setImageSize() au chargement des médias (voir loadMedia).
+        this.vp = HolafViewport.create(this.canvasEl, {
+            minZoom: 'fit',        // clamp bas = fit (containScale), ↔ ancien min 1
+            maxZoom: 30,           // ↔ ancien clamp haut
+            zoomFactor: 1.1,       // ↔ ancien pas de wheel
+            panClamp: true,        // l'image ne quitte jamais la vue
+            // dblclick maison (parité : zoom-to-natural-size clamp [2,30] ou reset),
+            // PAS le ×1.21 par défaut de la brique → on le désactive ici.
+            doubleClickZoom: false,
+            drag: true,
+            dragButton: 0,         // ↔ ancien : clic gauche uniquement
+            // canDrag : pas de pan au fit (parité avec l'ancien `scale <= 1 → return`)
+            // et jamais depuis un bouton flottant.
+            canDrag: (e) => {
+                if (e.target && e.target.closest && e.target.closest("button")) return false;
+                return this.vp.getScale() > this.vp.getFitScale() + 1e-6;
+            },
+        });
+
         this.enableWindowDragging(header);
         this.attachCanvasListeners();
         this.renderSidebarHistory();
@@ -594,46 +620,44 @@ const HolafRemoteComparer = {
     },
 
     attachCanvasListeners() {
+        // dblclick maison (parité) : zoom-to-natural-size clamp [2,30] au point
+        // sous le curseur, ou reset si déjà zoomé. La brique a doubleClickZoom:false.
         this.contentElement.addEventListener("dblclick", (e) => {
             if (e.target.tagName === "BUTTON" || e.target.closest("button")) return;
-            
-            if (this.zoomState.scale > 1) {
-                this.resetZoom();
+            if (this.images.length === 0) return;
+            const imgA = this.images[0];
+            if (!this.isMediaReady(imgA)) return;
+
+            const sizeA = this.getMediaSize(imgA);
+            if (sizeA.width === 0) return;
+
+            const { scale } = this.vp.getTransform();
+            if (scale > this.vp.getFitScale() + 1e-6) {
+                this.vp.fit();
             } else {
-                if (this.images.length === 0) return;
-                const imgA = this.images[0];
-                if (!this.isMediaReady(imgA)) return;
-
-                const sizeA = this.getMediaSize(imgA);
-                if (sizeA.width === 0) return;
-
-                const rect = this.contentElement.getBoundingClientRect();
-                const screenX = e.clientX - rect.left;
-                const screenY = e.clientY - rect.top;
-
                 const width = this.canvasEl.width;
                 const height = this.canvasEl.height;
                 const imgAspect = sizeA.width / sizeA.height;
                 const canvasAspect = width / height;
                 let drawWidth = imgAspect > canvasAspect ? width : height * imgAspect;
 
-                const targetScale = Math.min(Math.max(sizeA.width / drawWidth, 2), 30);
-                this.zoomState.scale = targetScale;
-                this.zoomState.tx = screenX - screenX * targetScale;
-                this.zoomState.ty = screenY - screenY * targetScale;
-                
-                this.mouseX = (screenX - this.zoomState.tx) / this.zoomState.scale;
-                this.rawMouseX = screenX;
-                this.updateVolumes();
-                this.draw();
+                // Parité : cible RELATIVE au fit (ancien scale=1), clamp [2,30],
+                // convertie en échelle ABSOLUE (fitScale × relatif) pour la brique.
+                const relTarget = Math.min(Math.max(sizeA.width / drawWidth, 2), 30);
+                const absTarget = this.vp.getFitScale() * relTarget;
+                this.vp.setScale(absTarget, e.clientX, e.clientY);
             }
+            this.draw();
         });
 
         this.contentElement.addEventListener("mousemove", (e) => {
             const rect = this.contentElement.getBoundingClientRect();
             this.rawMouseX = e.clientX - rect.left;
-            this.mouseX = (this.rawMouseX - this.zoomState.tx) / this.zoomState.scale;
-            
+            // mouseX image (espace image, origine 0,0) via la brique — la barre de
+            // séparation et le clip vivent dans le transform de la brique.
+            const imgPt = this.vp.screenToImage(e.clientX, e.clientY);
+            this.mouseX = imgPt.x;
+
             this.updateVolumes();
             if (this.isOpen || this.isPoppedOut) this.draw();
         });
@@ -650,60 +674,20 @@ const HolafRemoteComparer = {
             if (this.isOpen || this.isPoppedOut) this.draw();
         });
 
-        this.contentElement.addEventListener("wheel", (e) => {
-            if (this.images.length === 0) return;
-            e.preventDefault();
-
-            const state = this.zoomState;
-            const oldScale = state.scale;
-            const newScale = e.deltaY < 0 ? oldScale * 1.1 : oldScale / 1.1;
-            state.scale = Math.max(1, Math.min(newScale, 30));
-
-            if (state.scale === oldScale) return;
-
-            const rect = this.contentElement.getBoundingClientRect();
-            const screenX = e.clientX - rect.left;
-            const screenY = e.clientY - rect.top;
-
-            state.tx = screenX - (screenX - state.tx) * (state.scale / oldScale);
-            state.ty = screenY - (screenY - state.ty) * (state.scale / oldScale);
-
-            if (state.scale <= 1) this.resetZoom();
-            else this.draw();
-        });
-
-        this.contentElement.addEventListener("mousedown", (e) => {
+        // isPanning : la brique gère le pan (drag) ; on ne garde ici que le flag
+        // (affichage de la barre de séparation pendant un drag) + le curseur.
+        this.canvasEl.addEventListener("mousedown", (e) => {
+            if (e.button !== 0) return;
             if (e.target.tagName === "BUTTON" || e.target.closest("button")) return;
-            if (e.button !== 0 || this.zoomState.scale <= 1) return;
-            e.preventDefault();
-
+            if (this.vp.getScale() <= this.vp.getFitScale() + 1e-6) return;
             this.isPanning = true;
-            const state = this.zoomState;
-            let startX = e.clientX - state.tx;
-            let startY = e.clientY - state.ty;
             this.canvasEl.style.cursor = 'grabbing';
-
-            const onMouseMove = (moveEvent) => {
-                state.tx = moveEvent.clientX - startX;
-                state.ty = moveEvent.clientY - startY;
-
-                const rect = this.contentElement.getBoundingClientRect();
-                this.rawMouseX = moveEvent.clientX - rect.left;
-                this.mouseX = (this.rawMouseX - state.tx) / state.scale;
-                this.updateVolumes();
-                this.draw();
-            };
-
-            const targetDoc = this.contentElement.ownerDocument;
-            const onMouseUp = () => {
+        });
+        window.addEventListener("mouseup", () => {
+            if (this.isPanning) {
                 this.isPanning = false;
                 this.canvasEl.style.cursor = 'crosshair';
-                targetDoc.removeEventListener('mousemove', onMouseMove);
-                targetDoc.removeEventListener('mouseup', onMouseUp);
-            };
-
-            targetDoc.addEventListener('mousemove', onMouseMove);
-            targetDoc.addEventListener('mouseup', onMouseUp);
+            }
         });
     },
 
@@ -783,6 +767,8 @@ const HolafRemoteComparer = {
 
                 const onMediaReady = () => {
                     loadedCount++;
+                    // VAGUE 8 : la taille image (fit) est pilotée par A (index 0).
+                    if (i === 0) this.setViewportImageSize(mediaEl);
                     if (mediaEl.duration && mediaEl.duration > this.playbackState.maxDuration) {
                         this.playbackState.maxDuration = mediaEl.duration;
                     }
@@ -956,23 +942,16 @@ const HolafRemoteComparer = {
         const baseW = sizeA.width > 0 ? sizeA.width : 1280;
         const baseH = sizeA.height > 0 ? sizeA.height : 720;
 
-        this.ctx.translate(this.zoomState.tx, this.zoomState.ty);
-        this.ctx.scale(this.zoomState.scale, this.zoomState.scale);
+        // VAGUE 8 : le fit vit DANS le transform de la brique (headless, scale
+        // absolu = containScale). On applique exactement getTransform() — A et B
+        // partagent le MÊME transform (fit commun, parité avec l'ancien draw qui
+        // dessinait les deux médias dans la même boîte contain de A).
+        const { scale, tx, ty } = this.vp.getTransform();
+        this.ctx.translate(tx, ty);
+        this.ctx.scale(scale, scale);
 
-        const imgAspect = baseW / baseH;
-        const canvasAspect = width / height;
-        let drawWidth, drawHeight, offsetX = 0, offsetY = 0;
-
-        if (imgAspect > canvasAspect) {
-            drawWidth = width; drawHeight = width / imgAspect;
-            offsetY = (height - drawHeight) / 2;
-        } else {
-            drawHeight = height; drawWidth = height * imgAspect;
-            offsetX = (width - drawWidth) / 2;
-        }
-
-        // Draw Background (A)
-        this.drawMediaItem(this.ctx, imgA, offsetX, offsetY, drawWidth, drawHeight, true);
+        // Draw Background (A) — boîte image complète (0,0,baseW,baseH)
+        this.drawMediaItem(this.ctx, imgA, 0, 0, baseW, baseH, true);
 
         if (!imgB || !this.isMediaReady(imgB)) {
             this.drawAudioHUD(this.ctx, width, height);
@@ -984,19 +963,19 @@ const HolafRemoteComparer = {
             this.ctx.save();
             this.ctx.beginPath();
 
-            const clipWidth = Math.max(0, this.mouseX - offsetX);
-            this.ctx.rect(offsetX, offsetY, clipWidth, drawHeight);
+            const clipWidth = Math.max(0, this.mouseX);
+            this.ctx.rect(0, 0, clipWidth, baseH);
             this.ctx.clip();
 
-            this.drawMediaItem(this.ctx, imgB, offsetX, offsetY, drawWidth, drawHeight, false);
+            this.drawMediaItem(this.ctx, imgB, 0, 0, baseW, baseH, false);
             this.ctx.restore();
 
             // Split Line
-            if (this.mouseX >= offsetX && this.mouseX <= offsetX + drawWidth) {
+            if (this.mouseX >= 0 && this.mouseX <= baseW) {
                 this.ctx.beginPath();
-                this.ctx.moveTo(this.mouseX, offsetY);
-                this.ctx.lineTo(this.mouseX, offsetY + drawHeight);
-                this.ctx.lineWidth = 1 / (this.zoomState.scale || 1);
+                this.ctx.moveTo(this.mouseX, 0);
+                this.ctx.lineTo(this.mouseX, baseH);
+                this.ctx.lineWidth = 1 / (scale || 1);
                 this.ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
                 this.ctx.globalCompositeOperation = "difference";
                 this.ctx.stroke();
@@ -1014,6 +993,17 @@ const HolafRemoteComparer = {
         if (media instanceof HTMLVideoElement) return { width: media.videoWidth || 0, height: media.videoHeight || 0 };
         if (media instanceof HTMLImageElement) return { width: media.naturalWidth || 0, height: media.naturalHeight || 0 };
         return { width: 0, height: 0 }; // Audio
+    },
+
+    // VAGUE 8 : pose la taille image de la brique (headless). Le fit est un
+    // contain de A (parité avec l'ancien draw qui dessinait A et B dans la même
+    // boîte contain de A). Audio → taille virtuelle 16:9 (1280×720).
+    setViewportImageSize(media) {
+        if (!this.vp) return;
+        const size = this.getMediaSize(media);
+        const baseW = size.width > 0 ? size.width : 1280;
+        const baseH = size.height > 0 ? size.height : 720;
+        this.vp.setImageSize(baseW, baseH);
     },
 
     isMediaReady(media) {
@@ -1044,7 +1034,7 @@ const HolafRemoteComparer = {
     },
 
     resetZoom() {
-        this.zoomState = { scale: 1, tx: 0, ty: 0 };
+        if (this.vp) this.vp.fit();
         this.draw();
     },
 

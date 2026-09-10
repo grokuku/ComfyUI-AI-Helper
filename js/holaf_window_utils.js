@@ -542,6 +542,9 @@ export function applyContentZoom(contentEl, level) {
  * @param {number} [opts.max]
  * @param {number} [opts.step]
  * @returns {HTMLElement} le groupe de boutons (à insérer dans le header).
+ * VAGUE 9 : PAS migré vers la brique HolafViewport — ici le zoom est piloté par
+ * boutons +/− avec niveau persisté (panels de fenêtres), pas une surface image
+ * wheel/pan : interaction et contrat différents.
  */
 export function makeContentZoomable(contentEl, opts = {}) {
     const {
