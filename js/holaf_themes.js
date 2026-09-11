@@ -163,6 +163,21 @@ export function applyThemeState(target, state) {
     if (!el) return state || AIH_THEME_DEFAULT;
     const s = state || {};
 
+    // Purge LÉGACY sur la racine globale (<body>) : les anciennes classes
+    // combinées `.holaf-theme-*` redéfinissent des variables --holaf-* en dur
+    // PLUS BAS dans holaf_themes.css que les règles `.aih-mode-*` /
+    // `.aih-accent-*` (même spécificité → la règle la plus basse gagne) et
+    // écrasaient donc l'accent/mode 4-axes posés sur <body> : l'alias global
+    // `--holaf-accent-color` restait figé à la palette legacy et la couleur
+    // choisie dans les réglages ne s'appliquait qu'aux éléments portant la
+    // classe accent DIRECTEMENT (ex. la modale des réglages). Les thèmes
+    // legacy par-panel (classe posée sur la fenêtre elle-même par les widgets,
+    // ex. nodes manager / terminal / image viewer) ne sont PAS touchés : cette
+    // purge ne concerne que la source de vérité globale <body>.
+    if (el === (typeof document !== "undefined" ? document.body : null)) {
+        HOLAF_THEMES.forEach((legacy) => el.classList.remove(legacy.className));
+    }
+
     const mode = (s.mode && AIH_MODES[s.mode]) ? s.mode : AIH_DEFAULT_MODE;
     const accent = (s.accent && AIH_ACCENTS[s.accent]) ? s.accent : AIH_DEFAULT_ACCENT;
     const halo = s.halo !== false;

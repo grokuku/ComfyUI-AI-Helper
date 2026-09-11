@@ -122,10 +122,102 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
     // ── Membres ──────────────────────────────────────────────────────────
 
+    // Charge et rend la liste des membres. Réutilisable après suppression
+    // pour rafraîchir la table sans refermer la modale.
+    async function refreshMembers(modal, baseUrl) {
+        const [members, me] = await Promise.all([
+            remoteGet(`${baseUrl}/api/members`).catch((e) => { throw new Error(`HTTP ${e.status}`); }),
+            remoteGet(`${baseUrl}/api/auth/me`).catch(() => null),
+        ]);
+
+        const currentUserId = me && me.id ? me.id : null;
+        // La suppression d'un membre est une action admin : on n'affiche le
+        // bouton que pour un utilisateur courant admin (la BDD fait foi). Le
+        // serveur re-impose la garde _admin_required de toute façon.
+        const canManage = !!(me && me.role === "admin");
+
+        // Trier : admin en premier, puis kw_editor, puis par nom
+        members.sort((a, b) => {
+            const rank = (r) => r === "admin" ? 0 : r === "kw_editor" ? 1 : 2;
+            const diff = rank(a.role) - rank(b.role);
+            if (diff !== 0) return diff;
+            return (a.display_name || a.username || "").localeCompare(b.display_name || b.username || "");
+        });
+
+        let html = `<table style="width:100%;border-collapse:collapse;font-size:12px;color:#ccc;">
+            <thead>
+                <tr style="border-bottom:1px solid #555;">
+                    <th style="text-align:left;padding:6px 8px;color:#888;font-weight:600;">${t("menu.colMember")}</th>
+                    <th style="text-align:center;padding:6px 4px;color:#888;font-weight:600;">${t("menu.colRole")}</th>
+                    <th style="text-align:center;padding:6px 4px;color:#888;font-weight:600;">${t("menu.colFilters")}</th>
+                    <th style="text-align:center;padding:6px 4px;color:#888;font-weight:600;">${t("menu.colPrompts")}</th>
+                    <th style="text-align:center;padding:6px 4px;color:#888;font-weight:600;">${t("menu.colActions")}</th>
+                </tr>
+            </thead><tbody>`;
+
+        for (const m of members) {
+            const name = m.display_name || m.username || m.id?.substring(0, 8) || "?";
+            const avatarUrl = m.avatar_url || (m.avatar && m.id ? `https://cdn.discordapp.com/avatars/${m.id}/${m.avatar}.png?size=32` : null);
+            const roleBadge = m.role === "admin"
+                ? '<span style="background:var(--aih-accent, #D8700D);color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;">admin</span>'
+                : m.role === "kw_editor"
+                  ? '<span style="background:#d97706;color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;">kw_editor</span>'
+                  : '<span style="color:#888;font-size:11px;">' + t('menu.memberBadge') + '</span>';
+
+            // Pas de bouton sur sa propre ligne (le serveur bloque de toute
+            // façon « Tu ne peux pas te supprimer ») ni pour un non-admin.
+            const showDel = canManage && !(currentUserId && m.id && m.id === currentUserId);
+            const delCell = showDel
+                ? `<button class="aih-member-del" data-id="${m.id}" data-name="${name.replace(/"/g, '&quot;').replace(/'/g, '&#39;')}" title="${t("menu.del")}" style="background:transparent;border:none;cursor:pointer;color:#f87171;font-size:13px;padding:2px 4px;">🗑</button>`
+                : "";
+
+            html += `<tr style="border-bottom:1px solid #333;">
+                <td style="padding:6px 8px;display:flex;align-items:center;gap:8px;">
+                    ${avatarUrl ? `<img src="${avatarUrl}" style="width:24px;height:24px;border-radius:50%;flex-shrink:0;">` : '<span style="width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;background:#444;border-radius:50%;font-size:11px;flex-shrink:0;">👤</span>'}
+                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${name}</span>
+                </td>
+                <td style="text-align:center;padding:6px 4px;">${roleBadge}</td>
+                <td style="text-align:center;padding:6px 4px;">${m.filter_count ?? 0}</td>
+                <td style="text-align:center;padding:6px 4px;">${m.prompt_count ?? 0}</td>
+                <td style="text-align:center;padding:6px 4px;">${delCell}</td>
+            </tr>`;
+        }
+
+        html += "</tbody></table>";
+        modal.body.innerHTML = html;
+
+        // Brancher les boutons de suppression.
+        modal.body.querySelectorAll(".aih-member-del").forEach((btn) => {
+            btn.addEventListener("click", async () => {
+                const id = btn.getAttribute("data-id");
+                const name = btn.getAttribute("data-name") || "?";
+                const ok = await window.aihShowConfirm(t("dialog.delete"), t("menu.delMemberConfirm", { name }));
+                if (!ok) return;
+                try {
+                    // Route réelle : DELETE /api/admin/users/{id} (admin only),
+                    // renvoie 200 {'status':'ok'}. La route /api/members/{id}
+                    // n'a PAS de méthode DELETE côté serveur.
+                    await remoteRequest(`${baseUrl}/api/admin/users/${encodeURIComponent(id)}`, { method: "DELETE" });
+                    showToast({ message: t("menu.memberDeleted", { name }), type: "success" });
+                    await refreshMembers(modal, baseUrl);
+                } catch (e) {
+                    // HolafFetch lève « réponse non-JSON » sur un 204/corps
+                    // vide alors que la suppression a réussi : un 2xx est un
+                    // succès, quel que soit le corps.
+                    if (e && e.status && e.status >= 200 && e.status < 300) {
+                        showToast({ message: t("menu.memberDeleted", { name }), type: "success" });
+                        await refreshMembers(modal, baseUrl);
+                        return;
+                    }
+                    showToast({ message: t("menu.delError", { error: (e && e.message) || String(e) }), type: "error" });
+                }
+            });
+        });
+    }
+
     async function openMembers() {
         const cfg = getConfig();
         const baseUrl = (cfg.serverUrl || "").replace(/\/+$/, "");
-        const apiKey = cfg.apiKey || "";
 
         const modal = window.aihOpenModalV2({
             id: "aih-modal-members",
@@ -147,50 +239,7 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         }
 
         try {
-            const members = await remoteGet(`${baseUrl}/api/members`).catch((e) => {
-                throw new Error(`HTTP ${e.status}`);
-            });
-
-            // Trier : admin en premier, puis kw_editor, puis par nom
-            members.sort((a, b) => {
-                const rank = (r) => r === "admin" ? 0 : r === "kw_editor" ? 1 : 2;
-                const diff = rank(a.role) - rank(b.role);
-                if (diff !== 0) return diff;
-                return (a.display_name || a.username || "").localeCompare(b.display_name || b.username || "");
-            });
-
-            let html = `<table style="width:100%;border-collapse:collapse;font-size:12px;color:#ccc;">
-                <thead>
-                    <tr style="border-bottom:1px solid #555;">
-                        <th style="text-align:left;padding:6px 8px;color:#888;font-weight:600;">${t("menu.colMember")}</th>
-                        <th style="text-align:center;padding:6px 4px;color:#888;font-weight:600;">${t("menu.colRole")}</th>
-                        <th style="text-align:center;padding:6px 4px;color:#888;font-weight:600;">${t("menu.colFilters")}</th>
-                        <th style="text-align:center;padding:6px 4px;color:#888;font-weight:600;">${t("menu.colPrompts")}</th>
-                    </tr>
-                </thead><tbody>`;
-
-            for (const m of members) {
-                const name = m.display_name || m.username || m.id?.substring(0, 8) || "?";
-                const avatarUrl = m.avatar_url || (m.avatar && m.id ? `https://cdn.discordapp.com/avatars/${m.id}/${m.avatar}.png?size=32` : null);
-                const roleBadge = m.role === "admin"
-                    ? '<span style="background:var(--aih-accent, #D8700D);color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;">admin</span>'
-                    : m.role === "kw_editor"
-                      ? '<span style="background:#d97706;color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;">kw_editor</span>'
-                      : '<span style="color:#888;font-size:11px;">' + t('menu.memberBadge') + '</span>';
-
-                html += `<tr style="border-bottom:1px solid #333;">
-                    <td style="padding:6px 8px;display:flex;align-items:center;gap:8px;">
-                        ${avatarUrl ? `<img src="${avatarUrl}" style="width:24px;height:24px;border-radius:50%;flex-shrink:0;">` : '<span style="width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;background:#444;border-radius:50%;font-size:11px;flex-shrink:0;">👤</span>'}
-                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${name}</span>
-                    </td>
-                    <td style="text-align:center;padding:6px 4px;">${roleBadge}</td>
-                    <td style="text-align:center;padding:6px 4px;">${m.filter_count ?? 0}</td>
-                    <td style="text-align:center;padding:6px 4px;">${m.prompt_count ?? 0}</td>
-                </tr>`;
-            }
-
-            html += "</tbody></table>";
-            modal.body.innerHTML = html;
+            await refreshMembers(modal, baseUrl);
         } catch (err) {
             modal.body.innerHTML = `<p style="color:#f87171;font-size:12px;">${t("menu.membersError", { error: err.message })}</p>`;
         }

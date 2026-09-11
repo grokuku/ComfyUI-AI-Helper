@@ -51,12 +51,14 @@ const HolafUtilitiesMenu = {
                 this.startCompactWatchdog();
             }
 
-            if (!document.body.className.includes("holaf-theme-")) {
-                document.body.classList.add("holaf-theme-graphite-orange");
-            }
-
             // THEMING 4-axes (mode/accent/halo/highlight) : applique l'état persisté
             // sur <body>. Les panneaux et dialogues héritent des variables via CSS.
+            // (Plus de classe legacy `.holaf-theme-*` posée sur <body> : elle
+            // redéfinissait les alias --holaf-* en dur APRÈS les règles
+            // `.aih-mode-*`/`.aih-accent-*` de holaf_themes.css et figeait la
+            // palette globale — l'accent choisi dans les réglages ne s'appliquait
+            // qu'aux éléments portant la classe accent directement. applyThemeState
+            // purge désormais toute classe legacy résiduelle sur <body>.)
             try { applyPersistedTheme(document.body); } catch (e) { console.warn("[AIH] applyPersistedTheme failed:", e); }
 
             if (!window.holaf) {

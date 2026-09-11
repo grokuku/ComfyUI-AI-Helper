@@ -1,9 +1,9 @@
-# Third-Party Notices — CUI-Holaf-Utils
+# Third-Party Notices — ComfyUI-AI-Helper
 
 This file lists the third-party components that are **bundled (vendored) inside this
 repository** or otherwise distributed with it, along with their applicable licenses.
 
-CUI-Holaf-Utils itself is licensed under the **GNU General Public License v3.0 or
+ComfyUI-AI-Helper itself is licensed under the **GNU General Public License v3.0 or
 later** (see `LICENSE`). The components listed below are covered by their own
 permissive licenses, reproduced here as required by their terms.
 

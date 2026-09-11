@@ -1,4 +1,4 @@
-# Copyright (C) Holaf / grokuku — CUI-Holaf-Utils.
+# Copyright (C) Holaf — ComfyUI-AI-Helper.
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # This program is free software: you can redistribute it and/or modify it
