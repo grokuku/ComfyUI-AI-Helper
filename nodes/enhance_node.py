@@ -142,6 +142,32 @@ def _fetch_style(api_url, api_key, style_id):
     return None
 
 
+def _parse_style_shortlist(raw):
+    """Parse la shortlist JSON (ex: '["1","2"]') en liste d'IDs normalisés string.
+
+    La shortlist est le widget STRING 'style_shortlist', sérialisé dans le workflow.
+    Il contient les IDs des styles sélectionnés par l'utilisateur dans la node
+    (sélection multiple via le ⚙️ du dropdown). Retourne [] si invalide/vide.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(x) for x in parsed if str(x).strip()]
+
+
+def _filter_styles_by_shortlist(styles, selected):
+    """Restreint une pool de styles aux IDs présents dans la shortlist sélectionnée."""
+    if not styles or not selected:
+        return []
+    wanted = set(selected)
+    return [s for s in styles if isinstance(s, dict) and str(s.get("id")) in wanted]
+
+
 def _build_system_prompt_unified(template, special_instructions):
     """Construit le system prompt unifié : role fixe + template + examples + special_instructions.
 
@@ -269,7 +295,13 @@ class AIHEnhanceNode:
         except (ValueError, TypeError):
             style_id = 0
 
-        # Si style_id == -1 (mode random), piocher un style au hasard
+        # Si style_id == -1 (mode random), piocher un style au hasard.
+        # VAGUE 12 : le tirage doit se faire PARMI les styles SÉLECTIONNÉS dans
+        # la node (widget STRING 'style_shortlist'), pas dans toute la base.
+        # Edge cases :
+        #   - shortlist vide → fallback comportement historique : tirage parmi TOUS
+        #   - shortlist à 1 seul style → toujours lui
+        #   - shortlist non vide mais IDs introuvables côté backend → fallback tous
         if style_id == -1:
             try:
                 import requests as _req
@@ -280,9 +312,15 @@ class AIHEnhanceNode:
                 )
                 if resp.ok:
                     styles = resp.json()
-                    if styles:
+                    selected = _parse_style_shortlist(style_shortlist)
+                    pool = styles
+                    if selected:
+                        narrowed = _filter_styles_by_shortlist(styles, selected)
+                        if narrowed:
+                            pool = narrowed
+                    if pool:
                         import random as _rand
-                        chosen = _rand.choice(styles)
+                        chosen = _rand.choice(pool)
                         style_id = chosen.get("id", 0) if isinstance(chosen, dict) else 0
             except Exception as e:
                 logging.warning(f"[AIH Enhance] Random style fetch failed: {e}")
