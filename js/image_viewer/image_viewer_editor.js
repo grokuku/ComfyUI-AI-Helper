@@ -10,7 +10,7 @@
 import "../aih_strings.js";
 import { escapeHtml } from "../holaf_dom_utils.js";
 import { imageViewerState } from './image_viewer_state.js';
-import { resetTransform } from './image_viewer_navigation.js';
+import { resetTransform, getFullImageUrl } from './image_viewer_navigation.js';
 import { HolafFetch, HolafFetchError } from '../vendor/holaf/holaf-fetch.js';
 import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
 
@@ -1777,13 +1777,13 @@ export class ImageEditor {
         canvas.height = rect.height;
         const ctx = canvas.getContext('2d');
 
-        const originalUrl = editedImg.dataset.originalSrc || (
-            window.location.origin + '/view?' + new URLSearchParams({
-                filename: this.activeImage.filename,
-                subfolder: this.activeImage.subfolder || '',
-                type: 'output'
-            }).toString()
-        );
+        // VAGUE 10 : la source ORIGINALE doit être construite avec la MÊME
+        // fonction que le viewer (getFullImageUrl → /holaf/images/full avec
+        // path_canon + cache-buster mtime). L'ancien code reconstruisait une URL
+        // /view?filename=...&type=output qui pouvait résoudre vers un AUTRE
+        // fichier (quand path_canon ≠ subfolder/filename) ou servir une version
+        // en cache périmée → « le comparer ne compare pas avec la bonne image ».
+        const originalUrl = editedImg.dataset.originalSrc || getFullImageUrl(this.activeImage);
         const editedUrl = editedImg.src;
 
         const origImg = new Image(); origImg.crossOrigin = 'anonymous';
@@ -1862,8 +1862,18 @@ export class ImageEditor {
                 ox = rect.x; oy = rect.y; dw = rect.width; dh = rect.height;
             }
 
+            // VAGUE 10 : la boîte commune (ox,oy,dw,dh) est le rect du média
+            // COURANT (editImg). Si l'original et l'édité ont des ratios
+            // différents (ex. après un crop qui change les dimensions
+            // naturelles), dessiner les deux dans la même boîte étire l'un des
+            // deux. On letterboxe CHAQUE média (contain centré) dans la boîte
+            // commune — le transform du viewport n'est appliqué qu'une seule
+            // fois (via getImageRect).
+            const origRect = this._containRect(origImg, ox, oy, dw, dh);
+            const editRect = this._containRect(editImg, ox, oy, dw, dh);
+
             ctx.save();
-            ctx.drawImage(origImg, ox, oy, dw, dh);
+            ctx.drawImage(origImg, origRect.x, origRect.y, origRect.w, origRect.h);
 
             if (isOver && mouseX !== null) {
                 const localMouseX = mouseX; // coords écran (même espace que le dessin)
@@ -1872,7 +1882,7 @@ export class ImageEditor {
                 ctx.rect(ox, oy, Math.max(0, localMouseX - ox), dh);
                 ctx.clip();
                 ctx.filter = filterValue;
-                ctx.drawImage(editImg, ox, oy, dw, dh);
+                ctx.drawImage(editImg, editRect.x, editRect.y, editRect.w, editRect.h);
                 ctx.filter = 'none';
                 ctx.restore();
 
@@ -1891,6 +1901,18 @@ export class ImageEditor {
             this._compareRaf = requestAnimationFrame(render);
         };
         render();
+    }
+
+    // VAGUE 10 : rect « contain » (letterbox centré) d'un média dans une boîte
+    // commune (ox,oy,dw,dh). Chaque média est dessiné avec son propre aspect
+    // préservé — aucun étirement quand les ratios diffèrent (ex. après crop).
+    _containRect(img, ox, oy, dw, dh) {
+        const iw = (img && img.naturalWidth) || 1;
+        const ih = (img && img.naturalHeight) || 1;
+        const s = Math.min(dw / iw, dh / ih);
+        const w = iw * s;
+        const h = ih * s;
+        return { x: ox + (dw - w) / 2, y: oy + (dh - h) / 2, w, h };
     }
 
     _compareCleanup() {

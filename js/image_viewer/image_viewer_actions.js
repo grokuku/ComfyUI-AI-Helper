@@ -847,7 +847,11 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
         try {
             // La brique lève sur non-2xx (→ catch : mêmes toasts d'échec) ;
             // on ne teste plus que le statut métier de la réponse.
-            const result = await HolafFetch.post('/holaf/images/prepare-export', { body: payload });
+            // FIX(vague 11) : timeout: 0 — la préparation peut être LONGUE
+            // (transcodes ffmpeg vidéo/audio, batchs nombreux, tout est traité
+            // AVANT la réponse). L'ancien fetch n'avait aucun timeout : le
+            // défaut 30 s de la brique coupait les exports longs.
+            const result = await HolafFetch.post('/holaf/images/prepare-export', { body: payload, timeout: 0 });
 
             if (result.status !== 'ok') {
                 throw new Error(result.message || t('iv.failedToPrepareExport'));
@@ -859,9 +863,19 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
             }
 
             const manifestUrl = `/holaf/images/export-chunk?export_id=${result.export_id}&file_path=manifest.json&chunk_index=0&chunk_size=1000000`;
-            // La brique lève sur non-2xx/non-JSON → catch : toasts d'échec
-            // d'export (l'ancien code avalait une erreur HTTP en « noNewFiles »).
-            const manifest = await HolafFetch.get(manifestUrl);
+            // FIX(vague 11) : la route export-chunk sert TOUS les fichiers
+            // (manifest.json inclus) en application/octet-stream. En mode JSON
+            // la brique refuse ce content-type (throw « réponse non-JSON »)
+            // AVANT d'avoir lu un corps pourtant valide → tout export échouait
+            // ici. On repasse en raw:true + .json() explicite, à l'identique de
+            // l'ancien fetch ; la brique lève toujours sur réseau/timeout, et le
+            // test .ok ajoute la détection d'erreur HTTP (que l'ancien code
+            // avalait en « noNewFiles »).
+            const manifestResponse = await HolafFetch.get(manifestUrl, { raw: true });
+            if (!manifestResponse.ok) {
+                throw new Error(`HTTP error ${manifestResponse.status} (manifest)`);
+            }
+            const manifest = await manifestResponse.json();
 
             if (manifest && manifest.length > 0) {
                 const newFiles = manifest.map(file => ({ ...file, export_id: result.export_id }));

@@ -828,6 +828,10 @@ const HolafRemoteComparer = {
                 }
 
                 const params = new URLSearchParams({ filename: meta.filename, type: meta.type, subfolder: meta.subfolder || "" });
+                // VAGUE 10 : cache-buster (_t) pour ne jamais servir une version
+                // périmée en cache quand le même fichier est régénéré (ex. après
+                // un crop qui réécrit le même nom de sortie).
+                params.set("_t", String(Date.now()));
                 // Use api.apiURL if available, otherwise fallback to a direct URL
                 const viewUrl = api.apiURL ? api.apiURL(`/view?${params.toString()}`) : `/view?${params.toString()}`;
                 mediaEl.src = viewUrl;
@@ -958,6 +962,13 @@ const HolafRemoteComparer = {
             return;
         }
 
+        // VAGUE 10 : B est letterboxé (contain centré) dans la boîte commune de
+        // A. L'ancien code (et la migration vague 8) dessinait B étiré dans la
+        // boîte de A → quand A et B ont des ratios différents (ex. une des deux
+        // versions a été cropée), B était étiré. Chaque média garde son aspect.
+        const sizeB = this.getMediaSize(imgB);
+        const bRect = this._containRect(sizeB.width, sizeB.height, 0, 0, baseW, baseH);
+
         // Draw Foreground Split (B)
         if ((this.isMouseOver || this.isPanning) && this.mouseX !== null) {
             this.ctx.save();
@@ -967,7 +978,7 @@ const HolafRemoteComparer = {
             this.ctx.rect(0, 0, clipWidth, baseH);
             this.ctx.clip();
 
-            this.drawMediaItem(this.ctx, imgB, 0, 0, baseW, baseH, false);
+            this.drawMediaItem(this.ctx, imgB, bRect.x, bRect.y, bRect.w, bRect.h, false);
             this.ctx.restore();
 
             // Split Line
@@ -993,6 +1004,18 @@ const HolafRemoteComparer = {
         if (media instanceof HTMLVideoElement) return { width: media.videoWidth || 0, height: media.videoHeight || 0 };
         if (media instanceof HTMLImageElement) return { width: media.naturalWidth || 0, height: media.naturalHeight || 0 };
         return { width: 0, height: 0 }; // Audio
+    },
+
+    // VAGUE 10 : rect « contain » (letterbox centré) d'un média de taille
+    // (iw,ih) dans une boîte commune (ox,oy,dw,dh). Préserve l'aspect de
+    // CHAQUE média — aucun étirement quand les ratios diffèrent (ex. crop).
+    _containRect(iw, ih, ox, oy, dw, dh) {
+        const w = iw > 0 ? iw : 1;
+        const h = ih > 0 ? ih : 1;
+        const s = Math.min(dw / w, dh / h);
+        const cw = w * s;
+        const ch = h * s;
+        return { x: ox + (dw - cw) / 2, y: oy + (dh - ch) / 2, w: cw, h: ch };
     },
 
     // VAGUE 8 : pose la taille image de la brique (headless). Le fit est un
