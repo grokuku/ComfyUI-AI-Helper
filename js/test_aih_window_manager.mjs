@@ -2,13 +2,12 @@
 // HolafPanelManager.
 // Usage : node js/test_aih_window_manager.mjs
 import assert from "node:assert";
-import fs from "node:fs";
-
-const setup = fs.readFileSync("/tmp/setup.mjs", "utf8").replace(
-  /\/\* ─────────────────────────── Import du module ─────────────────────────── \*\/[\s\S]*$/,
-  ""
-);
-await import("data:text/javascript," + encodeURIComponent(setup));
+// Le faux DOM minimal est fourni par le helper PARTAGÉ js/test_helpers/fake_dom.mjs,
+// importé EXPLICITEMENT. Fini l'extraction par marqueur texte dans
+// test_aih_dialog.mjs : un renommage de commentaire ne peut plus provoquer
+// l'import silencieux de TOUT le fichier de test (asserts exécutés + effets de
+// bord) au lieu d'un échec clair.
+import "./test_helpers/fake_dom.mjs";
 
 globalThis.ResizeObserver = class { observe(){} disconnect(){} unobserve(){} };
 globalThis.fetch = async () => ({ ok:false, json: async () => ({}) });

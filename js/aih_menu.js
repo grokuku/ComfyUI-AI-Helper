@@ -45,6 +45,7 @@ import "./aih_strings.js";
 import { showToast } from "./aih_toast_bridge.js";
 import { remoteGet, remoteRequest } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
+import { escapeHtml } from "./holaf_dom_utils.js";
 (function () {
     "use strict";
 
@@ -55,6 +56,12 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         const I = window.AIH && window.AIH.I18n;
         return I && typeof I.t === "function" ? I.t(key, params) : key;
     };
+
+    // Libellé lisible d'un échec HTTP : évite le cosmétique « HTTP undefined »
+    // quand le statut est absent (échec réseau avant toute réponse). La valeur
+    // est une DONNÉE d'origine serveur/transport : elle est échappée au moment
+    // de l'interpolation HTML (escapeHtml), jamais insérée brute.
+    const httpStatusLabel = (e) => (e && e.status) ? `HTTP ${e.status}` : t("menu.httpNetworkError");
 
     function getConfig() {
         try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; }
@@ -126,7 +133,7 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
     // pour rafraîchir la table sans refermer la modale.
     async function refreshMembers(modal, baseUrl) {
         const [members, me] = await Promise.all([
-            remoteGet(`${baseUrl}/api/members`).catch((e) => { throw new Error(`HTTP ${e.status}`); }),
+            remoteGet(`${baseUrl}/api/members`).catch((e) => { throw new Error(httpStatusLabel(e)); }),
             remoteGet(`${baseUrl}/api/auth/me`).catch(() => null),
         ]);
 
@@ -157,6 +164,11 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
         for (const m of members) {
             const name = m.display_name || m.username || m.id?.substring(0, 8) || "?";
+            // Toute valeur fournie par le serveur est échappée AVANT d'être
+            // interpolée en innerHTML : le nom (cellule + data-name relu),
+            // l'URL d'avatar (attribut src), et le nom du message de
+            // confirmation (AIH.confirm l'injecte aussi en innerHTML).
+            const safeName = escapeHtml(name);
             const avatarUrl = m.avatar_url || (m.avatar && m.id ? `https://cdn.discordapp.com/avatars/${m.id}/${m.avatar}.png?size=32` : null);
             const roleBadge = m.role === "admin"
                 ? '<span style="background:var(--aih-accent, #D8700D);color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;">admin</span>'
@@ -168,17 +180,17 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             // façon « Tu ne peux pas te supprimer ») ni pour un non-admin.
             const showDel = canManage && !(currentUserId && m.id && m.id === currentUserId);
             const delCell = showDel
-                ? `<button class="aih-member-del" data-id="${m.id}" data-name="${name.replace(/"/g, '&quot;').replace(/'/g, '&#39;')}" title="${t("menu.del")}" style="background:transparent;border:none;cursor:pointer;color:#f87171;font-size:13px;padding:2px 4px;">🗑</button>`
+                ? `<button class="aih-member-del" data-id="${escapeHtml(m.id)}" data-name="${safeName}" title="${t("menu.del")}" style="background:transparent;border:none;cursor:pointer;color:#f87171;font-size:13px;padding:2px 4px;">🗑</button>`
                 : "";
 
             html += `<tr style="border-bottom:1px solid #333;">
                 <td style="padding:6px 8px;display:flex;align-items:center;gap:8px;">
-                    ${avatarUrl ? `<img src="${avatarUrl}" style="width:24px;height:24px;border-radius:50%;flex-shrink:0;">` : '<span style="width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;background:#444;border-radius:50%;font-size:11px;flex-shrink:0;">👤</span>'}
-                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${name}</span>
+                    ${avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" style="width:24px;height:24px;border-radius:50%;flex-shrink:0;">` : '<span style="width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;background:#444;border-radius:50%;font-size:11px;flex-shrink:0;">👤</span>'}
+                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeName}</span>
                 </td>
                 <td style="text-align:center;padding:6px 4px;">${roleBadge}</td>
-                <td style="text-align:center;padding:6px 4px;">${m.filter_count ?? 0}</td>
-                <td style="text-align:center;padding:6px 4px;">${m.prompt_count ?? 0}</td>
+                <td style="text-align:center;padding:6px 4px;">${escapeHtml(m.filter_count ?? 0)}</td>
+                <td style="text-align:center;padding:6px 4px;">${escapeHtml(m.prompt_count ?? 0)}</td>
                 <td style="text-align:center;padding:6px 4px;">${delCell}</td>
             </tr>`;
         }
@@ -191,25 +203,41 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             btn.addEventListener("click", async () => {
                 const id = btn.getAttribute("data-id");
                 const name = btn.getAttribute("data-name") || "?";
-                const ok = await window.aihShowConfirm(t("dialog.delete"), t("menu.delMemberConfirm", { name }));
+                // AIH.confirm insère son message en innerHTML : le nom (valeur
+                // serveur) est échappé AVANT interpolation, sinon XSS stocké.
+                const ok = await window.aihShowConfirm(t("dialog.delete"), t("menu.delMemberConfirm", { name: escapeHtml(name) }));
                 if (!ok) return;
+
+                // Suppression puis rafraîchissement SÉPARÉS : le refresh est hors
+                // du try de suppression pour qu'un échec de refresh ne soit pas
+                // présenté comme un échec de suppression (toast mensonger).
+                let deleted = false;
                 try {
                     // Route réelle : DELETE /api/admin/users/{id} (admin only),
                     // renvoie 200 {'status':'ok'}. La route /api/members/{id}
                     // n'a PAS de méthode DELETE côté serveur.
                     await remoteRequest(`${baseUrl}/api/admin/users/${encodeURIComponent(id)}`, { method: "DELETE" });
-                    showToast({ message: t("menu.memberDeleted", { name }), type: "success" });
-                    await refreshMembers(modal, baseUrl);
+                    deleted = true;
                 } catch (e) {
                     // HolafFetch lève « réponse non-JSON » sur un 204/corps
                     // vide alors que la suppression a réussi : un 2xx est un
                     // succès, quel que soit le corps.
                     if (e && e.status && e.status >= 200 && e.status < 300) {
-                        showToast({ message: t("menu.memberDeleted", { name }), type: "success" });
-                        await refreshMembers(modal, baseUrl);
-                        return;
+                        deleted = true;
+                    } else {
+                        showToast({ message: t("menu.delError", { error: (e && e.message) || String(e) }), type: "error" });
                     }
-                    showToast({ message: t("menu.delError", { error: (e && e.message) || String(e) }), type: "error" });
+                }
+                if (!deleted) return;
+
+                showToast({ message: t("menu.memberDeleted", { name }), type: "success" });
+                try {
+                    await refreshMembers(modal, baseUrl);
+                } catch (e) {
+                    // Le membre EST supprimé : l'échec du rafraîchissement est
+                    // signalé à part (liste potentiellement périmée), jamais
+                    // comme une erreur de suppression.
+                    showToast({ message: t("menu.membersError", { error: (e && e.message) || String(e) }), type: "error" });
                 }
             });
         });
@@ -241,7 +269,8 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         try {
             await refreshMembers(modal, baseUrl);
         } catch (err) {
-            modal.body.innerHTML = `<p style="color:#f87171;font-size:12px;">${t("menu.membersError", { error: err.message })}</p>`;
+            // err.message (issu du transport/serveur) est échappé AVANT innerHTML.
+            modal.body.innerHTML = `<p style="color:#f87171;font-size:12px;">${t("menu.membersError", { error: escapeHtml(err.message) })}</p>`;
         }
     }
 
@@ -365,8 +394,8 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         try {
             return await remoteRequest(`${baseUrl}/${finalPath}`, opts);
         } catch (e) {
-            // Reproduit le message historique : "HTTP <status>" ou body.error.
-            let msg = `HTTP ${e.status}`;
+            // Reproduit le message historique : "HTTP <status>"/"échec réseau" ou body.error.
+            let msg = httpStatusLabel(e);
             if (e && e.body) {
                 try {
                     const j = typeof e.body === "string" ? JSON.parse(e.body) : e.body;
@@ -535,10 +564,12 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         async function reloadPresets() {
             const presets = await _aihFetchApi("presets");
             listSection.innerHTML = "";
-            const t = document.createElement("h3");
-            t.textContent = t("menu.myPresets");
-            Object.assign(t.style, { margin: "0 0 8px", fontSize: "11px", color: "#888", fontWeight: "600" });
-            listSection.appendChild(t);
+            // NB : ne PAS nommer cette variable `t` — elle masquerait le helper
+            // de traduction du module et ferait lever « t is not a function ».
+            const titleEl = document.createElement("h3");
+            titleEl.textContent = t("menu.myPresets");
+            Object.assign(titleEl.style, { margin: "0 0 8px", fontSize: "11px", color: "#888", fontWeight: "600" });
+            listSection.appendChild(titleEl);
             if (presets.length === 0) {
                 const empty = document.createElement("p");
                 empty.textContent = t("menu.noPresets");
@@ -555,7 +586,9 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
                 const left = document.createElement("div");
                 const scope = p.is_global ? t("menu.scopeGlobal") : (p.owner_name ? `(${p.owner_name})` : t("menu.scopePersonal"));
                 const clientBadge = p.is_client_side ? " <span style='color:#f59e0b;'>🖥️</span>" : "";
-                left.innerHTML = `<strong style='color:#fff;'>${p.name}</strong> <span style='color:#888;'>[${scope}]</span> ${clientBadge}<br><span style='color:#888;font-size:10px;'>${p.model} @ ${p.base_url}</span>`;
+                // p.name / owner_name (via scope) / model / base_url sont des valeurs
+                // d'origine serveur : échappées AVANT innerHTML (markup statique conservé).
+                left.innerHTML = `<strong style='color:#fff;'>${escapeHtml(p.name)}</strong> <span style='color:#888;'>[${escapeHtml(scope)}]</span> ${clientBadge}<br><span style='color:#888;font-size:10px;'>${escapeHtml(p.model)} @ ${escapeHtml(p.base_url)}</span>`;
                 const actions = document.createElement("div");
                 Object.assign(actions.style, { display: "flex", gap: "4px" });
                 const editBtn = mkBtn(t("menu.edit"), _aihStyle.btnSecondary, () => fillForm(p));
@@ -566,14 +599,15 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
                     try {
                         await _aihFetchApi("presets", { method: "POST", body });
                         reloadPresets();
-                    } catch (e) { await window.aihShowAlert(t("dialog.error"), t("menu.dupError", { error: e.message }), "error"); }
+                    } catch (e) { await window.aihShowAlert(t("dialog.error"), t("menu.dupError", { error: escapeHtml(e.message) }), "error"); }
                 });
                 const delBtn = mkBtn(t("menu.del"), "padding:6px 12px;border-radius:4px;border:none;background:#7f1d1d;color:white;cursor:pointer;font-size:12px;", async () => {
-                    var ok = await window.aihShowConfirm(t("dialog.delete"), t("menu.delConfirm", { name: p.name })); if (!ok) return;
+                    // AIH.confirm injecte son message en innerHTML : p.name échappé.
+                    var ok = await window.aihShowConfirm(t("dialog.delete"), t("menu.delConfirm", { name: escapeHtml(p.name) })); if (!ok) return;
                     try {
                         await _aihFetchApi(`presets/${p.id}`, { method: "DELETE" });
                         reloadPresets();
-                    } catch (e) { await window.aihShowAlert(t("dialog.error"), t("menu.delError", { error: e.message }), "error"); }
+                    } catch (e) { await window.aihShowAlert(t("dialog.error"), t("menu.delError", { error: escapeHtml(e.message) }), "error"); }
                 });
                 actions.append(editBtn, dupBtn, delBtn);
                 row.append(left, actions);
@@ -652,7 +686,7 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
                     try {
                         data = await HolafFetch.request(url.replace(/\/+$/, "") + "/models", { headers });
                     } catch (e) {
-                        throw new Error("HTTP " + e.status);
+                        throw new Error(httpStatusLabel(e));
                     }
                     const raw = (data && data.data) || (data && data.models) || [];
                     models = raw.map(m => typeof m === "string" ? { id: m } : { id: m.id || m.name || "" });
@@ -665,10 +699,12 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
                     models = resp;
                 }
                 // Proposer un select inline pour choisir
-                var choice = await window.aihShowPrompt(t("menu.chooseModel"), t("menu.chooseModelMsg", { list: models.map(m => "- " + m.id).join("\n") }), models[0]?.id || "");
+                // AIH.prompt injecte son message en innerHTML : chaque id de modèle
+                // (valeur d'origine serveur) est échappé avant d'être joint.
+                var choice = await window.aihShowPrompt(t("menu.chooseModel"), t("menu.chooseModelMsg", { list: models.map(m => "- " + escapeHtml(m.id)).join("\n") }), models[0]?.id || "");
                 if (choice) fModel.value = choice.trim();
             } catch (e) {
-                await window.aihShowAlert(t("dialog.error"), t("menu.listModelsError", { error: e.message }), "error");
+                await window.aihShowAlert(t("dialog.error"), t("menu.listModelsError", { error: escapeHtml(e.message) }), "error");
             }
         };
         modelRow.appendChild(listModelsBtn);
@@ -724,7 +760,7 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
                 resetForm();
                 reloadPresets();
             } catch (e) {
-                await window.aihShowAlert(t("dialog.error"), t("menu.saveError", { error: e.message }), "error");
+                await window.aihShowAlert(t("dialog.error"), t("menu.saveError", { error: escapeHtml(e.message) }), "error");
             }
         });
         btnRow.append(cancelBtn, saveBtn);
@@ -845,7 +881,8 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
                 // Erreur
                 const errSection = document.createElement("div");
                 errSection.style.cssText = "margin-top:14px; padding:12px; background:#2e1a1a; border:1px solid #5a2d2d; border-radius:6px; text-align:center;";
-                errSection.innerHTML = `<p style="color:#f87171; font-size:13px; margin:0 0 8px;">✗ ${data.message || t("menu.updateError")}</p>`;
+                // data.message est un message du serveur : échappé AVANT innerHTML.
+                errSection.innerHTML = `<p style="color:#f87171; font-size:13px; margin:0 0 8px;">✗ ${data.message ? escapeHtml(data.message) : t("menu.updateError")}</p>`;
                 const closeBtn = document.createElement("button");
                 closeBtn.textContent = t("menu.close");
                 Object.assign(closeBtn.style, { padding: "6px 14px", borderRadius: "6px", border: "1px solid #555", background: "transparent", color: "#ccc", cursor: "pointer", fontSize: "12px" });

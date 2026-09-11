@@ -2,9 +2,11 @@
 // VAGUE 14 — Repro jsdom : « la couleur (accent → highlight) choisie dans la
 // modale des réglages doit thématiser TOUTE l'UI, pas seulement la modale ».
 //
-// Usage : JSDOM_DIR=/chemin/vers/dossier/avec/jsdom node test_theme_highlight_global.mjs
-//         (jsdom est un banc de test : cherché dans JSDOM_DIR, ./node_modules,
-//          puis /tmp/repro-v14 — jamais requis au runtime du pack.)
+// Usage : node test_theme_highlight_global.mjs
+//         jsdom est résolu par le helper partagé js/test_helpers/jsdom_loader.mjs
+//         (JSDOM_DIR → ./node_modules → ../holaf-lib/node_modules →
+//          /projects/holaf-lib/node_modules) ; introuvable = SKIP bruyant (exit 2).
+//         jsdom n'est jamais requis au runtime du pack.
 //
 // Ce que le test verrouille (avec le CSS RÉEL js/css/holaf_themes.css + le
 // module RÉEL holaf_themes.js) :
@@ -25,32 +27,9 @@
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
+import { loadJsdomOrSkip } from "./test_helpers/jsdom_loader.mjs";
 
-const require = createRequire(import.meta.url);
-const HERE = fileURLToPath(new URL(".", import.meta.url));
-
-async function loadJsdom() {
-    const dirs = [
-        process.env.JSDOM_DIR,
-        HERE.replace(/\/$/, ""),
-        "/tmp/repro-v14",
-    ].filter(Boolean);
-    for (const dir of dirs) {
-        try {
-            const resolved = require.resolve("jsdom", { paths: [dir] });
-            const mod = await import(resolved);
-            return mod.JSDOM || mod.default?.JSDOM;
-        } catch { /* candidat suivant */ }
-    }
-    return null;
-}
-
-const JSDOM = await loadJsdom();
-if (!JSDOM) {
-    console.info("⚠️  jsdom indisponible (JSDOM_DIR=… ou npm i jsdom) → test ignoré");
-    process.exit(0);
-}
+const JSDOM = await loadJsdomOrSkip("test_theme_highlight_global");
 
 const PACK = fileURLToPath(new URL("..", import.meta.url));
 const css = readFileSync(`${PACK}/js/css/holaf_themes.css`, "utf8");

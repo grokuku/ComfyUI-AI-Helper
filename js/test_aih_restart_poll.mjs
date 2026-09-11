@@ -94,6 +94,34 @@ async function run() {
     assert.strictEqual(captured.init.redirect, "manual", "redirect: 'manual' (ne suit pas le 302 Authentik)");
     assert.strictEqual(captured.init.method, "GET", "GET léger");
 
+    // ——— 6. TIMEOUT RÉEL : un fetch qui pend est ABORTÉ (AbortSignal.timeout) —
+    // Sans signal, la branche source:"timeout" était morte et chaque poll
+    // (setInterval 2000 ms) empilait une requête pendante pendant un redémarrage.
+    let receivedSignal = null;
+    const abortErr = () => { const e = new Error("The operation was aborted"); e.name = "AbortError"; return e; };
+    const hangingFetch = (_url, init) => new Promise((_resolve, reject) => {
+        receivedSignal = (init && init.signal) || null;
+        if (!receivedSignal) return reject(new Error("aucun signal d'annulation reçu"));
+        if (receivedSignal.aborted) return reject(abortErr());
+        receivedSignal.addEventListener("abort", () => reject(abortErr()), { once: true });
+    });
+    const t0 = Date.now();
+    // Keep-alive : le timer d'AbortSignal.timeout est UNREF en Node, sans lui
+    // le process sortirait avant l'abort (le test ne verrait jamais le timeout).
+    const keepAlive = setTimeout(() => {}, 1000);
+    let timedOut, elapsed;
+    try {
+        timedOut = await holafComfyHealthCheck({ fetchImpl: hangingFetch, origin: ORIGIN, timeoutMs: 25 });
+        elapsed = Date.now() - t0;
+    } finally {
+        clearTimeout(keepAlive);
+    }
+    assert.ok(receivedSignal, "un signal d'annulation est bien transmis au fetch");
+    assert.strictEqual(timedOut.ready, false, "timeout → pas prêt");
+    assert.strictEqual(timedOut.source, "timeout", "fetch qui pend → source timeout (AbortError)");
+    assert.ok(receivedSignal.aborted, "le signal est bien aborté après le délai");
+    assert.ok(elapsed < 2000, "timeout réel et court (pas d'attente infinie), elapsed=" + elapsed + "ms");
+
     console.log("✅ Repro poll redémarrage : le bouton ne s'active QUE sur le 200 JSON ComfyUI");
 }
 

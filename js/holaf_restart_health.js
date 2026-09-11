@@ -26,6 +26,47 @@
 
 "use strict";
 
+// Timeout par défaut d'une sonde de santé (ms). STRICTEMENT INFÉRIEUR à
+// l'intervalle de poll (setInterval(..., 2000) dans holaf_main.js) : c'est la
+// condition pour ne PAS empiler des requêtes pendantes quand ComfyUI tombe /
+// redémarre. Avec 3000 ms (> 2000), chaque tick lançait une nouvelle sonde
+// avant l'annulation de la précédente. On garde une marge de 500 ms sous
+// l'intervalle.
+const DEFAULT_TIMEOUT_MS = 1500;
+
+/**
+ * Construit un signal d'annulation "timeout" de façon portable.
+ *
+ * - `AbortSignal.timeout(ms)` quand disponible (navigateurs modernes, Node ≥ 17.3).
+ * - Repli `AbortController` + `setTimeout` sinon : même contrat
+ *   (l'abort produit une AbortError), avec un `cancel()` pour nettoyer le timer.
+ * - Aucun des deux → signal `undefined` (la sonde reste fonctionnelle, sans
+ *   timeout) : jamais d'erreur à cause de la feature-détection.
+ *
+ * @param {number} ms
+ * @returns {{signal: AbortSignal|undefined, cancel: (() => void)|null}}
+ */
+function makeTimeoutSignal(ms) {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+        try {
+            return { signal: AbortSignal.timeout(ms), cancel: null };
+        } catch (e) {
+            /* ms invalide → on tente le repli ci-dessous */
+        }
+    }
+    if (typeof AbortController === "function") {
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+            try { controller.abort(); } catch (e) { /* silencieux */ }
+        }, ms);
+        return {
+            signal: controller.signal,
+            cancel: () => clearTimeout(timer),
+        };
+    }
+    return { signal: undefined, cancel: null };
+}
+
 /**
  * Interroge l'endpoint de stats ComfyUI et indique si le serveur ComfyUI est
  * réellement en ligne (200 + JSON au format /system_stats).
@@ -33,7 +74,14 @@
  * @param {object} [opts]
  * @param {Function} [opts.fetchImpl=fetch] Implémentation de fetch (testable).
  * @param {string}   [opts.origin=window.location.origin] Base d'origine.
- * @returns {Promise<{ready:boolean,status:number,source:string}>}
+ * @param {number}   [opts.timeoutMs=1500] Délai avant annulation de la sonde
+ *                   (défaut < intervalle de poll de 2000 ms pour ne pas empiler
+ *                   les requêtes pendantes).
+ * @returns {Promise<{ready:boolean,status:number,source:string,error?:Error}>}
+ *   `error` est un champ ADDITIF présent uniquement sur les branches d'échec
+ *   réseau/timeout : l'AbortError (source "timeout") ou l'erreur réseau
+ *   (source "network") y est propagée pour le diagnostic appelant. Il est
+ *   absent des retours normaux (http / not-json / json-parse / shape).
  */
 export async function holafComfyHealthCheck(opts = {}) {
     const fetchImpl = opts.fetchImpl || (typeof fetch === "function" ? fetch : null);
@@ -49,6 +97,9 @@ export async function holafComfyHealthCheck(opts = {}) {
         return { ready: false, status: 0, source: "bad-origin" };
     }
 
+    const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
+    const timeout = makeTimeoutSignal(timeoutMs);
+
     let status = 0;
     try {
         const res = await fetchImpl(url, {
@@ -57,6 +108,7 @@ export async function holafComfyHealthCheck(opts = {}) {
             redirect: "manual",
             cache: "no-store",
             headers: { Accept: "application/json" },
+            ...(timeout.signal ? { signal: timeout.signal } : {}),
         });
 
         status = res && typeof res.status === "number" ? res.status : 0;
@@ -99,5 +151,8 @@ export async function holafComfyHealthCheck(opts = {}) {
             source: e && e.name === "AbortError" ? "timeout" : "network",
             error: e,
         };
+    } finally {
+        // Nettoie le timer du repli pour ne rien laisser pendre.
+        if (timeout.cancel) timeout.cancel();
     }
 }

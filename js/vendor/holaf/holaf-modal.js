@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafModal · version 0.3.0
+ * Holaf UI — Brique HolafModal · version 0.4.0
  * ─────────────────────────────────────────────────────────────────────────────
  * Modale autonome (zéro dépendance runtime) : overlay, pile d'overlays
  * document-level, helpers Promise (alert / confirm / prompt / busy), focus
@@ -10,6 +10,13 @@
  * v0.2.1 — finition : opt-out `theme: ""` silencieux (≡ null), warning unique
  * par nom de thème inconnu, themes.register renvoie une copie protégée,
  * clés --hm-* racine d'un { preset, … } fusionnées dans les surcharges.
+ * v0.4.0 — MODALE À CONTENU LIBRE (additif) : nouvelle option `actions` sur
+ * open() pour une modale dont le `content` est un formulaire du projet hôte.
+ * Une action peut porter un attribut HTML `form` (id d'un <form> du contenu) :
+ * le bouton est alors rendu en type="submit" + form="…" → la soumission
+ * NATIVE du formulaire se déclenche au clic, la validation restant dans le
+ * hôte. Les API existantes (alert / confirm / prompt / busy, fenêtre, thèmes)
+ * sont strictement inchangées.
  * Fichier DUAL : module ES (export) + global window.HolafModal — se
  * charge via <script type="module"> ou `import { HolafModal }`.
  *
@@ -26,7 +33,7 @@
 const HolafModal = (function () {
     "use strict";
 
-    const VERSION = "0.3.0";
+    const VERSION = "0.4.0";
 
     // ─── État global du module (partagé par toutes les modales) ──────────────
     // Pile des modales ouvertes : la DERNIÈRE entrée est le « sommet », la
@@ -606,6 +613,60 @@ body.holaf-modal-open { overflow: hidden; }
                     // Guard global sauf pour les boutons qui s'en excluent
                     // (btn.guard:false — ex. Annuler d'un confirm).
                     if (btn.guard === false) close(result);
+                    else runGuardThenClose(result);
+                });
+                footer.appendChild(b);
+            });
+            el.appendChild(footer);
+        }
+
+        // ── `actions` (v0.4.0, MODALE À CONTENU LIBRE — additif) ────────────
+        // API d'une modale dont le contenu est un formulaire injecté par le
+        // projet hôte (content = Node DOM). Les actions sont des boutons du
+        // footer ; une action avec `form` (id d'un <form> du contenu) est
+        // rendue en type="submit" + attribut HTML `form="…"` : le clic
+        // déclenche la soumission NATIVE du formulaire (la validation, le
+        // PATCH… et la fermeture via ctrl.close restent l'affaire du hôte,
+        // qui écoute l'événement submit du form). Compat : les options
+        // `buttons` et toute l'API existante sont strictement inchangées ;
+        // retour = handle ctrl (cohérent avec open()).
+        const actions = Array.isArray(opts.actions) ? opts.actions : [];
+        if (actions.length > 0) {
+            if (!footer) {
+                footer = document.createElement("div");
+                footer.className = "holaf-modal-footer";
+                el.appendChild(footer);
+            }
+            actions.forEach((act) => {
+                const isSubmit = typeof act.form === "string" && act.form;
+                const b = document.createElement("button");
+                b.type = isSubmit ? "submit" : "button";
+                if (isSubmit) b.setAttribute("form", act.form);
+                b.className = "holaf-modal-btn holaf-modal-btn-" + (act.type || "primary");
+                if (typeof act.className === "string" && act.className.trim()) {
+                    b.classList.add(act.className.replace(/^\./, ""));
+                }
+                b.textContent = str(act.label, "OK");
+                if (act.autoFocus) b.setAttribute("data-holaf-autofocus", "1");
+                b.addEventListener("click", () => {
+                    // Bouton soumission lié à un formulaire : la soumission
+                    // native est gérée par le hôte — on ne gère ni la
+                    // fermeture ni le onClose ici.
+                    if (isSubmit) return;
+                    let result = act.value;
+                    if (typeof act.onClick === "function") {
+                        let r;
+                        try {
+                            r = act.onClick(ctrl);
+                        } catch (err) {
+                            console.error("[HolafModal] action.onClick :", err);
+                            return;
+                        }
+                        if (r === false) return; // l'action refuse la fermeture
+                        if (r !== undefined && r !== null) result = r;
+                    }
+                    if (act.close === false) return;
+                    if (act.guard === false) close(result);
                     else runGuardThenClose(result);
                 });
                 footer.appendChild(b);
