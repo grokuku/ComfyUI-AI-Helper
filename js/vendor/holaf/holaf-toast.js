@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafToast · version 0.4.0
+ * Holaf UI — Brique HolafToast · version 0.5.0
  * ─────────────────────────────────────────────────────────────────────────────
  * Notifications flottantes (toasts) autonomes, zéro dépendance runtime :
  * 4 types (info/success/warning/error) avec icône, empilement par position
@@ -7,6 +7,18 @@
  * avec barre de progression animée en temps réel, PAUSE au survol (timer ET
  * barre), bouton ✕, actions cliquables, aria-live (polite / assertive pour
  * error), mobile pleine largeur en bas, prefers-reduced-motion respecté.
+ *
+ * v0.5.0 — position CONFIGURABLE : configure({ position }) accepte les 6
+ * presets (top/right/center/left × top/bottom). En valeur inconnue (ou absente)
+ * on rebat SÛREMENT sur top-right (défaut historique). Empilement adapté à la
+ * position : pour les positions bottom-*, le toast le plus RÉCENT reste collé
+ * au bord bas (la pile grimpe vers le haut), quel que soit newestFirst (un
+ * prepend placerait le plus récent en HAUT, à l'opposé du bord). Animations
+ * d'entrée/sortie PAR POSITION (slide depuis le côté du bord auquel colle le
+ * conteneur, sortie en fondu du même côté) — keyframes homonymes conservés
+ * comme base (top-center), variantes ajoutées (right/left/up/down), toujours
+ * sans fill-mode d'entrée (le to{opacity:1} garantit l'état final).
+ * Rétrocompatible : sans configuration, comportement historique identique.
  *
  * v0.4.0 — fond teinté PAR TYPE (info/success/warning/error) avec fallback :
  * nouvelles variables de thème OPTIONNELLES --ht-bg-info, --ht-bg-success,
@@ -42,7 +54,7 @@
 const HolafToast = (function () {
     "use strict";
 
-    const VERSION = "0.4.0";
+    const VERSION = "0.5.0";
 
     // ─── Constantes du module ────────────────────────────────────────────────
     const CSS_ID = "holaf-toast-style";
@@ -329,10 +341,14 @@ const HolafToast = (function () {
             if (VALID_POSITIONS.indexOf(opts.position) >= 0) {
                 defaultPosition = opts.position;
             } else {
+                // v0.5.0 : position inconnue → repli SÛR sur top-right (défaut
+                // historique), au lieu de conserver un éventuel défaut précédent.
                 console.warn(
                     '[HolafToast] configure : position inconnue "' + opts.position +
-                    '" — positions disponibles : ' + VALID_POSITIONS.join(", ")
+                    '" — repli sur "top-right" ; positions disponibles : ' +
+                    VALID_POSITIONS.join(", ")
                 );
+                defaultPosition = "top-right";
             }
         }
         if (opts.duration !== undefined) {
@@ -397,6 +413,18 @@ const HolafToast = (function () {
     cursor: default;
     animation: holaf-toast-slide-in 0.25s ease-out;
 }
+/* v0.5.0 : animation d'entrée ADAPTÉE à la position — le slide part du côté
+ * du bord auquel colle le conteneur. La règle de base .holaf-toast garde
+ * holaf-toast-slide-in (glisse DEPUIS le haut, couvre top-center) ; les
+ * variantes ci-dessous ne surchargent que les autres positions (même nom de
+ * keyframe homonyme conservé comme base). PAS de fill-mode d'entrée : la cible
+ * to du keyframe (opacity:1 + transform) garantit l'état final (bug
+ * historique évité — sans fill-mode, un toast interrompu retombait opacity:0). */
+.holaf-toast-container--top-right .holaf-toast,
+.holaf-toast-container--bottom-right .holaf-toast { animation: holaf-toast-slide-in-right 0.25s ease-out; }
+.holaf-toast-container--top-left .holaf-toast,
+.holaf-toast-container--bottom-left .holaf-toast { animation: holaf-toast-slide-in-left 0.25s ease-out; }
+.holaf-toast-container--bottom-center .holaf-toast { animation: holaf-toast-slide-in-up 0.25s ease-out; }
 /* v0.4.0 : fond teinté PAR TYPE avec fallback rétro-compatible. La règle de
  * base ci-dessus pose background:var(--ht-bg) ; chaque type la raffine avec
  * SA var optionnelle : si --ht-bg-<type> n'est pas définie (thèmes existants,
@@ -412,6 +440,14 @@ const HolafToast = (function () {
 .holaf-toast--closing {
     animation: holaf-toast-fade-out 0.2s ease-in forwards;
 }
+/* v0.5.0 : sortie en fondu ADAPTÉE à la position — le toast part du même côté
+ * que son entrée. Base holaf-toast-fade-out (vers le haut, top-center) ;
+ * variantes pour les autres positions. forwards conservé (état final tenu). */
+.holaf-toast-container--top-right .holaf-toast--closing,
+.holaf-toast-container--bottom-right .holaf-toast--closing { animation: holaf-toast-fade-out-right 0.2s ease-in forwards; }
+.holaf-toast-container--top-left .holaf-toast--closing,
+.holaf-toast-container--bottom-left .holaf-toast--closing { animation: holaf-toast-fade-out-left 0.2s ease-in forwards; }
+.holaf-toast-container--bottom-center .holaf-toast--closing { animation: holaf-toast-fade-out-down 0.2s ease-in forwards; }
 
 .holaf-toast__icon {
     flex: none;
@@ -504,9 +540,35 @@ const HolafToast = (function () {
     from { opacity: 0; transform: translateY(-10px); }
     to   { opacity: 1; transform: translateY(0); }
 }
+/* v0.5.0 : variantes d'entrée par position (homonyme de base conservé). */
+@keyframes holaf-toast-slide-in-right {
+    from { opacity: 0; transform: translateX(24px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes holaf-toast-slide-in-left {
+    from { opacity: 0; transform: translateX(-24px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes holaf-toast-slide-in-up {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
 @keyframes holaf-toast-fade-out {
     from { opacity: 1; }
     to   { opacity: 0; transform: translateY(-6px); }
+}
+/* v0.5.0 : variantes de sortie par position (homonyme de base conservé). */
+@keyframes holaf-toast-fade-out-right {
+    from { opacity: 1; }
+    to   { opacity: 0; transform: translateX(24px); }
+}
+@keyframes holaf-toast-fade-out-left {
+    from { opacity: 1; }
+    to   { opacity: 0; transform: translateX(-24px); }
+}
+@keyframes holaf-toast-fade-out-down {
+    from { opacity: 1; }
+    to   { opacity: 0; transform: translateY(8px); }
 }
 @media (prefers-reduced-motion: reduce) {
     .holaf-toast, .holaf-toast--closing { animation: none; }
@@ -575,6 +637,13 @@ const HolafToast = (function () {
             c.el.parentNode.removeChild(c.el);
             delete containers[pos];
         }
+    }
+
+    // v0.5.0 : une position « bas de l'écran » (bottom-*) a son bord de
+    // référence EN BAS. L'insertion (et donc l'empilement) en dépend : le toast
+    // le plus récent doit rester collé au bord bas, la pile grimpe vers le haut.
+    function isBottomPosition(pos) {
+        return pos.indexOf("bottom") === 0;
     }
 
     // ─── Cœur : show() ───────────────────────────────────────────────────────
@@ -816,7 +885,14 @@ const HolafToast = (function () {
         toast.closeWithReason = close; // interne : fermeture « replaced »
         container.toasts.push(toast);
         // v0.3.0 : newestFirst → prepend (en premier) au lieu d'append (défaut).
-        if (newestFirst) container.el.insertBefore(el, container.el.firstChild);
+        // v0.5.0 : pour les positions bottom-*, le plus récent doit rester COLLÉ
+        // au bord bas (la pile grimpe vers le haut). Le DOM est en flex column :
+        // le DERNIER enfant est collé au bord bas. On force donc TOUJOURS
+        // l'append pour les bottom-*, même avec newestFirst (un prepend poserait
+        // le plus récent EN HAUT, à l'opposé du bord de référence). newestFirst
+        // ne vaut donc que pour les positions top-* (comportement historique).
+        const prependNewest = newestFirst && !isBottomPosition(position);
+        if (prependNewest) container.el.insertBefore(el, container.el.firstChild);
         else container.el.appendChild(el);
         while (container.toasts.length > MAX_VISIBLE) {
             const oldest = container.toasts.shift();

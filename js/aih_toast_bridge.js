@@ -16,6 +16,14 @@
 
 import { HolafToast } from "./vendor/holaf/holaf-toast.js";
 
+// ─── Position par défaut (v0.5.0) ──────────────────────────────────────────
+// Les toasts de l'extension s'affichent EN BAS de l'écran et CENTRÉS
+// horizontalement (bottom-center) : pile qui monte depuis le bord bas, slide
+// d'entrée vers le haut, fondu de sortie vers le bas. Position globale au
+// niveau du conteneur ; tout appel show() sans position hérite de ce défaut.
+// À positionner AVANT le premier show (configure est volatil, en mémoire).
+HolafToast.configure({ position: "bottom-center" });
+
 const THEME_NAME = "aih";
 
 // Lit une variable CSS depuis le style calculé du <body> (hérite de :root).

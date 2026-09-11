@@ -282,6 +282,22 @@
     border-color: var(--aih-border-strong);
 }
 
+/* État désactivé (ex. bouton « Actualiser » de la modale de redémarrage,
+   actif UNIQUEMENT une fois le retour de ComfyUI détecté de façon fiable). */
+.aih-dialog-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    filter: grayscale(0.35);
+    background: var(--aih-btn-bg);
+    border-color: var(--aih-btn-border);
+    color: var(--aih-text-secondary);
+}
+.aih-dialog-btn:disabled:hover {
+    background: var(--aih-btn-bg);
+    border-color: var(--aih-btn-border);
+    color: var(--aih-text-secondary);
+}
+
 /* ─── Overlay (mode modal) ────────────────────────────────────────────────── */
 .aih-dialog-overlay {
     position: fixed;

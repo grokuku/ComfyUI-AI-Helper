@@ -9,6 +9,7 @@ import { showToast, updateToast, hideToast } from "./aih_toast_bridge.js";
 import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { applyPersistedTheme } from "./holaf_themes.js";
+import { holafComfyHealthCheck } from "./holaf_restart_health.js";
 
 import "./holaf_themes.js";
 import "./aih_dialog.js";
@@ -638,7 +639,8 @@ const HolafUtilitiesMenu = {
 
             // POST migré vers HolafFetch (la route répond immédiatement — le
             // redémarrage est planifié dans un thread) : timeout défaut conservé.
-            // Le suivi HEAD toutes les 2 s reste en fetch natif (health-check).
+            // Suivi /system_stats toutes les 2 s (GET léger, credentials:'include',
+            // redirect:'manual') via holaf_restart_health.js.
             HolafFetch.post("/holaf/utilities/restart")
                 .then(data => {
                     if (data.status !== "ok") throw new Error(data.message || 'Unknown server error');
@@ -656,38 +658,31 @@ const HolafUtilitiesMenu = {
                     }, 1000);
 
                     let serverIsDown = false;
-                    const checkServerStatus = () => {
-                        fetch(window.location.origin, { method: 'HEAD', cache: 'no-cache' })
-                            .then(response => {
-                                if (response.ok) {
-                                    if (serverIsDown) {
-                                        clearInterval(window.holaf.restartMonitorInterval);
-                                        clearInterval(window.holaf.restartTimerInterval);
-                                        delete window.holaf.restartMonitorInterval;
-                                        delete window.holaf.restartTimerInterval;
+                    // Check robuste : interroge /system_stats (VRAI endpoint ComfyUI)
+                    // avec credentials:'include' + redirect:'manual'. Un 302 Authentik
+                    // (réponse opaque) ou un 502 Caddy ne sont PAS considérés comme
+                    // « serveur revenu » : seul un 200 + JSON /system_stats de ComfyUI
+                    // active le bouton « Actualiser ». (holaf_restart_health.js)
+                    const checkServerStatus = async () => {
+                        const { ready } = await holafComfyHealthCheck();
+                        if (ready) {
+                            clearInterval(window.holaf.restartMonitorInterval);
+                            clearInterval(window.holaf.restartTimerInterval);
+                            delete window.holaf.restartMonitorInterval;
+                            delete window.holaf.restartTimerInterval;
 
-                                        if (!messageEl || !refreshBtn) return;
+                            if (!messageEl || !refreshBtn) return;
 
-                                        messageEl.textContent = t("main.serverRebooted", { seconds });
-                                        if (timerLineEl) timerLineEl.style.visibility = "hidden";
-                                        refreshBtn.textContent = t("main.refreshPage");
-                                        refreshBtn.disabled = false;
-                                        refreshBtn.onclick = () => location.reload();
-                                        refreshBtn.focus();
-                                    }
-                                } else {
-                                    if (!serverIsDown) {
-                                        if (messageEl) messageEl.textContent = t("main.serverOffline");
-                                        serverIsDown = true;
-                                    }
-                                }
-                            })
-                            .catch(() => {
-                                if (!serverIsDown) {
-                                    if (messageEl) messageEl.textContent = t("main.serverOffline");
-                                    serverIsDown = true;
-                                }
-                            });
+                            messageEl.textContent = t("main.serverRebooted", { seconds });
+                            if (timerLineEl) timerLineEl.style.visibility = "hidden";
+                            refreshBtn.textContent = t("main.refreshPage");
+                            refreshBtn.disabled = false;
+                            refreshBtn.onclick = () => location.reload();
+                            refreshBtn.focus();
+                        } else if (!serverIsDown) {
+                            if (messageEl) messageEl.textContent = t("main.serverOffline");
+                            serverIsDown = true;
+                        }
                     };
 
                     window.holaf.restartMonitorInterval = setInterval(checkServerStatus, 2000);

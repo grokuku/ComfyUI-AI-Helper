@@ -154,6 +154,7 @@ import {
 .aih-dialog-btn-danger:hover { background: var(--aih-danger-hover); border-color: var(--aih-danger-hover); }
 .aih-dialog-btn-cancel { background: var(--aih-btn-bg); border-color: var(--aih-btn-border); color: var(--aih-text); }
 .aih-dialog-btn-cancel:hover { background: var(--aih-btn-bg-hover); border-color: var(--aih-border-strong); }
+.aih-dialog-btn:disabled { opacity: 0.45; cursor: not-allowed; filter: grayscale(0.35); background: var(--aih-btn-bg); border-color: var(--aih-btn-border); color: var(--aih-text-secondary); }
 .aih-dialog-input { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--aih-border); background: var(--aih-bg-input); color: var(--aih-text); font-size: var(--aih-font-size); outline: none; box-sizing: border-box; margin-top: 8px; }
 .aih-dialog-input:focus { border-color: var(--aih-input-focus); }
 .aih-dialog-message { color: var(--aih-text-secondary); font-size: var(--aih-font-size); line-height: 1.5; }
