@@ -418,9 +418,13 @@ const HolafUtilitiesMenu = {
                     }
                 }
 
-                // Le toggle Blobby et le Chat ne ferment pas le menu
-                // (comportement de la source aih_menu.js).
-                if (!checkbox && itemInfo.special !== 'aih_chat') {
+                // Les entrées à case à cocher (toggles) restent ouvertes pour
+                // laisser cliquer plusieurs fois ; le toggle Blobby est traité
+                // plus haut (buildAihBlobbyToggleItem, pas de fermeture). Toute
+                // autre entrée — y compris « 💬 Chat » — ferme le menu une fois
+                // l'action lancée (sinon le menu, resté ouvert, recouvre la
+                // fenêtre du chat qu'on vient d'ouvrir).
+                if (!checkbox) {
                     this.hideDropdown();
                 }
             };

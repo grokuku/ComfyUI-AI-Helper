@@ -1265,7 +1265,7 @@ const Blobby = {
             return;
         }
         // Fallback : si la modale AIH n'existe pas, on crée la notre via v2
-        var existing = document.querySelector('.aih-modal.blobby-chat-settings');
+        var existing = document.querySelector('.blobby-chat-settings');
         if (existing) { existing.style.display = 'flex'; return; }
 
         var _self = this;
@@ -1640,8 +1640,13 @@ const Blobby = {
     },
 
     _openChatModal() {
-        // Si deja ouverte, la ramener au premier plan
-        var existing = document.querySelector('.aih-modal.blobby-chat-modal');
+        // Si deja ouverte, la ramener au premier plan. Selecteur sur la classe
+        // RÉELLE de la modale v2 (AIH.Dialog pose `blobby-chat-modal` sur son
+        // élément racine `.aih-dialog-root`) — l'ancien `.aih-modal` (modale v1)
+        // ne matchait plus en production : chaque openChat empilait une NOUVELLE
+        // modale + un 2ᵉ #blobby-chat-msgs, et le 🗑 (qui cible le 1er id)
+        // effaçait la mauvaise fenêtre.
+        var existing = document.querySelector('.blobby-chat-modal');
         if (existing) {
             existing.querySelector('.blobby-chat-input')?.focus();
             return;
@@ -1959,11 +1964,13 @@ const Blobby = {
         clearBtn.onmouseleave = () => clearBtn.style.color = '#888';
         clearBtn.onclick = function(e) {
             e.stopPropagation();
-            var msgs = document.getElementById('blobby-chat-msgs');
-            if (msgs) { msgs.innerHTML = ''; }
+            // Cible la zone de messages de CETTE modale (fermeture sur `messages`),
+            // jamais un getElementById global : avec une éventuelle modale
+            // résiduelle, le 1er id du document serait le mauvais.
+            if (messages) { messages.innerHTML = ''; }
             _blobbySaveChatHistory([]);
             if (typeof Blobby !== 'undefined' && Blobby._addChatMessage) {
-                Blobby._addChatMessage(msgs, 'blobby', t("bl.welcome"));
+                Blobby._addChatMessage(messages, 'blobby', t("bl.welcome"));
             }
         };
         _appendHeaderBtn(clearBtn);
@@ -2390,12 +2397,15 @@ const Blobby = {
     // ─── Étape 2 : boucle tool_calls (mode Actif) ──────────────────────────
     // Contrat backend (étape 1) : POST accepte `messages` (liste complète,
     // remplace la construction system+user), `tools` et `tool_choice` ; la
-    // réponse contient `tool_calls` [{id, name, arguments}] (arguments =
+    // réponse contient `tool_calls` en forme PROVIDER VERBATIM
+    // `[{id, type:'function', function:{name, arguments}}]` (arguments =
     // STRING à JSON.parse) et `output` (peut être null sur un tour d'outil
     // pur). Chaque tool_call est dispatché (enforcement + snapshot/undo dans
     // blobby_tools.js), loggé comme ligne d'action (bouton « Annuler » si
     // mutation), puis les résultats repartent en messages role:'tool'
-    // (tool_call_id) pour le tour suivant, jusqu'à une réponse texte.
+    // (tool_call_id) pour le tour suivant, jusqu'à une réponse texte. L'écho
+    // du message assistant conserve la forme provider (`type` + `function`) :
+    // c'est ce que DeepSeek/OpenAI exigent au tour suivant.
     async _runToolModeChat(container, p) {
         var self = this;
         var app = window.app || window.comfyAPI?.app?.app;
@@ -2437,7 +2447,7 @@ const Blobby = {
                 });
             },
             onToolCall: function(res, tc) {
-                var labelTxt = (res && res.action) ? res.action : String(tc.name);
+                var labelTxt = (res && res.action) ? res.action : String(BlobbyTools.toolCallName(tc));
                 var undoId = (res && res.ok && res.snapshotId) ? res.snapshotId : null;
                 self._addChatMessage(container, 'action', labelTxt, { undoId: undoId });
             }
@@ -2851,7 +2861,7 @@ window.BlobbyCompanion = {
         Blobby._openChatModal();
     },
     chatVisible: () => {
-        var m = document.querySelector('.aih-modal.blobby-chat-modal');
+        var m = document.querySelector('.blobby-chat-modal');
         return m && m.style.display !== 'none';
     }
 };

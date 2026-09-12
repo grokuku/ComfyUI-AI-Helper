@@ -34,7 +34,7 @@ import {
     normalizeMode, getToolsForMode, listTools, dispatchToolCall,
     pushUndoSnapshot, undoSnapshot, undoLast, canUndo, canUndoId, clearUndo, UNDO_LIMIT,
     extractToolCalls, parseToolArguments, renderToolContent, runToolLoop,
-    detectToolsUnsupported,
+    detectToolsUnsupported, toolCallName, toolCallArguments, normalizeToolCallForEcho,
 } from "./blobby_tools.js";
 
 let n = 0;
@@ -365,11 +365,10 @@ console.log("4. Boucle tool_calls (stubs send/dispatch)");
 
 {
     const posts = [];
+    const providerTc1 = { id: "c1", type: "function", function: { name: "set_widget_value", arguments: '{"id":1,"widget":"steps","value":30}' } };
+    const providerTc2 = { id: "c2", type: "function", function: { name: "get_node_widget", arguments: '{"id":1,"widget":"steps"}' } };
     const responses = [
-        { tool_calls: [
-            { id: "c1", name: "set_widget_value", arguments: '{"id":1,"widget":"steps","value":30}' },
-            { id: "c2", name: "get_node_widget", arguments: '{"id":1,"widget":"steps"}' },
-        ] },
+        { tool_calls: [providerTc1, providerTc2] },
         { output: "C'est réglé !" },
     ];
     const dispatched = [];
@@ -390,7 +389,11 @@ console.log("4. Boucle tool_calls (stubs send/dispatch)");
     assert.strictEqual(convo2.length, 4, "user + assistant + 2 tool");
     assert.strictEqual(convo2[1].role, "assistant");
     assert.strictEqual(convo2[1].tool_calls.length, 2, "tool_calls du backend renvoyés tels quels");
-    assert.deepStrictEqual(convo2[1].tool_calls[0], { id: "c1", name: "set_widget_value", arguments: '{"id":1,"widget":"steps","value":30}' });
+    // ECHO conforme à l'API provider : `type:'function'` + wrapper `function`.
+    assert.deepStrictEqual(convo2[1].tool_calls[0], providerTc1);
+    assert.strictEqual(convo2[1].tool_calls[0].type, "function", "type:'function' présent à l'echo (exigence DeepSeek)");
+    assert.strictEqual(convo2[1].tool_calls[0].function.name, "set_widget_value", "wrapper function.name présent à l'echo");
+    assert.deepStrictEqual(convo2[1].tool_calls[1], providerTc2);
     assert.strictEqual(convo2[2].role, "tool");
     assert.strictEqual(convo2[2].tool_call_id, "c1");
     assert.ok(convo2[2].content.includes("set_widget_value"), "contenu du résultat sérialisé");
@@ -408,7 +411,7 @@ console.log("4. Boucle tool_calls (stubs send/dispatch)");
         send: async (convo) => {
             posts.push(convo.length);
             return posts.length === 1
-                ? { tool_calls: [{ id: "c9", name: "set_widget_value", arguments: "{bad json" }] }
+                ? { tool_calls: [{ id: "c9", type: "function", function: { name: "set_widget_value", arguments: "{bad json" } }] }
                 : { output: "ok" };
         },
         dispatch: async (name, args) => { dispatched.push(name); return { ok: true, data: {} }; },
@@ -425,7 +428,7 @@ console.log("4. Boucle tool_calls (stubs send/dispatch)");
     const result = await runToolLoop({
         messages: [{ role: "user", content: "x" }],
         maxTurns: 5,
-        send: async () => ({ tool_calls: [{ id: "c", name: "get_queue_status", arguments: "" }] }),
+        send: async () => ({ tool_calls: [{ id: "c", type: "function", function: { name: "get_queue_status", arguments: "" } }] }),
         dispatch: async () => { calls++; return { ok: true, data: {} }; },
     });
     assert.strictEqual(result.ok, false);
@@ -465,6 +468,19 @@ console.log("4. Boucle tool_calls (stubs send/dispatch)");
 {
     assert.deepStrictEqual(extractToolCalls({ tool_calls: [] }), [], "tool_calls vide → []");
     assert.deepStrictEqual(extractToolCalls({}), [], "pas de tool_calls → []");
+    // Forme provider (contrat étape 1) : lecture via .function.name.
+    const provTc = { id: "c1", type: "function", function: { name: "get_queue_status", arguments: "" } };
+    assert.deepStrictEqual(extractToolCalls({ tool_calls: [provTc] }), [provTc], "forme provider extraite");
+    assert.strictEqual(toolCallName(provTc), "get_queue_status");
+    assert.strictEqual(toolCallArguments(provTc), "");
+    // Tolérance lecture : ancienne forme normalisée encore lisible…
+    assert.strictEqual(toolCallName({ id: "c", name: "f", arguments: "{}" }), "f");
+    assert.strictEqual(toolCallArguments({ id: "c", name: "f", arguments: "{}" }), "{}");
+    // …mais l'ECHO repasse en forme provider (défense en profondeur).
+    assert.deepStrictEqual(normalizeToolCallForEcho({ id: "c", name: "f", arguments: "{}" }),
+        { id: "c", type: "function", function: { name: "f", arguments: "{}" } });
+    // Echo verbatim pour la forme provider (même référence).
+    assert.strictEqual(normalizeToolCallForEcho(provTc), provTc, "forme provider échoée verbatim");
     const p = parseToolArguments('{"a":1}');
     assert.deepStrictEqual(p, { ok: true, value: { a: 1 } });
     assert.strictEqual(parseToolArguments("").ok, true, "arguments vides → {}");
@@ -708,8 +724,8 @@ ok(`(g) parité FR/EN OK : ${frKeys.length} clés bl.*, 0 manquante, 0 vide`);
 resetChat();
 llmQueue.push(
     { tool_calls: [
-        { id: "c1", name: "set_widget_value", arguments: '{"id":1,"widget":"steps","value":30}' },
-        { id: "c2", name: "set_node_title", arguments: '{"id":1,"title":"Mon <b>Loader</b>"}' },
+        { id: "c1", type: "function", function: { name: "set_widget_value", arguments: '{"id":1,"widget":"steps","value":30}' } },
+        { id: "c2", type: "function", function: { name: "set_node_title", arguments: '{"id":1,"title":"Mon <b>Loader</b>"}' } },
     ] },
     { output: "Voilà, c'est réglé !" },
 );
@@ -731,6 +747,10 @@ const convo2 = llmPostsD[1].body.messages;
 assert.strictEqual(convo2.length, 4, "user + assistant + 2 role:'tool'");
 assert.strictEqual(convo2[1].role, "assistant");
 assert.strictEqual(convo2[1].tool_calls.length, 2, "tool_calls renvoyés au backend");
+// ECHO conforme API provider : `type` + wrapper `function` (sinon DeepSeek 400).
+assert.strictEqual(convo2[1].tool_calls[0].type, "function", "type:'function' à l'echo");
+assert.deepStrictEqual(convo2[1].tool_calls[0],
+    { id: "c1", type: "function", function: { name: "set_widget_value", arguments: '{"id":1,"widget":"steps","value":30}' } });
 assert.strictEqual(convo2[2].role, "tool");
 assert.strictEqual(convo2[2].tool_call_id, "c1");
 assert.ok(convo2[2].content.includes("steps"), "résultat outil sérialisé dans le message tool");

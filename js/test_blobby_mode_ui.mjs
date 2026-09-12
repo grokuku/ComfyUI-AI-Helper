@@ -107,7 +107,7 @@ let modalSeq = 0;
 function mockOpenModal(opts) {
     modalSeq++;
     const modal = document.createElement("div");
-    modal.className = "aih-modal " + (opts.className || "");
+    modal.className = "aih-dialog-root " + (opts.className || "");
     const header = document.createElement("div");
     header.className = "aih-dialog-header";
     const title = document.createElement("span");
@@ -162,7 +162,7 @@ Blobby._initMode();
 assert.strictEqual(Blobby.getMode(), "read", "état initial : read");
 Blobby._openChatModal();
 
-const modal = document.querySelector(".aih-modal.blobby-chat-modal");
+const modal = document.querySelector(".blobby-chat-modal");
 assert.ok(modal, "modale ouverte (mock v2)");
 const header = modal.querySelector(".aih-dialog-header");
 const bar = document.getElementById("blobby-chat-modebar");
@@ -241,7 +241,7 @@ ok("(b) valeur inconnue : rejetée par setMode, <select> resynchronisé (aucune 
 console.log("(c) Persistance round-trip : setMode → save → fermeture/réouverture");
 
 modal.remove(); // fermeture
-assert.ok(!document.querySelector(".aih-modal.blobby-chat-modal"), "modale fermée");
+assert.ok(!document.querySelector(".blobby-chat-modal"), "modale fermée");
 Blobby._openChatModal();
 const bar2 = document.getElementById("blobby-chat-modebar");
 const sel2 = bar2.querySelector("#blobby-chat-mode-select");
@@ -255,14 +255,14 @@ assert.strictEqual(Blobby._initMode(), "active", "_initMode lit la valeur persis
 assert.strictEqual(Blobby.getMode(), "active", "mode restauré depuis la persistance");
 
 // Retour à read via le <select> puis re-test.
-document.querySelector(".aih-modal.blobby-chat-modal").remove();
+document.querySelector(".blobby-chat-modal").remove();
 sel2.value = "read"; // ancien noeud détaché → on rouvre
 Blobby._openChatModal();
 const sel3 = document.getElementById("blobby-chat-modebar").querySelector("#blobby-chat-mode-select");
 sel3.value = "read";
 sel3.dispatchEvent(new domWindow.Event("change", { bubbles: true }));
 assert.strictEqual(Blobby.getMode(), "read", "retour read via le <select>");
-document.querySelector(".aih-modal.blobby-chat-modal").remove();
+document.querySelector(".blobby-chat-modal").remove();
 Blobby._openChatModal();
 const sel4 = document.getElementById("blobby-chat-modebar").querySelector("#blobby-chat-mode-select");
 assert.strictEqual(sel4.value, "read", "réouverture : read restauré");
@@ -357,6 +357,39 @@ for (const k of MODE_KEYS) {
     assert.ok(refs >= 1, `${k} : référencée dans blobby_companion.js (aucune clé morte)`);
 }
 ok("(g) 7 clés mode : 2 définitions FR/EN chacune (0 doublon), toutes référencées (0 clé morte)");
+
+/* ══════════════════ (h) BUG 2 : garde anti-doublon + bouton 🗑 ══════════ */
+console.log("(h) BUG 2 : une seule modale chat + le 🗑 efface la conversation");
+
+// État propre : retirer toute modale résiduelle.
+domWindow.document.querySelectorAll(".blobby-chat-modal").forEach((m) => m.remove());
+
+// La modale v2 réelle porte `aih-dialog-root` (pas `.aih-modal`) + className :
+// l'ancien garde `.aih-modal.blobby-chat-modal` ne matchait jamais en prod.
+Blobby._openChatModal();
+const m1 = domWindow.document.querySelector(".blobby-chat-modal");
+assert.ok(m1, "modale chat ouverte");
+assert.strictEqual(m1.classList.contains("aih-modal"), false, "modale v2 : PAS de classe .aih-modal (ancien garde cassé en prod)");
+// Deuxième ouverture SANS fermer : le garde doit retrouver la modale existante.
+Blobby._openChatModal();
+assert.strictEqual(domWindow.document.querySelectorAll(".blobby-chat-modal").length, 1, "garde anti-doublon : UNE seule modale après 2 openChat");
+assert.strictEqual(domWindow.document.querySelectorAll("#blobby-chat-msgs").length, 1, "UN seul #blobby-chat-msgs (pas d'id dupliqué)");
+
+// Le bouton poubelle cible SA modale et efface bien l'historique.
+const chatH = m1.querySelector("#blobby-chat-msgs");
+Blobby._addChatMessage(chatH, "user", "message à effacer");
+Blobby._addChatMessage(chatH, "blobby", "réponse à effacer");
+assert.ok([...chatH.querySelectorAll(".blobby-msg")].some((e) => e.textContent.includes("message à effacer")), "message présent avant l'effacement");
+const trash = [...m1.querySelectorAll(".aih-dialog-header-right button")].find((b) => b.textContent === "🗑");
+assert.ok(trash, "bouton 🗑 présent dans le header de la modale");
+trash.dispatchEvent(new domWindow.MouseEvent("click", { bubbles: true }));
+const roles = [...chatH.querySelectorAll(".blobby-msg")].map((e) => e.dataset.role);
+assert.strictEqual(roles.filter((r) => r === "user").length, 0, "conversation effacée (plus de message user)");
+assert.ok(!chatH.textContent.includes("message à effacer"), "ancien message retiré du DOM");
+const hist = (JSON.parse(domWindow.localStorage.getItem("AIH_config")).blobbyData || {}).chatHistory || [];
+assert.ok(!hist.some((h) => String(h.text || "").includes("message à effacer")), "historique PERSISTÉ : ancien message absent");
+assert.ok(chatH.textContent.includes("Salut"), "message de bienvenue réaffiché après l'effacement");
+ok("(h) BUG 2 : garde anti-doublon OK (1 modale) + 🗑 efface DOM et historique persisté");
 
 console.log(`\n✅ Étape 3 — mode UI + conscience du prompt : TOUS LES TESTS PASSENT (${n} groupes d'assertions)`);
 process.exit(0);

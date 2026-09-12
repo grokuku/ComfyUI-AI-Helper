@@ -15,11 +15,14 @@
  *     précédée d'un snapshot COMPLET du workflow (app.graph.serialize()),
  *     empilé (borné à 10) pour alimenté le bouton « Annuler » du log d'action.
  *
- * Contrat backend (étape 1, livré) : POST /api/keywords/llm-process accepte
+ * Contrat backend (étape 1) : POST /api/keywords/llm-process accepte
  * `tools`, `tool_choice` et `messages` (liste complète, remplace la
- * construction system+user) ; la réponse contient `tool_calls`
- * [{id, name, arguments}] (arguments = STRING à JSON.parse) et `output`
- * (peut être null sur un tour d'outil pur).
+ * construction system+user) ; la réponse contient `tool_calls` en forme
+ * PROVIDER VERBATIM `[{id, type:'function', function:{name, arguments}}]`
+ * (arguments = STRING à JSON.parse) et `output` (peut être null sur un tour
+ * d'outil pur). Le pack lit `.function.name` / `.function.arguments` et
+ * re-écho ce tour assistant dans `messages` — la forme est ainsi acceptée par
+ * DeepSeek/OpenAI (qui exigent `type` + le wrapper `function`).
  *
  * PURETÉ : aucun import, aucun accès DOM à l'import. `app` / `api` arrivent
  * via ctx (ou sont résolus défensivement depuis window À L'APPEL). Les textes
@@ -1047,10 +1050,62 @@ registerTool({
 
 // ─── Boucle d'agents PURE (tool_calls) ───────────────────────────────────────
 
-/** Extrait les tool_calls d'une réponse backend (contrat étape 1). */
+/**
+ * Nom d'un tool_call. Contrat backend (étape 1) : forme provider VERBATIM
+ * `{id, type, function:{name, arguments}}` — on lit donc `.function.name`.
+ * Tolérance : l'ancienne forme normalisée `{id, name, arguments}` reste lisible
+ * (rétrocompat lecture), mais l'ECHO, lui, repasse en forme provider.
+ */
+function toolCallName(tc) {
+    if (!tc || typeof tc !== "object") return "";
+    if (tc.function && typeof tc.function === "object" && typeof tc.function.name === "string") {
+        return tc.function.name;
+    }
+    return typeof tc.name === "string" ? tc.name : "";
+}
+
+/** Arguments bruts d'un tool_call (STRING à JSON.parse) — `.function.arguments`. */
+function toolCallArguments(tc) {
+    if (!tc || typeof tc !== "object") return "";
+    if (tc.function && typeof tc.function === "object") return tc.function.arguments;
+    return tc.arguments;
+}
+
+/**
+ * Garantit la forme provider `{id, type:'function', function:{name, arguments}}`
+ * pour l'ECHO du message assistant renvoyé au provider au tour suivant.
+ *
+ * - forme provider (`.function`) : renvoyée TELLE QUELLE (même référence) —
+ *   l'écho est verbatim, donc TOUJOURS conforme au fournisseur ; `type` est
+ *   complété à 'function' seulement s'il manque ;
+ * - ancienne forme normalisée `{id, name, arguments}` : reconstruite en forme
+ *   provider (défense en profondeur si un backend plus ancien est déployé) ;
+ * - entrée inexploitable (ni `.function` ni `.name`) : `null` (ignorée).
+ */
+function normalizeToolCallForEcho(tc) {
+    if (!tc || typeof tc !== "object") return null;
+    if (tc.function && typeof tc.function === "object") {
+        if (tc.type === "function") return tc; // verbatim (même référence)
+        return Object.assign({}, tc, { type: "function" });
+    }
+    const name = typeof tc.name === "string" ? tc.name : "";
+    if (!name) return null;
+    let args = tc.arguments;
+    if (args === undefined || args === null) args = "";
+    else if (typeof args !== "string") {
+        try { args = JSON.stringify(args); } catch { args = ""; }
+    }
+    return {
+        id: tc.id !== undefined && tc.id !== null ? tc.id : "",
+        type: "function",
+        function: { name: name, arguments: args },
+    };
+}
+
+/** Extrait les tool_calls d'une réponse backend (contrat étape 1, forme provider). */
 function extractToolCalls(resp) {
     if (!resp || !Array.isArray(resp.tool_calls)) return [];
-    return resp.tool_calls.filter((tc) => tc && typeof tc.name === "string" && tc.name.length > 0);
+    return resp.tool_calls.filter((tc) => tc && typeof tc === "object" && toolCallName(tc).length > 0);
 }
 
 /** arguments = STRING à JSON.parse (contrat backend) ; objet déjà parsé accepté. */
@@ -1093,10 +1148,12 @@ function renderToolContent(result) {
  *   onToolCall(result, tc, index) → hook UI (ligne d'action + bouton Annuler).
  *
  * À chaque réponse : si resp.tool_calls est non vide → dispatch séquentiel,
- * echo assistant (tool_calls renvoyés tels quels au backend, qui remappe vers
- * son fournisseur) + messages role:'tool' (tool_call_id + contenu) → tour
- * suivant. Sinon → réponse finale (resp.output). Garde anti-boucle :
- * maxTurns (le chemin texte historique plafonne déjà à 100 tours).
+ * echo assistant dans la forme provider `{id, type:'function', function:{...}}`
+ * (le backend relaie ces tool_calls VERBATIM depuis le provider, donc l'echo
+ * reste conforme — DeepSeek exige `type` + wrapper `function`) + messages
+ * role:'tool' (tool_call_id + contenu) → tour suivant. Sinon → réponse finale
+ * (resp.output). Garde anti-boucle : maxTurns (le chemin texte historique
+ * plafonne déjà à 100 tours).
  *
  * Retour : { ok, finalReply, turns } | { ok:false, sendError?, turns, phase }
  *          | { ok:false, unexpected:true, resp, turns } | { ok:false, exhausted:true, turns, lastOutput }.
@@ -1132,21 +1189,27 @@ async function runToolLoop(opts) {
             return { ok: true, finalReply: out, turns: turns, resp: resp };
         }
         lastOutput = resp && resp.output !== undefined && resp.output !== null ? String(resp.output) : "";
-        // Echo du tour assistant : les tool_calls du backend sont renvoyés
-        // TELS QUELS (le backend remappe vers son fournisseur) ; le champ
-        // content garde le texte éventuellement produit à côté des appels.
-        convo.push({ role: "assistant", content: lastOutput, tool_calls: tcs });
+        // Echo du tour assistant : chaque tool_call est renvoyé dans la forme
+        // provider (verbatim si le backend a déjà relayé `{id, type, function}` ;
+        // sinon reconstruit — défense en profondeur). Le champ content garde le
+        // texte éventuellement produit à côté des appels.
+        const echoCalls = [];
+        for (let k = 0; k < tcs.length; k++) {
+            const echo = normalizeToolCallForEcho(tcs[k]);
+            if (echo) echoCalls.push(echo);
+        }
+        convo.push({ role: "assistant", content: lastOutput, tool_calls: echoCalls });
         for (let i = 0; i < tcs.length; i++) {
             const tc = tcs[i];
-            const parsed = parseToolArguments(tc.arguments);
+            const parsed = parseToolArguments(toolCallArguments(tc));
             const result = parsed.ok
-                ? await dispatch(tc.name, parsed.value)
+                ? await dispatch(toolCallName(tc), parsed.value)
                 : { ok: false, code: "bad_arguments", error: parsed.error };
             if (typeof o.onToolCall === "function") { try { o.onToolCall(result, tc, i); } catch { /* hook UI : non bloquant */ } }
             convo.push({
                 role: "tool",
                 tool_call_id: tc.id !== undefined && tc.id !== null ? tc.id : "call_" + i,
-                name: tc.name,
+                name: toolCallName(tc),
                 content: renderToolContent(result),
             });
         }
@@ -1207,6 +1270,9 @@ const BlobbyTools = {
     canUndoId: canUndoId,
     clearUndo: clearUndo,
     extractToolCalls: extractToolCalls,
+    toolCallName: toolCallName,
+    toolCallArguments: toolCallArguments,
+    normalizeToolCallForEcho: normalizeToolCallForEcho,
     parseToolArguments: parseToolArguments,
     renderToolContent: renderToolContent,
     runToolLoop: runToolLoop,
@@ -1220,6 +1286,7 @@ export {
     listTools, getToolsForMode, registerTool, dispatchToolCall,
     UNDO_LIMIT, pushUndoSnapshot, undoSnapshot, undoLast, canUndo, canUndoId, clearUndo,
     extractToolCalls, parseToolArguments, renderToolContent, runToolLoop, detectToolsUnsupported,
+    toolCallName, toolCallArguments, normalizeToolCallForEcho,
     TOOL_REGISTRY,
 };
 
