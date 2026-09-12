@@ -9,7 +9,7 @@
 embedding_engine.py — Moteur d'embedding 100% local pour la recherche
 sémantique des keywords de l'extension AIH (ComfyUI).
 
-Porté depuis AI-Helper/AIH_ComfyUI/embedding_engine.py dans le sous-package
+Porté depuis le monorepo AI-Helper dans le sous-package
 aih/ de CUI-Holaf-Utils (fusion PLAN_FUSION.md, Phase 2 chantier A) ; le bloc
 d'import « robuste » de store (pré-enregistrement sys.modules + chargement
 par chemin via importlib) devient un import absolu standard.

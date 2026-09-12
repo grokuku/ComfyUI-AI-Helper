@@ -8,7 +8,7 @@
 """
 credentials.py — Helper pour charger les credentials AIH depuis ComfyUI/user/.
 
-Porté depuis AI-Helper/AIH_ComfyUI/nodes/_credentials.py (fusion PLAN_FUSION.md,
+Porté depuis l'ancien monorepo AI-Helper (fusion PLAN_FUSION.md,
 Phase 2 chantier A) : renommé 'aih.credentials' car il n'est plus un private
 module de nodes mais un élément du socle partagé (utilisé par sync_engine,
 les routes /aih/* et les nodes).

@@ -35,7 +35,7 @@ réhydratent ces colonnes en best-effort — uniquement quand le JSON est un
 dict ou une liste (les scalaires restent tels quels, pour ne pas corrompre
 des chaînes légitimes type "123").
 
-Porté depuis AI-Helper/AIH_ComfyUI/local_source.py dans le sous-package aih/
+Porté depuis le monorepo AI-Helper dans le sous-package aih/
 de CUI-Holaf-Utils (fusion PLAN_FUSION.md, Phase 2 chantier A) : le chargement
 « robuste » de store (pré-enregistrement sys.modules + fallback importlib)
 est remplacé par un simple import absolu.

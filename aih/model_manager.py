@@ -7,7 +7,7 @@
 
 """model_manager.py — List, upload et download de models/loras (Phase 2 chantier C).
 
-Porté depuis AIH_ComfyUI/nodes/model_manager.py (fusion PLAN_FUSION.md,
+Porté depuis l'ancien monorepo AI-Helper (fusion PLAN_FUSION.md,
 routes /api/aih/models/* — « SFTP chunked + fingerprint » gardées §2.2).
 Le module ne déclare AUCUNE node ComfyUI : il est consommé exclusivement
 par aih/routes.py (groupe « models »).

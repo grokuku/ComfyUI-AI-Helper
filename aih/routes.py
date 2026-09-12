@@ -52,9 +52,9 @@ Groupes (ordre historique des commits du chantier C) :
      obtenu via POST /holaf/auth/login ou POST /holaf/terminal/auth) ; 401 sinon.
   4. ``models``      : /api/aih/models/* (liste locale/distante, upload et
      download SFTP chunked via paramiko, fingerprint head/tail, progression)
-     portés fidèlement depuis AIH_ComfyUI/nodes/model_manager.py →
+     portés fidèlement depuis l'ancien monorepo AI-Helper →
      ``aih/model_manager.py`` ; /api/aih/custom-nodes* depuis
-     AIH_ComfyUI/nodes/custom_nodes_manager.py → ``aih/custom_nodes_manager.py``
+     l'ancien manager custom-nodes du monorepo → ``aih/custom_nodes_manager.py``
      (SANS l'auto ``pip install`` post-clone, interdit — cf. §3.3).
   5. ``local``       : GET /aih/local/status, /aih/local/api/* (miroirs du
      store SQLite, sync/outbox/conflicts/retry, recherche sémantique,
@@ -90,7 +90,7 @@ from aiohttp import web
 
 # Socle léger (pur Python, aucun effet de bord à l'import) : le helper de
 # credentials partagé du sous-package aih/ — mêmes fonctions que la source
-# (ex AIH_ComfyUI/nodes/_credentials.py, renommé aih.credentials au chantier A).
+# (ex ancien helper _credentials du monorepo AI-Helper, renommé aih.credentials au chantier A).
 from aih import credentials
 
 # Racine du pack (routes.py vit dans <pack>/aih/). Utilisée par le groupe
@@ -435,7 +435,7 @@ def _register_update_group(r, require_auth):
 def _get_blobby_file():
     """Chemin des paramètres du companion : user/default/aih/blobby.json.
 
-    Porté de AIH_ComfyUI/blobby_companion/settings_api.py (chemin inchangé),
+    Porté du blobby companion de l'ancien monorepo AI-Helper (chemin inchangé),
     avec migration paresseuse depuis l'ancien user/default/aih_blobby.json.
     Calculé à la volée (et non à l'import comme la source) pour rester
     testable hors ComfyUI.

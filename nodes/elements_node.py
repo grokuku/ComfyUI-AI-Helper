@@ -7,7 +7,8 @@
 
 """
 AIH Elements Picker Node — Custom widget (JavaScript).
-L'UI interactive est rendue par web/js/aih_elements_widget.js.
+L'UI interactive est rendue par js/aih_elements_widget.js (WEB_DIRECTORY="js"
+du pack).
 
 Au "Run" (workflow), Python appelle directement l'API /api/generate
 avec le seed courant + les éléments sérialisés → résultat déterministe.

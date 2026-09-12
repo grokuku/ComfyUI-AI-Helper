@@ -1,7 +1,7 @@
 /**
  * AIH Shared Helpers — Fonctions partagées entre les widgets ComfyUI.
  *
- * Chargé automatiquement par ComfyUI (WEB_DIRECTORY = "web").
+ * Chargé automatiquement par ComfyUI (WEB_DIRECTORY = "js" du pack).
  * Pas d'ESM : attache les helpers à l'objet global window.AIH.
  *
  * Les fichiers widget délèguent à ces helpers pour éviter la duplication.

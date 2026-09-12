@@ -19,8 +19,6 @@ Deux modes :
     prompts des 5 étapes sont importés depuis aih.music_prompts (⚠️ mirror,
     socle partagé du pack fusionné).
 
-DOM widget : web/js/aih_music_widget.js.
-
 Prompts maîtres de référence du pipeline (miroirs documentaires des presets
 MiniMax Music 3.0 côté backend) : aih/templates/minimax_music3_*.txt.
 """

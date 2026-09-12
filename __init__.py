@@ -44,7 +44,7 @@ except Exception as _mig_err:
 # --- AIH shared backend package bootstrap -----------------------------------
 # The shared AIH backend lives in the 'aih/' subpackage at the root of this
 # extension (SQLite mirror store, sync engine, embeddings, local source,
-# credentials, unified LLM helper — ported from AI-Helper/AIH_ComfyUI).
+# credentials, unified LLM helper — ported from the legacy AI-Helper monorepo).
 # ComfyUI loads custom-node packs through importlib WITHOUT adding the pack
 # folder to sys.path (and the per-file node loader below registers each file
 # under a synthetic "<package>.nodes.<stem>" name), so plain absolute imports

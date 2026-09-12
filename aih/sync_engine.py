@@ -8,7 +8,7 @@
 """
 sync_engine.py — Moteur de synchronisation locale AIH (ComfyUI).
 
-Porté depuis AI-Helper/AIH_ComfyUI/sync_engine.py dans le sous-package aih/
+Porté depuis le monorepo AI-Helper dans le sous-package aih/
 de CUI-Holaf-Utils (fusion PLAN_FUSION.md, Phase 2 chantier A) ; les blocs
 d'import « exotiques » (pré-enregistrement sys.modules + chargement par
 chemin via importlib) sont remplacés par des imports absolus standards,

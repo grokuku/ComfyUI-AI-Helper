@@ -7,7 +7,7 @@
 
 """custom_nodes_manager.py — Détection et installation de custom nodes.
 
-Porté depuis AIH_ComfyUI/nodes/custom_nodes_manager.py (Phase 2 chantier C).
+Porté depuis l'ancien monorepo AI-Helper (Phase 2 chantier C).
 Le module ne déclare AUCUNE node ComfyUI : il est consommé exclusivement par
 aih/routes.py (groupe « models », routes /api/aih/custom-nodes*).
 

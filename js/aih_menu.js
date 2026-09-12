@@ -1,5 +1,5 @@
 /**
- * AIH — Menu helpers (portage de AI-Helper/web/js/aih_menu.js).
+ * AIH — Menu helpers (portage de l'ancien widget aih_menu.js du monorepo AI-Helper).
  *
  * Note pack fusionné : ce fichier ne crée PLUS son propre bouton de menu
  * (l'ancien bouton indigo « AI Helper ▾ » est remplacé par le menu orange

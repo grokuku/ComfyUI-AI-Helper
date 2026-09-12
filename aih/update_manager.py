@@ -7,7 +7,7 @@
 
 """update_manager.py — Mise à jour git du pack fusionné (Phase 2 chantier C).
 
-Porté depuis AI-Helper/AIH_ComfyUI/update_manager.py avec UNE différence
+Porté depuis le monorepo AI-Helper avec UNE différence
 majeure et assumée : le redémarrage automatique du serveur a été SUPPRIMÉ.
 
 - La stratégie de mise à jour d'origine est conservée à l'identique :
@@ -51,8 +51,8 @@ def update_repo(repo_root=None):
             de production) = détection en remontant depuis ce fichier
             (<pack>/aih/) jusqu'au .git — dans le pack fusionné c'est la
             racine du pack elle-même ; dans l'extension AI-Helper d'origine
-            c'était son parent (AIH_ComfyUI/ étant un sous-dossier), ce que
-            la boucle générique couvre aussi. Le paramètre existe pour les
+            c'était son parent (l'extension ComfyUI étant un sous-dossier), ce
+            que la boucle générique couvre aussi. Le paramètre existe pour les
             tests : NE JAMAIS passer la racine du pack en cours d'exécution
             depuis un harnais, au risque de rewinder le repo (reset --hard).
 

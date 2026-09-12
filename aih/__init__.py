@@ -5,7 +5,7 @@
 # under the terms of the GNU General Public License, version 3 or any later
 # version. <https://www.gnu.org/licenses/>
 
-"""aih — Socle backend partagé AIH (porté depuis AI-Helper/AIH_ComfyUI).
+"""aih — Socle backend partagé AIH (porté depuis le monorepo AI-Helper).
 
 Ce sous-package héberge l'infrastructure partagée par les futures nodes et
 routes ``/aih/*`` :

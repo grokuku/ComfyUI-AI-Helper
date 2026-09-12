@@ -4,8 +4,8 @@
  * Dessiné 100% Canvas 2D (zero asset visuel).
  * Activation/désactivation via le menu AIH.
  *
- * Ce fichier est la version déployée.
- * La source de développement est dans AIH_ComfyUI/blobby_companion/web/js/blobby.js
+ * Ce fichier est la version déployée (la variante de dev de l'ancien monorepo
+ * AI-Helper n'existe plus depuis la fusion).
  *
  * Note pack fusionné : POST /aih/blobby/exec est sécurisé derrière l'auth
  * terminal Holaf (cookie holaf_session). Un 401 est affiché à l'utilisateur
@@ -17,6 +17,9 @@ import "./aih_strings.js";
 import { saveWindowRect, loadWindowRect } from "./holaf_window_utils.js";
 import { remoteGet, remotePost, HolafFetch } from "./aih_fetch_bridge.js";
 import { formatContextBar, applyContextBar } from "./aih_context_utils.js";
+import { escapeHtml } from "./holaf_dom_utils.js";
+// Registre d'outils + dispatcher + enforcement de mode + undo (étape 2).
+import BlobbyTools from "./blobby_tools.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -140,6 +143,39 @@ function _blobbySaveChatState(data) { _blobbySave('chatState', data); }
 function _blobbyLoadChatState(def) { return _blobbyLoad('chatState', def); }
 function _blobbySaveFps(fps) { _blobbySave('fps', fps); }
 function _blobbyLoadFps(def) { return _blobbyLoad('fps', def); }
+// ── Mode d'agent (étape 2) : 'read' (lecture seule, défaut) | 'active' ──
+// Persisté via la même voie que les autres réglages Blobby (blobbyData).
+function _blobbySaveMode(mode) { _blobbySave('blobbyMode', mode); }
+function _blobbyLoadMode(def) { return _blobbyLoad('blobbyMode', def); }
+
+// ── CSS de la barre de mode du chat (étape 3) ────────────────────────────
+// Injecté une seule fois (idempotent) : pas de feuille externe à charger, le
+// chat reste autonome. Les classes blobby-mode-read / blobby-mode-active
+// portent la bordure colorée (bleu read / orange active).
+function _blobbyEnsureChatCSS() {
+    if (document.getElementById('blobby-chat-css')) return;
+    var style = document.createElement('style');
+    style.id = 'blobby-chat-css';
+    style.textContent = [
+        '.blobby-chat-modebar {',
+        '  display: flex; align-items: center; gap: 8px;',
+        '  padding: 5px 12px; font-size: 11px; color: #94a3b8;',
+        '  background: #242428; flex-shrink: 0; user-select: none;',
+        '  border-bottom: 2px solid #3b82f6;',
+        '  transition: border-color .15s, background .15s;',
+        '}',
+        '.blobby-chat-modebar.blobby-mode-read { border-bottom-color: #3b82f6; }',
+        '.blobby-chat-modebar.blobby-mode-active { border-bottom-color: #D8700D; }',
+        '.blobby-chat-mode-label { font-weight: 600; letter-spacing: .02em; color: #94a3b8; }',
+        '.blobby-chat-mode-select {',
+        '  background: #1a1a1e; color: #e2e8f0; border: 1px solid #555;',
+        '  border-radius: 6px; padding: 2px 6px; font-size: 11px;',
+        '  cursor: pointer; outline: none; max-width: 150px;',
+        '}',
+        '.blobby-chat-mode-select:focus { border-color: var(--aih-accent, #D8700D); }',
+    ].join('\n');
+    (document.head || document.documentElement).appendChild(style);
+}
 
 // ── Skill management (Blobby's learned procedures) ──
 
@@ -409,6 +445,43 @@ const Blobby = {
     REPULSION: 0.4,
     COHESION: 0.04,
     CUT_RADIUS: 50,
+
+    // ── Mode d'agent (étape 2) ────────────────────────────────────────────
+    // 'read' (défaut) : lecture seule — les outils de mutation/exécution ne
+    // sont ni proposés au LLM (filtrage du schéma) ni exécutés (dispatcher).
+    // 'active' : tout, sans confirmation humaine, avec snapshot/undo.
+    // L'état vit ICI ; le SEUL changement autorisé passe par setMode()
+    // (l'étape 3 branchera le dropdown sur ce point unique).
+    mode: "read",
+    setMode(mode) {
+        // Rejet explicite des valeurs inconnues (pas de normalisation
+        // silencieuse : garbage ne doit pas faire basculer actif → read).
+        const m = typeof mode === "string" ? mode.trim().toLowerCase() : "";
+        if (m !== "read" && m !== "active") {
+            console.warn("[Blobby] setMode : mode invalide ignoré :", mode);
+            return this.mode;
+        }
+        if (m !== this.mode) {
+            Blobby.mode = m;
+            _blobbySaveMode(m);
+            console.log("%c🧡 Blobby mode : " + (m === "active" ? "🟠 ACTIF" : "🔵 lecture seule"), "color:#FF8F00;font-weight:bold;");
+        }
+        return Blobby.mode;
+    },
+    getMode() { return this.mode === "active" ? "active" : "read"; },
+    // Consigne de mode injectée dans le prompt LLM (étape 3). Le LLM doit être
+    // CONSCIENT de son mode : en Lecture seule il refuse explicitement les
+    // mutations (message de refus repris mot pour mot dans bl.mode.readPrompt),
+    // en Actif il sait qu'il peut agir via les outils. Source unique : getMode()
+    // (jamais un état dupliqué dans l'appelant).
+    _modeInstruction() {
+        return this.getMode() === "active" ? t("bl.mode.activePrompt") : t("bl.mode.readPrompt");
+    },
+    _initMode() {
+        // Persistance (défaut 'read') : valeur inconnue/corrompue → repli
+        // silencieux sur 'read' via normalizeMode (défensif).
+        return this.setMode(_blobbyLoadMode("read"));
+    },
 
     mood: "happy",
     moodTimer: 0,
@@ -1553,7 +1626,14 @@ const Blobby = {
         if (!msgs) return;
         var history = [];
         msgs.querySelectorAll('.blobby-msg').forEach(function(el) {
-            history.push({ role: el.dataset.role, text: el.innerHTML });
+            var html = el.innerHTML;
+            if (el.dataset.role === 'action') {
+                // Les boutons « Annuler » ne sont vivants que pour la session
+                // courante (la pile undo n'est pas persistée) : on ne stocke
+                // pas leur HTML mort dans l'historique.
+                html = html.replace(/<button[^>]*data-undo-btn[\s\S]*?<\/button>/g, '');
+            }
+            history.push({ role: el.dataset.role, text: html });
         });
         if (history.length > 50) history = history.slice(-50);
         _blobbySaveChatHistory(history);
@@ -1605,11 +1685,66 @@ const Blobby = {
 
         var _self = this;
 
-        // ── Contenu interne : messages + ctx + input ──
+        // ── Contenu interne : mode + messages + ctx + input ──
         var bodyWrapper = document.createElement('div');
         Object.assign(bodyWrapper.style, {
             display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden',
         });
+
+        // ── Barre de mode (étape 3) : 🔵 Lecture seule / 🟠 Actif ──
+        // Première barre du corps, juste sous le header ; PAS de badge séparé
+        // (décision utilisateur) — la barre EST l'indicateur d'état et sa
+        // bordure basse change de couleur (bleu read / orange active).
+        // Source d'état unique : Blobby.getMode() ; tout changement passe par
+        // Blobby.setMode() (validation + persistance + enforcement).
+        _blobbyEnsureChatCSS();
+        var modeBar = document.createElement('div');
+        modeBar.id = 'blobby-chat-modebar';
+        modeBar.className = 'blobby-chat-modebar';
+        var modeBarLabel = document.createElement('label');
+        modeBarLabel.className = 'blobby-chat-mode-label';
+        modeBarLabel.setAttribute('for', 'blobby-chat-mode-select');
+        modeBarLabel.textContent = t('bl.mode.label');
+        var modeSelect = document.createElement('select');
+        modeSelect.id = 'blobby-chat-mode-select';
+        modeSelect.className = 'blobby-chat-mode-select';
+        var optReadBody = document.createElement('option');
+        optReadBody.value = 'read';
+        optReadBody.textContent = t('bl.mode.read'); // 🔵 Lecture seule
+        var optActiveBody = document.createElement('option');
+        optActiveBody.value = 'active';
+        optActiveBody.textContent = t('bl.mode.active'); // 🟠 Actif
+        modeSelect.appendChild(optReadBody);
+        modeSelect.appendChild(optActiveBody);
+        function _syncModeBar() {
+            // Reflète TOUJOURS l'état réellement APPLIQUÉ (jamais l'état tenté) :
+            // une valeur inconnue serait rejetée par setMode, le <select> ne
+            // doit pas afficher un mode qui n'est pas actif.
+            var applied = _self.getMode();
+            modeSelect.value = applied;
+            modeSelect.title = t('bl.mode.tooltip');
+            modeBar.classList.toggle('blobby-mode-read', applied === 'read');
+            modeBar.classList.toggle('blobby-mode-active', applied === 'active');
+        }
+        modeSelect.onchange = function(e) {
+            e.stopPropagation();
+            var prev = _self.getMode();
+            // setMode est la SEULE fenêtre de changement : il valide et persiste.
+            var applied = _self.setMode(modeSelect.value);
+            _syncModeBar();
+            if (applied !== prev) {
+                // Le nouveau mode prend effet au prochain tour. Un tour déjà en
+                // cours conserve la consigne construite à son démarrage mais
+                // reste borné par l'enforcement live du dispatcher (aucune
+                // mutation possible si on repasse en Lecture seule en cours de
+                // route) — la boucle n'est jamais cassée, au pire les tool_calls
+                // suivants sont refusés proprement.
+                _self._addChatMessage(messages, 'system', t('bl.mode.switched', { mode: applied === 'active' ? t('bl.mode.active') : t('bl.mode.read') }));
+            }
+        };
+        _syncModeBar();
+        modeBar.appendChild(modeBarLabel);
+        modeBar.appendChild(modeSelect);
 
         // Messages area
         var messages = document.createElement('div');
@@ -1744,6 +1879,7 @@ const Blobby = {
         inputArea.appendChild(input);
         inputArea.appendChild(sendBtn);
 
+        bodyWrapper.appendChild(modeBar);
         bodyWrapper.appendChild(messages);
         bodyWrapper.appendChild(ctxBar);
         bodyWrapper.appendChild(inputArea);
@@ -1800,6 +1936,10 @@ const Blobby = {
             if (!headerRight) return;
             headerRight.insertBefore(btn, headerRight.firstChild);
         }
+
+        // ── Barre de mode (étape 3) : le <select> vit dans le CORPS, en 1er
+        // enfant sous le header (design validé) — aucun badge ni contrôle de
+        // mode dans le header. Voir la construction de bodyWrapper ci-dessus.
 
         // Settings button
         var settingsBtn = document.createElement('button');
@@ -1867,7 +2007,8 @@ const Blobby = {
         input.focus();
     },
 
-    _addChatMessage(container, role, text) {
+    _addChatMessage(container, role, text, opts) {
+        var self = this;
         var div = document.createElement('div');
         div.className = 'blobby-msg';
         div.dataset.role = role;
@@ -1900,7 +2041,32 @@ const Blobby = {
             div.style.alignSelf = 'center';
             div.style.fontSize = '11px';
             div.style.border = '1px solid #166534';
-            div.innerHTML = '⚡ ' + text;
+            // Valeurs du workflow interpolées dans du HTML → escapeHtml.
+            div.innerHTML = '⚡ ' + escapeHtml(text);
+            if (opts && opts.undoId) {
+                // Ligne d'action issue d'une mutation (mode Actif) : bouton
+                // « Annuler » qui restaure le snapshot d'avant l'action. La
+                // pile étant runtime-only, le bouton n'est vivant que pour
+                // la session courante (cf. _saveChatHistory).
+                var ub = document.createElement('button');
+                ub.type = 'button';
+                ub.textContent = t("bl.undoAction");
+                ub.title = t("bl.undoTooltip");
+                ub.setAttribute('data-undo-btn', '1');
+                ub.setAttribute('data-undo-id', String(opts.undoId));
+                Object.assign(ub.style, {
+                    marginLeft: '8px', padding: '1px 6px', fontSize: '10px',
+                    borderRadius: '4px', border: '1px solid #166534',
+                    background: '#0f2a0f', color: '#86efac', cursor: 'pointer',
+                });
+                ub.onmouseenter = () => { if (!ub.disabled) ub.style.background = '#14532d'; };
+                ub.onmouseleave = () => { ub.style.background = '#0f2a0f'; };
+                ub.onclick = function(ev) {
+                    ev.stopPropagation();
+                    self._undoChatAction(container, ub, String(opts.undoId));
+                };
+                div.appendChild(ub);
+            }
         }
         container.appendChild(div);
         container.scrollTop = container.scrollHeight;
@@ -1908,6 +2074,43 @@ const Blobby = {
         // Mettre a jour la barre de contexte (valeur + source reelles, jamais inventees)
         var ctxBar = document.getElementById('blobby-chat-ctx');
         if (ctxBar) _blobbyUpdateContextBar(container, ctxBar);
+    },
+
+    async _undoChatAction(container, btn, undoId) {
+        var app = window.app || window.comfyAPI?.app?.app;
+        var res = await BlobbyTools.undoSnapshot(undoId, { app: app, t: t });
+        if (res && res.ok) {
+            this._addChatMessage(container, 'system', t("bl.undoDone", { action: (res.data && res.data.action) || '?' }));
+        } else {
+            this._addChatMessage(container, 'system', t("bl.undoFail", { error: (res && res.error) || '?' }));
+        }
+        // Après restauration, les actions postérieures deviennent incohérentes :
+        // leurs boutons sont désactivés (id sorti de la pile).
+        this._refreshUndoButtons(container);
+    },
+
+    _refreshUndoButtons(container) {
+        if (!container || !container.querySelectorAll) return;
+        var btns = container.querySelectorAll('button[data-undo-id]');
+        for (var i = 0; i < btns.length; i++) {
+            var b = btns[i];
+            if (!BlobbyTools.canUndoId(b.getAttribute('data-undo-id'))) {
+                b.disabled = true;
+                b.style.opacity = '0.4';
+                b.title = t("bl.undoExpired");
+            }
+        }
+    },
+
+    // Retire l'indicateur de réflexion (messages system contenant « Blobby… »).
+    // Nécessaire parce qu'en mode tool_calls les lignes d'action s'ajoutent
+    // APRÈS l'indicateur : il n'est plus le dernier enfant du conteneur.
+    _removeThinking(container) {
+        if (!container || !container.querySelectorAll) return;
+        var sys = container.querySelectorAll('.blobby-msg[data-role="system"]');
+        for (var i = sys.length - 1; i >= 0; i--) {
+            if ((sys[i].textContent || '').indexOf('Blobby') >= 0) { sys[i].remove(); break; }
+        }
     },
 
     async _handleChatMessage(container, userText) {
@@ -1972,6 +2175,7 @@ const Blobby = {
                 + '- Le repo AIH Tools est dans custom_nodes/AIH_Tools/\n'
                 + '- Pour les boucles, prefere des commandes simples (ex: ls, find, xargs) plutot que des scripts complexes\n'
                 + '\n'
+                + this._modeInstruction() + '\n\n'
                 + 'Message de l\'utilisateur : ' + userText;
 
             // Aucune URL par défaut codée en dur : sans serveur configuré,
@@ -1987,16 +2191,55 @@ const Blobby = {
             var headers = { 'Content-Type': 'application/json' };
             if (cfg.apiKey) headers['Authorization'] = 'Bearer ' + cfg.apiKey;
 
+            // ── Étape 2 : chemin tool_calls (mode Actif + outils disponibles) ──
+            // En mode Actif, Blobby reçoit les schémas d'outils (déjà filtrés
+            // par le mode : getToolsForMode) et agit sur le workflow via des
+            // tool_calls. En mode Lecture seule (défaut), ce chemin n'est PAS
+            // emprunté : le parsing texte historique ([SHELL]/[SET…]/[MOVE_TO]…)
+            // reste seul en piste (conservé inchangé ci-dessous).
+            var finalReply = '';
+            var toolRan = false;
+            var toolFallbackText = false;
+            var toolSchemas = null;
+            if (this.getMode() === 'active') {
+                try { toolSchemas = BlobbyTools.getToolsForMode('active'); } catch (eTool) { toolSchemas = null; }
+                if (!toolSchemas || toolSchemas.length === 0) toolSchemas = null; // registre vide → repli texte
+            }
+            if (toolSchemas) {
+                var toolRun = await this._runToolModeChat(container, {
+                    baseUrl: baseUrl, presetId: presetId, userText: userText,
+                    character: character, moodDesc: moodDesc, memoryBlock: memoryBlock,
+                    workflowDesc: workflowDesc, tools: toolSchemas
+                });
+                if (toolRun.ok) {
+                    finalReply = toolRun.finalReply;
+                    toolRan = true;
+                } else if (toolRun.fallbackToText) {
+                    // Repli 4b : le fournisseur/modèle ne gère pas les tools.
+                    toolFallbackText = true; // le tour continue en chemin texte
+                } else {
+                    var toolErr = toolRun.sendError;
+                    this._removeThinking(container);
+                    this._addChatMessage(container, 'blobby', t("bl.sorry", { error: (toolErr && toolErr.data && toolErr.data.error) || (toolErr && toolErr.message) || t("bl.errorStatus", { status: toolErr && toolErr.status }) }));
+                    return;
+                }
+            }
+            if (toolFallbackText) {
+                // Repli 4b : avertissement clair PUIS reprise du même message via
+                // le chemin texte historique — le tour n'est pas cassé.
+                this._addChatMessage(container, 'system', t("bl.toolsUnsupported"));
+            }
+
                         // ── Boucle agentic : LLM → commandes → résultats → LLM → ... ──
             // Pas de limite fixe — Blobby continue jusqu'à ce qu'il ait fini.
             // Sécurité : détection de boucle infinie (même réponse 2x de suite).
+            // toolRan ⇒ le chemin tool_calls a déjà produit la réponse finale.
             var currentInstruction = instruction;
-            var finalReply = '';
             var allCommandResults = [];
             var lastReplyHash = '__INITIAL__';
             var repeatedCount = 0;  // 0 = première occurrence, 1 = 2ème occurrence identique → break
 
-            for (var turn = 0; turn < 100; turn++) {  // 100 = sécurité, jamais atteint en pratique
+            for (var turn = 0; !toolRan && turn < 100; turn++) {  // 100 = sécurité, jamais atteint en pratique
                 // Mettre à jour l'indicateur
                 var thinking = container.querySelector('div:last-child');
                 if (thinking && thinking.textContent.indexOf('Blobby') >= 0) {
@@ -2052,8 +2295,10 @@ const Blobby = {
                 // Verifier les [SHELL] AVANT _executeCommands
                 var hasShellCommands = /\[SHELL\s+.+\]/i.test(reply);
 
-                // Executer les commandes locales (MOVE_TO, SET, FOCUS)
-                reply = this._executeCommands(reply);
+                // Executer les commandes locales (MOVE_TO, SET, FOCUS) — [SET…]
+                // passe par le dispatcher d'outils (enforcement + undo), les
+                // autres restent des actions de vue sans mutation.
+                reply = await this._executeCommands(reply, container);
 
                 if (hasShellCommands) {
                     // Mettre à jour l'indicateur pendant l'exécution
@@ -2072,6 +2317,7 @@ const Blobby = {
 
                     var chatHistory = this._getRecentChatHistory(6);
                     currentInstruction = character + '\n\n'
+                        + this._modeInstruction() + '\n\n'
                         + 'Historique de la conversation:\n' + chatHistory + '\n\n'
                         + 'Tu as exécuté des commandes shell. Voici les résultats:\n\n'
                         + resultsText + '\n\n'
@@ -2093,9 +2339,11 @@ const Blobby = {
             }
 
 
-            // Enlever le thinking
+            // Enlever le thinking (robuste : en mode tool_calls, les lignes
+            // d'action passent APRÈS l'indicateur, qui n'est plus last-child).
             var thinkingEl = container.querySelector('div:last-child');
             if (thinkingEl && thinkingEl.textContent.indexOf('Blobby') >= 0) thinkingEl.remove();
+            this._removeThinking(container);
 
             // Nettoyer les placeholders restants
             finalReply = finalReply.replace(/⏳[^\n]*/g, '').replace(/\n{3,}/g, '\n\n').trim();
@@ -2139,6 +2387,151 @@ const Blobby = {
         }
     },
 
+    // ─── Étape 2 : boucle tool_calls (mode Actif) ──────────────────────────
+    // Contrat backend (étape 1) : POST accepte `messages` (liste complète,
+    // remplace la construction system+user), `tools` et `tool_choice` ; la
+    // réponse contient `tool_calls` [{id, name, arguments}] (arguments =
+    // STRING à JSON.parse) et `output` (peut être null sur un tour d'outil
+    // pur). Chaque tool_call est dispatché (enforcement + snapshot/undo dans
+    // blobby_tools.js), loggé comme ligne d'action (bouton « Annuler » si
+    // mutation), puis les résultats repartent en messages role:'tool'
+    // (tool_call_id) pour le tour suivant, jusqu'à une réponse texte.
+    async _runToolModeChat(container, p) {
+        var self = this;
+        var app = window.app || window.comfyAPI?.app?.app;
+        var messages = this._buildToolModeMessages(p);
+
+        var result = await BlobbyTools.runToolLoop({
+            messages: messages,
+            maxTurns: 100, // même garde anti-boucle que la boucle agentic texte
+            send: async function(convo) {
+                var data = await remotePost(p.baseUrl + '/api/keywords/llm-process', {
+                    preset_id: parseInt(p.presetId),
+                    messages: convo,
+                    tools: p.tools,
+                    tool_choice: 'auto'
+                });
+                // Fenêtre de contexte renvoyée par llm-process : max_context
+                // (int OU null) + context_source — même mise à jour honnête
+                // de la barre que le chemin texte (jamais de repli chiffré).
+                if (data && (data.max_context !== undefined || data.context_source !== undefined)) {
+                    var ctxBar = document.getElementById('blobby-chat-ctx');
+                    if (ctxBar) {
+                        ctxBar.dataset.maxCtx = (data.max_context !== null && data.max_context !== undefined)
+                            ? String(data.max_context) : '';
+                        ctxBar.dataset.ctxSource = data.context_source || 'unknown';
+                        _blobbyUpdateContextBar(container, ctxBar);
+                    }
+                }
+                return data;
+            },
+            dispatch: function(name, args) {
+                var thinking = container.querySelector('div:last-child');
+                if (thinking && thinking.textContent.indexOf('Blobby') >= 0) {
+                    thinking.textContent = t("bl.toolRunning", { name: name });
+                }
+                return BlobbyTools.dispatchToolCall(name, args, {
+                    app: app,
+                    mode: self.getMode(), // enforcement 2ᵉ barrière (blobby_tools)
+                    t: t
+                });
+            },
+            onToolCall: function(res, tc) {
+                var labelTxt = (res && res.action) ? res.action : String(tc.name);
+                var undoId = (res && res.ok && res.snapshotId) ? res.snapshotId : null;
+                self._addChatMessage(container, 'action', labelTxt, { undoId: undoId });
+            }
+        });
+
+        if (result.ok) {
+            // La réponse finale passe AUSSI par _executeCommands : les
+            // commandes locales [SET…]/[MOVE_TO]/[FOCUS] restent comprises
+            // dans les deux modes ([SET…] via le dispatcher : enforcement +
+            // snapshot/undo). [SHELL]/[SKILL_*] ne sont traités que par la
+            // boucle texte historique (fournisseurs sans tools / read).
+            var reply = result.finalReply;
+            try { reply = await self._executeCommands(reply, container); } catch { /* jamais bloquant */ }
+            return { ok: true, finalReply: reply, turns: result.turns };
+        }
+
+        if (result.exhausted) {
+            // Garde anti-boucle atteinte : on rend ce qui est connu.
+            return { ok: true, finalReply: t("bl.giveUp") + (result.lastOutput || ''), turns: result.turns };
+        }
+
+        // ── Repli 4b : détection DÉLIMITÉE au 1ᵉʳ tour ──
+        // - erreur d'envoi au 1ᵉʳ tour dont le message/le payload signale un
+        //   refus des tools (payload error, champ detail…) ;
+        // - réponse 200 inattendue au 1ᵉʳ tour (ni tool_calls ni output).
+        if (result.turns === 1
+            && (result.unexpected
+                || BlobbyTools.detectToolsUnsupported(result.resp, result.sendError))) {
+            return { ok: false, fallbackToText: true };
+        }
+
+        if (result.sendError) {
+            return { ok: false, sendError: result.sendError };
+        }
+        return { ok: false, sendError: new Error('tool loop: ' + JSON.stringify(result).substring(0, 200)) };
+    },
+
+    // Messages du tour initial : conversation récente (DOM) + message courant
+    // enrichi (caractère, humeur, souvenirs, workflow). Le bloc d'instructions
+    // [SHELL]/[SET…] du chemin texte est remplacé par la consigne d'outils —
+    // les schémas voyagent dans `tools`, pas dans le texte.
+    _buildToolModeMessages(p) {
+        var msgs = this._getRecentChatMessages(8); // [{role:'user'|'assistant', content}]
+        // Le message courant est déjà dans l'historique (ajouté au DOM avant
+        // _handleChatMessage) : on le retire pour ne pas le doubler dans
+        // l'instruction enrichie qui se termine par « Message de l'utilisateur ».
+        if (msgs.length && msgs[msgs.length - 1].role === 'user' && msgs[msgs.length - 1].content === p.userText) {
+            msgs.pop();
+        }
+        var instruction = p.character + (p.memoryBlock || '') + '\n\n'
+            + 'Humeur actuelle : ' + p.moodDesc + '\n'
+            + '(Ton "Blobby" doit refletter cette humeur)\n\n'
+            + 'Workflow actuel :\n' + p.workflowDesc + '\n\n'
+            + this._modeInstruction() + '\n'
+            + 'Tu disposes d\'OUTILS (schémas fournis avec la requête) pour lire,\n'
+            + 'modifier et exécuter le workflow ComfyUI : describe_workflow, list_nodes, get_node_by_id,\n'
+            + 'get_node_widgets, get_node_widget, get_node_connections, get_object_info, get_queue_status,\n'
+            + 'get_execution_status, set_widget_value, set_node_title, set_node_color, move_node, add_node,\n'
+            + 'remove_node, connect_nodes, disconnect_nodes, queue_prompt, interrupt.\n'
+            + '- Pour agir, ÉMETS un tool_call (ne décris pas l\'action, fais-la).\n'
+            + '- Les résultats d\'outils te seront renvoyés : analyse-les, enchaîne si nécessaire, puis\n'
+            + '  donne ta réponse finale en Markdown.\n'
+            + '- Les commandes texte [SHELL]/[SKILL_*] ne sont traitées qu\'en mode Lecture seule ; ici,\n'
+            + '  utilise les outils ([SET…]/[MOVE_TO] dans le texte restent compris, mais préfère les outils).\n'
+            + 'Environnement :\n'
+            + '- OS : ' + (navigator.platform || 'inconnu') + '\n'
+            + '- Shell : /bin/bash (Linux) ou cmd (Windows) — utilise des commandes simples et compatibles\n'
+            + '- ComfyUI est installe dans le dossier custom_nodes/ de ComfyUI\n'
+            + '- Le repo AIH Tools est dans custom_nodes/AIH_Tools/\n'
+            + 'Tu peux utiliser le Markdown pour mettre en forme tes reponses.\n\n'
+            + 'Message de l\'utilisateur : ' + p.userText;
+        msgs.push({ role: 'user', content: instruction });
+        return msgs;
+    },
+
+    // Historique structuré (messages OpenAI-like) pour le contrat `messages`.
+    _getRecentChatMessages(count) {
+        var msgs = document.getElementById('blobby-chat-msgs');
+        if (!msgs) return [];
+        var out = [];
+        var allMsgs = msgs.querySelectorAll('.blobby-msg');
+        var start = Math.max(0, allMsgs.length - count);
+        for (var i = start; i < allMsgs.length; i++) {
+            var el = allMsgs[i];
+            var role = el.dataset.role;
+            var text = (el.textContent || '').trim();
+            if (!text) continue;
+            if (role === 'user') out.push({ role: 'user', content: text });
+            else if (role === 'blobby') out.push({ role: 'assistant', content: text.substring(0, 300) });
+            // 'system'/'action' exclus : lignes d'état, pas de la conversation.
+        }
+        return out;
+    },
+
     _getRecentChatHistory(count) {
         var msgs = document.getElementById('blobby-chat-msgs');
         if (!msgs) return '';
@@ -2180,17 +2573,62 @@ const Blobby = {
         return desc;
     },
 
-    _executeCommands(reply) {
+    async _executeCommands(reply, container) {
         // Executer les commandes [MOVE_TO ...], [SET ...], [FOCUS ...]
+        // ([SET…] passe par le dispatcher d'outils : enforcement du mode +
+        // snapshot/undo — en Lecture seule il est refusé avec un message,
+        // il ne mute jamais en douceur).
         var app = window.app || window.comfyAPI?.app?.app;
         if (!app || !app.graph || !app.graph.nodes) return reply;
 
+        var self = this;
         var result = reply;
-        var commandsFound = false;
+
+        // [SET nom param valeur] — extraction d'abord (replace synchrone),
+        // puis exécution async et réinjection des résultats.
+        var setCommands = [];
+        result = result.replace(/\[SET\s+([^\]]+)\]/gi, function(match, argsStr) {
+            var parts = argsStr.trim().split(/\s+/);
+            if (parts.length < 3) {
+                setCommands.push({ error: t("bl.setFormat") });
+                return '⏳BSET' + (setCommands.length - 1) + '⏳';
+            }
+            setCommands.push({ nodeName: parts[0], widget: parts[1], value: parts.slice(2).join(' ') });
+            return '⏳BSET' + (setCommands.length - 1) + '⏳';
+        });
+        for (var s = 0; s < setCommands.length; s++) {
+            var c = setCommands[s];
+            var rep;
+            if (c.error) {
+                rep = c.error;
+            } else {
+                var nameLc = c.nodeName.toLowerCase();
+                var nodeFound = null;
+                for (var i = 0; i < app.graph.nodes.length; i++) {
+                    var n = app.graph.nodes[i];
+                    var title = (n.title || n.comfyClass || '').toLowerCase();
+                    if (title.includes(nameLc)) { nodeFound = n; break; }
+                }
+                if (!nodeFound) {
+                    rep = t("bl.nodeNotFound", { name: c.nodeName });
+                } else {
+                    var resSet = await BlobbyTools.dispatchToolCall('set_widget_value',
+                        { id: nodeFound.id, widget: c.widget, value: c.value },
+                        { app: app, mode: self.getMode(), t: t });
+                    rep = resSet.ok
+                        ? (resSet.action || t("bl.done"))
+                        : '⚠️ ' + (resSet.error || t("bl.error"));
+                    if (resSet.ok && resSet.snapshotId && container) {
+                        // Ligne d'action avec bouton « Annuler », comme le chemin tool_calls.
+                        self._addChatMessage(container, 'action', resSet.action || t("bl.done"), { undoId: resSet.snapshotId });
+                    }
+                }
+            }
+            result = result.replace('⏳BSET' + s + '⏳', rep);
+        }
 
         // [MOVE_TO nom_du_noeud]
         result = result.replace(/\[MOVE_TO\s+([^\]]+)\]/gi, (match, nodeName) => {
-            commandsFound = true;
             var name = nodeName.trim().toLowerCase();
             for (var i = 0; i < app.graph.nodes.length; i++) {
                 var n = app.graph.nodes[i];
@@ -2205,7 +2643,6 @@ const Blobby = {
 
         // [FOCUS nom_du_noeud]
         result = result.replace(/\[FOCUS\s+([^\]]+)\]/gi, (match, nodeName) => {
-            commandsFound = true;
             var name = nodeName.trim().toLowerCase();
             for (var i = 0; i < app.graph.nodes.length; i++) {
                 var n = app.graph.nodes[i];
@@ -2396,6 +2833,10 @@ window.BlobbyCompanion = {
     activate: () => Blobby.activate(),
     deactivate: () => Blobby.deactivate(),
     isActive: () => Blobby.isActive(),
+    // Mode d'agent (étape 2) : le dropdown de l'étape 3 passera par ces
+    // deux points — setMode() est la SEULE fenêtre de changement.
+    setMode: (m) => Blobby.setMode(m),
+    getMode: () => Blobby.getMode(),
     toggle: () => {
         const newState = !Blobby.isActive();
         if (newState) { Blobby.activate(); } else { Blobby.deactivate(); }
@@ -2415,6 +2856,11 @@ window.BlobbyCompanion = {
     }
 };
 
+// Accès complet à l'objet (historiquement absent : `_self = window.Blobby || Blobby`
+// retombait toujours sur le module). Sert aux tests, à l'étape 3 (dropdown de
+// mode) et au diagnostic console ; la façade ci-dessus reste l'API officielle.
+window.Blobby = Blobby;
+
 // ─── Auto-init ───
 (function waitForApp() {
     const app = window.app || window.comfyAPI?.app?.app;
@@ -2426,6 +2872,11 @@ window.BlobbyCompanion = {
             const canvas = app.canvas;
             if (!canvas) { console.warn("[Blobby] Pas de canvas"); return; }
             Blobby.init(canvas);
+
+            // Mode d'agent (étape 2) : 'read' par défaut, restauré depuis la
+            // persistance via setMode() — la seule fenêtre de changement
+            // (l'UI dropdown de l'étape 3 s'y branchera).
+            Blobby._initMode();
 
             const cfg = _getAIHConfig();
             if (cfg.blobbyActive) {

@@ -9,7 +9,7 @@
 LLM Helper — Appels LLM unifiés pour les nodes AIH.
 Supporte LM Studio (SDK local) et OpenAI-compatible (HTTP).
 
-Porté depuis AI-Helper/AIH_ComfyUI/nodes/_llm_helper.py dans le sous-package
+Porté depuis le monorepo AI-Helper dans le sous-package
 aih/ de CUI-Holaf-Utils (fusion PLAN_FUSION.md, Phase 2 chantier A) ;
 promu 'aih.llm_helper' car il est partagé par plusieurs nodes et futures
 routes /aih/*.
