@@ -81,6 +81,14 @@ async def load_edits_route(request: web.Request):
                 content = await f.read()
                 edit_data = json.loads(content)
 
+        # ── Migration schéma v2 À LA LECTURE (idempotente, sans destruction) ──
+        # Un .edt v1 (format plat ou {value, range}) est renvoyé au front déjà
+        # normalisé v2 (contrôles tonaux en `zones`, "v": 2 estampillé). Le
+        # fichier sur disque n'est pas réécrit ici : la migration s'applique à
+        # chaque lecture, et le prochain save persistera le format v2.
+        if isinstance(edit_data, dict):
+            edit_data = logic._migrate_edit_data(edit_data)
+
         # ── Masks multiples : renvoyer le PNG de chaque contrôle type 'mask' (data URL) ──
         if isinstance(edit_data, dict):
             controls = edit_data.get('controls') or []
@@ -165,6 +173,12 @@ async def save_edits_route(request: web.Request):
             # Retirer l'ancien champ mask unique (remplacé par les entrées dans controls)
             edits.pop('mask', None)
             edits.pop('mask_base64', None)
+
+            # ── Contrat schéma v2 : normalisation + estampillage "v": 2 avant écriture ──
+            # Migration idempotente et sans destruction : un payload v1 reçu du
+            # front (value/range ou format plat) est converti en zones ; masks,
+            # crop et clés vidéo sont inchangés. Tout .edt écrit porte "v": 2.
+            edits = logic._migrate_edit_data(edits)
 
             controls = edits.get('controls') or []
             active_mask_files = set()

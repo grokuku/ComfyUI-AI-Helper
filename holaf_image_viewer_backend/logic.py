@@ -966,49 +966,170 @@ def _get_luminance_mask(image, range_type):
     return gray.point(table)
 
 
+# ── Schéma v2 des .edt (contrat partagé backend Python / front-end JS) ──────
+# {
+#   "v": 2,
+#   "controls": [
+#     {"id":"c_1","type":"brightness","zones":{"all":1.2,"shadows":1.5,"midtones":1.1,"highlights":1.3}},
+#     {"id":"c_2","type":"blur","value":8},
+#     {"id":"m_1","type":"mask","value":12,"file":"edit/<base>_mask_m_1.png"}
+#   ],
+#   "targetFps":30,"playbackRate":1.0,"interpolate":false,
+#   "crop":{"x":0,"y":0,"w":0.75,"h":1.0}
+# }
+# Types ZONAUX (ajustements tonaux) : portent un dict `zones` ; clé absente =
+#   neutre (1 pour brightness/contrast/saturation, 0 pour hue).
+# Types NON ZONAUX (effets spatiaux + masks) : UNE valeur globale `value` ; un
+#   éventuel `range` v1 est supprimé à la migration (le rendu reste global —
+#   bug latent v1 : le front proposait des plages jamais appliquées).
+_TONAL_TYPES = ('brightness', 'contrast', 'saturation', 'hue')
+_SPATIAL_TYPES = ('blur', 'pixelate', 'vignette', 'sharpen')
+# Ordre d'application des zones (fixe, documenté pour parité avec le JS) :
+# all → shadows → midtones → highlights.
+_ZONE_KEYS = ('all', 'shadows', 'midtones', 'highlights')
+# Valeur neutre par type tonal.
+_TONAL_NEUTRAL = {'brightness': 1.0, 'contrast': 1.0, 'saturation': 1.0, 'hue': 0.0}
+
+
+def _is_neutral_zone(ctype, value):
+    """
+    True si `value` est EXACTEMENT la valeur neutre du type tonal `ctype`.
+    Comparaison exacte (pas d'epsilon) pour garantir que toute valeur non
+    exactement neutre déclenche une passe, comme dans l'ancien code mono-plage.
+    Une valeur illisible (None, texte) est traitée comme neutre (passe ignorée
+    au lieu d'un crash).
+    """
+    neutral = _TONAL_NEUTRAL.get(ctype)
+    if neutral is None:
+        return False
+    try:
+        return float(value) == neutral
+    except (TypeError, ValueError):
+        return True
+
+
+def _migrate_tonal_control(control):
+    """Normalise un contrôle TONAL vers le schéma v2 (dict `zones`)."""
+    migrated = {k: v for k, v in control.items() if k not in ('value', 'range', 'zones')}
+    zones = control.get('zones')
+    if isinstance(zones, dict) and len(zones) > 0:
+        # Déjà v2 (ou déjà migré) : `zones` fait foi, relicats value/range v1 ignorés.
+        migrated['zones'] = dict(zones)
+        return migrated
+    if 'value' in control or 'range' in control:
+        # v1 {value, range} → zones[range || 'all'] = value ; les autres zones
+        # restent ABSENTES (= neutres). range inconnu → 'all' (comportement
+        # historique : plage inconnue appliquée partout).
+        if control.get('value') is None:
+            migrated['zones'] = {}
+        else:
+            zone_key = control.get('range') or 'all'
+            if zone_key not in _ZONE_KEYS:
+                zone_key = 'all'
+            migrated['zones'] = {zone_key: control['value']}
+        return migrated
+    migrated['zones'] = {}  # Contrôle sans donnée : aucune zone → ignoré au rendu
+    return migrated
+
+
+def _migrate_spatial_control(control):
+    """
+    Normalise un contrôle NON TONAL (blur/pixelate/vignette/sharpen/mask) :
+    `value` globale conservée, `range` supprimé, `zones` sans signification
+    (supprimée ; défensivement, zones['all'] est récupérée comme value si le
+    front n'a fourni que ça).
+    """
+    migrated = {k: v for k, v in control.items() if k not in ('value', 'range', 'zones')}
+    if 'value' in control:
+        migrated['value'] = control['value']
+    else:
+        zones = control.get('zones')
+        if isinstance(zones, dict) and zones.get('all') is not None:
+            migrated['value'] = zones.get('all')
+    return migrated
+
+
+def _migrate_control(control):
+    """Normalise un contrôle unique vers le schéma v2 selon son type."""
+    if not isinstance(control, dict):
+        return control
+    if control.get('type') in _TONAL_TYPES:
+        return _migrate_tonal_control(control)
+    return _migrate_spatial_control(control)
+
+
 def _migrate_edit_data(edit_data):
     """
-    Converts old flat edit format to new controls array format.
-    Old format: { 'brightness': 1.2, 'brightnessRange': 'shadows', 'contrast': 1.1 }
-    New format: { 'controls': [{ 'id': 'c_1', 'type': 'brightness', 'value': 1.2, 'range': 'shadows' }, ...] }
+    Normalise les données d'édition vers le schéma v2, À LA LECTURE, de façon
+    IDEMPOTENTE et SANS DESTRUCTION (un v1 relu puis re-sauvegardé devient v2 ;
+    le fichier sur disque n'est jamais réécrit par la migration).
+
+    Gère :
+    - le format tableau v1 {id, type, value, range} : sur un type TONAL,
+      {value, range} → zones[range || 'all'] = value (autres zones neutres =
+      absentes), suppression de value/range ; sur un type NON TONAL, value est
+      conservée et range supprimé (rendu global inchangé) ;
+    - le format plat legacy {'brightness': 1.2, 'brightnessRange': 'shadows'} :
+      converti en contrôles puis migré pareil ;
+    - les masks (type 'mask') : inchangés (value = feather, file conservé) ;
+    - le crop et les clés vidéo (playbackRate/targetFps/interpolate) : inchangés.
+
+    Un .edt sans "v" est considéré v1. Retourne toujours une COPIE normalisée
+    estampillée "v": 2 (le dict d'entrée n'est jamais muté).
     """
     if not isinstance(edit_data, dict):
         return edit_data
 
-    if 'controls' in edit_data:
-        return edit_data  # Already new format
+    result = dict(edit_data)
+    result['v'] = 2
 
-    # Extract video-specific keys (keep them at top level for ffmpeg pipeline)
-    result = {}
-    for key in ['playbackRate', 'targetFps', 'interpolate']:
-        if key in edit_data:
-            result[key] = edit_data[key]
+    controls = edit_data.get('controls')
+    if isinstance(controls, list):
+        result['controls'] = [_migrate_control(c) for c in controls]
+        return result
 
-    # Build controls from flat keys
+    # ── Format plat legacy : {'brightness': 1.2, 'brightnessRange': 'shadows', ...} ──
+    # On convertit les clés tonales en contrôles puis on migre chaque contrôle.
+    # Les clés vidéo et le crop sont préservés ; les clés tonales converties
+    # (brightness, brightnessRange, ...) sont retirées du résultat.
     controls = []
     cid = 0
-    for ctype in ['brightness', 'contrast', 'saturation', 'hue']:
+    for ctype in _TONAL_TYPES:
         if ctype in edit_data:
             cid += 1
-            controls.append({
+            controls.append(_migrate_control({
                 'id': f'ctrl_{cid}',
                 'type': ctype,
                 'value': edit_data[ctype],
                 'range': edit_data.get(f'{ctype}Range', 'all')
-            })
+            }))
 
     if controls:
         result['controls'] = controls
+        for ctype in _TONAL_TYPES:
+            result.pop(ctype, None)
+            result.pop(f'{ctype}Range', None)
         return result
 
-    return edit_data  # No known keys, return as-is
+    return result  # Aucune clé connue : copie estampillée v2, inchangée sinon
 
 
 def apply_edits_to_image(image, edit_data, mask_images=None):
     """
     Applies adjustments (brightness, contrast, saturation, hue, blur, pixelate,
-    vignette, sharpen) to a PIL Image. Supports both old flat format and new
-    controls array format.
+    vignette, sharpen) to a PIL Image. Supports old flat format, v1 controls
+    array (value + range) and the v2 multi-zone schema.
+
+    Contrôles TONAUX (schéma v2, dict `zones`) : chaque zone NON NEUTRE (all /
+    shadows / midtones / highlights) est appliquée séquentiellement — ordre
+    fixe all → shadows → midtones → highlights — restreinte à sa bande de
+    luminance ('all' = partout) et compositée sur le résultat courant, avec les
+    mêmes LUT/profils que _get_luminance_mask. Les zones neutres (clé absente
+    ou valeur neutre : 1 pour brightness/contrast/saturation, 0 pour hue) ne
+    déclenchent AUCUNE passe. UNE seule zone non neutre ⇒ rendu identique à
+    l'ancien comportement mono-plage (value + range).
+    Contrôles NON TONAUX (blur/pixelate/vignette/sharpen/mask) : valeur
+    globale `value` unique (un éventuel `range` v1 est ignoré, comme avant).
 
     ``mask_images`` (optionnel) : dict { file: PIL Image 'L' } des masks
     référencés par les contrôles de type 'mask'. Pour rétro-compatibilité, un
@@ -1028,6 +1149,8 @@ def apply_edits_to_image(image, edit_data, mask_images=None):
     edit_data = _migrate_edit_data(edit_data)
 
     controls = edit_data.get('controls', [])
+    if not isinstance(controls, list):
+        controls = []
     crop = edit_data.get('crop')
 
     if not controls and not crop:
@@ -1063,73 +1186,52 @@ def apply_edits_to_image(image, edit_data, mask_images=None):
 
         for control in seg_controls:
             ctype = control.get('type')
-            value = control.get('value')
-            range_type = control.get('range', 'all')
 
-            if ctype == 'brightness':
-                if range_type == 'all':
-                    result = ImageEnhance.Brightness(result).enhance(float(value))
-                else:
-                    mask = _get_luminance_mask(result, range_type)
-                    if mask:
-                        adjusted = ImageEnhance.Brightness(result.copy()).enhance(float(value))
-                        result = Image.composite(adjusted, result, mask)
-
-            elif ctype == 'contrast':
-                if range_type == 'all':
-                    result = ImageEnhance.Contrast(result).enhance(float(value))
-                else:
-                    mask = _get_luminance_mask(result, range_type)
-                    if mask:
-                        adjusted = ImageEnhance.Contrast(result.copy()).enhance(float(value))
-                        result = Image.composite(adjusted, result, mask)
-
-            elif ctype == 'saturation':
-                if range_type == 'all':
-                    result = ImageEnhance.Color(result).enhance(float(value))
-                else:
-                    mask = _get_luminance_mask(result, range_type)
-                    if mask:
-                        adjusted = ImageEnhance.Color(result.copy()).enhance(float(value))
-                        result = Image.composite(adjusted, result, mask)
-
-            elif ctype == 'hue' and value != 0:
-                try:
-                    hue_deg = float(value)
-
-                    def _apply_hue(img):
-                        img_hsv = img.convert('HSV')
-                        h, s, v = img_hsv.split()
-                        shift = int((hue_deg % 360) * (255 / 360))
-                        h = h.point(lambda i: (i + shift) % 255)
-                        return Image.merge('HSV', (h, s, v)).convert('RGB')
-
-                    if range_type == 'all':
-                        result = _apply_hue(result)
-                    else:
-                        mask = _get_luminance_mask(result, range_type)
-                        if mask:
-                            adjusted = _apply_hue(result.copy())
-                            result = Image.composite(adjusted, result, mask)
-                except Exception as e:
-                    print(f"🟡 [Holaf-Logic] Failed to apply Hue adjustment: {e}")
+            if ctype in _TONAL_TYPES:
+                # ── Contrôle tonal multi-plages (schéma v2) ──
+                # Chaque zone NON NEUTRE est appliquée séquentiellement, restreinte
+                # à sa bande de luminance ('all' = partout), et compositée sur le
+                # résultat courant (mêmes LUT/profils que _get_luminance_mask).
+                # Les zones neutres (clé absente ou valeur neutre) ne déclenchent
+                # AUCUNE passe — une seule zone non neutre ⇒ rendu identique à
+                # l'ancien comportement mono-plage (value + range).
+                zones = control.get('zones') or {}
+                for zone_key in _ZONE_KEYS:  # ordre fixe : all → shadows → midtones → highlights
+                    if zone_key not in zones:
+                        continue  # clé absente = neutre
+                    zone_value = zones[zone_key]
+                    if _is_neutral_zone(ctype, zone_value):
+                        continue  # zone neutre : aucune passe
+                    result = _apply_tonal_zone(result, ctype, zone_value, zone_key)
 
             elif ctype == 'blur':
-                radius = max(0.0, float(value))
+                try:
+                    radius = max(0.0, float(control.get('value')))
+                except (TypeError, ValueError):
+                    continue  # valeur illisible → contrôle ignoré
                 if radius > 0:
                     result = result.filter(ImageFilter.GaussianBlur(radius))
 
             elif ctype == 'pixelate':
-                size = max(2, int(value))
+                try:
+                    size = max(2, int(control.get('value')))
+                except (TypeError, ValueError):
+                    continue  # valeur illisible → contrôle ignoré
                 w, h = result.size
                 result = result.resize((max(1, w // size), max(1, h // size)), Image.Resampling.NEAREST)
                 result = result.resize((w, h), Image.Resampling.NEAREST)
 
             elif ctype == 'vignette':
-                result = _apply_vignette(result, float(value))
+                try:
+                    result = _apply_vignette(result, float(control.get('value')))
+                except (TypeError, ValueError):
+                    continue  # valeur illisible → contrôle ignoré
 
             elif ctype == 'sharpen':
-                amount = float(value)
+                try:
+                    amount = float(control.get('value'))
+                except (TypeError, ValueError):
+                    continue  # valeur illisible → contrôle ignoré
                 if amount > 0:
                     result = result.filter(ImageFilter.UnsharpMask(radius=2, percent=round(min(300, amount * 100)), threshold=2))
 
@@ -1181,6 +1283,70 @@ def apply_edits_to_image(image, edit_data, mask_images=None):
     return result
 
 
+def _apply_tonal_zone(image, ctype, value, range_type):
+    """
+    Applique UNE passe tonale (brightness/contrast/saturation/hue) soit à toute
+    l'image (range_type 'all'), soit restreinte à sa bande de luminance via
+    _get_luminance_mask puis compositée sur l'image d'entrée.
+
+    Reproduit à l'identique les passes de l'ancien code mono-plage (value +
+    range) : mêmes appels ImageEnhance / mêmes LUT, mask calculé sur l'image
+    courante. Retourne toujours une NOUVELLE image (jamais l'objet `image`
+    modifié) ; en cas de valeur illisible ou d'échec, l'image d'entrée est
+    retournée telle quelle (passe sans effet).
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return image
+
+    if ctype == 'brightness':
+        if range_type == 'all':
+            return ImageEnhance.Brightness(image).enhance(v)
+        mask = _get_luminance_mask(image, range_type)
+        if mask:
+            return Image.composite(ImageEnhance.Brightness(image.copy()).enhance(v), image, mask)
+        return image
+
+    if ctype == 'contrast':
+        if range_type == 'all':
+            return ImageEnhance.Contrast(image).enhance(v)
+        mask = _get_luminance_mask(image, range_type)
+        if mask:
+            return Image.composite(ImageEnhance.Contrast(image.copy()).enhance(v), image, mask)
+        return image
+
+    if ctype == 'saturation':
+        if range_type == 'all':
+            return ImageEnhance.Color(image).enhance(v)
+        mask = _get_luminance_mask(image, range_type)
+        if mask:
+            return Image.composite(ImageEnhance.Color(image.copy()).enhance(v), image, mask)
+        return image
+
+    if ctype == 'hue':
+        try:
+            hue_deg = v
+
+            def _apply_hue(img):
+                img_hsv = img.convert('HSV')
+                h, s, v_ = img_hsv.split()
+                shift = int((hue_deg % 360) * (255 / 360))
+                h = h.point(lambda i: (i + shift) % 255)
+                return Image.merge('HSV', (h, s, v_)).convert('RGB')
+
+            if range_type == 'all':
+                return _apply_hue(image)
+            mask = _get_luminance_mask(image, range_type)
+            if mask:
+                return Image.composite(_apply_hue(image.copy()), image, mask)
+        except Exception as e:
+            print(f"🟡 [Holaf-Logic] Failed to apply Hue adjustment: {e}")
+        return image
+
+    return image
+
+
 def _apply_vignette(img, intensity):
     """Assombrit les bords de l'image radialement (intensité 0-1)."""
     if intensity <= 0:
@@ -1230,10 +1396,17 @@ def _load_edit_mask(edit_data, original_path_abs):
 def build_ffmpeg_filter_string(edit_data):
     """
     Translates edit_data into an FFmpeg filter string (-vf).
-    Supports both old flat format and new controls array format.
-    Ranges are ignored (FFmpeg can't do luminance masking).
-    Masks (contrôles de type 'mask') sont ignorés en vidéo : FFmpeg ne peut pas
-    appliquer de masks bitmap par pixel dans un filtre simple -vf.
+    Supports old flat format, v1 controls array and v2 zones schema.
+
+    ── POLITIQUE VIDÉO (schéma v2) ──
+    FFmpeg ne peut pas appliquer de masque de luminance par pixel. Pour un
+    contrôle TONAL (brightness/contrast/saturation/hue), la valeur plate
+    utilisée est zones['all'] SI ELLE EST NON NEUTRE ; sinon le contrôle est
+    IGNORÉ (pas d'ajustement partiel par bande en vidéo — statu quo décidé).
+    Pour un contrôle NON TONAL (blur/pixelate/vignette/sharpen), la valeur
+    globale `value` est utilisée telle quelle (les plages v1 y étaient déjà
+    ignorées). Les masks (type 'mask') sont ignorés en vidéo : FFmpeg ne peut
+    pas appliquer de masks bitmap par pixel dans un filtre simple -vf.
     """
     if not edit_data:
         return ""
@@ -1241,13 +1414,25 @@ def build_ffmpeg_filter_string(edit_data):
     # Normalize to new format and extract flat values
     edit_data = _migrate_edit_data(edit_data)
     
-    # Build a flat lookup from controls (ignoring ranges)
+    # Build a flat lookup from controls.
+    # Tonal controls: only zones['all'] NON NEUTRE feeds the flat value
+    # (zones.all absent/neutre → contrôle ignoré en vidéo). Un contrôle
+    # restreint à une bande ne contribue PAS et n'écrase pas la valeur d'un
+    # contrôle précédent du même type. Non-tonal controls: value globale.
     flat = {}
     for control in edit_data.get('controls', []):
         ctype = control.get('type')
-        value = control.get('value')
-        if ctype and value is not None:
-            flat[ctype] = value
+        if not ctype:
+            continue
+        if ctype in _TONAL_TYPES:
+            zones = control.get('zones') or {}
+            all_value = zones.get('all')
+            if all_value is not None and not _is_neutral_zone(ctype, all_value):
+                flat[ctype] = all_value
+        elif ctype in _SPATIAL_TYPES or ctype == 'mask':
+            value = control.get('value')
+            if value is not None:
+                flat[ctype] = value
     # Also copy top-level video keys
     for key in ['playbackRate', 'targetFps', 'interpolate']:
         if key in edit_data:

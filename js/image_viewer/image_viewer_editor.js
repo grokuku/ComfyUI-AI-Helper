@@ -8,11 +8,28 @@
  */
 
 import "../aih_strings.js";
-import { escapeHtml } from "../holaf_dom_utils.js";
 import { imageViewerState } from './image_viewer_state.js';
 import { resetTransform, getFullImageUrl } from './image_viewer_navigation.js';
 import { HolafFetch, HolafFetchError } from '../vendor/holaf/holaf-fetch.js';
 import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
+import {
+    SCHEMA_VERSION,
+    ZONE_KEYS,
+    ZONE_LABEL_KEYS,
+    ZONE_SHORT_LABEL_KEYS,
+    ZONE_TINT_CLASS,
+    findControlDef,
+    neutralZones,
+    zonesFromControl,
+    zoneValue,
+    controlZonePasses,
+    hasRangedZones,
+    buildCssFilterFromControls,
+    normalizeStateV2,
+    buildPickerHTML,
+    buildPickerItemsHTML,
+    buildControlPickerFamilies,
+} from './image_viewer_editor_model.js';
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -25,29 +42,10 @@ function _controlTypeLabel(id) {
     return t('iv.ctrl' + id.charAt(0).toUpperCase() + id.slice(1));
 }
 
-// Catégories des contrôles d'édition (rangement « dossier » du picker).
-// Ajouter une catégorie = entrée ici + champ `category` sur les contrôles.
-const CONTROL_CATEGORIES = [
-    { id: 'geometry', labelKey: 'iv.catGeometry', icon: '📐' },
-    { id: 'basic',   labelKey: 'iv.catBasic',   icon: '⚙️' },
-    { id: 'color',   labelKey: 'iv.catColor',   icon: '🎨' },
-    { id: 'effects', labelKey: 'iv.catEffects', icon: '✨' },
-];
+// Catégories + types de contrôles : définis dans le module modèle pur
+// (js/image_viewer/image_viewer_editor_model.js) — schéma v2, tests non-DOM.
 
-// Modèle de valeur :
-//   - défaut : `value` = ratio (1 = 100%) ; le slider affiche value*100
-//   - `raw: true` : `value` est utilisé tel quel (degrés hue, px blur/pixelate)
-//   - `unit` : suffixe d'affichage ('px', '%', '°')
-const CONTROL_TYPES = [
-    { id: 'brightness', label: 'Brightness', category: 'basic',   default: 1, min: 0, max: 200, step: 1 },
-    { id: 'contrast',   label: 'Contrast',   category: 'basic',   default: 1, min: 0, max: 200, step: 1 },
-    { id: 'saturation', label: 'Saturation', category: 'color',   default: 1, min: 0, max: 200, step: 1 },
-    { id: 'hue',        label: 'Hue',        category: 'color',   default: 0, min: -180, max: 180, step: 1, raw: true },
-    { id: 'blur',       label: 'Blur',       category: 'effects', default: 8, min: 0, max: 50, step: 0.5, raw: true, unit: 'px' },
-    { id: 'pixelate',   label: 'Pixelate',   category: 'effects', default: 12, min: 2, max: 64, step: 1, raw: true, unit: 'px' },
-    { id: 'vignette',   label: 'Vignette',   category: 'effects', default: 0.5, min: 0, max: 100, step: 1, unit: '%' },
-    { id: 'sharpen',    label: 'Sharpen',    category: 'effects', default: 1, min: 0, max: 300, step: 5, unit: '%' },
-];
+// Note : les types zonaux portent `zones` (4 bandes) ; les autres `value`.
 
 // ── Méta slider : traduit value ↔ slider et formate l'affichage ─────────────
 function _ctrlSliderMeta(def, value) {
@@ -65,58 +63,140 @@ function _ctrlSliderMeta(def, value) {
     };
 }
 
-// ── Pickeur « liste structurée » (AIH.Dialog) ───────────────────────────────
-// groups: [{ label?, items: [{ id, label, hint? }] }] — clic ou Entrée sélectionne.
-function _buildPickerHTML(groups) {
-    let html = '<div class="aih-picker">';
-    groups.forEach((g) => {
-        if (g.label) {
-            html += `<div class="aih-picker-cat">${escapeHtml(g.label)}</div>`;
-        }
-        g.items.forEach((it) => {
-            html += `<div class="aih-picker-item" data-pick="${it.id}" role="button" tabindex="0">`
-                + `<span class="aih-picker-item-name">${escapeHtml(it.label)}</span>`
-                + (it.hint ? `<span class="aih-picker-item-hint">${escapeHtml(it.hint)}</span>` : '')
-                + '</div>';
-        });
-    });
-    html += '</div>';
-    return html;
+// ── Pickeur V4 master-detail (AIH.Dialog) ────────────────────────────────
+// Familles à gauche (catégories + compteur), contrôles à droite (icônes SVG) ;
+// un clic sur un contrôle l'ajoute DIRECTEMENT (plus d'étape « plage »).
+// Le contrat `data-pick` est conservé.
+function _buildPickerFamilies() {
+    return buildControlPickerFamilies(_controlTypeLabel, t);
 }
 
-function _pickFromList(title, groups, opts) {
+function _pickFromList(title, families, opts) {
     opts = opts || {};
     return new Promise((resolve) => {
+        const ids = families.map((f) => f.id);
+        let activeId = ids.includes(opts.lastFamily) ? opts.lastFamily : ids[0];
+        let ctrlRef = null;
+        let focusActiveFamily = null;
+
         const ctrl = AIH.Dialog.open({
             title: title,
             modal: true,
             draggable: true,
             resizable: false,
-            width: opts.width || '380px',
+            width: opts.width || '430px',
             _onResolve: (v) => resolve(v),
-            content: (body) => { body.innerHTML = _buildPickerHTML(groups); },
+            content: (body) => {
+                body.innerHTML = buildPickerHTML(families, activeId);
+                const familiesEl = body.querySelector('.aih-picker-families');
+                const itemsEl = body.querySelector('.aih-picker-controls');
+                const familyEls = () => Array.from(familiesEl.querySelectorAll('.aih-picker-family'));
+                const itemEls = () => Array.from(itemsEl.querySelectorAll('.aih-picker-item'));
+
+                const renderItems = (fid) => {
+                    activeId = fid;
+                    const fam = families.find((f) => f.id === fid) || families[0];
+                    itemsEl.innerHTML = buildPickerItemsHTML(fam);
+                    familyEls().forEach((el) => {
+                        const on = el.dataset.family === fid;
+                        el.classList.toggle('active', on);
+                        el.setAttribute('aria-selected', on ? 'true' : 'false');
+                    });
+                    if (typeof opts.onFamilyChange === 'function') opts.onFamilyChange(fid);
+                };
+                const pickItem = (el) => { if (el && ctrlRef) ctrlRef.close(el.dataset.pick); };
+
+                body.addEventListener('click', (e) => {
+                    const fam = e.target.closest('.aih-picker-family');
+                    if (fam) { renderItems(fam.dataset.family); fam.focus(); return; }
+                    const it = e.target.closest('.aih-picker-item');
+                    if (it) pickItem(it);
+                });
+
+                // Navigation clavier : ↑↓ (familles / contrôles), ←→, ↵, Échap (Dialog).
+                body.addEventListener('keydown', (e) => {
+                    const fam = e.target.closest('.aih-picker-family');
+                    const it = e.target.closest('.aih-picker-item');
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        if (it) { e.preventDefault(); pickItem(it); return; }
+                        if (fam) { e.preventDefault(); renderItems(fam.dataset.family); return; }
+                    }
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        const dir = e.key === 'ArrowDown' ? 1 : -1;
+                        if (fam) {
+                            const list = familyEls();
+                            const n = (list.indexOf(fam) + dir + list.length) % list.length;
+                            renderItems(list[n].dataset.family);
+                            list[n].focus();
+                        } else if (it) {
+                            const list = itemEls();
+                            const n = (list.indexOf(it) + dir + list.length) % list.length;
+                            list[n].focus();
+                        }
+                        return;
+                    }
+                    if (e.key === 'ArrowRight' && fam) {
+                        e.preventDefault();
+                        const list = itemEls();
+                        if (list[0]) list[0].focus();
+                        return;
+                    }
+                    if (e.key === 'ArrowLeft' && it) {
+                        e.preventDefault();
+                        const active = familyEls().find((el) => el.dataset.family === activeId);
+                        if (active) active.focus();
+                    }
+                });
+
+                focusActiveFamily = () => {
+                    const f = familyEls().find((el) => el.dataset.family === activeId) || familyEls()[0];
+                    if (f) f.focus();
+                };
+            },
             buttons: [{ text: t('iv.cancel'), value: null, type: 'cancel' }],
         });
-        const items = ctrl.el.querySelectorAll('[data-pick]');
-        const pick = (item) => () => ctrl.close(item.dataset.pick);
-        items.forEach((item) => {
-            const handler = pick(item);
-            item.addEventListener('click', handler);
-            item.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handler(); }
-            });
-        });
-        if (items[0]) items[0].focus();
+        ctrlRef = ctrl;
+        // Le focus est posé APRÈS insertion dans le document (open() rend le
+        // contenu avant que `el` ne soit attaché à <body>).
+        if (focusActiveFamily) focusActiveFamily();
     });
 }
 
 const DEFAULT_EDIT_STATE = () => ({
+    v: SCHEMA_VERSION,
     controls: [],
     targetFps: null,
     playbackRate: 1.0,
     interpolate: false,
     crop: null
 });
+
+// ── Rendu des lignes de contrôle (zonaux / non zonaux) ─────────────────────
+
+// Pastille compacte d'une bande (ligne repliée) : teinte + valeur.
+function _zonePillHtml(zone, value, def) {
+    const meta = _ctrlSliderMeta(def, value);
+    const label = t(ZONE_LABEL_KEYS[zone]);
+    return `<span class="holaf-editor-zone-pill" data-zone="${zone}" title="${label} : ${meta.display}">`
+        + `<span class="holaf-editor-zone-dot ${ZONE_TINT_CLASS[zone]}"></span>${meta.display}</span>`;
+}
+
+// Ligne slider d'une bande (ligne dépliée). `data-zone` porte la cible du reset.
+// La colonne étroite (58px) affiche le libellé COURT ; la forme LONGUE est
+// conservée dans le `title` (tooltip) — et reste utilisée par les pastilles.
+function _zoneRowHtml(ctrl, def, zone) {
+    const value = zoneValue(zonesFromControl(ctrl), ctrl.type, zone);
+    const meta = _ctrlSliderMeta(def, value);
+    const label = t(ZONE_LABEL_KEYS[zone]);
+    const shortLabel = t(ZONE_SHORT_LABEL_KEYS[zone]);
+    return `<div class="holaf-editor-zone-row" data-zone="${zone}">`
+        + `<span class="holaf-editor-zone-label" title="${label}">${shortLabel}</span>`
+        + `<span class="holaf-editor-zone-dot ${ZONE_TINT_CLASS[zone]}"></span>`
+        + `<input type="range" data-zone="${zone}" min="${def.min}" max="${def.max}" step="${def.step}" value="${meta.sliderVal}">`
+        + `<span class="holaf-editor-slider-value">${meta.display}</span>`
+        + '</div>';
+}
 
 let _ctrlIdCounter = 0;
 let _maskIdCounter = 0;
@@ -138,6 +218,7 @@ export class ImageEditor {
         this._activeOverlayMaskId = null;
         this._lastToggledCtrlId = null; // mémo pour le dblclick reset après re-render
         this._lastToggledAt = 0;
+        this._lastPickerFamily = null; // dernière famille du picker (mémorisée)
     }
 
     init() {
@@ -289,11 +370,11 @@ export class ImageEditor {
             if (d.processed_video_url) { this.processedVideoUrl = d.processed_video_url; this._dispatchVideoOverride(this.processedVideoUrl); }
             else this._dispatchVideoOverride(null);
             if (d.status === 'ok') {
-                this.currentState = { ...DEFAULT_EDIT_STATE(), ...d.edits };
-                // Ensure controls array exists and is not shared by reference
-                if (d.edits && Array.isArray(d.edits.controls)) {
-                    this.currentState.controls = d.edits.controls.map(c => ({ ...c }));
-                }
+                // Migration v1 → v2 à la LECTURE (le front recharge des .edt v1) :
+                // idempotente, « v » absent = v1. Chaque contrôle est copié (pas
+                // de partage de référence) et les champs inconnus sont conservés.
+                this.currentState = normalizeStateV2({ ...DEFAULT_EDIT_STATE(), ...d.edits });
+                this._syncIdCounters();
             }
             // ── Masks multiples : charger le PNG de CHAQUE contrôle type 'mask' ──
             this._maskCanvases = {};
@@ -364,9 +445,11 @@ export class ImageEditor {
             // Ne pas muter currentState.controls avec les base64 : on les met dans
             // une structure séparée payload.mask_layers. On retire aussi les
             // mask_base64 injectés au load (le serveur les re-injecte au prochain load).
+            // normalizeStateV2 pose `v: 2` et migre tout contrôle resté en v1.
+            const normalized = normalizeStateV2(this.currentState);
             const editsPayload = {
-                ...this.currentState,
-                controls: (this.currentState.controls || []).map(c => {
+                ...normalized,
+                controls: (normalized.controls || []).map(c => {
                     const { mask_base64, ...rest } = c;
                     return rest;
                 }),
@@ -436,20 +519,17 @@ export class ImageEditor {
     }
 
     _buildCssFilter() {
-        let b = 1, c = 1, s = 1, h = 0;
-        for (const ctrl of this.currentState.controls || []) {
-            if (ctrl.range !== 'all') continue;
-            if (ctrl.type === 'brightness') b = ctrl.value;
-            if (ctrl.type === 'contrast') c = ctrl.value;
-            if (ctrl.type === 'saturation') s = ctrl.value;
-            if (ctrl.type === 'hue') h = ctrl.value;
-        }
-        return `brightness(${b}) contrast(${c}) saturate(${s}) hue-rotate(${h}deg)`;
+        // Fast-path CSS : ne reflète que la bande « all » de chaque contrôle
+        // zonaux. Utilisé uniquement quand `_hasRangedAdjustments()` est faux
+        // (ou en repli d'erreur) — sinon le rendu canvas prend le relais.
+        return buildCssFilterFromControls(this.currentState.controls);
     }
 
     _hasRangedAdjustments() {
+        // Vrai si un contrôle zonaux a une bande ≠ « all » non neutre. Les
+        // edits migrés v1 (uniquement « all ») restent donc sur le fast-path CSS.
         if (this.nativeFps > 0) return false;
-        return (this.currentState.controls || []).some(c => c.range && c.range !== 'all');
+        return hasRangedZones(this.currentState.controls);
     }
 
     // Effets qui ne peuvent pas passer par les CSS filters (spatiaux) ou mask,
@@ -541,58 +621,56 @@ export class ImageEditor {
     }
 
     // Applique les contrôles par pixel (brightness/contrast/saturation/hue) à un
-    // ImageData source, en tenant compte des plages (ranges) de luminance.
+    // ImageData source, en respectant les bandes de luminance du schéma v2.
+    // Les bandes NON NEUTRES d'un contrôle sont appliquées SÉQUENTIELLEMENT
+    // (ordre all → shadows → midtones → highlights), chacune restreinte à sa
+    // bande de luminance ('all' = partout) et compositée sur le RÉSULTAT
+    // COURANT — même sémantique que le rendu serveur. Le poids par pixel vient
+    // des mêmes profils que _luminanceWeight ; une bande neutre = aucune passe.
     _applyPixelControls(srcData, w, h, controls) {
         const data = srcData.data;
         const dst = new Uint8ClampedArray(data.length);
-        const allControls = controls.filter(c => (c.range || 'all') === 'all');
-        const rangedControls = controls.filter(c => (c.range || 'all') !== 'all');
-        const hasRanged = rangedControls.length > 0;
         const len = data.length;
+
+        // Pré-calcul (hors boucle pixel) des passes non neutres, dans l'ordre.
+        const passesList = [];
+        for (const ctrl of controls) {
+            const passes = controlZonePasses(ctrl);
+            if (passes.length) passesList.push({ type: ctrl.type, passes });
+        }
+
         for (let i = 0; i < len; i += 4) {
             let r = data[i], g = data[i + 1], b = data[i + 2];
             const a0 = data[i + 3];
-            for (let ci = 0; ci < allControls.length; ci++) {
-                const ctrl = allControls[ci]; const val = ctrl.value;
-                if (ctrl.type === 'brightness') { r *= val; g *= val; b *= val; }
-                else if (ctrl.type === 'contrast') { r = 128 + (r - 128) * val; g = 128 + (g - 128) * val; b = 128 + (b - 128) * val; }
-                else if (ctrl.type === 'saturation') { const gr = 0.299 * r + 0.587 * g + 0.114 * b; r = gr + (r - gr) * val; g = gr + (g - gr) * val; b = gr + (b - gr) * val; }
-                else if (ctrl.type === 'hue') {
-                    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
-                    let hh; if (d === 0) hh = 0; else if (mx === r) hh = ((g - b) / d) % 6; else if (mx === g) hh = (b - r) / d + 2; else hh = (r - g) / d + 4;
-                    hh = hh * 60; if (hh < 0) hh += 360;
-                    const ss = mx === 0 ? 0 : d / mx, vv = mx;
-                    let nH = (hh + val) % 360; if (nH < 0) nH += 360;
-                    const c = vv * ss, x = c * (1 - Math.abs((nH / 60) % 2 - 1)), m = vv - c;
-                    let nr2, ng2, nb2;
-                    if (nH < 60) { nr2 = c; ng2 = x; nb2 = 0; } else if (nH < 120) { nr2 = x; ng2 = c; nb2 = 0; } else if (nH < 180) { nr2 = 0; ng2 = c; nb2 = x; } else if (nH < 240) { nr2 = 0; ng2 = x; nb2 = c; } else if (nH < 300) { nr2 = x; ng2 = 0; nb2 = c; } else { nr2 = c; ng2 = 0; nb2 = x; }
-                    r = nr2 + m; g = ng2 + m; b = nb2 + m;
-                }
-            }
-            if (hasRanged) {
-                const oR = data[i], oG = data[i + 1], oB = data[i + 2];
-                const origLum = 0.299 * oR + 0.587 * oG + 0.114 * oB;
-                for (let ci = 0; ci < rangedControls.length; ci++) {
-                    const ctrl = rangedControls[ci]; const val = ctrl.value;
-                    const weight = this._luminanceWeight(origLum, ctrl.range);
+
+            for (let ci = 0; ci < passesList.length; ci++) {
+                const type = passesList[ci].type;
+                const passes = passesList[ci].passes;
+                for (let pi = 0; pi < passes.length; pi++) {
+                    const val = passes[pi].value;
+                    const zone = passes[pi].zone;
+                    // Poids de la bande, calculé sur le pixel COURANT.
+                    const weight = zone === 'all' ? 1 : this._luminanceWeight(0.299 * r + 0.587 * g + 0.114 * b, zone);
                     if (weight <= 0) continue;
-                    if (ctrl.type === 'brightness') { r += (oR * val - oR) * weight; g += (oG * val - oG) * weight; b += (oB * val - oB) * weight; }
-                    else if (ctrl.type === 'contrast') { r += (128 + (oR - 128) * val - oR) * weight; g += (128 + (oG - 128) * val - oG) * weight; b += (128 + (oB - 128) * val - oB) * weight; }
-                    else if (ctrl.type === 'saturation') { const oGr = 0.299 * oR + 0.587 * oG + 0.114 * oB; r += (oGr + (oR - oGr) * val - oR) * weight; g += (oGr + (oG - oGr) * val - oG) * weight; b += (oGr + (oB - oGr) * val - oB) * weight; }
-                    else if (ctrl.type === 'hue') {
-                        const mx = Math.max(oR, oG, oB), mn = Math.min(oR, oG, oB), d = mx - mn;
-                        let hh; if (d === 0) hh = 0; else if (mx === oR) hh = ((oG - oB) / d) % 6; else if (mx === oG) hh = (oB - oR) / d + 2; else hh = (oR - oG) / d + 4;
+                    let nr = r, ng = g, nb = b;
+                    if (type === 'brightness') { nr = r * val; ng = g * val; nb = b * val; }
+                    else if (type === 'contrast') { nr = 128 + (r - 128) * val; ng = 128 + (g - 128) * val; nb = 128 + (b - 128) * val; }
+                    else if (type === 'saturation') { const gr = 0.299 * r + 0.587 * g + 0.114 * b; nr = gr + (r - gr) * val; ng = gr + (g - gr) * val; nb = gr + (b - gr) * val; }
+                    else if (type === 'hue') {
+                        const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+                        let hh; if (d === 0) hh = 0; else if (mx === r) hh = ((g - b) / d) % 6; else if (mx === g) hh = (b - r) / d + 2; else hh = (r - g) / d + 4;
                         hh = hh * 60; if (hh < 0) hh += 360;
                         const ss = mx === 0 ? 0 : d / mx, vv = mx;
                         let nH = (hh + val) % 360; if (nH < 0) nH += 360;
                         const c = vv * ss, x = c * (1 - Math.abs((nH / 60) % 2 - 1)), m = vv - c;
-                        let nr2, ng2, nb2;
-                        if (nH < 60) { nr2 = c; ng2 = x; nb2 = 0; } else if (nH < 120) { nr2 = x; ng2 = c; nb2 = 0; } else if (nH < 180) { nr2 = 0; ng2 = c; nb2 = x; } else if (nH < 240) { nr2 = 0; ng2 = x; nb2 = c; } else if (nH < 300) { nr2 = x; ng2 = 0; nb2 = c; } else { nr2 = c; ng2 = 0; nb2 = x; }
-                        r += (nr2 + m - oR) * weight; g += (ng2 + m - oG) * weight; b += (nb2 + m - oB) * weight;
+                        if (nH < 60) { nr = c; ng = x; nb = 0; } else if (nH < 120) { nr = x; ng = c; nb = 0; } else if (nH < 180) { nr = 0; ng = c; nb = x; } else if (nH < 240) { nr = 0; ng = x; nb = c; } else if (nH < 300) { nr = x; ng = 0; nb = c; } else { nr = c; ng = 0; nb = x; }
+                        nr += m; ng += m; nb += m;
                     }
+                    if (weight === 1) { r = nr; g = ng; b = nb; }
+                    else { r += (nr - r) * weight; g += (ng - g) * weight; b += (nb - b) * weight; }
                 }
             }
-            dst[i] = Math.round(r); dst[i+1] = Math.round(g); dst[i+2] = Math.round(b); dst[i+3] = a0;
+            dst[i] = Math.round(r); dst[i + 1] = Math.round(g); dst[i + 2] = Math.round(b); dst[i + 3] = a0;
         }
         return new ImageData(dst, w, h);
     }
@@ -707,16 +785,33 @@ export class ImageEditor {
 
     // ── Controls management (auto-save on every change) ──
 
-    _addControl(typeId, range = 'all') {
-        const def = CONTROL_TYPES.find(c => c.id === typeId);
+    _addControl(typeId, range) {
+        const def = findControlDef(typeId);
         if (!def) return;
         _ctrlIdCounter++;
         const newId = 'c_' + _ctrlIdCounter;
-        this.currentState.controls = [...this.currentState.controls, { id: newId, type: typeId, value: def.default, range: range }];
+        // Types zonaux : `zones` (4 bandes neutres). Types non zonaux : `value`.
+        // (Le paramètre `range` est conservé en signature pour compat mais ignoré :
+        //  le picker n'a plus d'étape « plage ».)
+        const ctrl = def.zonal
+            ? { id: newId, type: typeId, zones: neutralZones(typeId) }
+            : { id: newId, type: typeId, value: def.default };
+        this.currentState.controls = [...this.currentState.controls, ctrl];
         this._expandedCtrlId = newId; // déplier automatiquement le contrôle ajouté
         this._updateUIFromState();
         this.applyPreview();
         this._scheduleAutoSave();
+    }
+
+    // Aligne les compteurs d'id sur les contrôles chargés (c_N / m_N) : évite de
+    // ré-émettre un id déjà présent quand on rouvre une image ayant des edits.
+    _syncIdCounters() {
+        for (const c of this.currentState.controls || []) {
+            const cm = /^c_(\d+)$/.exec(c.id || '');
+            if (cm) _ctrlIdCounter = Math.max(_ctrlIdCounter, parseInt(cm[1], 10));
+            const mm = /^m_(\d+)$/.exec(c.id || '');
+            if (mm) _maskIdCounter = Math.max(_maskIdCounter, parseInt(mm[1], 10));
+        }
     }
 
     // Crée un NOUVEAU layer mask (élément ordonné de la pipeline) et ouvre son éditeur.
@@ -798,26 +893,47 @@ export class ImageEditor {
                 return;
             }
 
-            const def = CONTROL_TYPES.find(t => t.id === c.type);
+            const def = findControlDef(c.type);
             if (!def) return;
-            const meta = _ctrlSliderMeta(def, c.value);
-            const rangeLabel = c.range === 'all' ? t('iv.all') : c.range.charAt(0).toUpperCase() + c.range.slice(1);
-            const rangeStyle = c.range === 'all' ? 'opacity:0.5;' : 'color:var(--holaf-accent-color,#4682B4);font-weight:bold;';
             const expanded = this._expandedCtrlId === c.id;
             const delBtn = iconBtn(`data-ctrl-id="${c.id}" title="${t('iv.removeCtrlTitle', { label: _controlTypeLabel(c.type) })}"`, '✕', 'color:var(--holaf-error-color,#c44);');
             const nameStyle = 'text-align:left;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
 
             if (!expanded) {
-                // Replié : pas de slider — clic sur la ligne (hors boutons) pour déplier
+                // Replié : nom + pastilles des SEULES bandes ≠ neutre (ou valeur
+                // pour un contrôle non zonaux). Clic sur la ligne pour déplier.
+                let summary;
+                if (def.zonal) {
+                    const passes = controlZonePasses(c);
+                    summary = passes.length
+                        ? passes.map((p) => _zonePillHtml(p.zone, p.value, def)).join('')
+                        : `<span class="holaf-editor-slider-value" style="opacity:0.4;">—</span>`;
+                    summary = `<span class="holaf-editor-zone-pills">${summary}</span>`;
+                } else {
+                    const meta = _ctrlSliderMeta(def, c.value);
+                    summary = `<span class="holaf-editor-slider-value" style="min-width:36px;flex-shrink:0;">${meta.display}</span>`;
+                }
                 html += `
                     <div class="holaf-editor-slider-container" data-ctrl-id="${c.id}" style="display:flex;align-items:center;gap:6px;">
                         <label style="${nameStyle}">${_controlTypeLabel(c.type)}</label>
-                        <span class="holaf-editor-range-label" style="font-size:11px;flex-shrink:0;${rangeStyle}">${rangeLabel}</span>
-                        <span class="holaf-editor-slider-value" style="min-width:36px;flex-shrink:0;">${meta.display}</span>
+                        ${summary}
                         ${upBtn}${downBtn}${delBtn}
                     </div>`;
+            } else if (def.zonal) {
+                // Déplié zonal : en-tête + 4 sliders étiquetés (Tout/Ombres/…).
+                html += `
+                    <div class="holaf-editor-slider-container holaf-editor-zonal" data-ctrl-id="${c.id}" style="display:block;padding:2px 0;">
+                        <div style="display:flex;align-items:center;gap:6px;">
+                            <label style="${nameStyle}">${_controlTypeLabel(c.type)}</label>
+                            ${upBtn}${downBtn}${delBtn}
+                        </div>
+                        <div data-ctrl-body class="holaf-editor-zonal-body">
+                            ${ZONE_KEYS.map((zone) => _zoneRowHtml(c, def, zone)).join('')}
+                        </div>
+                    </div>`;
             } else {
-                // Déplié : en-tête (nom + ordre + suppression) + slider/plage/valeur en dessous
+                // Déplié non zonal : en-tête + slider unique.
+                const meta = _ctrlSliderMeta(def, c.value);
                 html += `
                     <div class="holaf-editor-slider-container" data-ctrl-id="${c.id}" style="display:block;padding:2px 0;">
                         <div style="display:flex;align-items:center;gap:6px;">
@@ -825,7 +941,6 @@ export class ImageEditor {
                             ${upBtn}${downBtn}${delBtn}
                         </div>
                         <div data-ctrl-body style="display:flex;align-items:center;gap:6px;margin-top:3px;">
-                            <span class="holaf-editor-range-label" style="font-size:11px;flex-shrink:0;${rangeStyle}">${rangeLabel}</span>
                             <input type="range" min="${def.min}" max="${def.max}" step="${def.step}" value="${meta.sliderVal}" style="flex-grow:1;min-width:0;margin:0;">
                             <span class="holaf-editor-slider-value" style="min-width:36px;flex-shrink:0;">${meta.display}</span>
                         </div>
@@ -1468,23 +1583,13 @@ export class ImageEditor {
         const addBtn = this.panelEl.querySelector('#holaf-editor-add-btn');
         if (addBtn) {
             addBtn.onclick = async () => {
-                // Liste structurée par catégories (évolutive) : clic sélectionne
-                const groups = CONTROL_CATEGORIES.map((cat) => {
-                    const items = CONTROL_TYPES
-                        .filter((ct) => ct.category === cat.id)
-                        .map((ct) => ({ id: ct.id, label: _controlTypeLabel(ct.id) }));
-                    // Item spécial « Crop » dans la catégorie Géométrie
-                    if (cat.id === 'geometry') {
-                        items.push({ id: 'crop', label: t('iv.cropItem') });
-                    }
-                    return { label: t(cat.labelKey), items };
-                }).filter((g) => g.items.length > 0);
-                // Item spécial « Masque » : crée toujours un NOUVEAU layer mask
-                groups.push({
-                    label: t('iv.maskGroup'),
-                    items: [{ id: 'mask', label: t('iv.createMask') }],
+                // Picker V4 master-detail : familles + compteur à gauche, contrôles
+                // à droite. Un clic ajoute DIRECTEMENT (plus d'étape « plage »).
+                const families = _buildPickerFamilies();
+                const chosenType = await _pickFromList(t('iv.addControlTitle'), families, {
+                    lastFamily: this._lastPickerFamily,
+                    onFamilyChange: (fid) => { this._lastPickerFamily = fid; },
                 });
-                const chosenType = await _pickFromList(t('iv.addControlTitle'), groups);
                 if (!chosenType) return;
 
                 // Crop : ouvre l'éditeur de recadrage (comme le mask)
@@ -1499,27 +1604,16 @@ export class ImageEditor {
                     return;
                 }
 
-                // Portée du réglage — même picker
-                const rangeGroups = [{
-                    items: [
-                        { id: 'all', label: t('iv.all') },
-                        { id: 'shadows', label: t('iv.shadows') },
-                        { id: 'midtones', label: t('iv.midtones') },
-                        { id: 'highlights', label: t('iv.highlights') },
-                    ],
-                }];
-                const chosenRange = await _pickFromList(
-                    t('iv.rangeTitle', { label: _controlTypeLabel(chosenType) }),
-                    rangeGroups
-                );
-                if (!chosenRange) return;
-                this._addControl(chosenType, chosenRange);
+                // Contrôle zonaux/non zonal : ajout direct, bandes neutres.
+                this._addControl(chosenType);
             };
         }
 
         const list = this.panelEl.querySelector('#holaf-editor-controls-list');
         if (list) {
-            // Slider input → auto-save after debounce
+            // Slider input → auto-save after debounce. Un slider zonal porte
+            // `data-zone` (all/shadows/midtones/highlights) ; un non zonal n'a
+            // qu'une `value`.
             list.addEventListener('input', (e) => {
                 const slider = e.target.closest('input[type="range"]');
                 if (!slider) return;
@@ -1527,18 +1621,29 @@ export class ImageEditor {
                 const ctrlId = container?.dataset.ctrlId;
                 const ctrl = this.currentState.controls.find(c => c.id === ctrlId);
                 if (!ctrl) return;
-                const def = CONTROL_TYPES.find(t => t.id === ctrl.type);
-                const meta = _ctrlSliderMeta(def, ctrl.value);
-                ctrl.value = meta.fromSlider(parseFloat(slider.value));
-                const valEl = container.querySelector('.holaf-editor-slider-value');
-                if (valEl) valEl.textContent = _ctrlSliderMeta(def, ctrl.value).display;
+                const def = findControlDef(ctrl.type);
+                if (!def) return;
+                const zone = slider.dataset.zone || null;
+                const raw = parseFloat(slider.value);
+                if (def.zonal && zone) {
+                    if (!ctrl.zones || typeof ctrl.zones !== 'object') ctrl.zones = neutralZones(ctrl.type);
+                    ctrl.zones[zone] = _ctrlSliderMeta(def, ctrl.value).fromSlider(raw);
+                } else {
+                    ctrl.value = _ctrlSliderMeta(def, ctrl.value).fromSlider(raw);
+                }
+                const scope = slider.closest('[data-zone]') || container;
+                const valEl = scope.querySelector('.holaf-editor-slider-value');
+                if (valEl) {
+                    const v = (def.zonal && zone) ? ctrl.zones[zone] : ctrl.value;
+                    valEl.textContent = _ctrlSliderMeta(def, v).display;
+                }
                 this._schedulePreview();
                 this._scheduleAutoSave();
             });
 
-            // Double-click → reset control value (ligne dépliée uniquement ;
-            // le re-render du toggle de la ligne peut faire perdre la cible du
-            // dblclick → retombe sur la dernière ligne togglée < 600ms)
+            // Double-click → reset la BANDE ciblée (slider) à sa valeur neutre.
+            // Ligne dépliée uniquement ; le re-render du toggle peut faire perdre
+            // la cible du dblclick → retombe sur la dernière ligne togglée < 600ms.
             list.addEventListener('dblclick', (e) => {
                 const container = e.target.closest('.holaf-editor-slider-container');
                 const ctrlId = container
@@ -1548,9 +1653,17 @@ export class ImageEditor {
                 const ctrl = this.currentState.controls.find(c => c.id === ctrlId);
                 if (!ctrl) return;
                 if (this._expandedCtrlId !== ctrlId) return; // reset visible seulement déplié
-                const def = CONTROL_TYPES.find(t => t.id === ctrl.type);
+                const def = findControlDef(ctrl.type);
                 if (!def) return;
-                ctrl.value = def.default;
+                const zoneEl = e.target.closest('[data-zone]');
+                const zone = zoneEl ? zoneEl.dataset.zone : null;
+                if (def.zonal) {
+                    if (!ctrl.zones || typeof ctrl.zones !== 'object') ctrl.zones = neutralZones(ctrl.type);
+                    if (zone) ctrl.zones[zone] = def.default;
+                    else ctrl.zones = neutralZones(ctrl.type); // pas de cible → reset global
+                } else {
+                    ctrl.value = def.default;
+                }
                 this._updateUIFromState();
                 this._schedulePreview();
                 this._scheduleAutoSave();

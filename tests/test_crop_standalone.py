@@ -16,13 +16,20 @@ import sys
 from PIL import Image
 
 # ── extract_defs : extrait les définitions de fonctions nommées du source ──
+# (ainsi que les constantes de premier niveau, ex. _TONAL_TYPES, dont
+# apply_edits_to_image dépend depuis le schéma v2 multi-plages)
 def extract_defs(source_path, names):
     with open(source_path, "r", encoding="utf-8") as f:
-        tree = ast.parse(f.read())
+        src = f.read()
+    tree = ast.parse(src)
     defs = {}
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
-            defs[node.name] = ast.get_source_segment(open(source_path, encoding="utf-8").read(), node)
+            defs[node.name] = ast.get_source_segment(src, node)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in names:
+                    defs[target.id] = ast.get_source_segment(src, node)
     return defs
 
 
@@ -31,7 +38,14 @@ def main():
     logic_path = os.path.join(here, "..", "holaf_image_viewer_backend", "logic.py")
     logic_path = os.path.normpath(logic_path)
 
-    names = ["_migrate_edit_data", "_get_luminance_mask", "_apply_vignette", "apply_edits_to_image"]
+    names = [
+        # Constantes du schéma v2 (utilisées par apply_edits_to_image et la migration)
+        "_TONAL_TYPES", "_ZONE_KEYS", "_TONAL_NEUTRAL",
+        # Migration + helpers de rendu
+        "_migrate_edit_data", "_migrate_control", "_migrate_tonal_control",
+        "_migrate_spatial_control", "_is_neutral_zone", "_apply_tonal_zone",
+        "_get_luminance_mask", "_apply_vignette", "apply_edits_to_image",
+    ]
     defs = extract_defs(logic_path, names)
     missing = [n for n in names if n not in defs]
     if missing:
