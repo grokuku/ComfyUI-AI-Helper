@@ -39,7 +39,12 @@
     list-style: none;
     padding: 5px 0;
     margin: 0;
-    z-index: 100000;
+    /* Couche « popup » : au-dessus des panneaux HolafPanelManager (bande ~1001+)
+       et de l'overlay plein écran du viewer (10999), sous les modales AIH.Dialog
+       (AIH_MODAL_Z = 90000) et les toasts (200000). Doit rester synchronisée
+       avec AIH_POPUP_Z de js/holaf_window_utils.js, que holaf_main.js pose en
+       style inline (l'inline prime sur cette règle). */
+    z-index: 50000;
     min-width: 150px;
     box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
 }

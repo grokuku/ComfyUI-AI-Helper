@@ -10,6 +10,7 @@ import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { applyPersistedTheme } from "./holaf_themes.js";
 import { holafComfyHealthCheck } from "./holaf_restart_health.js";
+import { AIH_POPUP_Z } from "./holaf_window_utils.js";
 
 import "./holaf_themes.js";
 import "./aih_dialog.js";
@@ -93,7 +94,14 @@ const HolafUtilitiesMenu = {
             this.dropdownMenuEl = document.createElement("ul");
         this.dropdownMenuEl.id = "holaf-utilities-dropdown-menu";
         this.dropdownMenuEl.style.display = 'none';
-        this.dropdownMenuEl.style.zIndex = '10005';
+        // Couche « popup » unifiée (holaf_window_utils.js) : AU-DESSUS de tous
+        // les panneaux HolafPanelManager (bande fenêtres ~1001+) et de l'overlay
+        // plein écran du viewer (10999), SOUS les dialogues modaux AIH.Dialog
+        // (bande AIH_MODAL_Z = 90000) et les toasts (200000). Cet inline était
+        // auparavant figé à '10005', ce qui écrasait la règle CSS
+        // `#holaf-utilities-dropdown-menu { z-index }` et faisait passer le menu
+        // SOUS l'overlay fullscreen de la galerie.
+        this.dropdownMenuEl.style.zIndex = String(AIH_POPUP_Z);
 
         this.buildMenu(); 
 
@@ -880,6 +888,9 @@ const HolafUtilitiesMenu = {
         if (this.dropdownMenuEl.parentElement !== document.body) {
             document.body.appendChild(this.dropdownMenuEl);
         }
+        // Sécurité : garantit la couche popup même si un re-rendu a réinitialisé
+        // le style inline (le menu doit rester attaché à document.body).
+        this.dropdownMenuEl.style.zIndex = String(AIH_POPUP_Z);
 
         const rect = buttonElement.getBoundingClientRect();
         this.dropdownMenuEl.style.top = `${rect.bottom + 2}px`;

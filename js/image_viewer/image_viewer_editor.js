@@ -584,8 +584,18 @@ export class ImageEditor {
             }
             if (cur.controls.length || cur.maskCtrl) segments.push(cur);
 
-            // Le résultat démarre sur l'original
-            const resultCanvas = this._cloneCanvas(this._previewCanvas);
+            // Le résultat démarre TOUJOURS sur l'ORIGINAL : _previewCanvas est
+            // écrasé par le rendu précédent en fin de fonction (il sert de
+            // source au blob de préview). Cloner _previewCanvas accumulait les
+            // passes à CHAQUE re-rendu (drag d'un slider) : un vignettage ne
+            // faisait que s'assombrir et une zone tonale écrasée au minimum ne
+            // remontait jamais (0 × facteur = 0). _originalImgData, capturé au
+            // chargement, est la seule base valide → rendu idempotent (deux
+            // rendus du même état = mêmes pixels).
+            const resultCanvas = document.createElement('canvas');
+            resultCanvas.width = w;
+            resultCanvas.height = h;
+            resultCanvas.getContext('2d').putImageData(this._originalImgData, 0, 0);
             const rctx = resultCanvas.getContext('2d');
 
             for (const seg of segments) {

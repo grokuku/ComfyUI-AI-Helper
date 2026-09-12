@@ -628,25 +628,69 @@ export function makeContentZoomable(contentEl, opts = {}) {
 // et UN SEUL état actif/halo partagé. `bringToFront` monte la fenêtre au-dessus
 // de toutes les autres (max+1 global) et ne laisse qu'une seule `.active` à la
 // fois, indépendamment du système d'origine.
+//
+// ─── Bandes de z-index (une échelle, trois bandes) ──────────────────────────
+//   [1000, AIH_POPUP_Z)   : fenêtres empilables — panneaux holaf + dialogues
+//                           AIH NON-modaux. Échelle continue historique.
+//   { AIH_POPUP_Z }       : couche « popup » transitoire — le menu du pack
+//                           (attaché à document.body). AU-DESSUS de toutes les
+//                           fenêtres et de l'overlay plein écran du viewer,
+//                           SOUS les modales et les toasts.
+//   [AIH_MODAL_Z, +∞)     : dialogues AIH modaux (racine + overlay). Toujours
+//                           AU-DESSUS d'un menu ouvert (exigence d'empilement).
+// Auparavant un panneau gagnait le premier plan sur TOUTE fenêtre (y compris
+// une modale, faute de bandes) ; le menu du pack, lui, était figé à 10005 et
+// passait sous l'overlay plein écran du viewer (10999).
 
-const WINDOW_BASE_Z = 1000;      // échelle continue unique (plus de 90000/1000)
-const WINDOW_MAX_Z = 1000000;    // seuil de renormalisation (évite croissance ∞)
+/** Couche popup (menu du pack) : au-dessus des panneaux, sous les modales. */
+export const AIH_POPUP_Z = 50000;
+/** Plancher de la bande modale : un dialogue modal reste au-dessus du popup. */
+export const AIH_MODAL_Z = 90000;
+
+const WINDOW_BASE_Z = 1000;      // base de la bande « fenêtres »
+// La bande « fenêtres » ne franchit JAMAIS la couche popup : au-delà on
+// renormalise (voir _renormalize) — ainsi un panneau ne peut pas recouvrir le
+// menu du pack, quelle que soit l'accumulation de bringToFront.
 const _windows = new Set();
 let _zCounter = 0;
 
+// Un élément est dans la bande modale si son z-index inline atteint le
+// plancher AIH_MODAL_Z (posé par AIH.Dialog pour les dialogues modaux).
+function _isModalBand(w) {
+    const z = parseInt(w && w.style && w.style.zIndex, 10);
+    return !isNaN(z) && z >= AIH_MODAL_Z;
+}
+
+// Max de la bande « fenêtres » uniquement : les modales ne gonflent pas le
+// compteur des panneaux (sinon un panneau créé après une modale passerait
+// au-dessus d'elle).
 function _globalMaxZ() {
     let max = WINDOW_BASE_Z;
     _windows.forEach((w) => {
+        if (_isModalBand(w)) return;
         const z = parseInt(w.style.zIndex, 10);
         if (!isNaN(z) && z > max) max = z;
     });
     return max;
 }
 
-// Renormalise toutes les fenêtres enregistrées sur une plage contiguë
-// [WINDOW_BASE_Z+1 .. WINDOW_BASE_Z+n]. La fenêtre active garde le halo.
+// Max de la bande « modales » : permet d'empiler correctement deux modales
+// (la dernière ouverte / cliquée reste au premier plan).
+function _modalMaxZ() {
+    let max = AIH_MODAL_Z - 1;
+    _windows.forEach((w) => {
+        if (!_isModalBand(w)) return;
+        const z = parseInt(w.style.zIndex, 10);
+        if (z > max) max = z;
+    });
+    return max;
+}
+
+// Renormalise les fenêtres NON-modales sur une plage contiguë
+// [WINDOW_BASE_Z+1 .. WINDOW_BASE_Z+n]. La bande modale est laissée intacte.
 function _renormalize() {
-    const sorted = [..._windows].sort((a, b) =>
+    const normal = [..._windows].filter((w) => !_isModalBand(w));
+    const sorted = normal.sort((a, b) =>
         (parseInt(a.style.zIndex, 10) || WINDOW_BASE_Z) - (parseInt(b.style.zIndex, 10) || WINDOW_BASE_Z)
     );
     sorted.forEach((w, i) => { w.style.zIndex = String(WINDOW_BASE_Z + i + 1); });
@@ -671,20 +715,39 @@ export function aihWindowManager() {
         },
 
         /**
-         * Met `el` au-dessus de TOUTES les fenêtres enregistrées : z-index =
-         * max global + 1 (échelle continue partagée), ajoute `.active` à el et
-         * la RETIRE de toutes les autres (halo unique).
+         * Met `el` au premier plan, ajoute `.active` à el et la RETIRE de
+         * toutes les autres fenêtres (halo unique).
+         *
+         * Empilement par bandes :
+         *  - fenêtre normale → max de la bande fenêtres + 1 (plafonné sous la
+         *    couche popup ; renormalisation si nécessaire) ;
+         *  - modale (`opts.minZ >= AIH_MODAL_Z`, ou z déjà dans la bande) →
+         *    max de la bande modale + 1 : reste au-dessus du menu du pack.
+         *
+         * @param {HTMLElement} el
+         * @param {{minZ?: number}} [opts] plancher de z-index (ex. AIH_MODAL_Z).
          * @returns {number} le z-index attribué.
          */
-        bringToFront(el) {
+        bringToFront(el, opts) {
             if (!el) return 0;
+            const minZ = (opts && typeof opts.minZ === "number") ? opts.minZ : 0;
             _windows.add(el);
             _windows.forEach((w) => { if (w !== el) w.classList.remove("active"); });
             el.classList.add("active");
-            const next = Math.max(_globalMaxZ() + 1, WINDOW_BASE_Z + _zCounter + 1);
-            _zCounter = next - WINDOW_BASE_Z;
+            let next;
+            if (minZ >= AIH_MODAL_Z || _isModalBand(el)) {
+                // Bande modale : au-dessus de toutes les fenêtres / popups et
+                // des modales déjà présentes.
+                next = Math.max(_modalMaxZ() + 1, minZ, AIH_MODAL_Z);
+            } else {
+                next = Math.max(_globalMaxZ() + 1, WINDOW_BASE_Z + _zCounter + 1);
+                if (next >= AIH_POPUP_Z) {
+                    _renormalize();
+                    next = Math.max(_globalMaxZ() + 1, WINDOW_BASE_Z + _zCounter + 1);
+                }
+                _zCounter = next - WINDOW_BASE_Z;
+            }
             el.style.zIndex = String(next);
-            if (next > WINDOW_BASE_Z + WINDOW_MAX_Z) _renormalize();
             return next;
         },
 

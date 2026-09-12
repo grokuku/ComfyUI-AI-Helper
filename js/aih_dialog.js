@@ -24,7 +24,7 @@
  */
 
 import "./aih_i18n.js";
-import { makeDraggable, makeResizable, saveWindowRect, loadWindowRect, makeContentZoomable, applyContentZoom, loadZoomLevel, saveZoomLevel, aihWindowManager } from "./holaf_window_utils.js";
+import { makeDraggable, makeResizable, saveWindowRect, loadWindowRect, makeContentZoomable, applyContentZoom, loadZoomLevel, saveZoomLevel, aihWindowManager, AIH_MODAL_Z } from "./holaf_window_utils.js";
 import { holafExtUrl } from "./holaf_ext_base.js";
 import {
     AIH_MODES,
@@ -480,6 +480,9 @@ import {
         // échelle que les panneaux holaf). Sauf z-index explicite (ex. login
         // 210000), on passe au premier plan immédiatement : el devient l'unique
         // fenêtre `.active` (halo) et monte au-dessus de toutes les autres.
+        // Les dialogues MODAUX sont placés dans la bande `AIH_MODAL_Z` : ils
+        // restent ainsi au-dessus de la couche « popup » (menu du pack), qui
+        // elle-même surplombe les panneaux et l'overlay plein écran du viewer.
         windowManager.register(el);
         if (overlay) windowManager.register(overlay);
         let z;
@@ -489,7 +492,7 @@ import {
             if (overlay) overlay.style.zIndex = String(z);
             windowManager.markActive(el);
         } else {
-            z = windowManager.bringToFront(el);
+            z = windowManager.bringToFront(el, modal ? { minZ: AIH_MODAL_Z } : undefined);
             if (overlay) overlay.style.zIndex = String(z);
         }
 
@@ -643,7 +646,7 @@ import {
 
         // ── Bring to front (délégué à l'autorité partagée) ─────────────────
         function bringToFront() {
-            const newZ = windowManager.bringToFront(el);
+            const newZ = windowManager.bringToFront(el, modal ? { minZ: AIH_MODAL_Z } : undefined);
             if (overlay) overlay.style.zIndex = String(newZ);
         }
 
