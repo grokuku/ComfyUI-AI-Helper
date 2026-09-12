@@ -69,6 +69,8 @@ const PRESETS = [{
 
 // Erreur serveur (body.error) réinjectée via AIH.alert lors d'une action presets.
 let presetPostError = null;
+// `detail` d'origine serveur renvoyé par detect-context (contrôle XSS).
+let detectDetail = null;
 
 function jsonResponse(data, status = 200) {
     return {
@@ -85,6 +87,16 @@ window.fetch = globalThis.fetch = async (url, init) => {
     const method = ((init && init.method) || "GET").toUpperCase();
     if (/\/api\/members$/.test(u)) return jsonResponse(MEMBERS);
     if (/\/api\/auth\/me$/.test(u)) return jsonResponse({ id: "u-admin", role: "admin" });
+    // Duplication : endpoint dédié (le pack ne POSTe plus sur /presets).
+    if (/\/api\/presets\/[^/]+\/duplicate$/.test(u) && method === "POST") {
+        if (presetPostError) return jsonResponse({ error: presetPostError }, 500);
+        return jsonResponse({ status: "ok" });
+    }
+    // detect-context : réponse pilotée par le test (detail malveillant possible).
+    if (/\/api\/presets\/[^/]+\/detect-context$/.test(u) && method === "POST") {
+        return jsonResponse({ detected_length: null, source: "unknown", probe: "none",
+                              status: "unreachable", detail: detectDetail });
+    }
     if (/\/api\/presets$/.test(u) && method === "POST") {
         if (presetPostError) return jsonResponse({ error: presetPostError }, 500);
         return jsonResponse({ status: "ok" });
@@ -96,6 +108,9 @@ window.fetch = globalThis.fetch = async (url, init) => {
 // Import du module RÉEL (installe window.AIHMenu, window.aihOpenModalV2, etc.).
 await import("./aih_i18n.js");
 await import("./aih_menu.js");
+// Locale figée en FR : les libellés (Edit/Dup/Del) sont identiques dans les
+// deux langues, mais « Détecter » est nécessaire pour le bloc detect-context.
+window.AIH.I18n.setLocale("fr");
 
 const doc = window.document;
 const flush = () => new Promise((r) => setTimeout(r, 20));
@@ -225,4 +240,29 @@ assert.strictEqual(probe.querySelectorAll("script, img, svg").length, 0,
 assert.ok(probe.textContent.includes(MALICIOUS_PRESET_NAME),
     "le message d'erreur s'affiche en TEXTE (entités décodées)");
 
-console.log("✅ VAGUES 17/18 — XSS rendu INERTE : membres (nom/avatar/confirm), presets (name/owner/model/url/confirm) et erreur serveur : TOUS LES TESTS PASSENT");
+/* ══════════ 3. DETECT-CONTEXT (detail serveur échappé) ═════════════════ */
+// Le `detail` renvoyé par POST /api/presets/<id>/detect-context est une donnée
+// d'origine serveur injectée dans AIH.alert (innerHTML) : il DOIT être échappé.
+// Retirer escapeHtml() sur cette interpolation doit faire ÉCHOUER ce bloc.
+const editBtn = Array.from(providerContainer.querySelectorAll("button"))
+    .find((b) => b.textContent === "Edit");
+assert.ok(editBtn, "bouton Edit présent pour tester la détection");
+editBtn.click();
+await flush();
+
+const detectBtn = Array.from(providerContainer.querySelectorAll("button"))
+    .find((b) => b.textContent === "Détecter");
+assert.ok(detectBtn, "bouton Détecter présent");
+alertMessage = null;
+probe.innerHTML = "";
+detectDetail = MALICIOUS_PRESET_NAME;   // <img src=x onerror=alert(1)>
+detectBtn.click();
+await flush(); await flush();
+assert.ok(alertMessage && alertMessage.includes("&lt;img") && !alertMessage.includes("<img"),
+    "detect-context : le `detail` serveur est ÉCHAPPÉ dans l'alerte");
+assert.strictEqual(probe.querySelectorAll("script, img, svg").length, 0,
+    "aucun élément injecté par le detail de detect-context");
+assert.ok(probe.textContent.includes(MALICIOUS_PRESET_NAME),
+    "le detail s'affiche en TEXTE (entités décodées)");
+
+console.log("✅ VAGUES 17/18 — XSS rendu INERTE : membres (nom/avatar/confirm), presets (name/owner/model/url/confirm), erreur serveur et detail detect-context : TOUS LES TESTS PASSENT");

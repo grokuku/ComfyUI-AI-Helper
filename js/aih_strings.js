@@ -331,6 +331,36 @@ import "./aih_i18n.js";
         "menu.delConfirm": "Supprimer {name} ?",
         "menu.unknown": "inconnu",
 
+        /* AIH · Provider LLM — fenêtre de contexte (aih_menu.js) */
+        "menu.ctxField": "Contexte (tokens)",
+        "menu.ctxPlaceholder": "auto",
+        "menu.ctxAutoHint": "Vide = détection automatique.",
+        "menu.ctxDetect": "Détecter",
+        "menu.ctxDetecting": "Détection...",
+        "menu.ctxBadgeManual": "manuel",
+        "menu.ctxBadgeAuto": "détecté",
+        "menu.ctxBadgeFamily": "≈ estimation",
+        "menu.ctxBadgeUnknown": "? inconnu",
+        "menu.ctxBadgeManualTitle": "Valeur saisie manuellement.",
+        "menu.ctxBadgeAutoTitle": "Valeur détectée auprès du provider.",
+        "menu.ctxBadgeFamilyTitle": "Estimation par famille de modèle, non vérifiée chez le provider.",
+        "menu.ctxBadgeUnknownTitle": "Fenêtre de contexte inconnue.",
+        "menu.ctxSummaryManual": "{value} tokens (manuel)",
+        "menu.ctxSummaryAuto": "{value} tokens (détecté)",
+        "menu.ctxSummaryFamily": "≈ {value} tokens (estimation)",
+        "menu.ctxSummaryUnknown": "? contexte inconnu",
+        "menu.ctxSummaryUnknownSource": "{value} tokens (? source)",
+        "menu.ctxInvalid": "Le contexte doit être un entier supérieur à 0 (ou vide pour automatique).",
+        "menu.ctxDetectNeedSave": "Enregistre d'abord le preset pour détecter son contexte.",
+        "menu.ctxDetectTitle": "Contexte détecté",
+        "menu.ctxDetectApplyMsg": "Contexte détecté : {value} tokens ({source}). L'appliquer au champ « Contexte (tokens) » ?",
+        "menu.ctxDetectApplied": "✓ Valeur appliquée. Pense à sauvegarder le preset.",
+        "menu.ctxDetectUnauthorized": "Accès refusé (401) : vérifie la clé API du serveur.",
+        "menu.ctxDetectUnreachable": "Provider injoignable : {detail}",
+        "menu.ctxDetectNotFound": "Le provider n'expose pas d'information de contexte (champ absent).",
+        "menu.ctxDetectBlocked": "Requête bloquée (SSRF) : l'URL du provider n'est pas autorisée.",
+        "menu.ctxDetectFailed": "Échec de la détection : {detail}",
+
         /* Elements Picker (aih_elements_widget.js) */
         "el.addFilter": "+ Add saved filter",
         "el.addText": "+ Add custom text",
@@ -666,6 +696,11 @@ import "./aih_i18n.js";
         "bl.skillRunning": "🔄 Exécution de la skill {name}...",
         "bl.skillsAvailable": "📋 Skills disponibles :",
         "bl.skillNotFoundList": "⚠️ Skill \"{name}\" introuvable. Utilise [SKILL_LIST] pour voir les skills.",
+
+        /* Barre de contexte du chat (blobby_companion.js) */
+        "bl.ctxBar": "~{tokens} tokens | {max} max",
+        "bl.ctxUnknownTitle": "Fenêtre de contexte inconnue — cliquez pour la définir",
+        "bl.ctxEstimatedTitle": "Fenêtre de contexte estimée par famille de modèle (non vérifiée chez le provider)",
 
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
         "iv.operationProcessed": "Opération traitée.",
@@ -1423,6 +1458,36 @@ import "./aih_i18n.js";
         "menu.delConfirm": "Delete {name}?",
         "menu.unknown": "unknown",
 
+        /* AIH · LLM Provider — context window (aih_menu.js) */
+        "menu.ctxField": "Context (tokens)",
+        "menu.ctxPlaceholder": "auto",
+        "menu.ctxAutoHint": "Empty = automatic detection.",
+        "menu.ctxDetect": "Detect",
+        "menu.ctxDetecting": "Detecting...",
+        "menu.ctxBadgeManual": "manual",
+        "menu.ctxBadgeAuto": "detected",
+        "menu.ctxBadgeFamily": "≈ estimate",
+        "menu.ctxBadgeUnknown": "? unknown",
+        "menu.ctxBadgeManualTitle": "Value entered manually.",
+        "menu.ctxBadgeAutoTitle": "Value detected from the provider.",
+        "menu.ctxBadgeFamilyTitle": "Estimated from the model family, not verified with the provider.",
+        "menu.ctxBadgeUnknownTitle": "Unknown context window.",
+        "menu.ctxSummaryManual": "{value} tokens (manual)",
+        "menu.ctxSummaryAuto": "{value} tokens (detected)",
+        "menu.ctxSummaryFamily": "≈ {value} tokens (estimate)",
+        "menu.ctxSummaryUnknown": "? unknown context",
+        "menu.ctxSummaryUnknownSource": "{value} tokens (? source)",
+        "menu.ctxInvalid": "Context must be an integer greater than 0 (or empty for automatic).",
+        "menu.ctxDetectNeedSave": "Save the preset first to detect its context.",
+        "menu.ctxDetectTitle": "Context detected",
+        "menu.ctxDetectApplyMsg": "Detected context: {value} tokens ({source}). Apply it to the \"Context (tokens)\" field?",
+        "menu.ctxDetectApplied": "✓ Value applied. Remember to save the preset.",
+        "menu.ctxDetectUnauthorized": "Access denied (401): check the server API key.",
+        "menu.ctxDetectUnreachable": "Provider unreachable: {detail}",
+        "menu.ctxDetectNotFound": "The provider does not expose context information (field missing).",
+        "menu.ctxDetectBlocked": "Request blocked (SSRF): the provider URL is not allowed.",
+        "menu.ctxDetectFailed": "Detection failed: {detail}",
+
         /* Elements Picker (aih_elements_widget.js) */
         "el.addFilter": "+ Add saved filter",
         "el.addText": "+ Add custom text",
@@ -1758,6 +1823,11 @@ import "./aih_i18n.js";
         "bl.skillRunning": "🔄 Executing skill {name}...",
         "bl.skillsAvailable": "📋 Available skills:",
         "bl.skillNotFoundList": "⚠️ Skill \"{name}\" not found. Use [SKILL_LIST] to see the skills.",
+
+        /* Chat context bar (blobby_companion.js) */
+        "bl.ctxBar": "~{tokens} tokens | {max} max",
+        "bl.ctxUnknownTitle": "Unknown context window — click to set it",
+        "bl.ctxEstimatedTitle": "Context window estimated from the model family (not verified with the provider)",
 
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
         "iv.operationProcessed": "Operation processed.",

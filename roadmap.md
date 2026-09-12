@@ -1,7 +1,7 @@
 # Roadmap & Rapport de Bugs — ComfyUI-Holaf-Utils
 
-**Dernière mise à jour :** 2026-08-25  
-**Version du projet :** Schema v13, éditeur à contrôles empilables, sauvegarde automatique
+**Dernière mise à jour :** 2026-09-12  
+**Version du projet :** Schema v13, éditeur d'images schéma `.edt` v2 (contrôles à plages), sauvegarde automatique
 
 > **Fusion** : ce fichier unique remplace l'ancien couple `ROADMAP.md` (vision produit app mobile) + `roadmap.md` (rapport de bugs/statut), afin d'éviter toute collision de casse sur les filesystems insensibles à la casse (Windows/macOS). Il contient deux volets :
 >
@@ -190,17 +190,69 @@ Grand chantier d'unification réalisé après la Phase 2, pour faire disparaîtr
 
 ### FONCTIONNALITÉS IMPLÉMENTÉES
 
-#### 🎨 Éditeur d'images
-- **Contrôles empilables** — Plus de sliders fixes. Bouton "+ Add Control" → choisit un type (Brightness/Contrast/Saturation/Hue) + choix du range (All/Shadows/Midtones/Highlights) → le contrôle s'ajoute à la liste
-- **Duplication autorisée** — Plusieurs contrôles du même type (ex: 2× Brightness avec ranges différents)
-- **Range masking** — Shadows/Midtones/Highlights avec masques de luminance progressifs (PIL côté backend, canvas côté frontend)
-- **Hue** — Supporté en CSS et en canvas, avec ranges
-- **Sauvegarde automatique** — 500ms après le dernier changement, les modifications sont sauvegardées. Plus de boutons Save/Cancel.
-- **Reset** — Supprime tous les réglages et le fichier `.edt`
-- **Compare mode** — Overlay canvas qui split l'original (gauche) et l'édité (droite) avec `ctx.clip()`. Suit la souris. Supporte le zoom/pan. Compatible ranged adjustments.
-- **Aperçu temps réel** — CSS filter quand tous les ranges sont 'all' (GPU). Canvas pixel processing sinon (avec downscale 1920px max + optimisations)
-- **Transition plein écran fluide** — La miniature sert de placeholder pendant le chargement de l'image pleine taille. Blur + spinner si > 1s
-- **Suppression optimiste** — Delete en zoom/éditeur → image retirée immédiatement de la galerie + navigation vers la suivante. Requête en arrière-plan avec rollback si échec
+#### 🎨 Éditeur d'images — refonte « un slider par plage » (schéma `.edt` v2)
+
+> Doc de planification historique : `image_editor_plan.md` (phases 1 & 3 terminées ; sa « Phase 2 » est désormais couverte ci-dessous).
+
+**État : LIVRÉ et testé** — 23 tests pytest + 10 tests JS verts (2026-09-12).
+
+**Schéma `.edt` v2 — contrôles tonaux par plage, effets spatiaux globaux**
+- **Contrôles tonaux** (luminosité, contraste, saturation, teinte) portent désormais leurs valeurs **par bande** `{all, shadows, midtones, highlights}` — neutres `1/1/1/0` (gains à 1, teinte à 0), **clé absente = neutre**, ordre d'application **all → shadows → midtones → highlights** (séquentiel sur le résultat courant). Plusieurs contrôles du même type restent autorisés.
+- **Effets SPATIAUX** (flou, pixeliser, vignettage, netteté) et **masques** conservent une valeur globale unique `value` (pas de bandes).
+- **Raison** — les plages proposées pour les effets spatiaux n'étaient **JAMAIS appliquées** (bug latent front + back : badge affiché, effet global) → l'UI de plage est supprimée pour ces effets.
+- **Migration v1 → v2** — à la lecture, **idempotente**, **SANS PERTE** : range `'all'` → `zones.all`, une bande → sa clé, range inconnu / vide / non-string → `'all'` (aligné sur le backend) ; champ `"v": 2` écrit au save. Preuve de non-régression **pixel-à-pixel** contre une copie figée du code pré-refonte (`tests/test_edit_schema_v2.py`).
+- **Vidéo** — politique documentée : valeur plate = `zones.all` si non neutre, sinon contrôle ignoré (FFmpeg ne sait pas masquer par luminance).
+
+**Picker « Ajouter un contrôle » — master-detail V4 (maquette validée)**
+- Familles à gauche **avec compteur**, contrôles à droite, **icônes SVG** (fin des emojis), largeur **430px**, catégorie active orange.
+- **MONO-ÉTAPE** (plus de choix de plage), **mémorisation de la dernière famille** + navigation clavier (**↑↓**, **↵**, **Échap**).
+
+**Lignes de contrôle**
+- **4 sliders par contrôle tonal** (pastille de teinte par bande) ; ligne **repliée = pastilles des SEULES bandes ≠ défaut**.
+- **Double-clic** = reset du slider ciblé.
+- **Libellés courts dédiés** (`iv.zoneShort*`) car « Tons moyens » / « Hautes lumières » étaient tronqués dans la colonne de 58px (formes longues conservées en **tooltip**).
+
+**Base v1 conservée (toujours active)**
+- **Sauvegarde automatique** — 500 ms après le dernier changement (plus de Save/Cancel) ; **Reset** supprime tous les réglages + le fichier `.edt`.
+- **Compare mode** — overlay canvas original (gauche) / édité (droite) via `ctx.clip()`, suit la souris, compatible zoom/pan.
+- **Aperçu temps réel** — CSS filter (GPU) quand tous les ranges sont `all`, sinon canvas pixel processing (downscale 1920px max + optimisations).
+- **Transition plein écran fluide** — la miniature sert de placeholder pendant le chargement pleine taille (blur + spinner si > 1 s).
+- **Suppression optimiste** — delete en zoom/éditeur → retrait immédiat de la galerie + navigation vers la suivante, rollback si échec.
+
+**Fichiers touchés**
+- **Backend** — `holaf_image_viewer_backend/logic.py`, `holaf_image_viewer_backend/routes/edit_routes.py`, `tests/test_edit_schema_v2.py` (nouveau), `tests/test_crop_standalone.py` (étendu).
+- **Frontend** — `js/image_viewer/image_viewer_editor_model.js` (nouveau module modèle pur), `js/image_viewer/image_viewer_editor.js`, `js/css/holaf_image_viewer.css`, `js/aih_strings.js`, `js/test_iv_editor_v2.mjs` + `js/test_iv_editor_dom.mjs` (nouveaux).
+
+**Déjà documenté / acté avant la refonte (rappel)**
+- Crop appliqué **EN DERNIER** (insensible au mask, normalisé 0-1).
+- Masques **multi-couches** (un masque remplace la zone active pour les contrôles suivants).
+- Brique `holaf-viewport` pour zoom/pan.
+- `AIH.Dialog` = système de fenêtres unique.
+
+**Bugs corrigés dans la foulée**
+- **Menu du pack passant SOUS la galerie** — cause : z-index inline `10005` du dropdown écrasant le `100000` du CSS, sous l'overlay plein écran du viewer (`10999`), alors qu'il passait au-dessus des modales. Fix : bandes de couches uniques `AIH_POPUP_Z=50000` (menu) / `AIH_MODAL_Z=90000` (modales), panneaux plafonnés sous le menu, `bringToFront` par bande. Ordre final : **panneaux < overlay viewer < menu < modales < picker < toasts**. Test `test_aih_zlayers.mjs` + preuves headless.
+- **Sliders d'effets incohérents (zones + vignettage)** — cause : la preview repartait du canvas **DÉJÀ modifié** au lieu de l'image d'origine (bug **PRÉ-EXISTANT**, prouvé identique dans le code d'avant la refonte) → application cumulative à chaque re-rendu. Fix : base reconstruite depuis `_originalImgData` (rendu idempotent, monotone dans les deux sens) ; mesures avant/après au banc chromium.
+
+**RESTE À FAIRE — prochain chantier déclaré**
+- **Phase 2** — refonte de la **ZONE D'EFFETS EMPILÉS** (les lignes de contrôle) ; inclut la correction du **débordement de la ligne MASQUE** (grid `80px 65px 1fr auto` + 5 boutons ≈ 313px fixes pour 300px dispo → slider écrasé, ~1px de débordement mesuré).
+- **Option** — intégrer le **banc de repro chromium** (accumulation zones/vignette) comme test permanent ; le runner JS du pack est en **node**.
+- **Limites connues documentées** — parité preview↔export approximative par conception (rampes JS `/128` vs LUT backend `/64`-`/127`, vignette gradient radial vs falloff numpy) ; perf preview **O(l×h×passes)** avec canvas plafonné 1920px ; race possible au premier rendu (repli sur le fast-path CSS) ; défauts appliqués dès l'ajout d'un contrôle (vignette 0.5, flou 8, pixelise 12).
+- **Candidats évoqués** — brique viewport v0.2 (pinch/touch), slideshow, gestion des fichiers corrompus, panneau de log de session.
+
+**DETTES / DÉCISIONS OUVERTES (issues des reviews, non bloquantes)**
+- Brique `holaf-modal` re-vendue en **0.4.0** mais **NON consommée** : décision à prendre (la retirer ou la garder alignée).
+- Variables locales `t` masquant le helper i18n `t()` dans 4 fichiers (`aih_workflow_share.js`, `holaf_panel_manager.js`, `blobby_companion.js`, `profiler/holaf_profiler.js`) : foot-gun → renommage préventif ou règle lint `no-shadow`.
+- `p.id` non encodé (`encodeURIComponent`) dans 2 URLs d'API de presets (`aih_menu.js`).
+- `run_tests.sh` sort `0` quand node est absent (exit code « vert » en CI malgré une ligne finale honnête).
+- Route dédiée pour servir `manifest.json` en `application/json` (micro-tâche).
+
+#### 🧩 Autres chantiers de la session (pour mémoire)
+
+- **Sonde de redémarrage fiabilisée** derrière Authentik (`GET /system_stats`, credentials `include` + `redirect: manual` + validation de shape) ; bouton « Actualiser » désactivé jusqu'au retour réel.
+- **Toasts déplacés en bas-centré** (brique `holaf-toast` v0.5.0, positions configurables ; vendu == lib).
+- **Couleur d'accent/highlight appliquée globalement** (purge des classes legacy sur `body`).
+- **Suppression d'un membre** implémentée côté pack (route `DELETE /api/admin/users/{id}`) + feedback d'erreur sur la page admin web.
+- **Corrections de sécurité de la review** (échappement HTML généralisé dans `aih_menu.js`, fix XSS pré-existant de l'onglet Provider LLM) ; suite JS enfin branchée dans `run_tests.sh` avec récap PASS/FAIL/SKIP non trompeur.
 
 #### 🖼️ Galerie
 - **Scrolling virtualisé** — Seuls les éléments visibles sont rendus dans le DOM

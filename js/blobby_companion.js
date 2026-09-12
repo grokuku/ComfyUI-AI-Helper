@@ -16,6 +16,7 @@ import "./aih_dialog.js";
 import "./aih_strings.js";
 import { saveWindowRect, loadWindowRect } from "./holaf_window_utils.js";
 import { remoteGet, remotePost, HolafFetch } from "./aih_fetch_bridge.js";
+import { formatContextBar, applyContextBar } from "./aih_context_utils.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -187,6 +188,31 @@ function _blobbyGetBackendUrl() {
 function _blobbyGetApiKey() {
     try { return JSON.parse(localStorage.getItem('AIH_config'))?.apiKey || ''; }
     catch { return ''; }
+}
+
+// ── Barre de contexte : estimation locale + rendu honnête ────────────────
+// Estimation du fil côté navigateur (~4 caractères/token). Indicative : elle
+// n'a de sens QUE comparée à une vraie fenêtre de contexte ; si celle-ci est
+// inconnue, la barre affiche « ? max » — jamais de repli chiffré inventé.
+function _blobbyEstimateTokens(container) {
+    if (!container) return 0;
+    var totalChars = 0;
+    container.querySelectorAll('.blobby-msg').forEach(function(el) {
+        totalChars += (el.textContent || '').length;
+    });
+    return Math.round(totalChars / 4);
+}
+
+// Met à jour la barre à partir de dataset.maxCtx / dataset.ctxSource (valeur et
+// source réelles, alimentées par GET /api/presets ou llm-process).
+function _blobbyUpdateContextBar(container, ctxBar) {
+    if (!ctxBar) return;
+    var info = formatContextBar(
+        _blobbyEstimateTokens(container),
+        ctxBar.dataset.maxCtx,
+        ctxBar.dataset.ctxSource
+    );
+    applyContextBar(ctxBar, info, t);
 }
 
 async function _blobbySearchMemories(query, limit) {
@@ -1640,18 +1666,43 @@ const Blobby = {
             textAlign: 'right', borderTop: '1px solid #2a2a2e', flexShrink: '0',
             userSelect: 'none',
         });
+        // Valeur + source initiales : celles du preset sélectionné (GET
+        // /api/presets), sinon inconnues → « ? max ». Jamais de repli chiffré.
+        ctxBar.dataset.ctxSource = 'unknown';
         function _updateCtxBar() {
-            var totalChars = 0;
-            messages.querySelectorAll('.blobby-msg').forEach(function(el) {
-                totalChars += (el.textContent || '').length;
-            });
-            var estTokens = Math.round(totalChars / 4);
-            var maxCtx = parseInt(ctxBar.dataset.maxCtx) || 4096;
-            ctxBar.textContent = '~' + estTokens + ' tokens | ' + maxCtx + ' max';
-            var pct = estTokens / maxCtx;
-            ctxBar.style.color = pct > 0.75 ? '#f87171' : (pct > 0.5 ? '#facc15' : '#555');
+            _blobbyUpdateContextBar(messages, ctxBar);
         }
         _updateCtxBar();
+
+        // Point d'entrée pour définir une fenêtre inconnue/estimée : ouvre
+        // l'onglet Provider LLM où vit le champ « Contexte (tokens) ».
+        ctxBar.onclick = function() {
+            if (ctxBar.dataset.ctxSource !== 'unknown' && ctxBar.dataset.ctxSource !== 'family') return;
+            if (window.AIHMenu && typeof window.AIHMenu.openSettings === 'function') {
+                window.AIHMenu.openSettings('aih-providers');
+            } else {
+                _self._openChatSettings();
+            }
+        };
+
+        // Charge le contexte du preset Blobby sélectionné (best-effort) : la
+        // barre reste honnête même si l'appel échoue.
+        (function _initCtxFromPreset() {
+            var presetId = '';
+            try { presetId = JSON.parse(localStorage.getItem('AIH_config'))?.blobbyPreset || ''; } catch {}
+            var baseUrl = _blobbyGetBackendUrl();
+            if (!baseUrl || !presetId) return;
+            remoteGet(baseUrl + '/api/presets').then(function(presets) {
+                if (!document.body.contains(ctxBar)) return; // modale fermée
+                var p = (presets || []).find(function(x) { return String(x.id) === String(presetId); });
+                if (p) {
+                    ctxBar.dataset.maxCtx = (p.context_length !== null && p.context_length !== undefined && p.context_length !== '')
+                        ? String(p.context_length) : '';
+                    ctxBar.dataset.ctxSource = p.context_source || 'unknown';
+                }
+                _updateCtxBar();
+            }).catch(function() { /* valeur inconnue conservée */ });
+        })();
 
         // Input area
         var inputArea = document.createElement('div');
@@ -1854,19 +1905,9 @@ const Blobby = {
         container.appendChild(div);
         container.scrollTop = container.scrollHeight;
         this._saveChatHistory();
-        // Mettre a jour la barre de contexte
+        // Mettre a jour la barre de contexte (valeur + source reelles, jamais inventees)
         var ctxBar = document.getElementById('blobby-chat-ctx');
-        if (ctxBar) {
-            var totalChars = 0;
-            container.querySelectorAll('.blobby-msg').forEach(function(el) {
-                totalChars += (el.textContent || '').length;
-            });
-            var estTokens = Math.round(totalChars / 4);
-            var maxCtx = parseInt(ctxBar.dataset.maxCtx) || 4096;
-            ctxBar.textContent = '~' + estTokens + ' tokens | ' + maxCtx + ' max';
-            var pct = estTokens / maxCtx;
-            ctxBar.style.color = pct > 0.75 ? '#f87171' : (pct > 0.5 ? '#facc15' : '#555');
-        }
+        if (ctxBar) _blobbyUpdateContextBar(container, ctxBar);
     },
 
     async _handleChatMessage(container, userText) {
@@ -1977,9 +2018,17 @@ const Blobby = {
                     return;
                 }
 
-                if (data.max_context) {
+                // Fenêtre de contexte renvoyée par llm-process : max_context
+                // (int OU null) + context_source. null ⇒ inconnu ; on ÉCRASE le
+                // dataset (jamais de repli chiffré arbitraire) et on re-rend la barre.
+                if (data && (data.max_context !== undefined || data.context_source !== undefined)) {
                     var ctxBar = document.getElementById('blobby-chat-ctx');
-                    if (ctxBar) ctxBar.dataset.maxCtx = data.max_context;
+                    if (ctxBar) {
+                        ctxBar.dataset.maxCtx = (data.max_context !== null && data.max_context !== undefined)
+                            ? String(data.max_context) : '';
+                        ctxBar.dataset.ctxSource = data.context_source || 'unknown';
+                        _blobbyUpdateContextBar(container, ctxBar);
+                    }
                 }
 
                 var reply = data.output || '...';

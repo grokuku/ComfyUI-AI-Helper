@@ -46,6 +46,15 @@ import { showToast } from "./aih_toast_bridge.js";
 import { remoteGet, remoteRequest } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 import { escapeHtml } from "./holaf_dom_utils.js";
+import {
+    formatContextCount,
+    contextBadgeKey,
+    contextBadgeTitleKey,
+    contextSummaryText,
+    contextDetectStatusKey,
+    normalizeContextSource,
+    hasContextLength,
+} from "./aih_context_utils.js";
 (function () {
     "use strict";
 
@@ -586,19 +595,23 @@ import { escapeHtml } from "./holaf_dom_utils.js";
                 const left = document.createElement("div");
                 const scope = p.is_global ? t("menu.scopeGlobal") : (p.owner_name ? `(${p.owner_name})` : t("menu.scopePersonal"));
                 const clientBadge = p.is_client_side ? " <span style='color:#f59e0b;'>🖥️</span>" : "";
+                // Résumé de contexte : valeur + source (manuel/détecté/≈ estimation/? inconnu).
+                // Aucune valeur inventée : sans context_length, « ? contexte inconnu ».
+                const ctxSummary = contextSummaryText(p.context_length, p.context_source, t);
                 // p.name / owner_name (via scope) / model / base_url sont des valeurs
                 // d'origine serveur : échappées AVANT innerHTML (markup statique conservé).
-                left.innerHTML = `<strong style='color:#fff;'>${escapeHtml(p.name)}</strong> <span style='color:#888;'>[${escapeHtml(scope)}]</span> ${clientBadge}<br><span style='color:#888;font-size:10px;'>${escapeHtml(p.model)} @ ${escapeHtml(p.base_url)}</span>`;
+                left.innerHTML = `<strong style='color:#fff;'>${escapeHtml(p.name)}</strong> <span style='color:#888;'>[${escapeHtml(scope)}]</span> ${clientBadge}<br><span style='color:#888;font-size:10px;'>${escapeHtml(p.model)} @ ${escapeHtml(p.base_url)}</span><br><span style='color:#888;font-size:10px;'>${escapeHtml(ctxSummary)}</span>`;
                 const actions = document.createElement("div");
                 Object.assign(actions.style, { display: "flex", gap: "4px" });
                 const editBtn = mkBtn(t("menu.edit"), _aihStyle.btnSecondary, () => fillForm(p));
+                // Duplication : endpoint DÉDIÉ (copie la clé chiffrée, force
+                // is_global=0). Un POST {…p} sur /presets perdait la clé (le
+                // corps ne la contient pas) et recopiait is_global (403 possible
+                // si l'auteur n'est pas admin).
                 const dupBtn = mkBtn(t("menu.dup"), _aihStyle.btnSecondary, async () => {
-                    const body = { ...p };
-                    delete body.id;
-                    body.name = p.name + t("menu.dupCopy");
                     try {
-                        await _aihFetchApi("presets", { method: "POST", body });
-                        reloadPresets();
+                        await _aihFetchApi(`presets/${p.id}/duplicate`, { method: "POST" });
+                        await reloadPresets();
                     } catch (e) { await window.aihShowAlert(t("dialog.error"), t("menu.dupError", { error: escapeHtml(e.message) }), "error"); }
                 });
                 const delBtn = mkBtn(t("menu.del"), "padding:6px 12px;border-radius:4px;border:none;background:#7f1d1d;color:white;cursor:pointer;font-size:12px;", async () => {
@@ -729,6 +742,140 @@ import { escapeHtml } from "./holaf_dom_utils.js";
         checks.append(fGlobal.wrap, fClient.wrap);
         form.appendChild(checks);
 
+        // ── Contexte (tokens) : champ manuel + bouton « Détecter » + badge source ──
+        // Vide = automatique côté serveur. Valeur + source viennent du contrat
+        // backend (context_length / context_source) ; aucun repli chiffré inventé.
+        let ctxPresetSource = "unknown"; // source serveur du preset en cours d'édition
+        let ctxPresetValue = null;        // valeur serveur (null si vide/absent)
+
+        const ctxRow = document.createElement("div");
+        ctxRow.style.cssText = "display:flex; gap:6px; margin-bottom:4px; align-items:flex-end;";
+
+        const fCtxWrap = document.createElement("div");
+        fCtxWrap.style.cssText = "flex:1;";
+        const fCtxLabel = document.createElement("label");
+        fCtxLabel.textContent = t("menu.ctxField");
+        fCtxLabel.style.cssText = _aihStyle.label;
+        fCtxWrap.appendChild(fCtxLabel);
+        const fContext = document.createElement("input");
+        fContext.type = "number";
+        fContext.min = "1";
+        fContext.step = "1";
+        fContext.placeholder = t("menu.ctxPlaceholder");
+        fContext.style.cssText = _aihStyle.input;
+        fCtxWrap.appendChild(fContext);
+        ctxRow.appendChild(fCtxWrap);
+
+        const detectBtn = mkBtn(t("menu.ctxDetect"), "padding:6px 10px;border-radius:4px;border:1px solid #ff8c00;background:transparent;color:#ff8c00;cursor:pointer;font-size:11px;flex:0 0 auto;height:28px;");
+        ctxRow.appendChild(detectBtn);
+
+        const ctxBadge = document.createElement("span");
+        ctxBadge.id = "aih-preset-ctx-badge";
+        Object.assign(ctxBadge.style, {
+            fontSize: "10px", padding: "2px 6px", borderRadius: "3px",
+            background: "#2a2a2e", color: "#888", whiteSpace: "nowrap",
+            alignSelf: "center", marginBottom: "3px",
+        });
+        ctxRow.appendChild(ctxBadge);
+        form.appendChild(ctxRow);
+
+        const ctxHint = document.createElement("p");
+        ctxHint.textContent = t("menu.ctxAutoHint");
+        Object.assign(ctxHint.style, { margin: "0 0 8px", fontSize: "10px", color: "#888" });
+        form.appendChild(ctxHint);
+
+        // Source affichée : identique au serveur tant que la valeur n'a pas été
+        // modifiée ; une saisie différente devient « manuel » ; vider revient à
+        // l'automatique (source inconnue tant que le serveur n'a pas re-répondu).
+        function currentCtxSource() {
+            const raw = fContext.value.trim();
+            if (raw === "") {
+                return ctxPresetValue !== null ? "unknown" : ctxPresetSource;
+            }
+            const num = Number(raw);
+            if (!Number.isFinite(num) || num <= 0) return "unknown";
+            if (ctxPresetValue !== null && num === ctxPresetValue) return ctxPresetSource;
+            return "manual";
+        }
+
+        function updateCtxBadge() {
+            const src = currentCtxSource();
+            ctxBadge.textContent = t(contextBadgeKey(src));
+            ctxBadge.title = t(contextBadgeTitleKey(src));
+            ctxBadge.style.color = src === "manual" ? "#ffb066"
+                : src === "auto" ? "#4ade80"
+                : src === "family" ? "#f59e0b"
+                : "#888";
+        }
+        fContext.addEventListener("input", updateCtxBadge);
+        updateCtxBadge();
+
+        // Détection auprès du provider (endpoint gelé : POST presets/<id>/detect-context).
+        // Un échec est signalé explicitement mais ne bloque JAMAIS la saisie manuelle.
+        detectBtn.onclick = async () => {
+            if (!editingId.value) {
+                await window.aihShowAlert(t("aih.info"), t("menu.ctxDetectNeedSave"), "info");
+                return;
+            }
+            const oldLabel = detectBtn.textContent;
+            detectBtn.disabled = true;
+            detectBtn.textContent = t("menu.ctxDetecting");
+            try {
+                const cfg = getConfig();
+                const baseUrl = (cfg.serverUrl || "").replace(/\/+$/, "");
+                if (!baseUrl) throw new Error(t("aih.notConfiguredError"));
+                const resp = await remoteRequest(
+                    `${baseUrl}/api/presets/${encodeURIComponent(editingId.value)}/detect-context`,
+                    { method: "POST" },
+                );
+                const status = resp && resp.status;
+                const detected = resp && resp.detected_length;
+                if (status === "ok" && hasContextLength(detected)) {
+                    const src = normalizeContextSource(resp && resp.source);
+                    const apply = await window.aihShowConfirm(
+                        t("menu.ctxDetectTitle"),
+                        t("menu.ctxDetectApplyMsg", {
+                            value: formatContextCount(detected),
+                            source: t(contextBadgeKey(src)),
+                        }),
+                    );
+                    if (apply) {
+                        fContext.value = String(Number(detected));
+                        // Un contexte appliqué puis sauvegardé est MANUEL côté serveur
+                        // (contrat : context_length > 0 ⇒ 'manual').
+                        ctxPresetValue = Number(detected);
+                        ctxPresetSource = "manual";
+                        updateCtxBadge();
+                        showToast({ message: t("menu.ctxDetectApplied"), type: "success" });
+                    }
+                    // Le serveur a persisté le résultat de détection : recharger
+                    // la liste pour que valeur/source affichées reflètent l'état
+                    // réel (le site web le fait dans le même cas).
+                    await reloadPresets();
+                    return;
+                }
+                // Échec métier explicite selon le status (champ absent, SSRF, non autorisé…).
+                const key = contextDetectStatusKey(status === "ok" ? "not_found" : status) || "menu.ctxDetectFailed";
+                await window.aihShowAlert(
+                    t("dialog.error"),
+                    t(key, { detail: escapeHtml((resp && resp.detail) || "") }),
+                    "error",
+                );
+            } catch (e) {
+                // Transport : 401 explicite, injoignable (réseau/timeout), sinon détail.
+                const key = (e && e.status === 401) ? "menu.ctxDetectUnauthorized"
+                    : ((e && e.status) ? "menu.ctxDetectFailed" : "menu.ctxDetectUnreachable");
+                await window.aihShowAlert(
+                    t("dialog.error"),
+                    t(key, { detail: escapeHtml((e && e.message) || "") }),
+                    "error",
+                );
+            } finally {
+                detectBtn.disabled = false;
+                detectBtn.textContent = oldLabel;
+            }
+        };
+
         // Boutons
         const btnRow = document.createElement("div");
         btnRow.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
@@ -736,20 +883,41 @@ import { escapeHtml } from "./holaf_dom_utils.js";
             editingId.value = null;
             fName.input.value = ""; fUrl.input.value = ""; fKey.input.value = "";
             fModel.value = ""; fGlobal.input.checked = false; fClientInput.checked = false;
+            ctxPresetSource = "unknown";
+            ctxPresetValue = null;
+            fContext.value = "";
+            updateCtxBadge();
             formTitle.textContent = t("menu.newPreset");
         };
         const cancelBtn = mkBtn(t("dialog.cancel"), _aihStyle.btnSecondary, resetForm);
         const saveBtn = mkBtn(t("menu.save"), _aihStyle.btn(), async () => {
+            const keyValue = fKey.input.value.trim();
             const body = {
                 name: fName.input.value.trim(),
                 base_url: fUrl.input.value.trim(),
-                api_key: fKey.input.value.trim(),
                 model: fModel.value.trim(),
                 is_global: fGlobal.input.checked ? 1 : 0,
                 is_client_side: fClientInput.checked ? 1 : 0,
             };
+            // Miroir du site web (frontend/js/app-filters.js : `if (!key) delete
+            // body.api_key;`) : en ÉDITION, un champ clé VIDE n'est PAS transmis —
+            // sinon le PUT écraserait la clé chiffrée par '' (401 silencieux au
+            // prochain appel LLM, le champ étant vidé au remplissage du formulaire).
+            // À la CRÉATION, la clé reste transmise (contrat du POST, même vide).
+            if (!editingId.value || keyValue) body.api_key = keyValue;
             if (!body.name || !body.base_url || !body.model) {
                 await window.aihShowAlert(t("aih.info"), t("menu.requiredFields"), "info"); return;
+            }
+            // Contexte : entier > 0 ⇒ 'manual' ; vide ⇒ null (répasse en auto).
+            const ctxRaw = fContext.value.trim();
+            if (ctxRaw !== "") {
+                const ctxNum = Number(ctxRaw);
+                if (!Number.isInteger(ctxNum) || ctxNum <= 0) {
+                    await window.aihShowAlert(t("aih.info"), t("menu.ctxInvalid"), "info"); return;
+                }
+                body.context_length = ctxNum;
+            } else {
+                body.context_length = null;
             }
             try {
                 if (editingId.value) {
@@ -775,6 +943,11 @@ import { escapeHtml } from "./holaf_dom_utils.js";
             fModel.value = p.model || "";
             fGlobal.input.checked = !!p.is_global;
             fClientInput.checked = !!p.is_client_side;
+            // Pré-remplissage du contexte + source affichée (valeur serveur).
+            ctxPresetSource = normalizeContextSource(p && p.context_source);
+            ctxPresetValue = hasContextLength(p && p.context_length) ? Number(p.context_length) : null;
+            fContext.value = ctxPresetValue !== null ? String(ctxPresetValue) : "";
+            updateCtxBadge();
             formTitle.textContent = t("menu.editPreset");
         }
     }
