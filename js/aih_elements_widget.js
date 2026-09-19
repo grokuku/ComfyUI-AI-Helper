@@ -88,52 +88,33 @@ function hideWidget(node, name) {
     return null;
 }
 
-// Parse la syntaxe ||concept[:count][;hint[:count]] utilisée dans le
-// test button de l'Elements Picker.  Retourne {concept, count, hint} ou null.
+// Parse la syntaxe ||concept[:count] utilisée dans le test button de
+// l'Elements Picker.  Retourne {concept, count} ou null.
+//
+// CHANGEMENT DE COMPORTEMENT : l'ancienne syntaxe inline « ;hint » a été
+// supprimée.  Le caractère « ; » n'est PLUS un séparateur spécial : il fait
+// désormais partie intégrante du concept littéral (ex. « ||a;b » → concept
+// « a;b »).  Le hint est porté par le champ dédié de l'entrée, pas par le
+// texte de la liste.
 function _parseConceptSyntax(text, defaultCount) {
     if (!text || !text.startsWith('||')) return null;
     var body = text.substring(2).trim();
     if (!body) return null;
 
-    // Split par premier ;
-    var semiIdx = body.indexOf(';');
-    var conceptPart, hintPart;
-    if (semiIdx >= 0) {
-        conceptPart = body.substring(0, semiIdx);
-        hintPart = body.substring(semiIdx + 1);
-    } else {
-        conceptPart = body;
-        hintPart = null;
-    }
-
     // Parse concept[:count]
-    var concept = conceptPart.trim();
+    var concept = body;
     var count = null;
-    var colonIdx = conceptPart.lastIndexOf(':');
+    var colonIdx = body.lastIndexOf(':');
     if (colonIdx >= 0) {
-        var afterColon = conceptPart.substring(colonIdx + 1).trim();
+        var afterColon = body.substring(colonIdx + 1).trim();
         if (/^\d+$/.test(afterColon)) {
-            concept = conceptPart.substring(0, colonIdx).trim();
+            concept = body.substring(0, colonIdx).trim();
             count = parseInt(afterColon);
         }
     }
 
-    // Parse hint[:count]
-    var hint = null;
-    if (hintPart) {
-        hint = hintPart.trim();
-        var hintColonIdx = hintPart.lastIndexOf(':');
-        if (hintColonIdx >= 0) {
-            var afterHintColon = hintPart.substring(hintColonIdx + 1).trim();
-            if (/^\d+$/.test(afterHintColon)) {
-                hint = hintPart.substring(0, hintColonIdx).trim();
-                if (count === null) count = parseInt(afterHintColon);
-            }
-        }
-    }
-
     if (count === null) count = defaultCount;
-    return { concept: concept, count: count, hint: hint };
+    return { concept: concept, count: count };
 }
 
 // Polling auto-contenu pour attendre window.app (évite la dépendance
@@ -231,8 +212,9 @@ function _parseConceptSyntax(text, defaultCount) {
                                 return { ...base, type: "filter", id: e.id, name: e.name || "", author: e.author || "", is_public: !!e.is_public, hint: e.hint || "" };
                             }
                             if (e.type === "text") {
-                                // "raw" est le format attendu par le backend /api/generate
-                                return { ...base, type: "raw", text: e.text };
+                                // "raw" est le format attendu par le backend /api/generate.
+                                // hint = préfixe de résolution optionnel (texte brut si vide).
+                                return { ...base, type: "raw", text: e.text, hint: e.hint || "" };
                             }
                             return { ...base, ...e };
                         }),
@@ -461,7 +443,9 @@ function _parseConceptSyntax(text, defaultCount) {
                                     };
                                 }
                                 if (e.type === "text" || e.type === "raw") {
-                                    return { type: "text", text: e.text || "", visible };
+                                    // hint conservé explicitement (sinon perte silencieuse
+                                    // au rechargement d'un preset).
+                                    return { type: "text", text: e.text || "", hint: e.hint || "", visible };
                                 }
                                 return { ...e, visible };
                             });
@@ -872,6 +856,21 @@ function _parseConceptSyntax(text, defaultCount) {
                             row.appendChild(textInput);
                             row.appendChild(choiceBadge);
                             updateChoiceBadge();
+
+                            // Hint input optionnel (préfixe de résolution) : même
+                            // pattern que le filtre. Vide → aucun préfixe (et surtout
+                            // AUCUN « : » inséré).
+                            const hintInput = document.createElement("input");
+                            hintInput.type = "text";
+                            hintInput.placeholder = t("el.hintPlaceholder");
+                            hintInput.value = item.hint || "";
+                            hintInput.style.cssText = "flex:1; min-width:60px; background:#1a1a1e; border:1px solid #444; color:#ccc; border-radius:3px; padding:2px 6px; font-size:11px;";
+                            hintInput.oninput = function() {
+                                item.hint = this.value;
+                                markDirty();
+                                syncElementsWidget(true);
+                            };
+                            row.appendChild(hintInput);
                         } else {
                             // Filtre : nom + meta
                             const label = document.createElement("span");
@@ -1301,7 +1300,7 @@ function _parseConceptSyntax(text, defaultCount) {
 
                 // ---- triggerGenerate ----
                 // Reproduit le flux du Python generate() : traite les éléments
-                // séquentiellement, résout ||concept et 🧠 via appels LLM réels,
+                // séquentiellement, résout ||concept[:count] et 🧠 via appels LLM réels,
                 // puis envoie le tout à /api/generate.
                 async function triggerGenerate(n) {
                     const allElements = n._aihElements || [];
@@ -1331,12 +1330,11 @@ function _parseConceptSyntax(text, defaultCount) {
                         var brainOn = brainToggles[i] || false;
                         var rawText = el.text || "";
 
-                        // Détecter ||concept[:count][;hint[:count]]
+                        // Détecter ||concept[:count] (l'ancien « ;hint » inline n'existe plus)
                         var parsed = _parseConceptSyntax(rawText, llmDefaultCount);
                         if (parsed && presetId > 0) {
                             var concept = parsed.concept;
                             var count = parsed.count;
-                            var hint = parsed.hint;
                             var instruction = brainOn && context.length > 0
                                 ? t("el.llmInstructionCtx", { count: count, concept: concept })
                                 : t("el.llmInstruction", { count: count, concept: concept });
@@ -1351,9 +1349,6 @@ function _parseConceptSyntax(text, defaultCount) {
                                 var llmList = (resp.output || "").split(/[,\n]/).map(function(s) { return s.trim(); }).filter(Boolean);
                                 if (llmList.length > 0) {
                                     var chosen = llmList[Math.floor(Math.random() * llmList.length)];
-                                    if (hint) {
-                                        chosen = hint + ": " + chosen;
-                                    }
                                     el.text = chosen;
                                     context.push(chosen);
                                 }
@@ -1420,7 +1415,7 @@ function _parseConceptSyntax(text, defaultCount) {
                     var payload = {
                         elements: elements.map(function(e) {
                             if (e.type === "filter") return { type: "filter", id: e.id, name: e.name, hint: e.hint || "" };
-                            if (e.type === "text") return { type: "raw", text: e.text };
+                            if (e.type === "text") return { type: "raw", text: e.text, hint: e.hint || "" };
                             return e;
                         }),
                     };
@@ -1569,8 +1564,10 @@ function _parseConceptSyntax(text, defaultCount) {
                                     };
                                 }
                                 if (e.type === "text" || e.type === "raw") {
-                                    // Format interne = "text" pour l'affichage
-                                    return { type: "text", text: e.text || "", visible };
+                                    // Format interne = "text" pour l'affichage.
+                                    // hint conservé explicitement (sinon perte silencieuse
+                                    // au rechargement d'un workflow).
+                                    return { type: "text", text: e.text || "", hint: e.hint || "", visible };
                                 }
                                 return { ...e, visible };
                             });

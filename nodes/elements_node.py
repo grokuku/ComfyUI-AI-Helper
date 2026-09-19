@@ -46,15 +46,16 @@ def _hash32(s):
 
 
 def _parse_concept_syntax(text, default_count=10):
-    """Parse ||concept[:count][;hint[:count]] syntax.
-    Returns (concept, count, hint) or None if not a concept syntax.
+    """Parse ||concept[:count] syntax.
+    Returns (concept, count) or None if not a concept syntax.
 
     Supported forms:
-        ||color                  → concept="color", count=default, hint=None
-        ||color:20               → concept="color", count=20,    hint=None
-        ||color;hair color       → concept="color", count=default, hint="hair color"
-        ||color:20;hair color    → concept="color", count=20,    hint="hair color"
-        ||color;hair color:20    → concept="color", count=20,    hint="hair color"
+        ||color                  → concept="color", count=default
+        ||color:20               → concept="color", count=20
+
+    NOTE : l'ancien séparateur inline « ;hint » a été supprimé. Le caractère
+    « ; » n'est plus spécial et fait partie intégrante du concept littéral.
+    Le hint est porté par le champ dédié de l'élément, jusqu'au backend.
     """
     if not text or not text.startswith('||'):
         return None
@@ -62,36 +63,19 @@ def _parse_concept_syntax(text, default_count=10):
     if not body:
         return None
 
-    # Split by first ; to separate concept part from hint part
-    if ';' in body:
-        concept_part, hint_part = body.split(';', 1)
-    else:
-        concept_part, hint_part = body, None
-
-    # Parse concept_part: concept[:count]
-    concept = concept_part.strip()
+    # Parse concept[:count]
+    concept = body
     count = None
-    if ':' in concept_part:
-        parts = concept_part.rsplit(':', 1)
+    if ':' in body:
+        parts = body.rsplit(':', 1)
         if parts[1].strip().isdigit():
             concept = parts[0].strip()
             count = int(parts[1].strip())
 
-    # Parse hint_part: hint[:count]
-    hint = None
-    if hint_part:
-        hint = hint_part.strip()
-        if ':' in hint_part:
-            parts = hint_part.rsplit(':', 1)
-            if parts[1].strip().isdigit():
-                hint = parts[0].strip()
-                if count is None:
-                    count = int(parts[1].strip())
-
     if count is None:
         count = default_count
 
-    return (concept, count, hint)
+    return (concept, count)
 
 
 # Regex pour trouver les blocs {choix1::choix2::...}
@@ -341,11 +325,11 @@ class AIHElementsNode:
                 else False
             )
 
-            # --- Détection syntaxe ||concept[:count][;hint[:count]] ---
+            # --- Détection syntaxe ||concept[:count] ---
             parsed = _parse_concept_syntax(raw_text.strip(), llm_default_count)
 
             if parsed:
-                concept, count, hint = parsed
+                concept, count = parsed
 
                 # preset_id == 0 → pas de LLM backend disponible
                 # (sauf si llm_config externe fournie)
@@ -375,12 +359,11 @@ class AIHElementsNode:
                     items = _parse_llm_list(output) if output else []
                 if items:
                     chosen_keyword = _pick_from_list(items, seed, i, raw_text)
-                    if hint:
-                        chosen_text = f"{hint}: {chosen_keyword}"
-                    else:
-                        chosen_text = chosen_keyword
-                    el["text"] = chosen_text
-                    context.append(chosen_text)
+                    # Le champ « hint » de l'élément est conservé tel quel :
+                    # il est forwardé au backend /api/generate qui l'applique
+                    # comme préfixe de résolution (aucun « : » si vide).
+                    el["text"] = chosen_keyword
+                    context.append(chosen_keyword)
                 else:
                     # Fallback LLM ||: skip (liste vide)
                     indices_to_skip.add(i)
@@ -471,8 +454,16 @@ class AIHElementsNode:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        # Construire un prompt de secours depuis les éléments locaux (au cas où l'API échoue)
-        final_list = [el.get("text", "").strip() for el in elements if el.get("text", "").strip()]
+        # Construire un prompt de secours depuis les éléments locaux (au cas où l'API échoue).
+        # Le hint est appliqué comme préfixe de résolution, cohérent avec le backend
+        # (aucun « : » si vide).
+        final_list = []
+        for el in elements:
+            text_val = el.get("text", "").strip()
+            if not text_val:
+                continue
+            hint_val = (el.get("hint") or "").strip()
+            final_list.append(f"{hint_val}: {text_val}" if hint_val else text_val)
         final_prompt = ", ".join(final_list)
         final_prompt = re.sub(r'\s*,\s*', ', ', final_prompt)
         final_prompt = re.sub(r',+', ',', final_prompt).strip(' ,')

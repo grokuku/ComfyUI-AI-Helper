@@ -395,6 +395,10 @@ Grand chantier d'unification réalisé après la Phase 2, pour faire disparaîtr
 | Fichier | Raison |
 |---------|--------|
 | `GEMINI.md` | Artefact de l'IA génératrice. Référençait des fichiers inexistants. |
+| `nodes/aih_guide_card.py`, `nodes/aih_slider_card.py` | Nodes Krea « AIHGuideCard » / « AIHSliderCard » — « pas d'impact voulu sur le rendu, non utilisés » (décision utilisateur). |
+| `js/aih_krea_cards.js`, `js/css/aih_krea_cards.css` | Habillage DOM des cartes Krea (retiré avec les nodes dont il dépendait). |
+| `js/test_aih_krea_cards.mjs`, `tests/test_krea_cards_contract.py` | Tests des cartes Krea (retirés avec les nodes testés). |
+| `THIRD-PARTY-NOTICES.md` §4 « krea-reference » | Attribution MIT du pack amont `krea-reference` : plus aucun code ne réutilise ses valeurs/recettes → attribution devenue inutile. |
 
 ---
 

@@ -351,8 +351,11 @@ class AIHEnhanceNode:
                 if e.get("type") == "filter":
                     name = e.get("name") or f"ID {e.get('id', '?')}"
                     lines.append(f"[Filtre: {name}]")
-                elif e.get("type") == "text":
-                    lines.append(f"[Recherche: {e.get('text', '')}]")
+                elif e.get("type") in ("text", "raw"):
+                    hint = (e.get("hint") or "").strip()
+                    text = e.get("text", "")
+                    # Le hint est un préfixe de résolution : aucun « : » si vide.
+                    lines.append(f"[Recherche: {hint + ': ' + text if hint else text}]")
                 elif e.get("type") == "random":
                     lines.append("[Éléments aléatoires]")
             return "\n".join(lines)
