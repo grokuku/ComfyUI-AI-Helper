@@ -16,11 +16,17 @@
  * FIX: Corrected API endpoint for hover edits.
  * FIX: Gallery disappearing thumbnails — robust load queue with generation counter,
  *       deduplication of activeThumbnailLoads decrements, and idle-restart mechanism.
+ * UPDATE (brique): Le cache LRU, la file bornée, la dédup in-flight, le prefetch,
+ *       le timeout + retries bornés, le protocole 202 + Retry-After et la
+ *       priorisation des vignettes visibles sont délégués à la brique PUR-JS
+ *       vendor/holaf/holaf-thumbcache.js ; ce module ne garde que l'adaptateur
+ *       (URL + HolafFetch) et le rendu DOM (placeholder -> <img>).
  */
 
 import "../aih_strings.js";
 import { imageViewerState } from "./image_viewer_state.js";
-import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
+import { HolafFetch } from "../vendor/holaf/holaf-fetch.js";
+import { HolafThumbCache } from "../vendor/holaf/holaf-thumbcache.js";
 import { showToast } from "../aih_toast_bridge.js";
 import { showFullscreenView, getFullImageUrl } from './image_viewer_navigation.js';
 import {
@@ -55,49 +61,74 @@ let benchmarkStartTime = 0;
 let benchmarkTotalItems = 0;
 let isBenchmarking = false;
 
-// --- LRU CACHE IMPLEMENTATION ---
-class ThumbnailLRUCache {
-    constructor(capacity = 2000) {
-        this.capacity = capacity;
-        this.cache = new Map(); // path_canon -> blobURL
-    }
+// --- HOLAF THUMB CACHE (brique holaf-thumbcache) ---
+// Le cache LRU, la file bornée, la dédup in-flight, le prefetch, le timeout +
+// retries bornés, le protocole 202 + Retry-After et la priorisation des
+// vignettes visibles sont gérés par la brique PUR-JS holaf-thumbcache.
+// gallery.js ne garde QUE l'adaptateur (construction d'URL + HolafFetch) et le
+// rendu DOM (placeholder -> <img>, overlay d'erreur).
+const THUMBNAIL_CACHE_CAPACITY = 2000;
+// Bound consecutive timeouts per thumbnail: transient server-side DB contention
+// must not leave a permanent "Timeout" overlay on an otherwise valid item.
+const MAX_THUMBNAIL_TIMEOUT_RETRIES = 4;
 
-    get(key) {
-        if (!this.cache.has(key)) return null;
-        // Refresh item (delete and re-add to mark as recently used)
-        const val = this.cache.get(key);
-        this.cache.delete(key);
-        this.cache.set(key, val);
-        return val;
-    }
-
-    has(key) {
-        // Non-mutating existence check (unlike get(), which refreshes recency).
-        return this.cache.has(key);
-    }
-
-    put(key, val) {
-        if (this.cache.has(key)) {
-            this.cache.delete(key);
-        } else if (this.cache.size >= this.capacity) {
-            // Evict oldest (first item in Map)
-            const oldestKey = this.cache.keys().next().value;
-            const oldestVal = this.cache.get(oldestKey);
-            URL.revokeObjectURL(oldestVal); // Free memory
-            this.cache.delete(oldestKey);
-        }
-        this.cache.set(key, val);
-    }
-
-    clear() {
-        for (const url of this.cache.values()) {
-            URL.revokeObjectURL(url);
-        }
-        this.cache.clear();
-    }
+function buildThumbnailUrl(image, { forceReload = false } = {}) {
+    const imageUrl = new URL(window.location.origin);
+    imageUrl.pathname = '/holaf/images/thumbnail';
+    let cacheBuster = image.thumb_hash ? image.thumb_hash : (image.mtime || '');
+    if (benchmarkCacheBuster) cacheBuster += `_${benchmarkCacheBuster}`;
+    const params = {
+        filename: image.filename,
+        subfolder: image.subfolder,
+        path_canon: image.path_canon,
+        mtime: cacheBuster,
+    };
+    if (forceReload) params.t = new Date().getTime();
+    imageUrl.search = new URLSearchParams(params);
+    return imageUrl.href;
 }
 
-const thumbnailCache = new ThumbnailLRUCache();
+const thumbCache = HolafThumbCache.create({
+    capacity: THUMBNAIL_CACHE_CAPACITY,
+    concurrency: currentConcurrencyLimit,
+    strategy: 'blob', // createObjectURL + revoke à l'éviction/clear/destroy
+    getId: (image) => image && image.path_canon,
+    // raw:true → Response brute : statut 202 + Retry-After + blob gérés par la
+    // brique ; signal + priority forwardés. timeout:0 → un seul garde-temps,
+    // tenu par la brique (retries bornés homogènes).
+    load: (image, { signal, priority }) =>
+        HolafFetch.get(buildThumbnailUrl(image, { forceReload: !!image._forceReload }), {
+            raw: true,
+            signal,
+            timeout: 0,
+            priority: priority >= HolafThumbCache.PRIORITY_HIGH ? 'high' : 'low',
+        }),
+    retry: { max: MAX_THUMBNAIL_TIMEOUT_RETRIES, delayMs: 3000 },
+    timeoutMs: FETCH_TIMEOUT_MS,
+    // 202 : garder le placeholder gris (state "pending") au lieu d'une image cassée.
+    onPending: (image) => {
+        const ph = renderedPlaceholders.get(image.path_canon);
+        if (ph && ph.isConnected) ph.dataset.thumbnailLoadingOrLoaded = "pending";
+    },
+    // Les échecs terminaux sont gérés PAR REQUÊTE (overlay sur le placeholder)
+    // dans fetchThumbnail() ; onError n'est qu'un filet de sécurité.
+    onError: () => {},
+    // Priorisation backend : la brique absorbe le débounce + le flush anticipé,
+    // on ne garde que le transport (POST fire-and-forget).
+    onPrioritize: (paths) => {
+        HolafFetch.post('/holaf/images/prioritize-thumbnails', { body: { paths_canon: paths } }).catch(() => {});
+    },
+    visibleDebounceMs: PRIORITIZE_DEBOUNCE_MS,
+    visibleFlushThreshold: PRIORITIZE_FLUSH_THRESHOLD,
+});
+
+// Shim de compatibilité : les call-sites historiques lisent `thumbnailCache`.
+const thumbnailCache = {
+    has: (pathCanon) => thumbCache.has(pathCanon),
+    // get historique = lecture QUI rafraîchit la récence (touch).
+    get: (pathCanon) => thumbCache.touch(pathCanon),
+    clear: () => thumbCache.clear(),
+};
 
 // --- Module-level state ---
 let viewerInstance = null;
@@ -113,34 +144,20 @@ const SKELETON_POOL_MAX = 200;
 let windowFetchDebounceTimer = null;
 const WINDOW_FETCH_DEBOUNCE_MS = 200;
 
-// Track active network requests to cancel them if needed
-// Map<path_canon, AbortController>
-const activeFetches = new Map();
-
-// Track hover timeouts and abort controllers for video preview race condition prevention
+// Track hover timeouts for video preview race condition prevention
 const hoverTimeouts = new Map();
-
-// Track consecutive timeouts per thumbnail to bound retries: transient server-side
-// DB contention must not leave a permanent "Timeout" overlay.
-const thumbnailTimeoutRetries = new Map(); // path_canon -> consecutive timeout count
-const MAX_THUMBNAIL_TIMEOUT_RETRIES = 4;
 
 let isWheelScrolling = false;
 let wheelScrollTimeout = null;
-let activeThumbnailLoads = 0;
 
 // --- UNLOADED TRACKING: O(1) lookup for next thumbnail to fetch ---
 const unloadedVisiblePaths = new Set(); // path_canon of visible items not yet loaded
 
-// --- LOAD QUEUE GENERATION ---
-// Simple kick-based scheduler - completed fetches always re-kick.
-// Queue fill is synchronous; no generation tracking needed.
-// 
+// --- LOAD QUEUE ---
+// Simple kick-based scheduler : on enfile les vignettes visibles unloaded et on
+// laisse la brique holaf-thumbcache faire le reste (concurrence/dédup/retries).
 let kickQueued = false;
 let idleRestartTimer = null;
-let prioritizeDebounceTimer = null;
-const pendingPrioritizePaths = new Set();
-const pendingThumbnailRetries = new Map(); // path_canon -> timeoutId
 
 let columnCount = 0;
 let itemWidth = 0;
@@ -157,6 +174,7 @@ window.holaf.runBenchmark = (concurrency = 6) => {
 
     // 1. Setup Benchmark Environment
     currentConcurrencyLimit = concurrency;
+    thumbCache.setConcurrency(concurrency);
     benchmarkCacheBuster = `bench_${Date.now()}`; // Unique ID to bypass browser cache
     isBenchmarking = true;
     thumbnailCache.clear(); // Clear cache for fair test
@@ -164,9 +182,7 @@ window.holaf.runBenchmark = (concurrency = 6) => {
     // 2. Reset Gallery
     if (viewerInstance) {
         // Cancel everything current
-        for (const controller of activeFetches.values()) controller.abort();
-        activeFetches.clear();
-        activeThumbnailLoads = 0;
+        thumbCache.abort();
         unloadedVisiblePaths.clear();
 
         // Clear DOM to force re-render
@@ -201,8 +217,8 @@ function getVisibleItemCount() {
 function checkBenchmarkCompletion() {
     if (!isBenchmarking) return;
 
-    // Check if queue is empty and no active fetches
-    if (activeThumbnailLoads === 0 && activeFetches.size === 0) {
+    // Rien en vol / en file / planifié → benchmark terminé
+    if (thumbCache.stats().pending === 0) {
         // Double check: are all visible placeholders actually loaded?
         const visiblePlaceholders = Array.from(galleryGridEl.children);
         const allLoaded = visiblePlaceholders.every(p => p.dataset.thumbnailLoadingOrLoaded === 'true' || p.dataset.thumbnailLoadingOrLoaded === 'error');
@@ -413,21 +429,23 @@ function renderVisibleItems() {
         // --- Backend priority queue: collect currently VISIBLE thumbnails ---
         // (debounced ~300ms, fire-and-forget). This tells the backend to generate
         // these thumbnails first (thumbnail_status=1). Only uncached, not-in-flight
-        // items are queued so we don't waste the request.
+        // items are queued so we don't waste the request. Le débounce + le flush
+        // anticipé sont tenus par la brique (onVisible).
         {
             const viewportStartRow = Math.max(0, Math.floor(scrollTop / itemHeightWithGap));
             const viewportEndRow = Math.ceil((scrollTop + viewportHeight) / itemHeightWithGap);
             const priorityStart = viewportStartRow * columnCount;
             const priorityEnd = Math.min(totalCount - 1, (viewportEndRow * columnCount) + columnCount - 1);
+            const visibleIds = [];
             for (let i = priorityStart; i <= priorityEnd; i++) {
                 const img = getImageAt(state, i);
                 if (!img) continue;
                 const pathCanon = img.path_canon;
-                if (!thumbnailCache.has(pathCanon) && !activeFetches.has(pathCanon)) {
-                    pendingPrioritizePaths.add(pathCanon);
+                if (!thumbCache.has(pathCanon) && !thumbCache.isLoading(pathCanon)) {
+                    visibleIds.push(pathCanon);
                 }
             }
-            if (pendingPrioritizePaths.size > 0) schedulePrioritizeVisibleThumbnails();
+            if (visibleIds.length > 0) thumbCache.onVisible(visibleIds);
         }
 
         // Fetch any not-yet-loaded window visible in the current range
@@ -490,48 +508,41 @@ function _doKick() {
     kickQueued = false;
     clearTimeout(idleRestartTimer);
 
-    // Phase 1: Load visible unloaded thumbnails
-    // Limit cache-hit processing per tick to avoid blocking the main thread.
-    // Each cache hit does DOM manipulation (createElement + prepend), so
-    // processing 200 items synchronously in a microtask can freeze the UI.
-    let cacheHitsThisTick = 0;
-    const MAX_CACHE_HITS_PER_TICK = 20;
+    // Phase 1: enqueue les vignettes VISIBLES non chargées. La concurrence, la
+    // dédup in-flight, le yield des cache-hits, le timeout/retries et le
+    // protocole 202 sont tenus par la brique holaf-thumbcache. On borne juste le
+    // nombre de placeholders traités par tick (chaque hit cache fait un
+    // createElement + prepend) pour ne pas figer l'UI en cas de gros lot.
+    const MAX_PER_TICK = 40;
+    let processed = 0;
 
-    while (activeThumbnailLoads < currentConcurrencyLimit) {
-        const next = _findNextUnloaded();
-        if (!next) break;
-
-        if (applyCachedThumbnail(next, next.dataset.pathCanon)) {
-            cacheHitsThisTick++;
-            if (cacheHitsThisTick >= MAX_CACHE_HITS_PER_TICK) {
-                // Yield to main thread, resume on next tick
-                setTimeout(kickLoadQueue, 0);
-                return;
-            }
+    for (const pathCanon of [...unloadedVisiblePaths]) {
+        const placeholder = renderedPlaceholders.get(pathCanon);
+        if (!placeholder || !placeholder.isConnected) {
+            unloadedVisiblePaths.delete(pathCanon);
             continue;
         }
+        if (placeholder.dataset.thumbnailLoadingOrLoaded) continue;
 
-        activeThumbnailLoads++;
-        const imageIndex = parseInt(next.dataset.index, 10);
+        const imageIndex = parseInt(placeholder.dataset.index, 10);
         const image = imageViewerState.getState().images[imageIndex];
+        if (!image) continue;
 
-        if (image) {
-            fetchThumbnail(next, image, false).finally(() => {
-                activeThumbnailLoads = Math.max(0, activeThumbnailLoads - 1);
-                if (isBenchmarking) checkBenchmarkCompletion();
-                kickLoadQueue();
-            });
-        } else {
-            activeThumbnailLoads = Math.max(0, activeThumbnailLoads - 1);
+        fetchThumbnail(placeholder, image, false);
+        processed++;
+        if (processed >= MAX_PER_TICK) {
+            // Yield to main thread, resume on next tick.
+            setTimeout(kickLoadQueue, 0);
+            break;
         }
     }
 
     // Phase 2: Prefetch thumbnails ahead of viewport into cache (no DOM)
-    if (activeThumbnailLoads < currentConcurrencyLimit) {
-        _prefetchAhead();
-    }
+    _prefetchAhead();
 
-    if (activeThumbnailLoads === 0) {
+    // Safety net : des placeholders peuvent rester sans état après une
+    // annulation (syncGallery) ; re-kick une fois la file au repos.
+    if (thumbCache.stats().active === 0 && unloadedVisiblePaths.size > 0) {
         idleRestartTimer = setTimeout(() => {
             const children = galleryGridEl.children;
             for (let i = 0; i < children.length; i++) {
@@ -563,81 +574,28 @@ function _prefetchAhead() {
     const prefetchStartIndex = endRow * columnCount;
     const prefetchEndIndex = Math.min(images.length - 1, prefetchStartIndex + (PREFETCH_ROWS * columnCount) - 1);
 
-    for (let i = prefetchStartIndex; i <= prefetchEndIndex; i++) {
-        if (activeThumbnailLoads >= currentConcurrencyLimit) break;
-
+    // On n'enfile le prefetch que s'il reste des slots libres (même throttle que
+    // l'ancien code) ; la brique ordonne de toute façon le prefetch APRÈS le visible.
+    let slots = currentConcurrencyLimit - thumbCache.stats().active;
+    const toPrefetch = [];
+    for (let i = prefetchStartIndex; i <= prefetchEndIndex && slots > 0; i++) {
         const image = images[i];
         if (!image) continue;
         const pathCanon = image.path_canon;
 
-        // Skip if already cached, loading, or fetched
-        if (thumbnailCache.get(pathCanon)) continue;
-        if (activeFetches.has(pathCanon)) continue;
-        if (renderedPlaceholders.has(pathCanon)) continue; // Will be handled by normal queue
+        // Skip if already cached, loading, or handled by the visible queue
+        if (thumbCache.has(pathCanon)) continue;
+        if (thumbCache.isLoading(pathCanon)) continue;
+        if (renderedPlaceholders.has(pathCanon)) continue;
 
-        // Fetch into cache only (no DOM placeholder needed)
-        activeThumbnailLoads++;
-        fetchPrefetchThumbnail(image).finally(() => {
-            activeThumbnailLoads = Math.max(0, activeThumbnailLoads - 1);
-            kickLoadQueue();
+        toPrefetch.push(image);
+        slots--;
+    }
+    if (toPrefetch.length > 0) {
+        thumbCache.prefetch(toPrefetch).then(() => {
+            if (isBenchmarking) checkBenchmarkCompletion();
         });
     }
-}
-
-async function fetchPrefetchThumbnail(image) {
-    const pathCanon = image.path_canon;
-    if (activeFetches.has(pathCanon)) return;
-
-    const imageUrl = new URL(window.location.origin);
-    imageUrl.pathname = '/holaf/images/thumbnail';
-    const cacheBuster = image.thumb_hash ? image.thumb_hash : (image.mtime || '');
-    const params = {
-        filename: image.filename,
-        subfolder: image.subfolder,
-        path_canon: image.path_canon,
-        mtime: cacheBuster
-    };
-    imageUrl.search = new URLSearchParams(params);
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort('timeout'), FETCH_TIMEOUT_MS);
-    activeFetches.set(pathCanon, controller);
-
-    try {
-        // raw:true → Response brute : statut 202 et blob gérés ici comme avec
-        // l'ancien fetch ; signal + priority:'low' sont forwardés par la brique.
-        const response = await HolafFetch.get(imageUrl.href, { raw: true, signal: controller.signal, priority: 'low' });
-        clearTimeout(timeoutId);
-        if (response.status === 202) {
-            // Backend busy generating — don't cache; it will be retried when visible.
-            return;
-        }
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const blob = await response.blob();
-        const objectURL = URL.createObjectURL(blob);
-        thumbnailCache.put(pathCanon, objectURL);
-    } catch (err) {
-        clearTimeout(timeoutId);
-        // Silently ignore prefetch errors — they'll retry when visible
-    } finally {
-        activeFetches.delete(pathCanon);
-    }
-}
-
-function _findNextUnloaded() {
-    // O(1) average case: iterate the Set of known-unloaded visible paths
-    for (const pathCanon of unloadedVisiblePaths) {
-        if (!activeFetches.has(pathCanon)) {
-            const placeholder = renderedPlaceholders.get(pathCanon);
-            if (placeholder && placeholder.isConnected) {
-                return placeholder;
-            }
-            // Stale entry — remove from tracking
-            unloadedVisiblePaths.delete(pathCanon);
-        }
-    }
-    return null;
 }
 
 function debouncedKickLoadQueue() {
@@ -693,55 +651,22 @@ async function fetchWindow(start) {
     return promise;
 }
 
-// --- Backend thumbnail prioritization (P4 frontend) ---
-function _flushPrioritizeThumbnails() {
-    if (pendingPrioritizePaths.size === 0) return;
-    const paths = [...pendingPrioritizePaths];
-    pendingPrioritizePaths.clear();
-    // Fire-and-forget: never block the gallery on this request.
-    // (La brique lève sur non-2xx → .catch() obligatoire.)
-    HolafFetch.post('/holaf/images/prioritize-thumbnails', { body: { paths_canon: paths } }).catch(() => {});
+// --- Thumbnail render (adaptateur brique → DOM) ---
+// La brique holaf-thumbcache tient le cache, la concurrence, la dédup in-flight,
+// le timeout + retries bornés et le protocole 202 + Retry-After. Ici on ne fait
+// que : demander la vignette (request haute priorité), dessiner le <img> au
+// succès, poser l'overlay d'erreur à l'échec terminal, nettoyer sur annulation.
+function isAbortError(err) {
+    return !!err && (err.name === 'AbortError' || err.aborted === true);
 }
 
-function schedulePrioritizeVisibleThumbnails() {
-    clearTimeout(prioritizeDebounceTimer);
-    if (pendingPrioritizePaths.size >= PRIORITIZE_FLUSH_THRESHOLD) {
-        prioritizeDebounceTimer = null;
-        _flushPrioritizeThumbnails();
-        return;
-    }
-    prioritizeDebounceTimer = setTimeout(() => {
-        prioritizeDebounceTimer = null;
-        _flushPrioritizeThumbnails();
-    }, PRIORITIZE_DEBOUNCE_MS);
-}
 
-// --- Pending (202) thumbnail retry scheduling (P4 frontend) ---
-// Uses a per-item timer instead of the shared idleRestartTimer so a busy backend
-// response never cancels the gallery-wide idle restart mechanism.
-function _scheduleThumbnailRetry(pathCanon, placeholder, delayMs) {
-    if (pendingThumbnailRetries.has(pathCanon)) {
-        clearTimeout(pendingThumbnailRetries.get(pathCanon));
-    }
-    const timer = setTimeout(() => {
-        pendingThumbnailRetries.delete(pathCanon);
-        // Only re-queue if the placeholder is still live and still pending.
-        if (placeholder.isConnected && placeholder.dataset.thumbnailLoadingOrLoaded === "pending") {
-            delete placeholder.dataset.thumbnailLoadingOrLoaded;
-            unloadedVisiblePaths.add(pathCanon);
-            kickLoadQueue();
-        }
-    }, delayMs);
-    pendingThumbnailRetries.set(pathCanon, timer);
-}
-
-async function fetchThumbnail(placeholder, image, forceReload = false) {
+function fetchThumbnail(placeholder, image, forceReload = false) {
     const pathCanon = image.path_canon;
 
-    // Cache Check (Early return)
-    if (!forceReload && applyCachedThumbnail(placeholder, pathCanon)) return;
-
-    if (activeFetches.has(pathCanon)) return;
+    // Force reload (édition d'image) : purge la valeur cachée puis recharge (le
+    // paramètre `t` est ajouté par buildThumbnailUrl via `_forceReload`).
+    if (forceReload) thumbCache.invalidate(pathCanon);
 
     // Flag as loading to prevent duplicate queueing
     placeholder.dataset.thumbnailLoadingOrLoaded = "loading";
@@ -751,72 +676,17 @@ async function fetchThumbnail(placeholder, image, forceReload = false) {
     const existingError = placeholder.querySelector('.holaf-viewer-error-overlay');
     if (existingError) existingError.remove();
 
-    const imageUrl = new URL(window.location.origin);
-    imageUrl.pathname = '/holaf/images/thumbnail';
-    let cacheBuster = image.thumb_hash ? image.thumb_hash : (image.mtime || '');
-    if (benchmarkCacheBuster) cacheBuster += `_${benchmarkCacheBuster}`;
+    const item = forceReload ? { ...image, _forceReload: true } : image;
 
-    const params = {
-        filename: image.filename,
-        subfolder: image.subfolder,
-        path_canon: image.path_canon,
-        mtime: cacheBuster,
-        t: forceReload ? new Date().getTime() : ''
-    };
-    imageUrl.search = new URLSearchParams(params);
-
-    const controller = new AbortController();
-    // --- TIMEOUT PROTECTION ---
-    const timeoutId = setTimeout(() => controller.abort('timeout'), FETCH_TIMEOUT_MS);
-
-    activeFetches.set(pathCanon, controller);
-
-    let decrementDone = false;
-
-    try {
-        const tStart = performance.now();
-        // raw:true → Response brute : statut 202 + Retry-After + blob gérés
-        // ici, comme avec l'ancien fetch ; signal + priority:'high' forwardés.
-        const response = await HolafFetch.get(imageUrl.href, { raw: true, signal: controller.signal, priority: 'high' });
-        const tFetch = performance.now();
-
-        clearTimeout(timeoutId);
-
-        if (response.status === 202) {
-            // Thumbnail generation is pending on the server (bounded inline generation).
-            // Keep the gray placeholder and re-schedule this thumbnail after Retry-After
-            // instead of showing a broken image. Mark it "pending" so the idle re-kick
-            // does not immediately re-request it in a hot loop.
-            const retryAfterMs = (parseFloat(response.headers.get('Retry-After')) || 2) * 1000;
-            placeholder.dataset.thumbnailLoadingOrLoaded = "pending";
-            unloadedVisiblePaths.delete(pathCanon);
-            _scheduleThumbnailRetry(pathCanon, placeholder, retryAfterMs);
-            return;
-        }
-
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const blob = await response.blob();
-        const tBlob = performance.now();
-        const totalMs = tBlob - tStart;
-        if (totalMs > 300) {
-            console.log("[Holaf Perf] fetchThumbnail " + pathCanon + " fetch_ms=" + (tFetch - tStart).toFixed(1) + " blob_ms=" + (tBlob - tFetch).toFixed(1) + " total_ms=" + totalMs.toFixed(1));
-        }
-        const objectURL = URL.createObjectURL(blob);
-
-        // Add to LRU Cache
-        thumbnailCache.put(pathCanon, objectURL);
-        thumbnailTimeoutRetries.delete(pathCanon);
-
+    return thumbCache.request(item, HolafThumbCache.PRIORITY_HIGH).then((objectURL) => {
         if (!placeholder.isConnected) {
-            // If placeholder is gone, we cached it, but we don't need to render it now.
+            // Placeholder évincé : la vignette est en cache, le prochain rendu la
+            // reprendra via applyCachedThumbnail. Rien à dessiner ici.
             return;
         }
-
         const img = document.createElement('img');
         img.className = "holaf-image-viewer-thumbnail";
         img.src = objectURL;
-
         // --- FIX: REMOVED forced JS style for images. CSS classes handle it. ---
         img.style.objectFit = '';
 
@@ -825,68 +695,32 @@ async function fetchThumbnail(placeholder, image, forceReload = false) {
         };
 
         const oldImg = placeholder.querySelector('img');
-        if (oldImg) {
-            oldImg.remove();
-        }
+        if (oldImg) oldImg.remove();
 
         // If a video preview is currently playing, we put the img behind it or hide it
         // But simplified logic: just prepend.
         placeholder.prepend(img);
         placeholder.dataset.thumbnailLoadingOrLoaded = "true";
         unloadedVisiblePaths.delete(pathCanon);
-
-    } catch (err) {
-        clearTimeout(timeoutId);
-
-        let isTimeout = false;
-        // Check if it's a timeout abort : soit l'AbortController externe
-        // (raison 'timeout'), soit le timeout interne de HolafFetch
-        // (HolafFetchError "timeout", status 0).
-        if (controller.signal.aborted && controller.signal.reason === 'timeout') {
-            isTimeout = true;
-        } else if (err instanceof HolafFetchError && err.status === 0 && err.message === 'timeout') {
-            isTimeout = true;
+    }).catch((err) => {
+        if (isAbortError(err)) {
+            // Annulation (syncGallery) : le blob n'est pas caché ; on rend l'item
+            // à la file pour qu'il soit rechargé quand il revient à l'écran.
+            if (placeholder.isConnected) delete placeholder.dataset.thumbnailLoadingOrLoaded;
+            return;
         }
-        // HolafFetch encapsule les rejets du fetch (abandons compris) en
-        // HolafFetchError : une annulation externe (syncGallery) se détecte
-        // via le signal, pas via err.name.
-        const isAborted = !isTimeout && controller.signal.aborted;
-
-        if (isTimeout || (!isAborted && err.name !== 'AbortError')) {
-            // Real error or timeout. A timeout is usually transient server-side
-            // DB contention: retry a bounded number of times instead of showing
-            // a permanent "Timeout" overlay.
-            if (placeholder.isConnected) {
-                if (isTimeout) {
-                    const retries = (thumbnailTimeoutRetries.get(pathCanon) || 0) + 1;
-                    if (retries <= MAX_THUMBNAIL_TIMEOUT_RETRIES) {
-                        thumbnailTimeoutRetries.set(pathCanon, retries);
-                        placeholder.dataset.thumbnailLoadingOrLoaded = "pending";
-                        unloadedVisiblePaths.delete(pathCanon);
-                        _scheduleThumbnailRetry(pathCanon, placeholder, 3000);
-                        return;
-                    }
-                    thumbnailTimeoutRetries.delete(pathCanon);
-                }
-                placeholder.classList.add('error');
-                placeholder.dataset.thumbnailLoadingOrLoaded = "error";
-                unloadedVisiblePaths.delete(pathCanon);
-                const errorDiv = document.createElement('div');
-                errorDiv.className = 'holaf-viewer-error-overlay';
-                errorDiv.textContent = isTimeout ? t('iv.timeout') : t('iv.err');
-                placeholder.appendChild(errorDiv);
-            }
-        } else {
-            // Fetch was aborted (timeout or syncGallery). Blob not cached.
-            // kickLoadQueue() will pick this item up again.
-            if (placeholder.isConnected) {
-                delete placeholder.dataset.thumbnailLoadingOrLoaded;
-            }
-        }
-        // Will re-fetch next time it scrolls into view.
-    } finally {
-        activeFetches.delete(pathCanon);
-    }
+        // Échec terminal (timeout après retries bornés, HTTP non-2xx, réseau).
+        if (!placeholder.isConnected) return;
+        placeholder.classList.add('error');
+        placeholder.dataset.thumbnailLoadingOrLoaded = "error";
+        unloadedVisiblePaths.delete(pathCanon);
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'holaf-viewer-error-overlay';
+        errorDiv.textContent = (err && err.timedOut) ? t('iv.timeout') : t('iv.err');
+        placeholder.appendChild(errorDiv);
+    }).finally(() => {
+        if (isBenchmarking) checkBenchmarkCompletion();
+    });
 }
 
 // --- Placeholder Object Pool ---
@@ -1000,12 +834,11 @@ function releasePlaceholder(placeholder) {
         placeholder._hoverCleanup = null;
     }
 
-    // Cancel any pending 202 retry for this item
+    // Stoppe un éventuel retry « pending » (202) : inutile de continuer à
+    // réclamer une vignette qui vient de quitter la vue. Un chargement DÉJÀ en
+    // vol n'est pas interrompu — il aboutira et remplira le cache.
     const releasedPath = placeholder.dataset.pathCanon;
-    if (releasedPath && pendingThumbnailRetries.has(releasedPath)) {
-        clearTimeout(pendingThumbnailRetries.get(releasedPath));
-        pendingThumbnailRetries.delete(releasedPath);
-    }
+    if (releasedPath) thumbCache.cancel(releasedPath);
 
     // Remove from DOM
     if (placeholder.parentNode) {
@@ -1310,13 +1143,10 @@ function syncGallery(viewer, images) {
     }
 
     // Full rebuild (image list actually changed)
-    for (const controller of activeFetches.values()) controller.abort();
-    activeFetches.clear();
-    activeThumbnailLoads = 0;
+    // Stoppe les chargements en vol + les retries planifiés (la brique rejette
+    // les promesses concernées ; fetchThumbnail nettoie l'état des placeholders).
+    thumbCache.abort();
     unloadedVisiblePaths.clear();
-    for (const t of pendingThumbnailRetries.values()) clearTimeout(t);
-    pendingThumbnailRetries.clear();
-    thumbnailTimeoutRetries.clear();
     resetWindowCache();
 
     // Keep LRU Cache alive! Don't clear it — thumbnails are still valid.
