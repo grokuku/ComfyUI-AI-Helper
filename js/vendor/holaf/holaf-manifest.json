@@ -5,5 +5,6 @@
   "viewport": "0.1.3",
   "collection": "0.1.0",
   "thumbcache": "0.1.0",
-  "virtualgrid": "0.1.0"
+  "virtualgrid": "0.1.0",
+  "lightbox": "0.1.0"
 }

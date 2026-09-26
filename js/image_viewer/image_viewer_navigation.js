@@ -6,6 +6,16 @@
  * zoomed view, fullscreen view, and pan/zoom interactions.
  * FIX: Removed DOM cloning which caused "parentNode is null" errors.
  * FIX: Added safety checks for missing video elements.
+ *
+ * VAGUE 4 (brique holaf-lightbox) : la logique de visionneuse (machine à états
+ * inline/zoom/fullscreen + restauration de la vue source, navigation ‹/› et
+ * grille ↑/↓, préchargement, garde de stale-load, clavier de visionneuse,
+ * délégation zoom/pan) est désormais portée par la brique vendue
+ * HolafLightbox. Ce module devient l'ADAPTATEUR : il fournit à la brique la
+ * SOURCE d'items (via imageViewerState), le RENDERER média (l'ancien
+ * _updateMediaSource : img/vidéo/audio + spinner + hooks éditeur), les
+ * CONTENEURS (les vues zoom/fullscreen existantes — l'éditeur requête leurs
+ * sélecteurs), le VIEWPORT (HolafViewport) et le garde-fou clavier.
  */
 
 import { imageViewerState } from './image_viewer_state.js';
@@ -13,9 +23,11 @@ import { handleDeletion } from './image_viewer_actions.js';
 import { dialogState } from '../holaf_panel_manager.js';
 import { getThumbnailUrl } from './image_viewer_gallery.js';
 import { getImageAt } from './image_viewer_data.js';
-// VAGUE 2 : la géométrie + les interactions zoom/pan sont déléguées à la brique
-// HolafViewport (vendored). L'hôte ne garde que le branchement, la synchro de
-// l'overlay mask de l'éditeur et le feedback curseur.
+// Brique vendue : visionneuse générique (machine à états, nav, préchargement,
+// clavier, délégation viewport). L'hôte ne garde que les adaptateurs.
+import { HolafLightbox } from '../vendor/holaf/holaf-lightbox.js';
+// La géométrie + interactions zoom/pan restent dans la brique HolafViewport
+// (vendored), INJECTÉE dans HolafLightbox (zéro import croisé côté brique).
 import { HolafViewport } from '../vendor/holaf/holaf-viewport.js';
 
 function _applyEditorPreview(viewer, element) {
@@ -47,26 +59,23 @@ async function _handleUnsavedChanges(viewer) {
 
 export function resetTransform(state, element) {
     if (!element || !state.viewport) return;
-    // VAGUE 2 : délégation à la brique. En mode content, le fit = scale 1
+    // Délégation à la brique. En mode content, le fit = scale 1
     // (l'object-fit:contain a déjà cadré) → reset() reproduit exactement
     // l'ancien translate(0,0) scale(1). Signature conservée : l'éditeur
     // (image_viewer_editor.js) l'appelle encore (ouverture mask/crop).
-    // VAGUE 9 : le fallback legacy « state.viewport inexistant » est supprimé —
-    // l'instance est créée de façon synchrone à l'init du viewer pour les deux
-    // states (UI._setupEventListeners → zoom, _createFullscreenOverlay →
-    // fullscreen), donc AVANT tout appel à resetTransform.
     state.viewport.reset();
     element.style.cursor = 'grab';
 }
 
-// --- Batch preload: load N images ahead when user stops navigating ---
-const _preloadJobs = new Set();
-let _preloadDebounceTimer = null;
-const PRELOAD_BATCH_SIZE = 10;
+// --- Média : types reconnus (préchargement + rendu) ---
+const VIDEO_FORMATS = ['MP4', 'WEBM', 'MKV', 'AVI', 'MOV', 'M4V'];
+const AUDIO_FORMATS = ['WAV', 'MP3', 'OGG', 'FLAC', 'AAC', 'M4A'];
+
+function _isVideoFormat(image) { return !!image && VIDEO_FORMATS.includes(image.format); }
+function _isAudioFormat(image) { return !!image && AUDIO_FORMATS.includes(image.format); }
 
 function _isMediaImage(image) {
-    return image && !['MP4', 'WEBM', 'MKV', 'AVI', 'MOV', 'M4V'].includes(image.format)
-        && !['WAV', 'MP3', 'OGG', 'FLAC', 'AAC', 'M4A'].includes(image.format);
+    return image && !_isVideoFormat(image) && !_isAudioFormat(image);
 }
 
 function _getTotalCount(state) {
@@ -80,56 +89,6 @@ async function _ensureImageLoaded(viewer, index) {
         return viewer.gallery.ensureImageLoaded(index);
     }
     return getImageAt(imageViewerState.getState(), index) || null;
-}
-
-function _cancelPreloads() {
-    for (const img of [..._preloadJobs]) {
-        img.src = '';
-    }
-    _preloadJobs.clear();
-}
-
-function _preloadBatch(viewer) {
-    const state = imageViewerState.getState();
-    if (state.currentNavIndex < 0) return;
-
-    // Cancel stale batch preloads
-    _cancelPreloads();
-
-    const total = _getTotalCount(state);
-    const start = Math.max(0, state.currentNavIndex + 1);
-    const end = Math.min(total - 1, state.currentNavIndex + PRELOAD_BATCH_SIZE);
-
-    for (let i = start; i <= end; i++) {
-        const img = getImageAt(state, i);
-        if (_isMediaImage(img)) {
-            const preloader = new Image();
-            _preloadJobs.add(preloader);
-            preloader.onload = preloader.onerror = () => _preloadJobs.delete(preloader);
-            preloader.src = getFullImageUrl(img);
-        }
-    }
-}
-
-function preloadNextImage(viewer) {
-    const state = imageViewerState.getState();
-    const total = _getTotalCount(state);
-    if (state.currentNavIndex < 0 || (state.currentNavIndex + 1) >= total) return;
-
-    // Immediately preload just the next image (instant response on next arrow press)
-    const nextImage = getImageAt(state, state.currentNavIndex + 1);
-    if (_isMediaImage(nextImage)) {
-        const preloader = new Image();
-        _preloadJobs.add(preloader);
-        preloader.onload = preloader.onerror = () => _preloadJobs.delete(preloader);
-        preloader.src = getFullImageUrl(nextImage);
-    }
-
-    // Batch preload debounced — fires after user stops navigating for 400ms
-    clearTimeout(_preloadDebounceTimer);
-    _preloadDebounceTimer = setTimeout(() => {
-        _preloadBatch(viewer);
-    }, 400);
 }
 
 export function getFullImageUrl(image) {
@@ -156,7 +115,9 @@ export function getFullImageUrl(image) {
 /**
  * Updates the container to show either the Image or Video element based on the file type.
  * Uses a load serial to prevent stale callbacks from overwriting the current image
- * when navigating rapidly.
+ * when navigating rapidly. VAGUE 4 : ce renderer est INJECTÉ dans HolafLightbox
+ * (renderMedia) — il retourne { el, destroy } et signale la disponibilité via
+ * onReady({width,height}) (la brique pose alors setImageSize sur le viewport).
  */
 let _loadSerial = 0;
 let _loadDelayTimer = null;
@@ -182,7 +143,7 @@ function _showSpinner(container) {
     container.appendChild(_spinnerEl);
 }
 
-function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformState, immediate) {
+function _updateMediaSource(viewer, image, container, imgEl, videoEl, state, immediate, signal, onReady) {
     // Cancel any pending delayed full-size load
     if (_loadDelayTimer) {
         clearTimeout(_loadDelayTimer);
@@ -191,9 +152,30 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
     // Cancel any pending loading spinner (single global instance)
     _clearLoadingUI();
 
+    const notifyReady = (payload) => {
+        if (typeof onReady === 'function') onReady(payload || {});
+    };
+
+    // destroy() : appelé par la brique avant le rendu suivant et à la fermeture.
+    // Il invalide les callbacks en vol (serial++), coupe le spinner et met la
+    // vidéo en pause (équivalent de l'ancien nettoyage à la fermeture de vue).
+    const destroy = () => {
+        _loadSerial++;
+        if (_loadDelayTimer) { clearTimeout(_loadDelayTimer); _loadDelayTimer = null; }
+        _clearLoadingUI();
+        if (videoEl) {
+            try { videoEl.pause(); } catch (e) { /* ignore */ }
+            videoEl.onloadedmetadata = null;
+        }
+    };
+    if (signal) {
+        if (signal.aborted) { destroy(); return { el: null, destroy }; }
+        try { signal.addEventListener('abort', destroy, { once: true }); } catch (e) { /* ignore */ }
+    }
+
     const serial = ++_loadSerial; // Each call gets a unique serial
-    const isVideo = ['MP4', 'WEBM', 'MKV', 'AVI', 'MOV', 'M4V'].includes(image.format);
-    const isAudio = ['WAV', 'MP3', 'OGG', 'FLAC', 'AAC', 'M4A'].includes(image.format);
+    const isVideo = _isVideoFormat(image);
+    const isAudio = _isAudioFormat(image);
     const url = getFullImageUrl(image);
 
     // Safety check: ensure videoEl exists (it might be missing if UI didn't initialize correctly)
@@ -210,8 +192,8 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
         if (hasVideoEl) {
             videoEl.style.display = 'block';
             videoEl.src = url;
-            resetTransform(transformState, videoEl);
-            
+            resetTransform(state, videoEl);
+
             // Audio-specific styling: smaller centered element
             videoEl.style.width = '80%';
             videoEl.style.maxWidth = '400px';
@@ -220,16 +202,17 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
             videoEl.style.border = '1px solid var(--holaf-border-color)';
             videoEl.style.borderRadius = 'var(--holaf-border-radius)';
 
-            // VAGUE 2 : le lecteur audio n'est pas une surface zoomable — force
-            // l'identité exacte (l'ancien resetTransform écrivait ce transform).
+            // Le lecteur audio n'est pas une surface zoomable — force l'identité
+            // exacte (l'ancien resetTransform écrivait ce transform).
             videoEl.style.transform = 'translate(0px, 0px) scale(1)';
 
             videoEl.play().catch(() => {});
         }
-        
+
         // Show a waveform/audio icon behind the player
         _applyEditorPreview(viewer, null);
-        
+        return { el: hasVideoEl ? videoEl : null, destroy };
+
     } else if (isVideo && hasVideoEl) {
         if (imgEl) {
             imgEl.style.display = 'none';
@@ -237,36 +220,30 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
         }
 
         // Reset any audio-specific styling
-        if (hasVideoEl) {
-            videoEl.style.width = '';
-            videoEl.style.maxWidth = '';
-            videoEl.style.height = '';
-            videoEl.style.margin = '';
-            videoEl.style.border = '';
-            videoEl.style.borderRadius = '';
-        }
+        videoEl.style.width = '';
+        videoEl.style.maxWidth = '';
+        videoEl.style.height = '';
+        videoEl.style.margin = '';
+        videoEl.style.border = '';
+        videoEl.style.borderRadius = '';
 
         videoEl.style.display = 'block';
         videoEl.src = url;
-        resetTransform(transformState, videoEl);
+        resetTransform(state, videoEl);
 
-        // Re-attach pan/zoom logic to the video element
-        setupZoomAndPan(transformState, container, videoEl);
-
-        // VAGUE 2 : pose les dimensions de la vidéo sur la brique dès que la
-        // metadata est décodée (letterbox/clamp/getImageRect précis) —
-        // setImageSize() refait le fit, ce qui reproduit le reset d'ouverture.
-        const vp = transformState.viewport || null;
+        // Pose les dimensions de la vidéo sur la brique dès que la metadata est
+        // décodée (letterbox/clamp/getImageRect précis) — setImageSize() refait
+        // le fit, ce qui reproduit le reset d'ouverture.
         videoEl.onloadedmetadata = () => {
             if (serial !== _loadSerial) return; // Chargement périmé — ignore
-            if (!vp || transformState.viewport !== vp) return; // Instance remplacée depuis
-            vp.setImageSize(videoEl.videoWidth, videoEl.videoHeight);
+            notifyReady({ width: videoEl.videoWidth, height: videoEl.videoHeight });
         };
 
         _applyEditorPreview(viewer, videoEl);
 
         // Attempt autoplay
         videoEl.play().catch(() => {});
+        return { el: videoEl, destroy };
 
     } else {
         // Reset any audio-specific styling on video element
@@ -290,7 +267,7 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
             if (thumbUrl) {
                 imgEl.src = thumbUrl;
                 imgEl.style.filter = 'blur(4px)';
-                resetTransform(transformState, imgEl);
+                resetTransform(state, imgEl);
             }
 
             // Pre-load full image — guard against stale callbacks from rapid navigation
@@ -299,16 +276,12 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
                 loader.onload = () => {
                     if (serial !== _loadSerial) return; // Stale callback — ignore
                     _clearLoadingUI();
-                    resetTransform(transformState, imgEl);
+                    resetTransform(state, imgEl);
                     imgEl.src = url;
                     imgEl.style.filter = '';
-                    setupZoomAndPan(transformState, container, imgEl);
-                    // VAGUE 2 : pose les dimensions naturelles de l'image sur la
-                    // brique (letterbox/clamp/getImageRect précis) — setImageSize()
-                    // refait le fit, ce qui reproduit le resetTransform d'ouverture.
-                    if (transformState.viewport) {
-                        transformState.viewport.setImageSize(loader.naturalWidth, loader.naturalHeight);
-                    }
+                    // Pose les dimensions naturelles de l'image sur la brique
+                    // (letterbox/clamp/getImageRect précis).
+                    notifyReady({ width: loader.naturalWidth, height: loader.naturalHeight });
                     _applyEditorPreview(viewer, imgEl);
                 };
                 loader.onerror = () => {
@@ -330,42 +303,132 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, transformS
                 }, 200);
             }
         }
+        return { el: imgEl, destroy };
     }
 }
 
-export function stopPlayback(viewer) {
-    if (viewer.elements?.zoomVideo) viewer.elements.zoomVideo.pause();
-    if (viewer.fullscreenElements?.video) viewer.fullscreenElements.video.pause();
+// Renderer média injecté dans HolafLightbox : mappe (mode → éléments) puis
+// délègue à _updateMediaSource.
+function _renderMedia(viewer, ctx) {
+    const { container, item, mode, onReady, signal, immediate } = ctx;
+    const imgEl = container.querySelector('img');
+    const videoEl = container.querySelector('video');
+    const state = (mode === 'zoom') ? viewer.zoomViewState : viewer.fullscreenViewState;
+    const result = _updateMediaSource(viewer, item, container, imgEl, videoEl, state, immediate, signal, onReady);
+    if (result && result.el) _bindViewElement(viewer, mode, result.el);
+    return result;
 }
 
-export function showZoomedView(viewer, image) {
-    imageViewerState.setState({ ui: { view_mode: 'zoom' } });
+// ── Adaptateurs HolafLightbox ───────────────────────────────────────────────
+// Le lightbox est per-viewer (aucun état de module partagé entre viewers).
+const LIGHTBOXES = new WeakMap();
+// Vues (conteneurs) déclarées par l'hôte via setupZoomAndPan AVANT la création
+// du lightbox : state → { mode, container }.
+const _pendingViews = new Map();
 
-    const view = document.getElementById('holaf-viewer-zoom-view');
-    const imgEl = view.querySelector('img');
-    const videoEl = viewer.elements ? viewer.elements.zoomVideo : null;
-
-    view.style.display = 'flex';
-    const galleryEl = document.getElementById('holaf-viewer-gallery');
-    if (galleryEl) galleryEl.style.display = 'none';
-
-    _updateMediaSource(viewer, image, view, imgEl, videoEl, viewer.zoomViewState, true);
-
-    preloadNextImage(viewer);
+function _modeForContainer(container) {
+    if (!container || !container.id) return null;
+    if (container.id === 'holaf-viewer-fullscreen-overlay') return 'fullscreen';
+    if (container.id === 'holaf-viewer-zoom-view') return 'zoom';
+    return null;
 }
 
-export async function hideZoomedView(viewer) {
-    const action = await _handleUnsavedChanges(viewer);
-    if (action === 'cancel') return;
+function _shouldHandleKey(viewer, e) {
+    if (dialogState.isOpen) return false;
+    if (!viewer.panelElements?.panelEl || viewer.panelElements.panelEl.style.display === 'none') return false;
+    const tag = e && e.target && e.target.tagName ? e.target.tagName.toLowerCase() : '';
+    const isInputFocused = ['input', 'textarea', 'select'].includes(tag);
+    if (isInputFocused && e.key !== 'Escape' && e.key !== 'Delete') return false;
+    return true;
+}
 
-    // Pause video
-    if (viewer.elements && viewer.elements.zoomVideo) viewer.elements.zoomVideo.pause();
+function _viewportOptions(viewer, mode, container, element) {
+    return {
+        content: element,   // mode content : <img>/<video> object-fit:contain remplissant la vue
+        minZoom: 'fit',     // ↔ ancien clamp bas : 1 (en mode content, fit = scale 1)
+        maxZoom: 30,        // ↔ ancien clamp haut
+        zoomFactor: 1.1,    // ↔ ancien pas de wheel
+        panClamp: true,     // l'image ne quitte jamais la vue
+        // Pas de zoom dblclick sur la vue zoomée : l'img y porte déjà
+        // ondblclick → fullscreen (image_viewer_ui.js). La vue fullscreen n'a
+        // pas de handler dblclick → zoom brique activé.
+        doubleClickZoom: container.id !== 'holaf-viewer-zoom-view',
+        drag: true,
+        dragButton: 0,
+        dragTarget: element,
+        // Le pan ne démarre JAMAIS depuis un overlay de dessin (crop/masque).
+        canDrag: (e) => !(e.target && e.target.closest &&
+            e.target.closest('#holaf-crop-overlay-wrap, #holaf-mask-overlay-wrap')),
+        // Overlay mask de l'éditeur : ré-enregistré comme follower à chaque
+        // changement (idempotent — cf. _syncMaskOverlay).
+        onChange: (vp) => { _syncMaskOverlay(element, vp); },
+    };
+}
+
+function _ensureLightbox(viewer) {
+    let lb = LIGHTBOXES.get(viewer);
+    if (lb) return lb;
+
+    lb = HolafLightbox.create({
+        host: document.body,
+        zIndex: 10999, // bande z actuelle de l'overlay plein écran du pack
+        getId: (item) => (item ? item.path_canon : null),
+        urlFor: (item) => getFullImageUrl(item),
+        renderMedia: (ctx) => _renderMedia(viewer, ctx),
+        shouldPreload: _isMediaImage,
+        preload: 10,
+        preloadDebounce: 400,
+        getColumnCount: () => (viewer.gallery && typeof viewer.gallery.getColumnCount === 'function')
+            ? viewer.gallery.getColumnCount() : 1,
+        getIndex: () => imageViewerState.getState().currentNavIndex,
+        shouldHandleKey: (e) => _shouldHandleKey(viewer, e),
+        beforeNavigate: () => _handleUnsavedChanges(viewer),
+        viewport: HolafViewport,
+        viewportOptions: (mode, container, element) => _viewportOptions(viewer, mode, container, element),
+        onViewport: (mode, vp) => {
+            // L'éditeur lit state.viewport (resetTransform) → on le tient à jour.
+            const st = (mode === 'zoom') ? viewer.zoomViewState : viewer.fullscreenViewState;
+            if (st) st.viewport = vp || undefined;
+        },
+        onOpen: (mode) => _onLightboxOpen(viewer, mode),
+        onClose: (mode) => _onLightboxClose(viewer, mode),
+        onNavigate: (dir, item, index) => _onLightboxNavigate(viewer, dir, item, index),
+        onResume: (mode, item) => _onLightboxResume(viewer, mode, item),
+    });
+
+    // Enregistre les vues déjà déclarées par setupZoomAndPan.
+    const zv = _pendingViews.get(viewer.zoomViewState);
+    if (zv && zv.container) lb.addView('zoom', { container: zv.container, display: 'flex' });
+    const fv = _pendingViews.get(viewer.fullscreenViewState);
+    if (fv && fv.container) lb.addView('fullscreen', { container: fv.container, display: 'flex' });
+    if (viewer.zoomViewState) _stateViewer.set(viewer.zoomViewState, viewer);
+    if (viewer.fullscreenViewState) _stateViewer.set(viewer.fullscreenViewState, viewer);
+
+    // Source d'items : total + résolution (async via la galerie) + lecture
+    // synchrone (cache de fenêtres) pour le préchargement.
+    lb.setSource({
+        total: () => _getTotalCount(imageViewerState.getState()),
+        getAt: (index) => _ensureImageLoaded(viewer, index),
+        getAtSync: (index) => getImageAt(imageViewerState.getState(), index) || null,
+    });
+
+    LIGHTBOXES.set(viewer, lb);
+    return lb;
+}
+
+function _onLightboxOpen(viewer, mode) {
+    if (mode === 'zoom') {
+        const galleryEl = document.getElementById('holaf-viewer-gallery');
+        if (galleryEl) galleryEl.style.display = 'none';
+    }
+    imageViewerState.setState({ ui: { view_mode: mode } });
+}
+
+function _onLightboxClose(viewer, mode) {
+    const lb = LIGHTBOXES.get(viewer);
+    if (lb && lb.isOpen()) return; // une vue sous-jacente reste affichée
 
     imageViewerState.setState({ ui: { view_mode: 'gallery' } });
-
-    const zoomView = document.getElementById('holaf-viewer-zoom-view');
-    if (zoomView) zoomView.style.display = 'none';
-
     const galleryEl = document.getElementById('holaf-viewer-gallery');
     if (galleryEl) galleryEl.style.display = 'flex';
 
@@ -376,151 +439,82 @@ export async function hideZoomedView(viewer) {
     }
 }
 
-export function showFullscreenView(viewer, image) {
-    if (!image) return;
+function _onLightboxNavigate(viewer, dir, item, index) {
+    if (!item) return;
+    imageViewerState.setState({ currentNavIndex: index, activeImage: item });
+    if (viewer.gallery?.render) viewer.gallery.render();
 
-    viewer._fullscreenSourceView = imageViewerState.getState().ui.view_mode;
-    imageViewerState.setState({ ui: { view_mode: 'fullscreen' } });
-
-    if (viewer._fullscreenSourceView === 'zoom') {
-        const zoomView = document.getElementById('holaf-viewer-zoom-view');
-        if (zoomView) zoomView.style.display = 'none';
-        // Pause zoom video while in fullscreen
-        if (viewer.elements && viewer.elements.zoomVideo) viewer.elements.zoomVideo.pause();
+    const lb = LIGHTBOXES.get(viewer);
+    if (lb && !lb.isOpen()) {
+        if (viewer.gallery?.ensureImageVisible) viewer.gallery.ensureImageVisible(index);
     }
-
-    const { overlay, img: imgEl, video: videoEl } = viewer.fullscreenElements;
-    overlay.style.display = 'flex';
-
-    _updateMediaSource(viewer, image, overlay, imgEl, videoEl, viewer.fullscreenViewState, true);
-
-    preloadNextImage(viewer);
 }
 
-export function hideFullscreenView(viewer) {
-    if (viewer.fullscreenElements && viewer.fullscreenElements.overlay) {
-        viewer.fullscreenElements.overlay.style.display = 'none';
-    }
+function _onLightboxResume(viewer, mode, item) {
+    if (mode !== 'zoom') return;
+    // Retour à la vue zoom (vue source du fullscreen) : on rétablit le mode.
+    imageViewerState.setState({ ui: { view_mode: mode } });
+    const zoomView = document.getElementById('holaf-viewer-zoom-view');
+    const imgEl = zoomView ? zoomView.querySelector('img') : null;
+    const videoEl = viewer.elements ? viewer.elements.zoomVideo : null;
 
-    // Pause fullscreen video
-    if (viewer.fullscreenElements && viewer.fullscreenElements.video) {
-        viewer.fullscreenElements.video.pause();
+    // Re-apply preview to the correct element (whichever is visible)
+    if (videoEl && videoEl.style.display !== 'none') {
+        _applyEditorPreview(viewer, videoEl);
+        videoEl.play().catch(() => { });
+    } else if (imgEl) {
+        _applyEditorPreview(viewer, imgEl);
     }
-
-    return viewer._fullscreenSourceView;
 }
 
-export async function navigate(viewer, direction) {
+// ── Façade (appelée par holaf_image_viewer.js / image_viewer_ui.js / gallery) ─
+export function stopPlayback(viewer) {
+    if (viewer.elements?.zoomVideo) viewer.elements.zoomVideo.pause();
+    if (viewer.fullscreenElements?.video) viewer.fullscreenElements.video.pause();
+}
+
+export function showZoomedView(viewer, image) {
+    const lb = _ensureLightbox(viewer);
+    return lb.openZoom(image);
+}
+
+export async function hideZoomedView(viewer) {
     const action = await _handleUnsavedChanges(viewer);
     if (action === 'cancel') return;
 
-    const state = imageViewerState.getState();
-    const total = _getTotalCount(state);
-    if (total === 0) return;
+    const lb = _ensureLightbox(viewer);
+    while (lb.isOpen()) lb.back();
+    await Promise.resolve();
+}
 
-    let newIndex = (state.currentNavIndex === -1) ? 0 : state.currentNavIndex + direction;
+export function showFullscreenView(viewer, image) {
+    if (!image) return;
+    viewer._fullscreenSourceView = imageViewerState.getState().ui.view_mode;
+    const lb = _ensureLightbox(viewer);
+    return lb.openFullscreen(image);
+}
 
-    if (newIndex < 0) {
-        newIndex = total - 1;
-    } else if (newIndex >= total) {
-        newIndex = 0;
-    }
+export function hideFullscreenView(viewer) {
+    const lb = LIGHTBOXES.get(viewer);
+    if (!lb) return viewer._fullscreenSourceView || 'gallery';
+    lb.back();
+    return lb.mode() || 'gallery';
+}
 
-    const newActiveImage = await _ensureImageLoaded(viewer, newIndex);
-    if (!newActiveImage) return;
-
-    imageViewerState.setState({ currentNavIndex: newIndex, activeImage: newActiveImage });
-
-    if (viewer.gallery?.render) viewer.gallery.render();
-
-    preloadNextImage(viewer);
-
-    const currentViewMode = imageViewerState.getState().ui.view_mode;
-
-    if (currentViewMode === 'gallery') {
-        if (viewer.gallery?.ensureImageVisible) {
-            viewer.gallery.ensureImageVisible(newIndex);
-        }
-    } else if (currentViewMode === 'zoom') {
-        const view = document.getElementById('holaf-viewer-zoom-view');
-        const imgEl = view.querySelector('img');
-        const videoEl = viewer.elements ? viewer.elements.zoomVideo : null;
-        _updateMediaSource(viewer, newActiveImage, view, imgEl, videoEl, viewer.zoomViewState);
-    } else if (currentViewMode === 'fullscreen') {
-        const { overlay, img, video } = viewer.fullscreenElements;
-        _updateMediaSource(viewer, newActiveImage, overlay, img, video, viewer.fullscreenViewState);
-    }
+export async function navigate(viewer, direction) {
+    const lb = _ensureLightbox(viewer);
+    return lb.navigate(direction);
 }
 
 export async function navigateGrid(viewer, direction) {
-    const state = imageViewerState.getState();
-    const total = _getTotalCount(state);
-    if (total === 0 || !viewer.gallery) return;
-
-    const columnCount = viewer.gallery.getColumnCount();
-    if (columnCount <= 0) return;
-
-    const currentIndex = state.currentNavIndex;
-    if (currentIndex === -1) {
-        const newActiveImage = await _ensureImageLoaded(viewer, 0);
-        if (!newActiveImage) return;
-        imageViewerState.setState({ currentNavIndex: 0, activeImage: newActiveImage });
-        if (viewer.gallery?.render) viewer.gallery.render();
-        if (viewer.gallery?.ensureImageVisible) {
-            viewer.gallery.ensureImageVisible(0);
-        }
-        return;
-    }
-
-    const newIndex = currentIndex + (direction * columnCount);
-
-    if (newIndex < 0 || newIndex >= total) {
-        return;
-    }
-
-    const newActiveImage = await _ensureImageLoaded(viewer, newIndex);
-    if (!newActiveImage) return;
-
-    imageViewerState.setState({ currentNavIndex: newIndex, activeImage: newActiveImage });
-
-    if (viewer.gallery?.render) viewer.gallery.render();
-
-    if (viewer.gallery?.ensureImageVisible) {
-        viewer.gallery.ensureImageVisible(newIndex);
-    }
+    if (!viewer.gallery) return;
+    const lb = _ensureLightbox(viewer);
+    return lb.navigateGrid(direction);
 }
 
 export async function handleEscape(viewer) {
-    const state = imageViewerState.getState();
-    const currentMode = state.ui.view_mode;
-
-    if (currentMode === 'fullscreen') {
-        const sourceView = hideFullscreenView(viewer);
-        const targetMode = sourceView === 'zoom' ? 'zoom' : 'gallery';
-        imageViewerState.setState({ ui: { view_mode: targetMode } });
-
-        if (targetMode === 'zoom') {
-            document.getElementById('holaf-viewer-zoom-view').style.display = 'flex';
-            const imgEl = document.querySelector('#holaf-viewer-zoom-view img');
-            const videoEl = viewer.elements ? viewer.elements.zoomVideo : null;
-
-            // Re-apply preview to the correct element (whichever is visible)
-            if (videoEl && videoEl.style.display !== 'none') {
-                _applyEditorPreview(viewer, videoEl);
-                videoEl.play().catch(() => { });
-            } else if (imgEl) {
-                _applyEditorPreview(viewer, imgEl);
-            }
-
-        } else {
-            const { currentNavIndex } = imageViewerState.getState();
-            if (currentNavIndex !== -1 && viewer.gallery?.alignImageOnExit) {
-                viewer.gallery.alignImageOnExit(currentNavIndex);
-            }
-        }
-    } else if (currentMode === 'zoom') {
-        await hideZoomedView(viewer);
-    }
+    const lb = _ensureLightbox(viewer);
+    lb.back();
 }
 
 export async function handleKeyDown(viewer, e) {
@@ -530,6 +524,12 @@ export async function handleKeyDown(viewer, e) {
     const isInputFocused = ['input', 'textarea', 'select'].includes(e.target.tagName.toLowerCase());
     if (isInputFocused && e.key !== 'Escape' && e.key !== 'Delete') return;
 
+    // Les touches de VISIONNEUSE (flèches, Entrée, Ctrl+Entrée, Échap, +/-, 0)
+    // sont absorbées par la brique (avec son propre garde-fou shouldHandleKey).
+    const lb = _ensureLightbox(viewer);
+    if (lb.handleKey(e)) return;
+
+    // Touches de GALERIE restantes.
     const state = imageViewerState.getState();
     const currentMode = state.ui.view_mode;
     const total = _getTotalCount(state);
@@ -568,15 +568,8 @@ export async function handleKeyDown(viewer, e) {
                 // Delete from edit/fullscreen — handleDeletion shows the confirmation.
                 const success = await handleDeletion(viewer, isPermanent, [state.activeImage]);
                 if (success) {
-                    if (currentMode === 'fullscreen') {
-                        hideFullscreenView(viewer);
-                    } else if (currentMode === 'zoom') {
-                        if (viewer.elements?.zoomVideo) viewer.elements.zoomVideo.pause();
-                        const zoomView = document.getElementById('holaf-viewer-zoom-view');
-                        if (zoomView) zoomView.style.display = 'none';
-                        const galleryView = document.getElementById('holaf-viewer-gallery');
-                        if (galleryView) galleryView.style.display = 'flex';
-                    }
+                    const lb2 = LIGHTBOXES.get(viewer);
+                    if (lb2 && lb2.isOpen()) lb2.close();
                     imageViewerState.setState({
                         selectedImages: new Set(),
                         activeImage: null,
@@ -616,72 +609,20 @@ export async function handleKeyDown(viewer, e) {
                 }
             }
             break;
-        case 'Enter':
-            e.preventDefault();
-            const { currentNavIndex, activeImage } = state;
-            let targetImage = activeImage;
-
-            if (currentNavIndex === -1 && total > 0) {
-                targetImage = await _ensureImageLoaded(viewer, 0);
-                if (targetImage) {
-                    imageViewerState.setState({ activeImage: targetImage, currentNavIndex: 0 });
-                }
-            }
-
-            if (targetImage) {
-                if (e.ctrlKey) {
-                    showFullscreenView(viewer, targetImage);
-                } else {
-                    showZoomedView(viewer, targetImage);
-                }
-            }
-            break;
-        case 'ArrowRight':
-        case 'ArrowLeft':
-            e.preventDefault();
-            await navigate(viewer, e.key === 'ArrowRight' ? 1 : -1);
-            break;
-        case 'ArrowUp':
-        case 'ArrowDown':
-            if (currentMode === 'gallery') {
-                e.preventDefault();
-                await navigateGrid(viewer, e.key === 'ArrowDown' ? 1 : -1);
-            }
-            break;
-        case 'Escape':
-            e.preventDefault();
-            await handleEscape(viewer);
-            break;
     }
 }
 
-// ── VAGUE 2 : délégation à la brique HolafViewport ──────────────────────
-// Toute la logique wheel→zoom (zoom-to-cursor ×1.1 clamp [1,30]), drag→pan,
-// clamps et transitions (none pendant le drag / .2s ease-out après) vit
-// désormais dans js/vendor/holaf/holaf-viewport.js. L'hôte ne conserve que :
-//   - la création/réutilisation de l'instance (un state = une instance,
-//     exposée sur state.viewport pour l'éditeur, image_viewer_editor.js) ;
-//   - la synchro de l'overlay mask de l'éditeur (via onChange) ;
-//   - le feedback curseur et l'anti-ghost <img> (dragstart), que la brique
-//     ne gère pas.
+// ── Zoom/pan : délégation à la brique HolafViewport (INJECTÉE dans HolafLightbox) ─
+// Toute la logique wheel→zoom, drag→pan, clamps et transitions vit dans
+// js/vendor/holaf/holaf-viewport.js, instanciée par HolafLightbox (une instance
+// par vue, recréée quand l'élément média change). setupZoomAndPan ne fait plus
+// que DÉCLARER la vue (conteneur) à la brique ; la garde de compatibilité est
+// conservée (appelée à l'init de l'UI et à la création de l'overlay fullscreen).
 
 // Synchronise l'overlay mask (posé par l'éditeur dans le zoom view) sur le
-// transform courant de l'élément média. VAGUE 4 : l'overlay est désormais un
-// FOLLOWER de la brique (addFollower) — il reçoit le même transform inline que
-// l'img (même string, même moment, même transition) → latence zéro, plus de
-// copie manuelle du transform. addFollower est idempotent (Set) : appelé à
-// chaque onChange, il ne fait rien si l'overlay suit déjà.
-// VAGUE 5 : le mask vit dans un WRAPPER follower (boîte de repos = boîte de
-// l'élément img, letterbox À L'INTÉRIEUR). C'est le WRAPPER qui suit le
-// viewport, PAS le canvas (sinon double transform).
-// VAGUE 7 : le viewport est PASSÉ en argument (au lieu de la ref lecture
-// `state.viewport` non résolue ici) — l'overlay passif du mask doit être
-// ré-enregistré comme follower de l'INSTANCE qui pilote réellement l'img
-// (celle de `viewer.zoomViewState`, fournie par setupZoomAndPan). L'ancienne
-// ref pointait une variable hors portée → ReferenceError silencieusement
-// avalée par la brique → le passif ne se re-synchronisait jamais au zoom.
-// addFollower est idempotent (Set) : rappelé à chaque onChange, sans effet
-// si l'overlay suit déjà.
+// transform courant de l'élément média. L'overlay est un FOLLOWER du viewport
+// (addFollower) : il reçoit le même transform inline que l'img (même string,
+// même moment, même transition) → latence zéro. addFollower est idempotent.
 function _syncMaskOverlay(element, vp) {
     const maskOv = document.getElementById('holaf-mask-overlay');
     if (!maskOv) return;
@@ -706,55 +647,41 @@ function _bindCursorFeedback(state, element) {
     });
 }
 
-// Contenu (élément média) porté par l'instance viewport de chaque state.
-const _viewportContents = new WeakMap();
-
 export function setupZoomAndPan(state, container, element) {
-    if (!element || !container) return;
+    if (!state || !container) return;
+    const mode = _modeForContainer(container);
+    if (!mode) return;
 
-    // Un state = une instance. Si l'élément média change (bascule img ↔ vidéo),
-    // l'instance précédente est détruite (elle restaure les styles inline de
-    // son contenu et décroche ses listeners) puis recrée sur le nouvel élément.
-    if (state.viewport && _viewportContents.get(state) !== element) {
-        state.viewport.destroy();
-        state.viewport = null;
-        _viewportContents.delete(state);
-    }
+    _pendingViews.set(state, { mode, container });
 
-    if (!state.viewport) {
-        state.viewport = HolafViewport.create(container, {
-            content: element,   // mode content : <img>/<video> object-fit:contain remplissant la vue
-            minZoom: 'fit',     // ↔ ancien clamp bas : 1 (en mode content, fit = scale 1)
-            maxZoom: 30,        // ↔ ancien clamp haut
-            zoomFactor: 1.1,    // ↔ ancien pas de wheel
-            panClamp: true,     // l'image ne quitte jamais la vue (l'ancien drag pan était libre)
-            // Pas de zoom dblclick sur la vue zoomée : l'img y porte déjà
-            // ondblclick → fullscreen (image_viewer_ui.js, hors périmètre) —
-            // déclencher AUSSI le zoom brique serait une régression. La vue
-            // fullscreen n'a pas de handler dblclick → zoom brique activé.
-            doubleClickZoom: container.id !== 'holaf-viewer-zoom-view',
-            drag: true,
-            dragButton: 0,      // ↔ ancien : clic gauche uniquement
-            dragTarget: element, // ↔ ancien : drag posé sur l'élément, pas le container
-            // VAGUE 6 : le pan ne démarre JAMAIS depuis un overlay de dessin
-            // (crop/masque). Le canvas d'édition (pointer-events:auto) est au-dessus
-            // de l'img → il intercepte le pointerdown pour le dessin ; ce garde-fou
-            // garantit qu'un pointerdown sur l'overlay (canvas OU wrapper) ne déclenche
-            // jamais le pan du viewport, sur les DEUX vues (zoom + fullscreen).
-            canDrag: (e) => !(e.target && e.target.closest &&
-                e.target.closest('#holaf-crop-overlay-wrap, #holaf-mask-overlay-wrap')),
-            onChange: () => {
-                // Overlay mask de l'éditeur : ré-enregistré comme follower à
-                // chaque changement (idempotent — cf. _syncMaskOverlay).
-                _syncMaskOverlay(element, state.viewport);
-            },
-        });
-        _viewportContents.set(state, element);
+    // La brique crée elle-même le viewport (une instance par vue). L'hôte garde
+    // le feedback curseur et l'anti-ghost <img>, que la brique ne gère pas.
+    if (element) {
         element.style.transformOrigin = '0 0'; // la brique le ré-applique à chaque applyTransform
+        element.ondragstart = (e) => e.preventDefault();
         _bindCursorFeedback(state, element);
     }
 
-    // Anti-ghost : la brique ne neutralise pas le dragstart natif des <img> —
-    // conservé côté hôte (parité avec l'ancien code).
+    // Si le lightbox existe déjà (vue déclarée tardivement), on enregistre la vue.
+    const viewer = _viewerForState(state);
+    if (viewer) {
+        const lb = LIGHTBOXES.get(viewer);
+        if (lb) lb.addView(mode, { container, display: 'flex' });
+    }
+}
+
+// Retrouve le viewer propriétaire d'un state déjà mappé par un lightbox.
+const _stateViewer = new WeakMap();
+function _viewerForState(state) {
+    return _stateViewer.get(state) || null;
+}
+
+// Exposé pour le renderer média : (re)branche le curseur + l'anti-ghost sur
+// l'élément courant de chaque vue.
+function _bindViewElement(viewer, mode, element) {
+    const state = (mode === 'zoom') ? viewer.zoomViewState : viewer.fullscreenViewState;
+    if (!state || !element) return;
+    element.style.transformOrigin = '0 0';
     element.ondragstart = (e) => e.preventDefault();
+    _bindCursorFeedback(state, element);
 }
