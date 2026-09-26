@@ -21,12 +21,24 @@
  *       priorisation des vignettes visibles sont délégués à la brique PUR-JS
  *       vendor/holaf/holaf-thumbcache.js ; ce module ne garde que l'adaptateur
  *       (URL + HolafFetch) et le rendu DOM (placeholder -> <img>).
+ * UPDATE (brique): Le layout virtualisé (sizer + surface absolus, colonnes/gap/
+ *       buffer), le pool de cellules recyclées + squelettes, le resize avec
+ *       ancrage de rangée, la sélection mono/multi (shift/ctrl) et le
+ *       scroll/alignement sont délégués à la brique DOM GÉNÉRIQUE
+ *       vendor/holaf/holaf-virtual-grid.js (HolafGrid). Ce module devient un
+ *       ADAPTATEUR : il fournit à la grille la source de données (via
+ *       image_viewer_data.js), le renderer de cellule (icônes ✎/🎥/🎵,
+ *       checkbox, hover vidéo, vignette) et rebranche ses call-sites
+ *       historiques via la façade viewer.gallery.*. La navigation clavier
+ *       reste tenue par image_viewer_navigation.js (le clavier de la grille est
+ *       désactivé ici : keyboard:false).
  */
 
 import "../aih_strings.js";
 import { imageViewerState } from "./image_viewer_state.js";
 import { HolafFetch } from "../vendor/holaf/holaf-fetch.js";
 import { HolafThumbCache } from "../vendor/holaf/holaf-thumbcache.js";
+import { HolafGrid } from "../vendor/holaf/holaf-virtual-grid.js";
 import { showToast } from "../aih_toast_bridge.js";
 import { showFullscreenView, getFullImageUrl } from './image_viewer_navigation.js';
 import {
@@ -43,7 +55,6 @@ const t = (key, params) => {
 };
 
 // --- Configuration ---
-const SCROLLBAR_DEBOUNCE_MS = 50;
 const FETCH_TIMEOUT_MS = 30000; // 30 seconds timeout per image
 const HOVER_DELAY_MS = 100; // Slight delay before playing video to prevent crazy flashing when moving mouse fast
 
@@ -60,6 +71,9 @@ let benchmarkCacheBuster = ''; // Used to bypass browser cache during tests
 let benchmarkStartTime = 0;
 let benchmarkTotalItems = 0;
 let isBenchmarking = false;
+
+const VIDEO_FORMATS = ['MP4', 'WEBM', 'MKV', 'AVI', 'MOV', 'M4V'];
+const AUDIO_FORMATS = ['WAV', 'MP3', 'OGG', 'FLAC', 'AAC', 'M4A'];
 
 // --- HOLAF THUMB CACHE (brique holaf-thumbcache) ---
 // Le cache LRU, la file bornée, la dédup in-flight, le prefetch, le timeout +
@@ -105,13 +119,12 @@ const thumbCache = HolafThumbCache.create({
         }),
     retry: { max: MAX_THUMBNAIL_TIMEOUT_RETRIES, delayMs: 3000 },
     timeoutMs: FETCH_TIMEOUT_MS,
-    // 202 : garder le placeholder gris (state "pending") au lieu d'une image cassée.
+    // 202 : marquer la cellule "pending" (placeholder gris) au lieu d'une image cassée.
     onPending: (image) => {
-        const ph = renderedPlaceholders.get(image.path_canon);
-        if (ph && ph.isConnected) ph.dataset.thumbnailLoadingOrLoaded = "pending";
+        if (grid) grid.markPending(image.path_canon);
     },
-    // Les échecs terminaux sont gérés PAR REQUÊTE (overlay sur le placeholder)
-    // dans fetchThumbnail() ; onError n'est qu'un filet de sécurité.
+    // Les échecs terminaux sont gérés PAR REQUÊTE (overlay sur la cellule) dans
+    // loadThumbnail() ; onError n'est qu'un filet de sécurité.
     onError: () => {},
     // Priorisation backend : la brique absorbe le débounce + le flush anticipé,
     // on ne garde que le transport (POST fire-and-forget).
@@ -133,37 +146,13 @@ const thumbnailCache = {
 // --- Module-level state ---
 let viewerInstance = null;
 let galleryEl = null;
-let gallerySizerEl = null;
-let galleryGridEl = null;
-let resizeObserver = null;
-let renderedPlaceholders = new Map(); // path_canon -> DOM Element
-let scrollbarDebounceTimeout = null;
-let renderedSkeletons = new Map();   // index -> DOM skeleton
-const skeletonPool = [];
-const SKELETON_POOL_MAX = 200;
+let grid = null;                     // instance HolafGrid (une galerie = une grille)
 let windowFetchDebounceTimer = null;
 const WINDOW_FETCH_DEBOUNCE_MS = 200;
+let lastPrefetchEnd = -1;
 
 // Track hover timeouts for video preview race condition prevention
 const hoverTimeouts = new Map();
-
-let isWheelScrolling = false;
-let wheelScrollTimeout = null;
-
-// --- UNLOADED TRACKING: O(1) lookup for next thumbnail to fetch ---
-const unloadedVisiblePaths = new Set(); // path_canon of visible items not yet loaded
-
-// --- LOAD QUEUE ---
-// Simple kick-based scheduler : on enfile les vignettes visibles unloaded et on
-// laisse la brique holaf-thumbcache faire le reste (concurrence/dédup/retries).
-let kickQueued = false;
-let idleRestartTimer = null;
-
-let columnCount = 0;
-let itemWidth = 0;
-let itemHeight = 0;
-let gap = 0;
-let renderRequestID = null;
 
 // --- EXPOSED BENCHMARK TOOL ---
 if (!window.holaf) window.holaf = {};
@@ -180,15 +169,12 @@ window.holaf.runBenchmark = (concurrency = 6) => {
     thumbnailCache.clear(); // Clear cache for fair test
 
     // 2. Reset Gallery
-    if (viewerInstance) {
+    if (viewerInstance && grid) {
         // Cancel everything current
         thumbCache.abort();
-        unloadedVisiblePaths.clear();
 
-        // Clear DOM to force re-render
-        galleryGridEl.innerHTML = '';
-        placeholderPool.length = 0; // Clear pool on benchmark reset
-        renderedPlaceholders.clear();
+        // Full rebuild to force re-loading from scratch (cache was cleared).
+        grid.render(true);
 
         // 3. Start Timer and Trigger Render
         setTimeout(() => {
@@ -198,7 +184,7 @@ window.holaf.runBenchmark = (concurrency = 6) => {
             benchmarkStartTime = performance.now();
 
             // Force re-layout and load
-            renderVisibleItems();
+            grid.render(true);
         }, 100);
     } else {
         console.error("Gallery not initialized. Open the Image Viewer first.");
@@ -206,21 +192,22 @@ window.holaf.runBenchmark = (concurrency = 6) => {
 };
 
 function getVisibleItemCount() {
-    if (!galleryEl) return 0;
+    if (!galleryEl || !grid) return 0;
+    const m = grid.getMetrics();
     const viewportHeight = galleryEl.clientHeight;
-    // Estimate based on layout
-    const itemHeightWithGap = itemHeight + gap;
+    const itemHeightWithGap = m.itemHeight + m.gap;
+    if (itemHeightWithGap <= 0) return 0;
     const rowsVisible = Math.ceil(viewportHeight / itemHeightWithGap) + 1; // +1 buffer
-    return Math.min(rowsVisible * columnCount, imageViewerState.getState().images.length);
+    return Math.min(rowsVisible * Math.max(1, m.columns), imageViewerState.getState().images.length);
 }
 
 function checkBenchmarkCompletion() {
-    if (!isBenchmarking) return;
+    if (!isBenchmarking || !grid) return;
 
     // Rien en vol / en file / planifié → benchmark terminé
     if (thumbCache.stats().pending === 0) {
         // Double check: are all visible placeholders actually loaded?
-        const visiblePlaceholders = Array.from(galleryGridEl.children);
+        const visiblePlaceholders = Array.from(grid.surface.querySelectorAll('.holaf-viewer-thumbnail-placeholder'));
         const allLoaded = visiblePlaceholders.every(p => p.dataset.thumbnailLoadingOrLoaded === 'true' || p.dataset.thumbnailLoadingOrLoaded === 'error');
 
         if (allLoaded) {
@@ -250,344 +237,286 @@ function checkBenchmarkCompletion() {
 
 // --- Internal Functions ---
 
-function handleResize() {
-    const { images } = imageViewerState.getState();
-    if (!images || images.length === 0 || !galleryEl) return;
-
-    const oldItemHeightWithGap = itemHeight + gap;
-
-    let topVisibleIndex = 0;
-    if (oldItemHeightWithGap > 0 && columnCount > 0) {
-        const topRow = Math.floor(galleryEl.scrollTop / oldItemHeightWithGap);
-        topVisibleIndex = topRow * columnCount;
-    }
-
-    updateLayout(false);
-
-    if (topVisibleIndex > 0 && columnCount > 0) {
-        const newTopRow = Math.floor(topVisibleIndex / columnCount);
-        const newScrollTop = newTopRow * (itemHeight + gap);
-        galleryEl.scrollTop = newScrollTop;
-    }
-
-    renderVisibleItems(true);
+function getThumbSize() {
+    const s = imageViewerState.getState();
+    return (s.ui && s.ui.thumbnail_size) ? s.ui.thumbnail_size : 150;
 }
 
-function updateLayout(renderAfter = true, overrideThumbSize = null) {
-    if (!galleryEl || !viewerInstance) return;
+// --- Cell renderer (injecté dans la grille) ---
+// La brique HolafGrid ne connaît AUCUNE notion métier : elle délègue au module
+// la construction/rafraîchissement/nettoyage des cellules, les slots (checkbox)
+// et les actions (icône zoom / plein écran).
+function createCell() {
+    const placeholder = document.createElement('div');
+    placeholder.className = 'holaf-viewer-thumbnail-placeholder';
+    placeholder.style.position = 'absolute';
 
-    const targetThumbSize = overrideThumbSize !== null ? overrideThumbSize : imageViewerState.getState().ui.thumbnail_size;
+    const actionIcon = document.createElement('div');
+    actionIcon.className = 'holaf-viewer-edit-icon';
+    actionIcon.setAttribute('data-holaf-action', 'zoom');
+    placeholder._actionIcon = actionIcon;
+    placeholder.appendChild(actionIcon);
 
-    const containerWidth = galleryEl.clientWidth;
-    const style = window.getComputedStyle(galleryGridEl);
-    gap = parseFloat(style.getPropertyValue('gap')) || 8;
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'holaf-viewer-thumb-checkbox';
+    checkbox.title = t('iv.selectImage');
+    placeholder._checkbox = checkbox;
+    placeholder.appendChild(checkbox);
 
-    columnCount = Math.max(1, Math.floor((containerWidth + gap) / (targetThumbSize + gap)));
-    const totalGapWidth = (columnCount - 1) * gap;
-    itemWidth = (containerWidth - totalGapWidth) / columnCount;
-    itemHeight = itemWidth;
-
-    const state = imageViewerState.getState();
-    const totalCount = (state.totalCount != null && state.totalCount > 0) ? state.totalCount : (state.images ? state.images.length : 0);
-    const rowCount = Math.ceil(totalCount / columnCount);
-    const totalHeight = rowCount * (itemHeight + gap);
-    gallerySizerEl.style.height = `${totalHeight}px`;
-
-    if (renderAfter) {
-        renderVisibleItems(true);
-    }
+    return placeholder;
 }
 
-function renderVisibleItems() {
-    if (renderRequestID) {
-        cancelAnimationFrame(renderRequestID);
+// Nettoie les enfants dynamiques + les écouteurs spécifiques AVANT (re)liaison
+// ou mise au pool : la cellule est recyclée par la brique.
+function cleanupCell(el) {
+    if (el._hoverCleanup) {
+        el._hoverCleanup();
+        el._hoverCleanup = null;
+    }
+    const path = el.dataset.pathCanon;
+    if (path && hoverTimeouts.has(path)) {
+        clearTimeout(hoverTimeouts.get(path));
+        hoverTimeouts.delete(path);
+    }
+    const oldImg = el.querySelector('img');
+    if (oldImg) oldImg.remove();
+    const oldVideo = el.querySelector('video.holaf-hover-preview');
+    if (oldVideo) { oldVideo.pause(); oldVideo.src = ""; oldVideo.remove(); }
+    const oldError = el.querySelector('.holaf-viewer-error-overlay');
+    if (oldError) oldError.remove();
+    const oldFsIcon = el.querySelector('.holaf-viewer-fullscreen-icon');
+    if (oldFsIcon) oldFsIcon.remove();
+    el._hoverGeneration = 0;
+}
+
+function updateCell(el, image, ctx) {
+    const id = image.path_canon;
+    cleanupCell(el);
+    el.dataset.pathCanon = id;
+    el.classList.remove('active', 'error');
+
+    const isVideo = VIDEO_FORMATS.includes(image.format);
+    const isAudio = AUDIO_FORMATS.includes(image.format);
+    const actionIcon = el._actionIcon;
+    actionIcon.classList.remove('active');
+    if (isVideo) {
+        actionIcon.innerHTML = '🎥';
+        actionIcon.title = t('iv.playVideo');
+        if (image.has_edit_file) actionIcon.classList.add('active');
+        el._hoverCleanup = attachVideoHoverListeners(el, image);
+    } else if (isAudio) {
+        actionIcon.innerHTML = '\uD83C\uDFB5';
+        actionIcon.title = t('iv.playAudio');
+        if (image.has_edit_file) actionIcon.classList.add('active');
+    } else {
+        actionIcon.innerHTML = '✎';
+        actionIcon.title = t('iv.editImage');
+        if (image.has_edit_file) actionIcon.classList.add('active');
+    }
+    if (ctx && ctx.refresh) actionIcon.classList.add('active');
+
+    delete el.dataset.thumbnailLoadingOrLoaded;
+    loadThumbnail(el, image, !!(ctx && ctx.refresh));
+
+    const active = imageViewerState.getState().activeImage;
+    el.classList.toggle('active', !!(active && active.path_canon === id));
+}
+
+function releaseCell(el) {
+    cleanupCell(el);
+    const path = el.dataset.pathCanon;
+    if (path) thumbCache.cancel(path);
+    el.classList.remove('active', 'error', 'holaf-grid-cell--pending');
+    delete el.dataset.thumbnailLoadingOrLoaded;
+}
+
+// --- Thumbnail render (adaptateur brique → DOM) ---
+// La brique holaf-thumbcache tient le cache, la concurrence, la dédup in-flight,
+// le timeout + retries bornés et le protocole 202 + Retry-After. Ici on ne fait
+// que : demander la vignette (request haute priorité), dessiner le <img> au
+// succès, poser l'overlay d'erreur à l'échec terminal, nettoyer sur annulation.
+function isAbortError(err) {
+    return !!err && (err.name === 'AbortError' || err.aborted === true);
+}
+
+function loadThumbnail(el, image, forceReload = false) {
+    const pathCanon = image.path_canon;
+
+    // Force reload (édition d'image) : purge la valeur cachée puis recharge (le
+    // paramètre `t` est ajouté par buildThumbnailUrl via `_forceReload`).
+    if (forceReload) {
+        thumbCache.invalidate(pathCanon);
+        const oldImg = el.querySelector('img');
+        if (oldImg) oldImg.remove();
+    } else if (el.dataset.thumbnailLoadingOrLoaded === 'true') {
+        return;
     }
 
-    renderRequestID = requestAnimationFrame(() => {
-        renderRequestID = null;
+    // Cache-hit : dessin immédiat (touch = rafraîchit la récence LRU).
+    const cachedUrl = thumbnailCache.get(pathCanon);
+    if (!forceReload && cachedUrl) {
+        drawThumbnail(el, cachedUrl, image);
+        return;
+    }
 
-        if (columnCount === 0) return;
-        const state = imageViewerState.getState();
-        const { images, activeImage, selectedPaths } = state;
-        const totalCount = (state.totalCount != null && state.totalCount > 0) ? state.totalCount : (images ? images.length : 0);
+    // Visual feedback for loading (optional: could be a spinner)
+    el.dataset.thumbnailLoadingOrLoaded = "loading";
+    el.classList.remove('error');
+    const existingError = el.querySelector('.holaf-viewer-error-overlay');
+    if (existingError) existingError.remove();
 
-        if (!totalCount || !galleryEl || !galleryGridEl || itemHeight === 0) {
+    const item = forceReload ? { ...image, _forceReload: true } : image;
+
+    return thumbCache.request(item, HolafThumbCache.PRIORITY_HIGH).then((objectURL) => {
+        if (!el.isConnected) {
+            // Cellule évincée : la vignette est en cache, le prochain rendu la
+            // reprendra via le cache-hit. Rien à dessiner ici.
             return;
         }
-
-        const viewportHeight = galleryEl.clientHeight;
-        const scrollTop = galleryEl.scrollTop;
-
-        // Increased buffer to smooth out fast scrolling
-        const buffer = viewportHeight * 1.5;
-        const visibleAreaStart = Math.max(0, scrollTop - buffer);
-        const visibleAreaEnd = scrollTop + viewportHeight + buffer;
-
-        const itemHeightWithGap = itemHeight + gap;
-        const startRow = Math.max(0, Math.floor(visibleAreaStart / itemHeightWithGap));
-        const endRow = Math.ceil(visibleAreaEnd / itemHeightWithGap);
-
-        const startIndex = startRow * columnCount;
-        const endIndex = Math.min(totalCount - 1, (endRow * columnCount) + columnCount - 1);
-
-        const newPlaceholdersToRender = new Map();
-        const newSkeletons = new Map();
-        const fragment = document.createDocumentFragment();
-        const renderStart = performance.now();
-
-        for (let i = startIndex; i <= endIndex; i++) {
-            const image = getImageAt(state, i);
-            if (!image) {
-                let sk;
-                if (renderedSkeletons.has(i)) {
-                    sk = renderedSkeletons.get(i);
-                    renderedSkeletons.delete(i);
-                } else {
-                    sk = acquireSkeleton(i);
-                    fragment.appendChild(sk);
-                }
-
-                const row = Math.floor(i / columnCount);
-                const col = i % columnCount;
-                const top = row * itemHeightWithGap;
-                const left = col * (itemWidth + gap);
-
-                const transformVal = `translate(${left}px, ${top}px)`;
-                if (sk.style.transform !== transformVal) {
-                    sk.style.transform = transformVal;
-                }
-                sk.style.width = `${itemWidth}px`;
-                sk.style.height = `${itemHeight}px`;
-
-                newSkeletons.set(i, sk);
-                continue;
-            }
-
-            const path = image.path_canon;
-            let placeholder;
-
-            if (renderedPlaceholders.has(path)) {
-                placeholder = renderedPlaceholders.get(path);
-                // FIX: Update index in case the images array order changed (e.g. after filter)
-                placeholder.dataset.index = i;
-                renderedPlaceholders.delete(path);
-            } else {
-                placeholder = acquirePlaceholder(viewerInstance, image, i);
-                fragment.appendChild(placeholder);
-                // Try to load immediately from Cache
-                applyCachedThumbnail(placeholder, path);
-            }
-
-            const row = Math.floor(i / columnCount);
-            const col = i % columnCount;
-            const top = row * itemHeightWithGap;
-            const left = col * (itemWidth + gap);
-
-            const transformVal = `translate(${left}px, ${top}px)`;
-            if (placeholder.style.transform !== transformVal) {
-                placeholder.style.transform = transformVal;
-            }
-
-            placeholder.style.width = `${itemWidth}px`;
-            placeholder.style.height = `${itemHeight}px`;
-
-            placeholder.classList.toggle('active', activeImage && activeImage.path_canon === path);
-            const isSelected = selectedPaths.has(path);
-            placeholder._checkbox.checked = isSelected;
-
-            newPlaceholdersToRender.set(path, placeholder);
-
-            // Track unloaded thumbnails for O(1) queue lookup
-            if (!placeholder.dataset.thumbnailLoadingOrLoaded) {
-                unloadedVisiblePaths.add(path);
-            }
+        drawThumbnail(el, objectURL, image);
+    }).catch((err) => {
+        if (isAbortError(err)) {
+            // Annulation (syncGallery) : le blob n'est pas caché ; on rend l'item
+            // à la file pour qu'il soit rechargé quand il revient à l'écran.
+            if (el.isConnected) delete el.dataset.thumbnailLoadingOrLoaded;
+            return;
         }
-
-        // Cleanup: remove placeholders leaving the viewport
-        // Do NOT abort in-flight fetches — let them complete and cache (LRU).
-        for (const [path, element] of renderedPlaceholders) {
-            if (hoverTimeouts.has(path)) {
-                clearTimeout(hoverTimeouts.get(path));
-                hoverTimeouts.delete(path);
-            }
-            releasePlaceholder(element);
-            unloadedVisiblePaths.delete(path);
-        }
-
-        // Cleanup: remove skeletons leaving the viewport
-        for (const sk of renderedSkeletons.values()) {
-            releaseSkeleton(sk);
-        }
-
-        if (fragment.childElementCount > 0) {
-            galleryGridEl.appendChild(fragment);
-        }
-
-        renderedPlaceholders = newPlaceholdersToRender;
-        renderedSkeletons = newSkeletons;
-
-        // --- Backend priority queue: collect currently VISIBLE thumbnails ---
-        // (debounced ~300ms, fire-and-forget). This tells the backend to generate
-        // these thumbnails first (thumbnail_status=1). Only uncached, not-in-flight
-        // items are queued so we don't waste the request. Le débounce + le flush
-        // anticipé sont tenus par la brique (onVisible).
-        {
-            const viewportStartRow = Math.max(0, Math.floor(scrollTop / itemHeightWithGap));
-            const viewportEndRow = Math.ceil((scrollTop + viewportHeight) / itemHeightWithGap);
-            const priorityStart = viewportStartRow * columnCount;
-            const priorityEnd = Math.min(totalCount - 1, (viewportEndRow * columnCount) + columnCount - 1);
-            const visibleIds = [];
-            for (let i = priorityStart; i <= priorityEnd; i++) {
-                const img = getImageAt(state, i);
-                if (!img) continue;
-                const pathCanon = img.path_canon;
-                if (!thumbCache.has(pathCanon) && !thumbCache.isLoading(pathCanon)) {
-                    visibleIds.push(pathCanon);
-                }
-            }
-            if (visibleIds.length > 0) thumbCache.onVisible(visibleIds);
-        }
-
-        // Fetch any not-yet-loaded window visible in the current range
-        scheduleEnsureRange(startIndex, endIndex);
-
-        // Kick off loading immediately — don't debounce on render frame
-        // (debounced for trackpad scrolling)
-        debouncedKickLoadQueue();
-
-        const renderMs = performance.now() - renderStart;
-        if (renderMs > 100) {
-            console.log("[Holaf Perf] renderVisibleItems total_ms=" + renderMs.toFixed(1));
-        }
+        // Échec terminal (timeout après retries bornés, HTTP non-2xx, réseau).
+        if (!el.isConnected) return;
+        el.classList.add('error');
+        el.dataset.thumbnailLoadingOrLoaded = "error";
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'holaf-viewer-error-overlay';
+        errorDiv.textContent = (err && err.timedOut) ? t('iv.timeout') : t('iv.err');
+        el.appendChild(errorDiv);
+    }).finally(() => {
+        if (isBenchmarking) checkBenchmarkCompletion();
     });
 }
 
-function applyCachedThumbnail(placeholder, pathCanon) {
-    const cachedUrl = thumbnailCache.get(pathCanon);
-    if (cachedUrl) {
-        const img = document.createElement('img');
-        img.className = "holaf-image-viewer-thumbnail";
-        img.src = cachedUrl;
+function drawThumbnail(el, url, image) {
+    const img = document.createElement('img');
+    img.className = "holaf-image-viewer-thumbnail";
+    img.src = url;
+    // --- FIX: REMOVED forced JS style for images. CSS classes handle it. ---
+    img.style.objectFit = '';
+    img.onload = () => {
+        addFullscreenIcon(el, image);
+    };
 
-        // --- FIX: REMOVED forced JS style for images. CSS classes handle it. ---
-        img.style.objectFit = '';
+    const oldImg = el.querySelector('img');
+    if (oldImg) oldImg.remove();
 
-        img.onload = () => {
-            addFullscreenIcon(placeholder, imageViewerState.getState().images[parseInt(placeholder.dataset.index)]);
-        };
-
-        const oldImg = placeholder.querySelector('img');
-        if (oldImg) oldImg.remove();
-
-        placeholder.prepend(img);
-        placeholder.dataset.thumbnailLoadingOrLoaded = "true";
-        unloadedVisiblePaths.delete(pathCanon);
-        return true;
-    }
-    return false;
+    el.prepend(img);
+    el.dataset.thumbnailLoadingOrLoaded = "true";
 }
 
 function addFullscreenIcon(placeholder, image) {
     if (!placeholder.querySelector('.holaf-viewer-fullscreen-icon')) {
         const fsIcon = document.createElement('div');
         fsIcon.className = 'holaf-viewer-fullscreen-icon';
+        fsIcon.setAttribute('data-holaf-action', 'fullscreen');
         fsIcon.innerHTML = '⛶';
         fsIcon.title = t('iv.viewFullscreen');
-        // Click handled via delegation on galleryGridEl
+        // Click handled via delegation on the grid surface
         placeholder.appendChild(fsIcon);
     }
 }
 
-function kickLoadQueue() {
-    if (kickQueued) return;
-    kickQueued = true;
-    queueMicrotask(_doKick);
-}
-
-function _doKick() {
-    kickQueued = false;
-    clearTimeout(idleRestartTimer);
-
-    // Phase 1: enqueue les vignettes VISIBLES non chargées. La concurrence, la
-    // dédup in-flight, le yield des cache-hits, le timeout/retries et le
-    // protocole 202 sont tenus par la brique holaf-thumbcache. On borne juste le
-    // nombre de placeholders traités par tick (chaque hit cache fait un
-    // createElement + prepend) pour ne pas figer l'UI en cas de gros lot.
-    const MAX_PER_TICK = 40;
-    let processed = 0;
-
-    for (const pathCanon of [...unloadedVisiblePaths]) {
-        const placeholder = renderedPlaceholders.get(pathCanon);
-        if (!placeholder || !placeholder.isConnected) {
-            unloadedVisiblePaths.delete(pathCanon);
-            continue;
-        }
-        if (placeholder.dataset.thumbnailLoadingOrLoaded) continue;
-
-        const imageIndex = parseInt(placeholder.dataset.index, 10);
-        const image = imageViewerState.getState().images[imageIndex];
-        if (!image) continue;
-
-        fetchThumbnail(placeholder, image, false);
-        processed++;
-        if (processed >= MAX_PER_TICK) {
-            // Yield to main thread, resume on next tick.
-            setTimeout(kickLoadQueue, 0);
-            break;
-        }
-    }
-
-    // Phase 2: Prefetch thumbnails ahead of viewport into cache (no DOM)
-    _prefetchAhead();
-
-    // Safety net : des placeholders peuvent rester sans état après une
-    // annulation (syncGallery) ; re-kick une fois la file au repos.
-    if (thumbCache.stats().active === 0 && unloadedVisiblePaths.size > 0) {
-        idleRestartTimer = setTimeout(() => {
-            const children = galleryGridEl.children;
-            for (let i = 0; i < children.length; i++) {
-                if (!children[i].dataset.thumbnailLoadingOrLoaded) {
-                    kickLoadQueue();
-                    return;
-                }
-            }
-        }, 200);
+// --- Sélection / activation / actions (rebranchées sur la grille) ---
+function handleSelectionChange(ids, items) {
+    // Source de vérité métier : state.selectedPaths (Set d'ids) + selectedImages.
+    imageViewerState.setState({
+        selectedPaths: new Set(ids),
+        selectedImages: new Set(items),
+    });
+    applyActiveClass();
+    if (viewerInstance && typeof viewerInstance._updateActionButtonsState === 'function') {
+        viewerInstance._updateActionButtonsState();
     }
 }
 
-function _prefetchAhead() {
-    if (!galleryEl || !galleryGridEl || columnCount === 0 || itemHeight === 0) return;
+function handleActivate(image, index, kind) {
+    if (!image) return;
+    imageViewerState.setState({ activeImage: image, currentNavIndex: index });
+    applyActiveClass();
+    if (kind === 'dblclick') {
+        viewerInstance._showZoomedView(image);
+    }
+}
 
-    const { images } = imageViewerState.getState();
-    if (!images || !images.length) return;
+function handleCellAction(actionId, image, index) {
+    if (!image) return;
+    imageViewerState.setState({ activeImage: image, currentNavIndex: index });
+    if (actionId === 'fullscreen') {
+        showFullscreenView(viewerInstance, image);
+    } else {
+        viewerInstance._showZoomedView(image);
+    }
+}
 
-    const viewportHeight = galleryEl.clientHeight;
-    const scrollTop = galleryEl.scrollTop;
-    const itemHeightWithGap = itemHeight + gap;
+// Reflète l'image active (state.métier) sur la bordure `.active` des cellules.
+// La brique ne connaît pas « active » (métier) : l'hôte le pilote.
+function applyActiveClass() {
+    if (!grid) return;
+    const active = imageViewerState.getState().activeImage;
+    const activePath = active ? active.path_canon : null;
+    const cells = grid.surface.children;
+    for (let i = 0; i < cells.length; i++) {
+        const el = cells[i];
+        if (el.dataset.pathCanon === undefined) continue;
+        el.classList.toggle('active', el.dataset.pathCanon === activePath);
+    }
+}
 
-    // Calculate visible range
-    const buffer = viewportHeight * 1.5;
-    const visibleAreaEnd = scrollTop + viewportHeight + buffer;
-    const endRow = Math.ceil(visibleAreaEnd / itemHeightWithGap);
+// --- Priorisation visible + fenêtres + prefetch (rebranchés sur la grille) ---
+function handleVisibleRange(start, end) {
+    const state = imageViewerState.getState();
+    const total = (state.totalCount != null && state.totalCount > 0) ? state.totalCount : (state.images ? state.images.length : 0);
+    if (!total) return;
 
-    // Prefetch zone: PREFETCH_ROWS beyond visible
-    const prefetchStartIndex = endRow * columnCount;
-    const prefetchEndIndex = Math.min(images.length - 1, prefetchStartIndex + (PREFETCH_ROWS * columnCount) - 1);
+    // Priorisation backend : uniquement les vignettes visibles non cachées /
+    // non en vol (débounce + flush tenus par la brique holaf-thumbcache).
+    const visibleIds = [];
+    for (let i = start; i <= end; i++) {
+        const img = getImageAt(state, i);
+        if (!img) continue;
+        const pathCanon = img.path_canon;
+        if (!thumbCache.has(pathCanon) && !thumbCache.isLoading(pathCanon)) {
+            visibleIds.push(pathCanon);
+        }
+    }
+    if (visibleIds.length > 0) thumbCache.onVisible(visibleIds);
 
-    // On n'enfile le prefetch que s'il reste des slots libres (même throttle que
-    // l'ancien code) ; la brique ordonne de toute façon le prefetch APRÈS le visible.
+    // Fetch any not-yet-loaded window visible in the current range.
+    scheduleEnsureRange(start, end);
+
+    // Prefetch ahead of the viewport (no DOM) — hors fenêtre rendue.
+    prefetchAhead(end, total);
+}
+
+function prefetchAhead(endIndex, total) {
+    if (!grid) return;
+    const m = grid.getMetrics();
+    if (m.itemHeight === 0) return;
+    const cols = Math.max(1, m.columns);
+    const endRow = Math.floor(endIndex / cols);
+    const start = (endRow + 1) * cols;
+    if (start === lastPrefetchEnd) return;
+    lastPrefetchEnd = start;
+    const stop = Math.min(total - 1, start + (PREFETCH_ROWS * cols) - 1);
+    if (start > stop) return;
+
     let slots = currentConcurrencyLimit - thumbCache.stats().active;
     const toPrefetch = [];
-    for (let i = prefetchStartIndex; i <= prefetchEndIndex && slots > 0; i++) {
-        const image = images[i];
+    const state = imageViewerState.getState();
+    for (let i = start; i <= stop && slots > 0; i++) {
+        const image = getImageAt(state, i);
         if (!image) continue;
         const pathCanon = image.path_canon;
-
-        // Skip if already cached, loading, or handled by the visible queue
         if (thumbCache.has(pathCanon)) continue;
         if (thumbCache.isLoading(pathCanon)) continue;
-        if (renderedPlaceholders.has(pathCanon)) continue;
-
         toPrefetch.push(image);
         slots--;
     }
@@ -596,11 +525,6 @@ function _prefetchAhead() {
             if (isBenchmarking) checkBenchmarkCompletion();
         });
     }
-}
-
-function debouncedKickLoadQueue() {
-    clearTimeout(scrollbarDebounceTimeout);
-    scrollbarDebounceTimeout = setTimeout(kickLoadQueue, isBenchmarking ? 5 : 30);
 }
 
 function scheduleEnsureRange(startIndex, endIndex) {
@@ -649,241 +573,6 @@ async function fetchWindow(start) {
     })();
     registerLoading(start, controller, promise);
     return promise;
-}
-
-// --- Thumbnail render (adaptateur brique → DOM) ---
-// La brique holaf-thumbcache tient le cache, la concurrence, la dédup in-flight,
-// le timeout + retries bornés et le protocole 202 + Retry-After. Ici on ne fait
-// que : demander la vignette (request haute priorité), dessiner le <img> au
-// succès, poser l'overlay d'erreur à l'échec terminal, nettoyer sur annulation.
-function isAbortError(err) {
-    return !!err && (err.name === 'AbortError' || err.aborted === true);
-}
-
-
-function fetchThumbnail(placeholder, image, forceReload = false) {
-    const pathCanon = image.path_canon;
-
-    // Force reload (édition d'image) : purge la valeur cachée puis recharge (le
-    // paramètre `t` est ajouté par buildThumbnailUrl via `_forceReload`).
-    if (forceReload) thumbCache.invalidate(pathCanon);
-
-    // Flag as loading to prevent duplicate queueing
-    placeholder.dataset.thumbnailLoadingOrLoaded = "loading";
-
-    // Visual feedback for loading (optional: could be a spinner)
-    placeholder.classList.remove('error');
-    const existingError = placeholder.querySelector('.holaf-viewer-error-overlay');
-    if (existingError) existingError.remove();
-
-    const item = forceReload ? { ...image, _forceReload: true } : image;
-
-    return thumbCache.request(item, HolafThumbCache.PRIORITY_HIGH).then((objectURL) => {
-        if (!placeholder.isConnected) {
-            // Placeholder évincé : la vignette est en cache, le prochain rendu la
-            // reprendra via applyCachedThumbnail. Rien à dessiner ici.
-            return;
-        }
-        const img = document.createElement('img');
-        img.className = "holaf-image-viewer-thumbnail";
-        img.src = objectURL;
-        // --- FIX: REMOVED forced JS style for images. CSS classes handle it. ---
-        img.style.objectFit = '';
-
-        img.onload = () => {
-            addFullscreenIcon(placeholder, image);
-        };
-
-        const oldImg = placeholder.querySelector('img');
-        if (oldImg) oldImg.remove();
-
-        // If a video preview is currently playing, we put the img behind it or hide it
-        // But simplified logic: just prepend.
-        placeholder.prepend(img);
-        placeholder.dataset.thumbnailLoadingOrLoaded = "true";
-        unloadedVisiblePaths.delete(pathCanon);
-    }).catch((err) => {
-        if (isAbortError(err)) {
-            // Annulation (syncGallery) : le blob n'est pas caché ; on rend l'item
-            // à la file pour qu'il soit rechargé quand il revient à l'écran.
-            if (placeholder.isConnected) delete placeholder.dataset.thumbnailLoadingOrLoaded;
-            return;
-        }
-        // Échec terminal (timeout après retries bornés, HTTP non-2xx, réseau).
-        if (!placeholder.isConnected) return;
-        placeholder.classList.add('error');
-        placeholder.dataset.thumbnailLoadingOrLoaded = "error";
-        unloadedVisiblePaths.delete(pathCanon);
-        const errorDiv = document.createElement('div');
-        errorDiv.className = 'holaf-viewer-error-overlay';
-        errorDiv.textContent = (err && err.timedOut) ? t('iv.timeout') : t('iv.err');
-        placeholder.appendChild(errorDiv);
-    }).finally(() => {
-        if (isBenchmarking) checkBenchmarkCompletion();
-    });
-}
-
-// --- Placeholder Object Pool ---
-// Reuse placeholder divs instead of creating/destroying on every scroll.
-// This avoids createElement/GC overhead and keeps the checkbox ref cached.
-const placeholderPool = [];
-const POOL_MAX_SIZE = 200;
-
-function acquirePlaceholder(viewer, image, index) {
-    let placeholder;
-    const isVideo = ['MP4', 'WEBM', 'MKV', 'AVI', 'MOV', 'M4V'].includes(image.format);
-    const isAudio = ['WAV', 'MP3', 'OGG', 'FLAC', 'AAC', 'M4A'].includes(image.format);
-
-    if (placeholderPool.length > 0) {
-        // Recycle from pool
-        placeholder = placeholderPool.pop();
-
-        // Update data attributes
-        placeholder.dataset.index = index;
-        placeholder.dataset.pathCanon = image.path_canon;
-
-        // Reset visual state
-        placeholder.classList.remove('active', 'error');
-        placeholder._checkbox.checked = false;
-        placeholder._hoverGeneration = 0;
-
-        // Remove leftover dynamic children (img, video, error overlays)
-        const oldImg = placeholder.querySelector('img');
-        if (oldImg) oldImg.remove();
-        const oldVideo = placeholder.querySelector('video.holaf-hover-preview');
-        if (oldVideo) { oldVideo.pause(); oldVideo.src = ""; oldVideo.remove(); }
-        const oldError = placeholder.querySelector('.holaf-viewer-error-overlay');
-        if (oldError) oldError.remove();
-        const oldFsIcon = placeholder.querySelector('.holaf-viewer-fullscreen-icon');
-        if (oldFsIcon) oldFsIcon.remove();
-
-        // Reset thumbnail loading state
-        delete placeholder.dataset.thumbnailLoadingOrLoaded;
-
-        // Update action icon
-        const actionIcon = placeholder._actionIcon;
-        actionIcon.classList.remove('active');
-        if (isVideo) {
-            actionIcon.innerHTML = '🎥';
-            actionIcon.title = t('iv.playVideo');
-            if (image.has_edit_file) actionIcon.classList.add('active');
-        } else if (isAudio) {
-            actionIcon.innerHTML = '\uD83C\uDFB5';
-            actionIcon.title = t('iv.playAudio');
-            if (image.has_edit_file) actionIcon.classList.add('active');
-        } else {
-            actionIcon.innerHTML = '✎';
-            actionIcon.title = t('iv.editImage');
-            if (image.has_edit_file) actionIcon.classList.add('active');
-        }
-
-        // Remove old hover listeners if this was a video placeholder
-        if (placeholder._hoverCleanup) {
-            placeholder._hoverCleanup();
-            placeholder._hoverCleanup = null;
-        }
-
-        // Add new hover listeners for videos
-        if (isVideo) {
-            placeholder._hoverCleanup = attachVideoHoverListeners(placeholder, image);
-        }
-
-    } else {
-        // Create new placeholder
-        placeholder = document.createElement('div');
-        placeholder.className = 'holaf-viewer-thumbnail-placeholder';
-        placeholder.style.position = 'absolute';
-        placeholder.dataset.index = index;
-        placeholder.dataset.pathCanon = image.path_canon;
-
-        const actionIcon = document.createElement('div');
-        actionIcon.className = 'holaf-viewer-edit-icon';
-        placeholder._actionIcon = actionIcon;
-
-        if (isVideo) {
-            actionIcon.innerHTML = '🎥';
-            actionIcon.title = t('iv.playVideo');
-            if (image.has_edit_file) actionIcon.classList.add('active');
-            placeholder._hoverCleanup = attachVideoHoverListeners(placeholder, image);
-        } else if (isAudio) {
-            actionIcon.innerHTML = '\uD83C\uDFB5';
-            actionIcon.title = t('iv.playAudio');
-            if (image.has_edit_file) actionIcon.classList.add('active');
-        } else {
-            actionIcon.innerHTML = '✎';
-            actionIcon.title = t('iv.editImage');
-            if (image.has_edit_file) actionIcon.classList.add('active');
-        }
-        placeholder.appendChild(actionIcon);
-
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.className = 'holaf-viewer-thumb-checkbox';
-        checkbox.title = t('iv.selectImage');
-        placeholder._checkbox = checkbox;
-        placeholder.appendChild(checkbox);
-    }
-
-    return placeholder;
-}
-
-function releasePlaceholder(placeholder) {
-    // Clean up hover listeners for videos
-    if (placeholder._hoverCleanup) {
-        placeholder._hoverCleanup();
-        placeholder._hoverCleanup = null;
-    }
-
-    // Stoppe un éventuel retry « pending » (202) : inutile de continuer à
-    // réclamer une vignette qui vient de quitter la vue. Un chargement DÉJÀ en
-    // vol n'est pas interrompu — il aboutira et remplira le cache.
-    const releasedPath = placeholder.dataset.pathCanon;
-    if (releasedPath) thumbCache.cancel(releasedPath);
-
-    // Remove from DOM
-    if (placeholder.parentNode) {
-        placeholder.parentNode.removeChild(placeholder);
-    }
-
-    // Return to pool if not too large
-    if (placeholderPool.length < POOL_MAX_SIZE) {
-        // Clean up dynamic children for pool hygiene
-        const img = placeholder.querySelector('img');
-        if (img) img.remove();
-        const vid = placeholder.querySelector('video.holaf-hover-preview');
-        if (vid) { vid.pause(); vid.src = ""; vid.remove(); }
-        const err = placeholder.querySelector('.holaf-viewer-error-overlay');
-        if (err) err.remove();
-        const fs = placeholder.querySelector('.holaf-viewer-fullscreen-icon');
-        if (fs) fs.remove();
-
-        // Reset state
-        placeholder.classList.remove('active', 'error');
-        placeholder._checkbox.checked = false;
-        placeholder._hoverGeneration = 0;
-        delete placeholder.dataset.thumbnailLoadingOrLoaded;
-
-        placeholderPool.push(placeholder);
-    } else {
-        // Pool is full, let GC collect
-    }
-}
-
-function acquireSkeleton(index) {
-    let sk;
-    if (skeletonPool.length > 0) sk = skeletonPool.pop();
-    else {
-        sk = document.createElement('div');
-        sk.className = 'holaf-viewer-thumbnail-placeholder holaf-viewer-skeleton';
-        sk.style.position = 'absolute';
-    }
-    sk.dataset.index = index;
-    return sk;
-}
-
-function releaseSkeleton(sk) {
-    if (sk.parentNode) sk.parentNode.removeChild(sk);
-    if (skeletonPool.length < SKELETON_POOL_MAX) skeletonPool.push(sk);
 }
 
 // --- Video Hover Preview (extracted for reuse with pooled placeholders) ---
@@ -982,6 +671,20 @@ function attachVideoHoverListeners(placeholder, image) {
         placeholder.removeEventListener('mouseleave', mouseleaveHandler);
     };
 }
+
+// --- Source de données injectée dans la grille ---
+// `getAt` est creux : les fenêtres non chargées renvoient null → squelettes.
+function makeGridSource() {
+    return {
+        getAt: (index) => getImageAt(imageViewerState.getState(), index),
+        total: () => {
+            const s = imageViewerState.getState();
+            return (s.totalCount != null && s.totalCount > 0) ? s.totalCount : (s.images ? s.images.length : 0);
+        },
+        forEachLoaded: (cb) => forEachLoadedImage(imageViewerState.getState(), cb),
+    };
+}
+
 // --- Functions to be exported ---
 
 function initGallery(viewer) {
@@ -993,117 +696,56 @@ function initGallery(viewer) {
         if (path_canon) refreshThumbnailInGallery(path_canon);
     });
 
-    galleryEl.innerHTML = `
-        <div id="holaf-gallery-sizer" style="position: relative; width: 100%; height: 0; pointer-events: none;"></div>
-        <div id="holaf-gallery-grid" style="position: absolute; top: 0; left: 0; width: 100%;"></div>
-    `;
-    gallerySizerEl = document.getElementById("holaf-gallery-sizer");
-    galleryGridEl = document.getElementById("holaf-gallery-grid");
-
-    // --- Event Delegation: single listeners on galleryGridEl instead of per-item ---
-    galleryGridEl.addEventListener('click', (e) => {
-        const placeholder = e.target.closest('.holaf-viewer-thumbnail-placeholder');
-        if (!placeholder) return;
-
-        const idx = parseInt(placeholder.dataset.index, 10);
-        const img = imageViewerState.getState().images[idx];
-
-        // Fullscreen icon delegates to fullscreen view
-        if (e.target.closest('.holaf-viewer-fullscreen-icon')) {
-            e.stopPropagation();
-            if (img) {
-                imageViewerState.setState({ activeImage: img, currentNavIndex: idx });
-                showFullscreenView(viewerInstance, img);
-            }
-            return;
-        }
-
-        // Edit icon delegates to zoomed view
-        if (e.target.closest('.holaf-viewer-edit-icon')) {
-            e.stopPropagation();
-            if (img) {
-                imageViewerState.setState({ activeImage: img, currentNavIndex: idx });
-                viewerInstance._showZoomedView(img);
-            }
-            return;
-        }
-
-        const state = imageViewerState.getState();
-        const clickedIndex = parseInt(placeholder.dataset.index, 10);
-        if (isNaN(clickedIndex)) return;
-        const clickedImageData = getImageAt(state, clickedIndex);
-        if (!clickedImageData) return;
-        const anchorIndex = state.currentNavIndex > -1 ? state.currentNavIndex : clickedIndex;
-        const selectedPaths = new Set(state.selectedPaths); // Copy for mutation
-        if (e.shiftKey) {
-            if (!e.ctrlKey) selectedPaths.clear();
-            const start = Math.min(anchorIndex, clickedIndex);
-            const end = Math.max(anchorIndex, clickedIndex);
-            for (let i = start; i <= end; i++) {
-                const img = getImageAt(state, i);
-                if (img) selectedPaths.add(img.path_canon);
-            }
-        } else if (e.ctrlKey || e.target.tagName === 'INPUT') {
-            if (selectedPaths.has(clickedImageData.path_canon)) {
-                selectedPaths.delete(clickedImageData.path_canon);
-            } else {
-                selectedPaths.add(clickedImageData.path_canon);
-            }
-        } else {
-            selectedPaths.clear();
-            selectedPaths.add(clickedImageData.path_canon);
-        }
-        const newSelectedImages = new Set();
-        forEachLoadedImage(state, (img) => {
-            if (selectedPaths.has(img.path_canon)) newSelectedImages.add(img);
-        });
-        imageViewerState.setState({ selectedImages: newSelectedImages, activeImage: clickedImageData, currentNavIndex: clickedIndex });
-        renderVisibleItems();
-        viewerInstance._updateActionButtonsState();
+    // La grille virtualisée possède désormais sizer/surface/cellules/pool,
+    // les listeners scroll + ResizeObserver et la sélection. Le clavier reste
+    // tenu par image_viewer_navigation.js (keyboard:false).
+    grid = HolafGrid.create(galleryEl, {
+        itemSize: () => getThumbSize(),
+        gap: 'auto',
+        bufferFactor: 1.5,
+        aspect: 1,
+        getId: (image) => image && image.path_canon,
+        selectable: true,
+        multi: true,
+        keyboard: false,
+        activateOnClick: true,
+        cell: { create: createCell, update: updateCell, release: releaseCell },
+        onSelectionChange: handleSelectionChange,
+        onVisibleRange: handleVisibleRange,
+        onActivate: handleActivate,
+        onAction: handleCellAction,
     });
-
-    galleryGridEl.addEventListener('dblclick', (e) => {
-        if (e.target.closest('.holaf-viewer-edit-icon, .holaf-viewer-fullscreen-icon, .holaf-viewer-thumb-checkbox')) return;
-        const placeholder = e.target.closest('.holaf-viewer-thumbnail-placeholder');
-        if (!placeholder) return;
-        const idx = parseInt(placeholder.dataset.index, 10);
-        const img = imageViewerState.getState().images[idx];
-        if (img) {
-            imageViewerState.setState({ activeImage: img, currentNavIndex: idx });
-            viewerInstance._showZoomedView(img);
-        }
-    });
-
-    resizeObserver = new ResizeObserver(handleResize);
-    resizeObserver.observe(galleryEl);
-
-    galleryEl.addEventListener('wheel', () => {
-        isWheelScrolling = true;
-        clearTimeout(wheelScrollTimeout);
-        wheelScrollTimeout = setTimeout(() => { isWheelScrolling = false; }, 300);
-    }, { passive: true });
-
-    galleryEl.addEventListener('scroll', () => {
-        renderVisibleItems();
-        if (isWheelScrolling) {
-            kickLoadQueue();
-        } else {
-            debouncedKickLoadQueue();
-        }
-
-
-    }, { passive: true });
+    // Source de données creuse (tableau d'images + fenêtres chargées à la demande).
+    grid.setSource(makeGridSource());
 
     viewer.gallery = {
         ensureImageVisible,
         alignImageOnExit,
         refreshThumbnail: refreshThumbnailInGallery,
         render: renderVisibleItems,
-        getColumnCount: () => columnCount,
+        getColumnCount: () => grid.getColumnCount(),
         jumpToOldest,
         jumpToNewest,
-        ensureImageLoaded
+        ensureImageLoaded,
+        selection: grid.selection,
     };
+}
+
+// Ré-affiche la fenêtre visible de la grille. Re-synchronise la sélection de la
+// brique depuis l'état métier (au cas où un module tiers — navigation clavier —
+// l'a modifiée) et reflète l'image active.
+function renderVisibleItems() {
+    if (!grid) return;
+    const st = imageViewerState.getState();
+    grid.selection.set(Array.from(st.selectedPaths || []), { silent: true });
+    // Re-ancre la sélection sur l'index de navigation courant (le clavier de
+    // PAGE tenu par image_viewer_navigation.js met à jour currentNavIndex) :
+    // shift+clic s'étend depuis cet index, comme l'ancien code.
+    if (typeof st.currentNavIndex === 'number' && st.currentNavIndex >= 0) {
+        grid.selection.setAnchor(st.currentNavIndex);
+    }
+    grid.render();
+    applyActiveClass();
 }
 
 function syncGallery(viewer, images) {
@@ -1136,42 +778,38 @@ function syncGallery(viewer, images) {
         // diff above sees no change and skips the full rebuild that normally clears the grid.
         // That leaves the "no images match" placeholder stuck under the thumbnails when we go
         // from an empty result back to a populated one. Remove it explicitly here.
-        const emptyMsg = galleryGridEl.querySelector('.holaf-viewer-empty-message');
+        const emptyMsg = grid.surface.querySelector('.holaf-viewer-empty-message');
         if (emptyMsg) emptyMsg.remove();
-        updateLayout(true);
+        grid.relayout();
+        applyActiveClass();
         return;
     }
 
     // Full rebuild (image list actually changed)
     // Stoppe les chargements en vol + les retries planifiés (la brique rejette
-    // les promesses concernées ; fetchThumbnail nettoie l'état des placeholders).
+    // les promesses concernées ; loadThumbnail nettoie l'état des cellules).
     thumbCache.abort();
-    unloadedVisiblePaths.clear();
+    lastPrefetchEnd = -1;
     resetWindowCache();
 
     // Keep LRU Cache alive! Don't clear it — thumbnails are still valid.
     // thumbnailCache.clear();
-
-    if (galleryGridEl) {
-        // Use textContent instead of removeChild loop for faster bulk removal
-        galleryGridEl.textContent = '';
-    }
-    renderedPlaceholders.clear();
-    placeholderPool.length = 0; // Clear pool on full rebuild
 
     const messageEl = galleryEl.querySelector('.holaf-viewer-message');
     if (messageEl) messageEl.remove();
 
     if (images && images.length > 0) {
         galleryEl.scrollTop = 0;
-        updateLayout(true);
+        grid.render(true);
+        applyActiveClass();
     } else {
-        gallerySizerEl.style.height = '300px';
+        grid.render(true);
+        grid.sizer.style.height = '300px';
         const placeholder = document.createElement('div');
         placeholder.className = 'holaf-viewer-thumbnail-placeholder holaf-viewer-empty-message';
         placeholder.style.cssText = `position: absolute; top: 8px; left: 8px; right: 8px; height: 200px; display: flex; align-items: center; justify-content: center; text-align: center; padding: 20px; box-sizing: border-box; border: 2px dashed var(--holaf-border-color); border-radius: var(--holaf-border-radius); color: var(--holaf-text-color-secondary);`;
         placeholder.textContent = t('iv.noImagesMatch');
-        galleryGridEl.appendChild(placeholder);
+        grid.surface.appendChild(placeholder);
     }
 }
 
@@ -1183,84 +821,54 @@ function refreshAfterIncremental(viewer) {
     viewerInstance = viewer;
     // Nothing to render if the gallery panel was never opened. The next full
     // load (panel open / filter change) rebuilds everything from state anyway.
-    if (!galleryEl || !galleryGridEl) return;
+    if (!galleryEl || !grid) return;
 
     const state = imageViewerState.getState();
     const total = (state.totalCount != null && state.totalCount > 0)
         ? state.totalCount
         : (state.images ? state.images.length : 0);
-    if (!total || !galleryGridEl) return;
+    if (!total) return;
 
     // Going from an empty result back to a populated one must drop the placeholder.
-    const emptyMsg = galleryGridEl.querySelector('.holaf-viewer-empty-message');
+    const emptyMsg = grid.surface.querySelector('.holaf-viewer-empty-message');
     if (emptyMsg) emptyMsg.remove();
 
-    updateLayout(true);
+    grid.relayout();
+    applyActiveClass();
 }
 
 function refreshThumbnailInGallery(path_canon) {
-    const placeholder = renderedPlaceholders.get(path_canon);
-    if (!placeholder) return;
+    if (!grid) return;
     const allImages = imageViewerState.getState().images;
     const image = allImages.find(img => img.path_canon === path_canon);
     if (!image) return;
-
-    const editIcon = placeholder.querySelector('.holaf-viewer-edit-icon');
-    if (editIcon) editIcon.classList.add('active');
-
-    fetchThumbnail(placeholder, image, true);
+    // La brique retrouve la cellule par id et rappelle updateCell(refresh:true),
+    // qui force le rechargement de la vignette et marque l'icône d'édition.
+    grid.refresh(path_canon);
 }
 
 function ensureImageVisible(imageIndex) {
-    if (!galleryEl || imageIndex < 0) return;
-    renderVisibleItems();
-    setTimeout(() => {
-        const targetElement = galleryGridEl.querySelector(`[data-index="${imageIndex}"]`);
-        if (targetElement) {
-            targetElement.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        } else {
-            if (columnCount <= 0 || itemHeight === 0) return;
-            const targetRow = Math.floor(imageIndex / columnCount);
-            galleryEl.scrollTop = targetRow * (itemHeight + gap);
-            renderVisibleItems();
-        }
-    }, 50);
+    if (!grid || imageIndex < 0) return;
+    // La brique gère l'alignement (scroll smooth) ; nearest = no-op si visible.
+    grid.scrollToIndex(imageIndex, { align: 'nearest', smooth: true });
 }
 
 function alignImageOnExit(imageIndex) {
-    if (!galleryEl || imageIndex < 0) return;
-    renderVisibleItems();
-    setTimeout(() => {
-        const targetElement = galleryGridEl.querySelector(`[data-index="${imageIndex}"]`);
-        if (targetElement) {
-            const rect = targetElement.getBoundingClientRect();
-            const galleryRect = galleryEl.getBoundingClientRect();
-            const isVisible = rect.top >= galleryRect.top && rect.bottom <= galleryRect.bottom;
-            if (isVisible) return;
-            if (rect.top < galleryRect.top) targetElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            else targetElement.scrollIntoView({ behavior: 'smooth', block: 'end' });
-        } else {
-            if (columnCount <= 0 || itemHeight === 0) return;
-            const targetRow = Math.floor(imageIndex / columnCount);
-            galleryEl.scrollTop = targetRow * (itemHeight + gap);
-            renderVisibleItems();
-        }
-    }, 50);
+    if (!grid || imageIndex < 0) return;
+    grid.scrollToIndex(imageIndex, { align: 'nearest', smooth: true });
 }
 
 function jumpToOldest() {
-    if (!galleryEl || columnCount <= 0 || itemHeight === 0) return;
+    if (!grid) return;
     const state = imageViewerState.getState();
     const total = (state.totalCount != null && state.totalCount > 0) ? state.totalCount : state.images.length;
-    const rowCount = Math.ceil(total / columnCount);
-    galleryEl.scrollTop = rowCount * (itemHeight + gap);
-    renderVisibleItems();
+    if (!total) return;
+    grid.scrollToIndex(total - 1, { align: 'end' });
 }
 
 function jumpToNewest() {
-    if (!galleryEl) return;
-    galleryEl.scrollTop = 0;
-    renderVisibleItems();
+    if (!grid) return;
+    grid.scrollToIndex(0, { align: 'start' });
 }
 
 async function ensureImageLoaded(index) {
@@ -1278,8 +886,8 @@ async function ensureImageLoaded(index) {
 }
 
 function forceRelayout(newSize) {
-    if (!galleryEl) return;
-    updateLayout(true, newSize);
+    if (!grid) return;
+    grid.relayout(newSize);
 }
 
 export {

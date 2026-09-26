@@ -540,16 +540,24 @@ export async function handleKeyDown(viewer, e) {
             if (currentMode !== 'gallery' || !state.activeImage) break;
             e.preventDefault();
 
-            const currentSelection = new Set(state.selectedImages); // Copy for mutation
-            if (currentSelection.has(state.activeImage)) {
-                currentSelection.delete(state.activeImage);
+            // La galerie délègue la sélection à la brique HolafGrid ; son
+            // onSelectionChange rebranche state.selectedPaths/selectedImages et
+            // les boutons d'action. Repli historique si la brique est absente.
+            const sel = viewer.gallery && viewer.gallery.selection;
+            if (sel && typeof sel.toggle === 'function' && state.activeImage.path_canon) {
+                sel.toggle(state.activeImage.path_canon);
             } else {
-                currentSelection.add(state.activeImage);
-            }
+                const currentSelection = new Set(state.selectedImages); // Copy for mutation
+                if (currentSelection.has(state.activeImage)) {
+                    currentSelection.delete(state.activeImage);
+                } else {
+                    currentSelection.add(state.activeImage);
+                }
 
-            imageViewerState.setState({ selectedImages: currentSelection });
-            if (viewer.gallery?.render) viewer.gallery.render();
-            viewer._updateActionButtonsState();
+                imageViewerState.setState({ selectedImages: currentSelection });
+                if (viewer.gallery?.render) viewer.gallery.render();
+                viewer._updateActionButtonsState();
+            }
             break;
         }
         case 'Delete': {
