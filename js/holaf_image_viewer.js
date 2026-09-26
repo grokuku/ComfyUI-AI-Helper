@@ -24,8 +24,9 @@ import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { holafExtUrl } from './holaf_ext_base.js';
 import * as Settings from './image_viewer/image_viewer_settings.js';
 import { UI, createThemeMenu } from './image_viewer/image_viewer_ui.js';
-import { initGallery, syncGallery, refreshThumbnailInGallery, forceRelayout } from './image_viewer/image_viewer_gallery.js';
-import { PAGE_SIZE, setWindowLoaded, resetWindowCache, forEachLoadedImage } from './image_viewer/image_viewer_data.js';
+import { initGallery, syncGallery, refreshThumbnailInGallery, forceRelayout, refreshAfterIncremental } from './image_viewer/image_viewer_gallery.js';
+import { PAGE_SIZE, setWindowLoaded, resetWindowCache, forEachLoadedImage, insertImagesAtTop, removeImagesByPaths } from './image_viewer/image_viewer_data.js';
+import { applyIncrementalDelta } from './image_viewer/image_viewer_delta.js';
 import * as Actions from './image_viewer/image_viewer_actions.js';
 import * as InfoPane from './image_viewer/image_viewer_infopane.js';
 import * as Navigation from './image_viewer/image_viewer_navigation.js';
@@ -37,6 +38,8 @@ const DOWNLOAD_CHUNK_SIZE = 5 * 1024 * 1024;
 const FILTER_REFRESH_INTERVAL_MS = 2000;
 // [NEW] Delay before reloading gallery after a filter click
 const FILTER_DEBOUNCE_DELAY_MS = 300; 
+// Debounce before applying an incremental delta (new/removed images) in place.
+const INCREMENTAL_APPLY_DEBOUNCE_MS = 1200;
 
 // SVG icons for folder locks for better compatibility than emojis
 const ICONS = {
@@ -491,17 +494,38 @@ const holafImageViewer = {
             }
 
             const newImages = (delta && delta.images) || [];
-            if (newImages.length > 0) {
+            const removedPaths = (delta && delta.removed_path_canons) || [];
+
+            // A DROP in the global DB count means images were removed out-of-band
+            // (external delete / trash from another client). The incremental
+            // endpoint only carries additions, so indices cannot be reconciled →
+            // full reload (the "suppression" case). A stable/increasing count is
+            // the normal "new images" delta and stays incremental.
+            const prevDbCount = state.status.totalImageCount;
+            const dbCountDropped = typeof (delta && delta.total_db_count) === 'number'
+                && typeof prevDbCount === 'number' && prevDbCount > 0
+                && delta.total_db_count < prevDbCount;
+            if (dbCountDropped) {
+                await this.loadFilteredImages();
+                return;
+            }
+
+            if (newImages.length > 0 || removedPaths.length > 0) {
                 const g = document.getElementById('holaf-viewer-gallery');
                 const isAtTop = g ? (g.scrollTop < g.clientHeight) : true;
                 if (isAtTop) {
-                    // Debounce: coalesce les rafales de "new data" (batch de génération) en un
-                    // seul rechargement, pour éviter de refaire COUNT + fetch + rebuild en boucle.
+                    // Debounce: coalesce les rafales de "new data" (batch de génération).
+                    // Le delta est ensuite appliqué EN PLACE (insertion en tête / retrait),
+                    // sans loadFilteredImages() ni resetWindowCache() : les fenêtres déjà
+                    // chargées et leurs miniatures sont conservées.
                     if (this._resyncDebounceTimer) clearTimeout(this._resyncDebounceTimer);
                     this._resyncDebounceTimer = setTimeout(() => {
                         this._resyncDebounceTimer = null;
-                        this.loadFilteredImages();
-                    }, 1200);
+                        this._applyIncrementalDelta(delta).catch((e) => {
+                            console.error("[Holaf ImageViewer] Incremental delta failed, full reload:", e);
+                            this.loadFilteredImages();
+                        });
+                    }, INCREMENTAL_APPLY_DEBOUNCE_MS);
                 } else {
                     imageViewerState.setState({ status: { pendingNewImages: true } });
                     showToast({ message: t("iv.newImagesDetected"), type: "info" });
@@ -513,6 +537,50 @@ const holafImageViewer = {
         } catch (e) {
             console.error("[Holaf ImageViewer] Error checking for updates:", e);
         }
+    },
+
+    /**
+     * Apply an incremental delta (new images / removed images) in place.
+     * NEVER calls loadFilteredImages()/resetWindowCache() for a reconcilable
+     * delta: the loaded windows and their thumbnails are preserved. A mass
+     * removal or an unreconcilable removal still falls back to a full reload.
+     */
+    async _applyIncrementalDelta(delta) {
+        // Capture the total BEFORE the delta mutates state.images in place.
+        const beforeState = imageViewerState.getState();
+        const oldTotal = (beforeState.totalCount != null && beforeState.totalCount > 0)
+            ? beforeState.totalCount
+            : beforeState.images.length;
+
+        const result = await applyIncrementalDelta(delta, {
+            getState: () => imageViewerState.getState(),
+            insertImagesAtTop,
+            removeImagesByPaths,
+            loadFilteredImages: () => this.loadFilteredImages(),
+        });
+        if (result.mode !== 'patched') return result;
+
+        const state = imageViewerState.getState();
+        const newTotal = Math.max(0, oldTotal + result.inserted - result.removed);
+
+        const update = { totalCount: newTotal, status: { pendingNewImages: false } };
+
+        // Prune removed images from the selection / active view.
+        if (result.removed > 0) {
+            const removedSet = new Set((delta && delta.removed_path_canons) || []);
+            update.selectedImages = new Set(
+                [...state.selectedImages].filter(img => !removedSet.has(img.path_canon))
+            );
+            if (state.activeImage && removedSet.has(state.activeImage.path_canon)) {
+                update.activeImage = null;
+                update.currentNavIndex = -1;
+            }
+        }
+
+        imageViewerState.setState(update);
+        refreshAfterIncremental(this);
+        this.updateStatusBar(newTotal, imageViewerState.getState().status.totalImageCount);
+        return result;
     },
 
     _performFullReset(resetLocks) {

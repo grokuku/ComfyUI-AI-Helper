@@ -316,6 +316,58 @@ def _update_image_tags_in_db(cursor, image_id, tags_list):
 
 # --- Database Synchronization ---
 
+# Filesystem timestamps can drift by tiny fractions across stat() calls / OS /
+# Python boundaries. Treat sub-millisecond deltas as "unchanged" so a re-copy
+# or an incidental touch never looks like a real content modification.
+_MTIME_TOLERANCE_S = 1e-3
+
+# Guard-rail thresholds for the periodic sync: a normal pass rewrites only the
+# few files that really changed. Above BOTH of these, the change predicate is
+# almost certainly broken (see the ANOMALY log in sync_image_database_blocking).
+_SYNC_CHANGED_ANOMALY_ABS = 200
+_SYNC_CHANGED_ANOMALY_RATIO = 0.5
+
+def thumb_hash_for_path(path_canon):
+    """Canonical thumbnail key for a path: sha1(path_canon).hexdigest().
+
+    Single source of truth shared by the sync, the live watcher update, the
+    edit route and the thumbnail routes (the thumbnail FILE is named
+    "<thumb_hash>.jpg"). Any divergence here used to make the periodic sync
+    flag every edited image as changed and regenerate its thumbnail forever.
+    """
+    return hashlib.sha1(path_canon.encode('utf-8')).hexdigest()
+
+def _image_file_changed(db_mtime, db_size, db_thumb_hash, disk_mtime, disk_size, disk_thumb_hash):
+    """Return True when the on-disk file no longer matches the DB row.
+
+    Tolerant mtime comparison plus strict size/thumb_hash equality. This is the
+    single predicate shared by add_or_update_single_image() (live watcher events)
+    and sync_image_database_blocking() (periodic full pass); keeping one tolerant
+    comparison is what prevents the false-positive storms that reset every
+    thumbnail on every poll.
+    """
+    try:
+        mtime_changed = abs(float(db_mtime) - float(disk_mtime)) > _MTIME_TOLERANCE_S
+    except (TypeError, ValueError):
+        mtime_changed = True
+    return bool(
+        mtime_changed
+        or db_size != disk_size
+        or (db_thumb_hash or None) != (disk_thumb_hash or None)
+    )
+
+def _should_process_image(existing_record, disk_mtime, disk_size, disk_thumb_hash):
+    """True when a DB record is missing, or the file changed on disk.
+
+    `existing_record` is a dict row (as built by sync_image_database_blocking).
+    """
+    if not existing_record:
+        return True
+    return _image_file_changed(
+        existing_record['mtime'], existing_record['size_bytes'], existing_record.get('thumb_hash'),
+        disk_mtime, disk_size, disk_thumb_hash,
+    )
+
 def add_or_update_single_image(image_abs_path, _attempts=1):
     """
     Efficiently adds or updates a single image in the database.
@@ -342,7 +394,7 @@ def add_or_update_single_image(image_abs_path, _attempts=1):
         if subfolder_str == '.': subfolder_str = ''
         path_canon = os.path.join(subfolder_str, filename).replace('\\', '/')
         
-        thumb_hash = hashlib.sha1(path_canon.encode('utf-8')).hexdigest()
+        thumb_hash = thumb_hash_for_path(path_canon)
 
         # Check exclusion for Trashcan AND Edit folder
         if (subfolder_str.startswith(TRASHCAN_DIR_NAME + '/') or subfolder_str == TRASHCAN_DIR_NAME or
@@ -377,18 +429,33 @@ def add_or_update_single_image(image_abs_path, _attempts=1):
         conn = holaf_database.get_db_connection()
         cursor = conn.cursor()
         
-        cursor.execute("SELECT id, is_trashed FROM images WHERE path_canon = ?", (path_canon,))
+        cursor.execute("SELECT id, is_trashed, mtime, size_bytes, thumb_hash FROM images WHERE path_canon = ?", (path_canon,))
         existing_image = cursor.fetchone()
 
         if existing_image:
             image_id = existing_image['id']
             was_trashed = existing_image['is_trashed']
-            cursor.execute("""
+
+            # Only invalidate a valid thumbnail when the file REALLY changed
+            # (mtime/size/thumb_hash). A watcher event that does not alter the
+            # file must not force thumbnail_status=0: doing so re-queued every
+            # touched image and made the whole visible grid regenerate its
+            # thumbnails on each poll.
+            file_changed = _image_file_changed(
+                existing_image['mtime'], existing_image['size_bytes'], existing_image['thumb_hash'],
+                file_stat.st_mtime, file_stat.st_size, thumb_hash,
+            )
+            thumb_reset_clause = (
+                ", thumbnail_status=0, thumbnail_priority_score=1000, thumbnail_last_generated_at=NULL"
+                if file_changed else ""
+            )
+            row_changed = file_changed or bool(was_trashed)
+            cursor.execute(f"""
                 UPDATE images SET
                     filename=?, subfolder=?, top_level_subfolder=?, format=?, mtime=?, size_bytes=?, last_synced_at=?,
                     is_trashed=0, original_path_canon=NULL, prompt_text=?, workflow_json=?, prompt_source=?,
                     workflow_source=?, width=?, height=?, aspect_ratio_str=?, has_edit_file=?, thumb_hash=?,
-                    has_prompt=?, has_workflow=?, has_edits=?, has_tags=?, thumbnail_status=0, thumbnail_priority_score=1000, thumbnail_last_generated_at=NULL
+                    has_prompt=?, has_workflow=?, has_edits=?, has_tags=?{thumb_reset_clause}
                 WHERE id=?
             """, (filename, subfolder_str, top_level_subfolder, file_ext[1:].upper(), file_stat.st_mtime, file_stat.st_size, time.time(),
                   meta.get('prompt'), json.dumps(meta.get('workflow')) if meta.get('workflow') else None, meta.get('prompt_source'),
@@ -409,6 +476,7 @@ def add_or_update_single_image(image_abs_path, _attempts=1):
                   meta.get('width'), meta.get('height'), meta.get('ratio'), has_edit_file, thumb_hash,
                   has_prompt_flag, has_workflow_flag, has_edits_flag, has_tags_flag))
             image_id = cursor.lastrowid
+            row_changed = True
             
             # --- NOTIFY STATS ---
             stats_manager.increment_total()
@@ -422,7 +490,11 @@ def add_or_update_single_image(image_abs_path, _attempts=1):
             _increment_folder_count(cursor, top_level_subfolder)
         conn.commit()
         print(f"✅ [Holaf-Logic-DB] Successfully added/updated in DB: {path_canon}")
-        update_last_db_update_time() 
+        # Only signal a DB update when the row really changed. A no-op watcher
+        # event (file bytes identical) must not bump LAST_DB_UPDATE_TIME, or the
+        # frontend polls a delta and churns the gallery for nothing.
+        if row_changed:
+            update_last_db_update_time() 
 
     except Exception as e:
         update_exception = e
@@ -536,7 +608,7 @@ def sync_image_database_blocking():
                             continue
 
                         path_canon = os.path.join(subfolder_str, filename).replace('\\', '/')
-                        thumb_hash = hashlib.sha1(path_canon.encode('utf-8')).hexdigest()
+                        thumb_hash = thumb_hash_for_path(path_canon)
                         
                         disk_images_canons.add(path_canon)
                         top_level_subfolder = 'root'
@@ -544,14 +616,9 @@ def sync_image_database_blocking():
 
                         # --- ONLY PROCESS IF CHANGED OR NEW ---
                         existing_record = db_images.get(path_canon)
-                        should_process = False
-                        
-                        if not existing_record:
-                            should_process = True
-                        elif (existing_record['mtime'] != file_stat.st_mtime or
-                              existing_record['size_bytes'] != file_stat.st_size or
-                              existing_record.get('thumb_hash') != thumb_hash):
-                            should_process = True
+                        should_process = _should_process_image(
+                            existing_record, file_stat.st_mtime, file_stat.st_size, thumb_hash,
+                        )
                             
                         if should_process:
                             # Only extract metadata if we actually need to write to DB
@@ -612,6 +679,19 @@ def sync_image_database_blocking():
             
             # Final commit for remaining updates
             conn.commit()
+
+        # Guard rail: a healthy incremental pass only rewrites the handful of
+        # files that actually changed. If almost the whole DB is flagged as
+        # "changed" on every pass, the comparison is broken (e.g. mtime drift /
+        # thumb_hash mismatch) and the frontend would refresh every thumbnail
+        # forever. Log loudly instead of failing silently.
+        if (changed_count > _SYNC_CHANGED_ANOMALY_ABS and
+                changed_count > _SYNC_CHANGED_ANOMALY_RATIO * max(1, len(db_images))):
+            print(f"⚠️ [Holaf-ImageViewer] ANOMALY: {changed_count}/{len(db_images)} images "
+                  f"flagged as changed in a single sync pass "
+                  f">({_SYNC_CHANGED_ANOMALY_RATIO:.0%}). The change predicate may be "
+                  f"broken (mtime drift / thumb_hash mismatch) — thumbnails would "
+                  f"regenerate on every poll.")
 
         stale_canons = set(db_images.keys()) - disk_images_canons
         if stale_canons:

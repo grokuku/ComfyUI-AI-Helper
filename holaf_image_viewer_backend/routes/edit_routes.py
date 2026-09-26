@@ -257,9 +257,8 @@ async def save_edits_route(request: web.Request):
         # --- FIX: Synchronously regenerate the thumbnail so the frontend gets the updated version ---
         original_abs_path = os.path.normpath(os.path.join(output_dir, safe_path))
         if os.path.isfile(original_abs_path):
-            import hashlib
             from ... import holaf_utils
-            path_hash = hashlib.sha1(safe_path.encode('utf-8')).hexdigest()
+            path_hash = logic.thumb_hash_for_path(safe_path)
             thumb_filename = f"{path_hash}.jpg"
             thumb_path_abs = os.path.join(holaf_utils.THUMBNAIL_CACHE_DIR, thumb_filename)
             try:
@@ -275,12 +274,16 @@ async def save_edits_route(request: web.Request):
             except Exception as e_thumb:
                 print(f"🟡 [Holaf-Edit] Thumbnail regeneration failed (non-fatal): {e_thumb}")
 
-            # ── Invalider le cache navigateur : nouveau thumb_hash ──
+            # ── thumb_hash : garder la clé CANONIQUE sha1(path_canon) ──
+            # Le cache navigateur est invalidé côté JS par forceReload (param `?t=`).
+            # Écrire ici un hash aléatoire faisait diverger la clé de la source de
+            # vérité utilisée partout ailleurs : le sync suivant voyait un faux
+            # changement et régénérait cette vignette (déjà à jour) en boucle.
             try:
                 conn2 = holaf_database.get_db_connection()
-                new_hash = hashlib.sha1((safe_path + str(time.time())).encode('utf-8')).hexdigest()[:12]
+                canonical_hash = logic.thumb_hash_for_path(safe_path)
                 cursor2 = conn2.cursor()
-                cursor2.execute("UPDATE images SET thumb_hash = ? WHERE path_canon = ?", (new_hash, path_canon))
+                cursor2.execute("UPDATE images SET thumb_hash = ? WHERE path_canon = ?", (canonical_hash, path_canon))
                 conn2.commit()
                 holaf_database.close_db_connection()
             except Exception as e:
@@ -349,9 +352,8 @@ async def delete_edits_route(request: web.Request):
         # --- FIX: Synchronously regenerate the thumbnail (without edits) ---
         original_abs_path = os.path.normpath(os.path.join(output_dir, safe_path))
         if os.path.isfile(original_abs_path):
-            import hashlib
             from ... import holaf_utils
-            path_hash = hashlib.sha1(safe_path.encode('utf-8')).hexdigest()
+            path_hash = logic.thumb_hash_for_path(safe_path)
             thumb_filename = f"{path_hash}.jpg"
             thumb_path_abs = os.path.join(holaf_utils.THUMBNAIL_CACHE_DIR, thumb_filename)
             try:

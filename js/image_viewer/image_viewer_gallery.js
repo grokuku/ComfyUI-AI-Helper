@@ -1345,6 +1345,29 @@ function syncGallery(viewer, images) {
     }
 }
 
+// Re-render after an incremental delta (insert at top / remove) WITHOUT
+// resetting the window cache: the loaded windows and their thumbnails survive.
+// Only used by the periodic-refresh delta path; full rebuilds still go through
+// syncGallery().
+function refreshAfterIncremental(viewer) {
+    viewerInstance = viewer;
+    // Nothing to render if the gallery panel was never opened. The next full
+    // load (panel open / filter change) rebuilds everything from state anyway.
+    if (!galleryEl || !galleryGridEl) return;
+
+    const state = imageViewerState.getState();
+    const total = (state.totalCount != null && state.totalCount > 0)
+        ? state.totalCount
+        : (state.images ? state.images.length : 0);
+    if (!total || !galleryGridEl) return;
+
+    // Going from an empty result back to a populated one must drop the placeholder.
+    const emptyMsg = galleryGridEl.querySelector('.holaf-viewer-empty-message');
+    if (emptyMsg) emptyMsg.remove();
+
+    updateLayout(true);
+}
+
 function refreshThumbnailInGallery(path_canon) {
     const placeholder = renderedPlaceholders.get(path_canon);
     if (!placeholder) return;
@@ -1435,6 +1458,7 @@ export {
     ensureImageVisible,
     alignImageOnExit,
     refreshThumbnailInGallery,
+    refreshAfterIncremental,
     forceRelayout,
     getThumbnailUrl
 };
