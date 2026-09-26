@@ -41,6 +41,7 @@ if _NODE_DIR not in _sys.path:
     _sys.path.insert(0, _NODE_DIR)
 
 from holaf_node_helpers import validate_base_path, validate_subfolder  # noqa: E402  (requires _NODE_DIR above)
+from aih import media_upload  # noqa: E402  (pack root on sys.path via extension __init__)
 
 logger = logging.getLogger("Holaf.SaveMedia")
 
@@ -60,6 +61,7 @@ class HolafSaveMedia:
                 "mode": (["image", "video", "audio"], {"default": "image"}),
 
                 "--- GENERIC SETTINGS ---": (["-----------------"],),
+                "save_to_server": ("BOOLEAN", {"default": False}),
                 "base_path": ("STRING", {"default": folder_paths.get_output_directory()}),
                 "subfolder": ("STRING", {"default": "%Y-%m-%d"}),
                 "filename": ("STRING", {"default": "%Y-%m-%d-%Hh%Mm%Ss"}),
@@ -220,6 +222,24 @@ class HolafSaveMedia:
             except OSError:
                 pass
 
+    @staticmethod
+    def _build_workflow_json(extra_pnginfo):
+        """Sérialise le graphe UI (extra_pnginfo['workflow']) en JSON.
+
+        Retourne une chaîne vide si le workflow n'est pas disponible. Ne
+        retombe JAMAIS sur le prompt API (prompt_hidden) : cela écrirait le
+        prompt comme s'il s'agissait du workflow (perte de données).
+        """
+        workflow_data = None
+        if extra_pnginfo and isinstance(extra_pnginfo, dict):
+            workflow_data = extra_pnginfo.get('workflow')
+        if not workflow_data:
+            return ""
+        try:
+            return json.dumps(workflow_data, indent=2)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to serialize workflow: {e}"})
+
     def _save_metadata(self, output_path, base_name, prompt, save_prompt, save_workflow, prompt_hidden, extra_pnginfo):
         workflow_json = ""
 
@@ -237,19 +257,9 @@ class HolafSaveMedia:
         # Never fall back to prompt_hidden (which is the API prompt, not the
         # UI workflow) — that would silently write the prompt as if it were
         # the workflow and cause data loss for the user.
-        workflow_data = None
-        if extra_pnginfo and isinstance(extra_pnginfo, dict):
-            workflow_data = extra_pnginfo.get('workflow')
-
-        if workflow_data:
-            try:
-                workflow_json = json.dumps(workflow_data, indent=2)
-            except Exception as e:
-                workflow_json = json.dumps({"error": f"Failed to serialize workflow: {e}"})
-        else:
-            workflow_json = ""
-            if save_workflow:
-                logger.warning("Workflow not available in extra_pnginfo; skipping workflow JSON save.")
+        workflow_json = self._build_workflow_json(extra_pnginfo)
+        if not workflow_json and save_workflow:
+            logger.warning("Workflow not available in extra_pnginfo; skipping workflow JSON save.")
 
         if save_workflow and workflow_json:
             workflow_path = os.path.join(output_path, f"{base_name}.json")
@@ -260,6 +270,68 @@ class HolafSaveMedia:
                 logger.error(f"Error saving workflow: {e}")
 
         return workflow_json
+
+    # ── Server mode (sauvegarde sur le backend AIH) ──────────────────────
+
+    def _unique_temp_name(self, directory, base_name, ext):
+        """Retourne (filepath, filename) unique dans ``directory``."""
+        counter = 1
+        name = f"{base_name}{ext}"
+        path = os.path.join(directory, name)
+        while os.path.exists(path):
+            name = f"{base_name}_{counter:04d}{ext}"
+            path = os.path.join(directory, name)
+            counter += 1
+        return path, name
+
+    def _make_preview_entry(self, src_path, base_name, ext, ts):
+        """Copie le média produit dans le dossier temp ComfyUI pour la vignette.
+
+        Le node est un OUTPUT_NODE : le résultat UI pointe vers un fichier de
+        type ``temp`` pour que la vignette native s'affiche sans être comptée
+        comme une sauvegarde locale. Échec best-effort (log warning, pas de
+        rupture : le média est déjà sauvegardé sur le serveur).
+        """
+        if not src_path or not os.path.isfile(src_path):
+            return None
+        try:
+            temp_root = folder_paths.get_temp_directory()
+            os.makedirs(temp_root, exist_ok=True)
+            preview_path, preview_name = self._unique_temp_name(temp_root, f"aih_srv_{base_name}", ext)
+            shutil.copy2(src_path, preview_path)
+            return {"filename": preview_name, "subfolder": "", "type": "temp"}
+        except Exception as e:
+            logger.warning(f"{ts()} Preview copy failed: {e}")
+            return None
+
+    def _upload_media_file(self, temp_path, formatted_subfolder, filename_base, ext,
+                           kind, prompt_meta, workflow_meta, ts):
+        """Upload chunké d'un média vers le serveur (ÉCHEC DUR).
+
+        Lève :class:`aih.media_upload.MediaUploadError` si le serveur n'est pas
+        configuré/injoignable ou refuse l'upload : le node passe en erreur, sans
+        aucun repli local.
+        """
+        t0 = time.time()
+        result = media_upload.upload_media(
+            temp_path,
+            subfolder=formatted_subfolder,
+            filename_base=filename_base,
+            ext=ext,
+            kind=kind,
+            prompt=prompt_meta,
+            workflow=workflow_meta,
+        )
+        logger.info(f"{ts()} Server upload OK ({kind}): {result.get('path')} in {time.time()-t0:.2f}s")
+        return result
+
+    def _cleanup_staged(self, path):
+        """Supprime un fichier de staging après upload (best-effort)."""
+        if path and os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _write_audio_to_stream(self, container, audio_stream, audio_np, sample_rate):
         """Safely writes a numpy audio array to a PyAV stream."""
@@ -382,6 +454,7 @@ class HolafSaveMedia:
         filename = kwargs.get("filename", "%Y-%m-%d-%Hh%Mm%Ss")
         save_prompt = kwargs.get("save_prompt", True)
         save_workflow = kwargs.get("save_workflow", True)
+        save_to_server = bool(kwargs.get("save_to_server", False))
         temp_dir_setting = kwargs.get("temp_dir", "")
 
         prompt = kwargs.get("prompt", "")
@@ -397,7 +470,12 @@ class HolafSaveMedia:
             formatted_subfolder = now.strftime(subfolder)
         except Exception:
             formatted_subfolder = now.strftime('%Y-%m-%d')
-        formatted_subfolder = self._validate_subfolder(base_path, formatted_subfolder)
+        if save_to_server:
+            # base_path est ignoré : le sous-dossier part tel quel vers le
+            # serveur (sanitizé ici, re-sanitizé côté backend).
+            formatted_subfolder = media_upload.sanitize_subfolder(formatted_subfolder)
+        else:
+            formatted_subfolder = self._validate_subfolder(base_path, formatted_subfolder)
         try:
             formatted_filename_base = now.strftime(filename)
         except Exception:
@@ -405,9 +483,6 @@ class HolafSaveMedia:
         # Security: sanitize the formatted base filename so it cannot contain
         # path separators or '..' components (path-traversal protection).
         formatted_filename_base = self._sanitize_base_filename(formatted_filename_base)
-
-        output_path = os.path.join(base_path, formatted_subfolder)
-        os.makedirs(output_path, exist_ok=True)
 
         # Resolve temp directory for fast encoding
         if temp_dir_setting and temp_dir_setting.strip():
@@ -422,7 +497,23 @@ class HolafSaveMedia:
                 temp_dir = self._detect_temp_dir()
         else:
             temp_dir = self._detect_temp_dir()
+
+        if save_to_server:
+            # Staging serveur : le média est encodé dans un dossier temporaire,
+            # uploadé, puis supprimé. Aucune écriture dans le dossier de sortie
+            # (base_path totalement ignoré) — aucune sauvegarde locale.
+            output_path = temp_dir
+        else:
+            output_path = os.path.join(base_path, formatted_subfolder)
+            os.makedirs(output_path, exist_ok=True)
         logger.info(f"{ts()} Mode: {mode} | Temp: {temp_dir} | Output: {output_path}")
+
+        # Métadonnées serveur (prompt + workflow), envoyées avec le média.
+        prompt_meta = ""
+        workflow_meta = ""
+        if save_to_server:
+            prompt_meta = prompt if save_prompt else ""
+            workflow_meta = self._build_workflow_json(extra_pnginfo) if save_workflow else ""
 
         # 3. ROUTING LOGIC
         if mode == "image":
@@ -457,15 +548,33 @@ class HolafSaveMedia:
                     else:
                         img.save(file_path, quality=kwargs.get("image_quality", 90))
 
-                    # Only update final_path after a successful save so we
-                    # never return a path to a file that doesn't exist (A14).
-                    final_path = file_path
-                    results.append({"filename": final_filename, "subfolder": formatted_subfolder, "type": self.type})
+                    if save_to_server:
+                        # ÉCHEC DUR : toute exception (save ou upload) remonte.
+                        server_result = self._upload_media_file(
+                            file_path, formatted_subfolder, base_name, ext,
+                            "image", prompt_meta, workflow_meta, ts)
+                        final_path = server_result.get("path", "")
+                        entry = self._make_preview_entry(file_path, base_name, ext, ts)
+                        if entry:
+                            results.append(entry)
+                        self._cleanup_staged(file_path)
+                    else:
+                        # Only update final_path after a successful save so we
+                        # never return a path to a file that doesn't exist (A14).
+                        final_path = file_path
+                        results.append({"filename": final_filename, "subfolder": formatted_subfolder, "type": self.type})
                 except Exception as e:
-                     logger.error(f"{ts()} Error saving image {i}: {e}")
+                    if save_to_server:
+                        # Échec dur : on nettoie le staging avant de propager.
+                        self._cleanup_staged(file_path)
+                        raise
+                    logger.error(f"{ts()} Error saving image {i}: {e}")
 
                 if i == 0:
-                    workflow_json = self._save_metadata(output_path, base_name, prompt, save_prompt, save_workflow, prompt_hidden, extra_pnginfo)
+                    if save_to_server:
+                        workflow_json = workflow_meta
+                    else:
+                        workflow_json = self._save_metadata(output_path, base_name, prompt, save_prompt, save_workflow, prompt_hidden, extra_pnginfo)
 
                 if total <= 10 or (i + 1) % 10 == 0:
                     logger.info(f"{ts()} Image {i+1}/{total} saved in {time.time()-t_img:.2f}s")
@@ -603,18 +712,32 @@ class HolafSaveMedia:
                 # --- MOVE FROM TEMP TO FINAL ---
                 self._safe_move(temp_video_path, video_path, ts)
 
-                # --- SAVE METADATA ---
-                t0 = time.time()
-                workflow_json = self._save_metadata(output_path, base_name, prompt, save_prompt, save_workflow, prompt_hidden, extra_pnginfo)
-                logger.info(f"{ts()} Metadata saved: {time.time()-t0:.2f}s")
+                if save_to_server:
+                    # ÉCHEC DUR : l'upload remonte toute erreur (pas de repli local).
+                    server_result = self._upload_media_file(
+                        video_path, formatted_subfolder, base_name, ext,
+                        "video", prompt_meta, workflow_meta, ts)
+                    final_output_path = server_result.get("path", "")
+                    entry = self._make_preview_entry(video_path, base_name, ext, ts)
+                    results = [entry] if entry else []
+                    workflow_json = workflow_meta
+                else:
+                    # --- SAVE METADATA ---
+                    t0 = time.time()
+                    workflow_json = self._save_metadata(output_path, base_name, prompt, save_prompt, save_workflow, prompt_hidden, extra_pnginfo)
+                    logger.info(f"{ts()} Metadata saved: {time.time()-t0:.2f}s")
+                    final_output_path = video_path
+                    results = [{"filename": final_video_filename, "subfolder": formatted_subfolder, "type": self.type}]
 
                 t_total = time.time() - t_total_start
                 logger.info(f"{ts()} ═══ VIDEO DONE ═══ {t_total:.2f}s total | {final_video_filename}")
-                results = [{"filename": final_video_filename, "subfolder": formatted_subfolder, "type": self.type}]
                 ui_key = "gifs" if v_container == "gif" else "videos"
             finally:
                 self._cleanup_temp(temp_video_path, video_path)
-            return {"ui": {ui_key: results}, "result": (image_tensor, audio_data, video_path, prompt, workflow_json)}
+                if save_to_server:
+                    # Supprime le staging après upload + aperçu (ou en cas d'échec).
+                    self._cleanup_staged(video_path)
+            return {"ui": {ui_key: results}, "result": (image_tensor, audio_data, final_output_path, prompt, workflow_json)}
 
 
         elif mode == "audio":
@@ -673,14 +796,33 @@ class HolafSaveMedia:
                 final_audio_filename = ""
                 base_name = ""
 
-            t0 = time.time()
-            workflow_json = self._save_metadata(output_path, base_name, prompt, save_prompt, save_workflow, prompt_hidden, extra_pnginfo)
-            logger.info(f"{ts()} Metadata saved: {time.time()-t0:.2f}s")
-            
+            # Le staging (audio_path) est uploadé puis supprimé en mode serveur.
+            final_output_path = audio_path or ""
+            results = []
+            if save_to_server:
+                if audio_path and os.path.isfile(audio_path):
+                    try:
+                        # ÉCHEC DUR : l'upload remonte toute erreur (pas de repli local).
+                        server_result = self._upload_media_file(
+                            audio_path, formatted_subfolder, base_name, ext,
+                            "audio", prompt_meta, workflow_meta, ts)
+                        final_output_path = server_result.get("path", "")
+                        entry = self._make_preview_entry(audio_path, base_name, ext, ts)
+                        if entry:
+                            results.append(entry)
+                    finally:
+                        # Supprime le staging après succès ou échec.
+                        self._cleanup_staged(audio_path)
+                workflow_json = workflow_meta
+            else:
+                t0 = time.time()
+                workflow_json = self._save_metadata(output_path, base_name, prompt, save_prompt, save_workflow, prompt_hidden, extra_pnginfo)
+                logger.info(f"{ts()} Metadata saved: {time.time()-t0:.2f}s")
+                results = [{"filename": final_audio_filename, "subfolder": formatted_subfolder, "type": self.type}]
+
             t_total = time.time() - t_total_start
             logger.info(f"{ts()} ═══ AUDIO DONE ═══ {t_total:.2f}s total | {final_audio_filename}")
-            results = [{"filename": final_audio_filename, "subfolder": formatted_subfolder, "type": self.type}]
-            return {"ui": {"audios": results}, "result": (image_tensor, audio_data, audio_path, prompt, workflow_json)}
+            return {"ui": {"audios": results}, "result": (image_tensor, audio_data, final_output_path, prompt, workflow_json)}
 
         logger.info(f"{ts()} ═══ NOTHING SAVED ═══ {time.time()-t_total_start:.2f}s total")
         return {"ui": {}, "result": (image_tensor, audio_data, "", "", "")}

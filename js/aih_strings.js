@@ -1197,6 +1197,10 @@ import "./aih_i18n.js";
         "lt.title": "Outils de mise en page",
         "lt.moveToOrigin": "Déplacer le workflow visible à l'origine (0,0)",
         "lt.recentered": "Recentré {count} éléments",
+
+        /* Save Media (aih_save_media_widget.js) */
+        "sm.saveToServer": "Sauvegarder sur le serveur",
+        "sm.basePathGreyed": "Ignoré : le média est sauvegardé sur le serveur",
     };
 
     // ─── ENGLISH ───────────────────────────────────────────────────────────
@@ -2372,6 +2376,10 @@ import "./aih_i18n.js";
         "lt.title": "Layout Tools",
         "lt.moveToOrigin": "Move Visible Workflow to Origin (0,0)",
         "lt.recentered": "Recentered {count} elements",
+
+        /* Save Media (aih_save_media_widget.js) */
+        "sm.saveToServer": "Save to server",
+        "sm.basePathGreyed": "Ignored: the media is saved on the server",
     };
 
     I18n.addDict("fr", FR);
