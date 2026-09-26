@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafToast · version 0.5.0
+ * Holaf UI — Brique HolafToast · version 0.6.0
  * ─────────────────────────────────────────────────────────────────────────────
  * Notifications flottantes (toasts) autonomes, zéro dépendance runtime :
  * 4 types (info/success/warning/error) avec icône, empilement par position
@@ -19,6 +19,38 @@
  * comme base (top-center), variantes ajoutées (right/left/up/down), toujours
  * sans fill-mode d'entrée (le to{opacity:1} garantit l'état final).
  * Rétrocompatible : sans configuration, comportement historique identique.
+ *
+ * v0.5.1 — NONCE CSP (additif, STRICTEMENT rétrocompatible) : les hôtes à CSP
+ * strict (style-src 'self', sans 'unsafe-inline') bloquent le <style> injecté
+ * par JS. setStyleNonce(nonce) pose un nonce GLOBAL (setStyleNonce(null)
+ * réinitialise) ; l'option par appel — 2ᵉ argument de show() { nonce } ou champ
+ * `nonce` de opts (helpers inclus) — PRIME sur le global. Le nonce est appliqué
+ * au <style id="holaf-toast-style"> AVANT son insertion dans le <head>. Sans
+ * nonce configuré : même id, même CSS, même point d'insertion, aucun attribut
+ * ajouté (comportement d'origine à l'identique). Aucune signature existante ne
+ * change.
+ *
+ * v0.5.2 — MODE CSS EXTERNE (additif, STRICTEMENT rétrocompatible) :
+ * alternative propre au nonce pour les hôtes à CSP strict (style-src 'self').
+ * HolafToast.getCss() expose la chaîne CSS complète de la brique (à servir
+ * comme fichier .css statique) ; l'option `injectStyles` (boolean, défaut
+ * true) désactive l'injection du <style> — globalement via
+ * configure({ injectStyles: false }), ou par appel (2ᵉ argument de show()
+ * { injectStyles } ou champ `injectStyles` de opts, helpers inclus), l'appel
+ * primant sur le global. Avec injectStyles:false, AUCUNE balise <style> n'est
+ * créée ni insérée (l'hôte charge le CSS via son propre fichier). Défaut
+ * inchangé.
+ * v0.6.0 — CATALOGUE DE THÈMES À 2 AXES (additif, STRICTEMENT rétrocompatible) :
+ * le registre passe des 4 presets plats historiques (dark / light / midnight /
+ * slate) aux 10 combinaisons `<famille>-<mode>` : indigo-light, indigo-dark,
+ * midnight-light, midnight-dark, slate-light, slate-dark, emerald-light,
+ * emerald-dark, amber-light, amber-dark. Cohérence STRICTE page↔toast sur les
+ * surfaces/texte/bordure (miroirs des presets homonymes de HolafTokens 0.2.0),
+ * embarqués en DONNÉES LITTÉRALES (aucune logique de génération dupliquée,
+ * zéro dépendance runtime). light / midnight / slate deviennent des ALIAS
+ * EXACTS de indigo-light / midnight-dark / slate-dark. `dark` reste un preset
+ * GELÉ (défaut CSS #2b2b2b) volontairement distinct de indigo-dark (#1e1e1e),
+ * pour zéro rupture — voir commentaire du registre. Aucune API ne change.
  *
  * v0.4.0 — fond teinté PAR TYPE (info/success/warning/error) avec fallback :
  * nouvelles variables de thème OPTIONNELLES --ht-bg-info, --ht-bg-success,
@@ -54,7 +86,7 @@
 const HolafToast = (function () {
     "use strict";
 
-    const VERSION = "0.5.0";
+    const VERSION = "0.6.0";
 
     // ─── Constantes du module ────────────────────────────────────────────────
     const CSS_ID = "holaf-toast-style";
@@ -216,17 +248,196 @@ const HolafToast = (function () {
     }
 
     // ─── Préréglages génériques (enregistrés au chargement de la brique) ────
-    // Contraste des textes ≥ 4.5:1. PAS de --ht-width dans un preset : la
-    // largeur reste gouvernée par la brique (un thème ne doit pas pouvoir
-    // casser le responsive mobile).
+    // CATALOGUE À 2 AXES (v0.6.0) : 5 familles (indigo, midnight, slate,
+    // emerald, amber) × 2 modes (light, dark) = 10 presets `<famille>-<mode>`,
+    // puis les 4 NOMS HISTORIQUES (dark / light / midnight / slate). Contraste
+    // des textes ≥ 4.5:1. PAS de --ht-width dans un preset : la largeur reste
+    // gouvernée par la brique (responsive mobile).
+    //
+    // PROVENANCE DES VALEURS (DONNÉES LITTÉRALES, aucun calcul runtime) : les
+    // 10 presets sont les MIROIRS des presets homonymes de HolafTokens 0.2.0
+    // (js/holaf-tokens.js), figés ici pour que la brique reste AUTONOME (zéro
+    // dépendance runtime). Cohérence STRICTE page↔toast sur les surfaces, le
+    // texte et la bordure :
+    //     --ht-bg ← surface · --ht-fg ← text · --ht-border ← border
+    // Les accents de TYPE (--ht-accent-*) sont propres au toast (HolafTokens
+    // n'a pas de notion de « type ») :
+    //     --ht-accent-info    = accent de la FAMILLE (HolafTokens `accent`) sur
+    //                           les presets non historiques ; pour indigo-light
+    //                           / midnight-dark / slate-dark on CONSERVE les
+    //                           accents de type HISTORIQUES (identité alias).
+    //     --ht-accent-success = vert sémantique par mode (light #15803d /
+    //                           dark #34d399)
+    //     --ht-accent-warning = ambre sémantique par mode (light #b45309 /
+    //                           dark #fbbf24)
+    //     --ht-accent-error   = danger de HolafTokens
     // v0.4.0 : chaque preset définit aussi des fonds teintés PAR TYPE
-    // (--ht-bg-success/warning/error : ~15 % de l'accent du type mélangé dans
-    // --ht-bg, hex calculés à la main — pas de color-mix(), compat maximum).
-    // PAS de --ht-bg-info : le type info reste neutre (fond --ht-bg via le
-    // fallback du CSS). SANS thème, les défauts CSS restent sans teinte.
-    // dark : reprend les valeurs par défaut du CSS injecté pour les vars
-    // communes (theme:"dark" ≡ défauts historiques) — il y ajoute les teintes
-    // par type ci-dessous.
+    // (--ht-bg-success/warning/error = mix(surface, accent de type, 0.15) —
+    // MÊME formule que les teintes historiques, pas de color-mix()). PAS de
+    // --ht-bg-info : le type info reste neutre (fond --ht-bg via le fallback
+    // du CSS). SANS thème, les défauts CSS restent sans teinte.
+    // --ht-radius (10px) et --ht-shadow (0 6px 24px …) restent propres au toast,
+    // alignés sur les presets historiques (pas les valeurs de page).
+    // Les hex GÉNÉRÉS sont repris À L'IDENTIQUE (casse comprise) de
+    // HolafTokens.PRESETS pour que le test de cohérence inter-briques passe.
+    const THEME_PRESETS = {
+        "indigo-light": {
+            "--ht-bg": "#ffffff",
+            "--ht-bg-success": "#dcece2",
+            "--ht-bg-warning": "#f4e5da",
+            "--ht-bg-error": "#fadede",
+            "--ht-fg": "#18181b",
+            "--ht-border": "#d4d4d8",
+            "--ht-accent-info": "#2563eb",
+            "--ht-accent-success": "#15803d",
+            "--ht-accent-warning": "#b45309",
+            "--ht-accent-error": "#dc2626",
+            "--ht-shadow": "0 6px 24px rgba(24, 24, 27, 0.18)",
+            "--ht-radius": "10px",
+        },
+        "indigo-dark": {
+            "--ht-bg": "#1e1e1e",
+            "--ht-bg-success": "#213930",
+            "--ht-bg-warning": "#3F361F",
+            "--ht-bg-error": "#3D2424",
+            "--ht-fg": "#e4e4e7",
+            "--ht-border": "#3f3f46",
+            "--ht-accent-info": "#6366f1",
+            "--ht-accent-success": "#34d399",
+            "--ht-accent-warning": "#fbbf24",
+            "--ht-accent-error": "#ef4444",
+            "--ht-shadow": "0 6px 24px rgba(0, 0, 0, 0.55)",
+            "--ht-radius": "10px",
+        },
+        "midnight-light": {
+            "--ht-bg": "#F6F7FC",
+            "--ht-bg-success": "#D4E5DF",
+            "--ht-bg-warning": "#ECDED8",
+            "--ht-bg-error": "#F2D8DC",
+            "--ht-fg": "#18181B",
+            "--ht-border": "#D4D6F3",
+            "--ht-accent-info": "#5B63D3",
+            "--ht-accent-success": "#15803d",
+            "--ht-accent-warning": "#b45309",
+            "--ht-accent-error": "#DC2626",
+            "--ht-shadow": "0 6px 24px rgba(24, 24, 27, 0.18)",
+            "--ht-radius": "10px",
+        },
+        "midnight-dark": {
+            "--ht-bg": "#10111d",
+            "--ht-bg-success": "#152e30",
+            "--ht-bg-warning": "#332b1e",
+            "--ht-bg-error": "#331f2a",
+            "--ht-fg": "#e2e4f0",
+            "--ht-border": "#272a44",
+            "--ht-accent-info": "#60a5fa",
+            "--ht-accent-success": "#34d399",
+            "--ht-accent-warning": "#fbbf24",
+            "--ht-accent-error": "#f87171",
+            "--ht-shadow": "0 6px 24px rgba(0, 0, 0, 0.6)",
+            "--ht-radius": "10px",
+        },
+        "slate-light": {
+            "--ht-bg": "#F4F6F8",
+            "--ht-bg-success": "#D3E4DC",
+            "--ht-bg-warning": "#EADED4",
+            "--ht-bg-error": "#F0D7D9",
+            "--ht-fg": "#18181B",
+            "--ht-border": "#CED3D9",
+            "--ht-accent-info": "#475569",
+            "--ht-accent-success": "#15803d",
+            "--ht-accent-warning": "#b45309",
+            "--ht-accent-error": "#DC2626",
+            "--ht-shadow": "0 6px 24px rgba(24, 24, 27, 0.18)",
+            "--ht-radius": "10px",
+        },
+        "slate-dark": {
+            "--ht-bg": "#1f232b",
+            "--ht-bg-success": "#2b4040",
+            "--ht-bg-warning": "#403d30",
+            "--ht-bg-error": "#40373d",
+            "--ht-fg": "#e6e9ee",
+            "--ht-border": "#3a4150",
+            "--ht-accent-info": "#93c5fd",
+            "--ht-accent-success": "#6ee7b7",
+            "--ht-accent-warning": "#fcd34d",
+            "--ht-accent-error": "#fca5a5",
+            "--ht-shadow": "0 6px 24px rgba(0, 0, 0, 0.5)",
+            "--ht-radius": "10px",
+        },
+        "emerald-light": {
+            "--ht-bg": "#FFFFFF",
+            "--ht-bg-success": "#DCECE2",
+            "--ht-bg-warning": "#F4E5DA",
+            "--ht-bg-error": "#FADEDE",
+            "--ht-fg": "#18181B",
+            "--ht-border": "#C8E1DA",
+            "--ht-accent-info": "#047857",
+            "--ht-accent-success": "#15803d",
+            "--ht-accent-warning": "#b45309",
+            "--ht-accent-error": "#DC2626",
+            "--ht-shadow": "0 6px 24px rgba(24, 24, 27, 0.18)",
+            "--ht-radius": "10px",
+        },
+        "emerald-dark": {
+            "--ht-bg": "#0B1512",
+            "--ht-bg-success": "#113226",
+            "--ht-bg-warning": "#2F2F15",
+            "--ht-bg-error": "#2D1C1A",
+            "--ht-fg": "#F4F4F5",
+            "--ht-border": "#143F30",
+            "--ht-accent-info": "#34D399",
+            "--ht-accent-success": "#34d399",
+            "--ht-accent-warning": "#fbbf24",
+            "--ht-accent-error": "#EF4444",
+            "--ht-shadow": "0 6px 24px rgba(0, 0, 0, 0.55)",
+            "--ht-radius": "10px",
+        },
+        "amber-light": {
+            "--ht-bg": "#FFFFFF",
+            "--ht-bg-success": "#DCECE2",
+            "--ht-bg-warning": "#F4E5DA",
+            "--ht-bg-error": "#FADEDE",
+            "--ht-fg": "#18181B",
+            "--ht-border": "#EFD9C9",
+            "--ht-accent-info": "#B45309",
+            "--ht-accent-success": "#15803d",
+            "--ht-accent-warning": "#b45309",
+            "--ht-accent-error": "#DC2626",
+            "--ht-shadow": "0 6px 24px rgba(24, 24, 27, 0.18)",
+            "--ht-radius": "10px",
+        },
+        "amber-dark": {
+            "--ht-bg": "#1A1408",
+            "--ht-bg-success": "#1E311E",
+            "--ht-bg-warning": "#3C2E0C",
+            "--ht-bg-error": "#3A1B11",
+            "--ht-fg": "#F4F4F5",
+            "--ht-border": "#4C3A0E",
+            "--ht-accent-info": "#FBBF24",
+            "--ht-accent-success": "#34d399",
+            "--ht-accent-warning": "#fbbf24",
+            "--ht-accent-error": "#EF4444",
+            "--ht-shadow": "0 6px 24px rgba(0, 0, 0, 0.55)",
+            "--ht-radius": "10px",
+        },
+    };
+    Object.keys(THEME_PRESETS).forEach((name) => themesRegister(name, THEME_PRESETS[name]));
+
+    // ─── Noms historiques (valeurs RIGOUREUSEMENT identiques) ───────────────
+    // light / midnight / slate deviennent des ALIAS EXACTS de indigo-light /
+    // midnight-dark / slate-dark : les surfaces/texte/bordure de ces familles
+    // sont déjà les palettes historiques, et leurs accents de type historiques
+    // sont conservés à l'intérieur des presets ci-dessus.
+    themesRegister("light", THEME_PRESETS["indigo-light"]);
+    themesRegister("midnight", THEME_PRESETS["midnight-dark"]);
+    themesRegister("slate", THEME_PRESETS["slate-dark"]);
+    // `dark` : ÉCART DOCUMENTÉ — le preset historique de la brique
+    // (#2b2b2b / #f0f0f0 / #4a4a4a, défaut du CSS injecté) est DISTINCT du preset
+    // indigo-dark de HolafTokens (#1e1e1e / #e4e4e7 / #3f3f46). Conformément à
+    // la règle « zéro rupture », on NE corrige PAS : `dark` reste un preset
+    // GELÉ et n'est donc PAS un alias de indigo-dark. Qui veut la cohérence
+    // page↔toast utilise `indigo-dark` (ou la famille choisie).
     themesRegister("dark", {
         "--ht-bg": "#2b2b2b",
         "--ht-bg-success": "#303f35",
@@ -239,51 +450,6 @@ const HolafToast = (function () {
         "--ht-accent-warning": "#e0a030",
         "--ht-accent-error": "#e05555",
         "--ht-shadow": "0 6px 24px rgba(0, 0, 0, 0.35)",
-        "--ht-radius": "10px",
-    });
-    // light : clair zinc, accents plus foncés pour garder le contraste ≥ 4.5:1.
-    themesRegister("light", {
-        "--ht-bg": "#ffffff",
-        "--ht-bg-success": "#dcece2",
-        "--ht-bg-warning": "#f4e5da",
-        "--ht-bg-error": "#fadede",
-        "--ht-fg": "#18181b",
-        "--ht-border": "#d4d4d8",
-        "--ht-accent-info": "#2563eb",
-        "--ht-accent-success": "#15803d",
-        "--ht-accent-warning": "#b45309",
-        "--ht-accent-error": "#dc2626",
-        "--ht-shadow": "0 6px 24px rgba(24, 24, 27, 0.18)",
-        "--ht-radius": "10px",
-    });
-    // midnight : bleu nuit profond « layered », accents doux et lumineux.
-    themesRegister("midnight", {
-        "--ht-bg": "#10111d",
-        "--ht-bg-success": "#152e30",
-        "--ht-bg-warning": "#332b1e",
-        "--ht-bg-error": "#331f2a",
-        "--ht-fg": "#e2e4f0",
-        "--ht-border": "#272a44",
-        "--ht-accent-info": "#60a5fa",
-        "--ht-accent-success": "#34d399",
-        "--ht-accent-warning": "#fbbf24",
-        "--ht-accent-error": "#f87171",
-        "--ht-shadow": "0 6px 24px rgba(0, 0, 0, 0.6)",
-        "--ht-radius": "10px",
-    });
-    // slate : gris ardoise neutre, accents gris-bleu doux — le plus polyvalent.
-    themesRegister("slate", {
-        "--ht-bg": "#1f232b",
-        "--ht-bg-success": "#2b4040",
-        "--ht-bg-warning": "#403d30",
-        "--ht-bg-error": "#40373d",
-        "--ht-fg": "#e6e9ee",
-        "--ht-border": "#3a4150",
-        "--ht-accent-info": "#93c5fd",
-        "--ht-accent-success": "#6ee7b7",
-        "--ht-accent-warning": "#fcd34d",
-        "--ht-accent-error": "#fca5a5",
-        "--ht-shadow": "0 6px 24px rgba(0, 0, 0, 0.5)",
         "--ht-radius": "10px",
     });
 
@@ -334,6 +500,9 @@ const HolafToast = (function () {
     // v0.3.0 : si true, les nouveaux toasts s'insèrent EN PREMIER dans le
     // conteneur (prepend) au lieu d'ajouter à la fin (append, défaut historique).
     let newestFirst = false;
+    // v0.5.2 : mode CSS externe — si false, la brique n'injecte PAS son
+    // <style> (l'hôte sert le CSS via HolafToast.getCss()). Défaut true.
+    let injectStylesGlobal = true;
 
     function configure(opts) {
         opts = opts || {};
@@ -360,6 +529,29 @@ const HolafToast = (function () {
         if (opts.newestFirst !== undefined) {
             newestFirst = !!opts.newestFirst;
         }
+        if (opts.injectStyles !== undefined) {
+            // Seul `false` désactive l'injection (toute autre valeur = actif).
+            injectStylesGlobal = opts.injectStyles !== false;
+        }
+    }
+
+    // Injection effective des styles : 2ᵉ argument (callOpts.injectStyles) >
+    // champ opts.injectStyles > réglage global. Seul `false` désactive (toute
+    // autre valeur = actif). Un `undefined` (option absente) laisse jouer le
+    // global. Voir aussi getCss() (mode CSS externe).
+    function resolveInjectStyles(opts, callOpts) {
+        let value;
+        if (callOpts && callOpts.injectStyles !== undefined) value = callOpts.injectStyles;
+        else if (opts && opts.injectStyles !== undefined) value = opts.injectStyles;
+        else return injectStylesGlobal;
+        return value !== false;
+    }
+
+    // CSS COMPLET de la brique — à écrire dans un fichier .css servi par
+    // l'hôte quand l'injection JS est désactivée (injectStyles: false). Retour
+    // strictement identique au contenu injecté par ensureStyle().
+    function getCss() {
+        return CSS_TEXT;
     }
 
     // ─── CSS auto-injecté (une seule fois) ───────────────────────────────────
@@ -589,11 +781,55 @@ const HolafToast = (function () {
 }
 `;
 
-    function ensureStyle() {
+    // ─── Nonce CSP (v0.5.1 — OPTIONNEL, additif) ────────────────────────────
+    // Les hôtes à CSP strict (style-src 'self', SANS 'unsafe-inline')
+    // bloquent un <style> inséré par JS tant qu'il ne porte pas le nonce de la
+    // page. On peut le fournir de deux façons, la seconde primant sur la
+    // première :
+    //   1) globalement : HolafToast.setStyleNonce("<nonce>") ;
+    //      HolafToast.setStyleNonce(null) réinitialise le comportement d'origine.
+    //   2) par appel : show(opts, { nonce }) ou champ `nonce` de opts (les
+    //      helpers success/error/warning/info le transmettent) — une valeur
+    //      null/vide = « aucun nonce » explicite (surcharge le global).
+    // Le nonce est posé sur l'élément AVANT son insertion dans le <head>.
+    // SANS nonce configuré : aucun attribut ajouté, comportement historique.
+    let styleNonce = null;
+
+    // Normalise une valeur de nonce : null/undefined/"" = aucun nonce.
+    function normalizeNonce(value) {
+        if (value === null || value === undefined || value === "") return null;
+        return String(value);
+    }
+
+    // Lit le nonce d'un élément : on privilégie l'IDL `el.nonce`, qui reste
+    // fiable même quand l'attribut est « masqué » après insertion (anti-
+    // exfiltration navigateur) ; repli getAttribute pour les vieux moteurs.
+    function readNonce(el) {
+        if (typeof el.nonce === "string") return normalizeNonce(el.nonce);
+        return normalizeNonce(el.getAttribute("nonce"));
+    }
+
+    // Réglage GLOBAL du nonce ; null/undefined/"" = réinitialisation.
+    function setStyleNonce(nonce) {
+        styleNonce = normalizeNonce(nonce);
+    }
+
+    function ensureStyle(nonceOpt) {
         if (typeof document === "undefined") return;
-        if (document.getElementById(CSS_ID)) return;
-        const style = document.createElement("style");
+        // Nonce effectif : option d'appel (nonceOpt) > réglage global. Un
+        // `undefined` (option absente) laisse donc jouer le réglage global.
+        const effective = nonceOpt === undefined ? styleNonce : normalizeNonce(nonceOpt);
+        let style = document.getElementById(CSS_ID);
+        const current = style ? readNonce(style) : null;
+        // Cas par défaut (aucun nonce des deux côtés) : le style existant est
+        // conservé tel quel — strictement identique à l'historique.
+        if (style && current === effective) return;
+        // Le nonce a changé (configuration tardive ou réinitialisation) : on
+        // recrée l'élément pour que le nonce soit appliqué AVANT l'insertion.
+        if (style && style.parentNode) style.parentNode.removeChild(style);
+        style = document.createElement("style");
         style.id = CSS_ID;
+        if (effective) style.setAttribute("nonce", effective);
         style.textContent = CSS_TEXT;
         document.head.appendChild(style);
     }
@@ -647,12 +883,19 @@ const HolafToast = (function () {
     }
 
     // ─── Cœur : show() ───────────────────────────────────────────────────────
-    function show(opts) {
+    function show(opts, callOpts) {
         opts = opts || {};
         if (typeof document === "undefined") {
             throw new Error("[HolafToast] DOM requis (show() appelé hors navigateur).");
         }
-        ensureStyle();
+        // Nonce CSP effectif : 2ᵉ argument (callOpts.nonce) > champ opts.nonce
+        // > réglage global setStyleNonce. `undefined` = on retombe sur le global.
+        const nonceOpt = (callOpts && Object.prototype.hasOwnProperty.call(callOpts, "nonce"))
+            ? callOpts.nonce
+            : (Object.prototype.hasOwnProperty.call(opts, "nonce") ? opts.nonce : undefined);
+        // Mode CSS externe : injectStyles:false → on n'injecte PAS le <style>
+        // (l'hôte sert le CSS via HolafToast.getCss()). Défaut : injection.
+        if (resolveInjectStyles(opts, callOpts)) ensureStyle(nonceOpt);
 
         // ── id métier (v0.3.0) : un toast vivant portant déjà cet id est MIS
         // À JOUR au lieu d'en créer un nouveau. Retourne le contrôleur existant.
@@ -964,7 +1207,14 @@ const HolafToast = (function () {
         // passent pas d'option `theme` — voir README section « Thèmes ».
         setTheme: setTheme,
         clearTheme: clearTheme,
-        // Défauts globaux (position, durée, thème, newestFirst) — voir README.
+        // Nonce CSP (v0.5.1) — global, surchargeable par appel : voir ensureStyle.
+        setStyleNonce: setStyleNonce,
+        // Mode CSS externe (v0.5.2) : getCss() renvoie le CSS complet de la
+        // brique ; configure({ injectStyles:false }) — ou show(...,
+        // { injectStyles:false }) par appel — désactivent l'injection du
+        // <style> (l'hôte sert alors son propre fichier .css).
+        getCss: getCss,
+        // Défauts globaux (position, durée, thème, newestFirst, injectStyles) — voir README.
         configure: configure,
         // Registre de thèmes (préréglages + customs) :
         //   themes.register(name, vars) — enregistre/remplace (retourne une copie protégée)

@@ -1,58 +1,54 @@
 /*
  * Copyright (C) 2025 Holaf
- * Holaf Utilities - Image Viewer incremental delta reconciliation.
+ * Holaf Utilities - Image Viewer incremental delta reconciliation (SHIM).
  *
- * Extracted from the periodic refresh (holaf_image_viewer.js#checkForUpdates) so
- * the "new / removed images" path is unit-testable without booting the whole
- * panel and its canvas/editor dependencies.
+ * Historiquement extrait de holaf_image_viewer.js#checkForUpdates pour rendre
+ * le chemin « nouvelles / images supprimées » testable sans démarrer tout le
+ * panneau. La logique vit désormais dans la brique VENDUE
+ * js/vendor/holaf/holaf-collection.js (HolafCollection.applyDelta) : ce fichier
+ * n'est plus qu'un ADAPTATEUR qui conserve À L'IDENTIQUE l'API publique
+ * (MASS_REMOVAL_THRESHOLD + applyIncrementalDelta(delta, deps)) sans modifier
+ * les call-sites.
  *
- * RULE: a small delta must NOT trigger a full loadFilteredImages() (which calls
- * resetWindowCache and re-fetches every visible thumbnail). Only the deltas that
- * cannot be reconciled in place — a mass removal, or a removal of an image that
- * is not currently in memory — fall back to a full reload. Filter changes and
- * the initial load are handled by the caller and keep doing a full reload.
+ * RÈGLE MÉTIER (inchangée) : un petit delta ne doit PAS déclencher un
+ * loadFilteredImages() complet (qui reset le cache de fenêtres et redemande
+ * chaque vignette). Seuls les deltas irréconciliables en place — suppression de
+ * masse, ou retrait d'une image absente de la mémoire — retombent sur un
+ * rechargement complet (deps.loadFilteredImages).
  */
 
-// Above this many removals in a single delta, patching indices is not worth it
-// (and is the signature of a bulk delete / trash empty) → full reload.
-export const MASS_REMOVAL_THRESHOLD = 100;
+import { HolafCollection } from '../vendor/holaf/holaf-collection.js';
+
+// Ré-export : la brique est la source de vérité du seuil.
+export const MASS_REMOVAL_THRESHOLD = HolafCollection.MASS_REMOVAL_THRESHOLD;
 
 /**
- * Apply an incremental delta without resetting the window cache.
+ * Applique un delta incrémental sans réinitialiser le cache de fenêtres.
  *
  * @param {{images?: Array, removed_path_canons?: Array}} delta
  * @param {object} deps
  * @param {Function} deps.getState
  * @param {Function} deps.insertImagesAtTop
  * @param {Function} deps.removeImagesByPaths
- * @param {Function} deps.loadFilteredImages - used ONLY for the fallback cases
+ * @param {Function} deps.loadFilteredImages - utilisé UNIQUEMENT en fallback.
  * @returns {Promise<{mode: string, inserted?: number, removed?: number, reason?: string}>}
  */
 export async function applyIncrementalDelta(delta, deps) {
-    const newImages = (delta && delta.images) || [];
-    const removedPaths = (delta && delta.removed_path_canons) || [];
+    // Adapte le delta spécifique à la galerie vers le delta générique de la brique.
+    const generic = {
+        items: (delta && delta.images) || [],
+        removedIds: (delta && delta.removed_path_canons) || [],
+    };
 
-    if (removedPaths.length >= MASS_REMOVAL_THRESHOLD) {
+    // La brique orchestre (seuil de masse, patch vs irréconciliable). On lui
+    // injecte les callbacks historiques pour préserver l'injection de deps.
+    const result = HolafCollection.applyDelta(generic, {
+        insertTop: (items) => deps.insertImagesAtTop(deps.getState(), items),
+        removeByIds: (ids) => deps.removeImagesByPaths(deps.getState(), ids),
+    });
+
+    if (result.mode === 'full-reload') {
         await deps.loadFilteredImages();
-        return { mode: 'full-reload', reason: 'mass-removal' };
     }
-
-    let inserted = 0;
-    if (newImages.length > 0) {
-        inserted = deps.insertImagesAtTop(deps.getState(), newImages);
-    }
-
-    let removed = 0;
-    if (removedPaths.length > 0) {
-        const result = deps.removeImagesByPaths(deps.getState(), removedPaths);
-        if (result === false) {
-            // Removal touched an image outside the loaded windows: its index is
-            // unknown, so patching indices would corrupt the list.
-            await deps.loadFilteredImages();
-            return { mode: 'full-reload', reason: 'unreconcilable-removal' };
-        }
-        removed = result;
-    }
-
-    return { mode: 'patched', inserted, removed };
+    return result;
 }

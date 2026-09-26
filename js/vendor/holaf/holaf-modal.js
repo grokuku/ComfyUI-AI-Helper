@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafModal · version 0.4.0
+ * Holaf UI — Brique HolafModal · version 0.5.0
  * ─────────────────────────────────────────────────────────────────────────────
  * Modale autonome (zéro dépendance runtime) : overlay, pile d'overlays
  * document-level, helpers Promise (alert / confirm / prompt / busy), focus
@@ -17,6 +17,37 @@
  * NATIVE du formulaire se déclenche au clic, la validation restant dans le
  * hôte. Les API existantes (alert / confirm / prompt / busy, fenêtre, thèmes)
  * sont strictement inchangées.
+ * v0.4.1 — NONCE CSP (additif, STRICTEMENT rétrocompatible) : les hôtes à CSP
+ * strict (style-src 'self', sans 'unsafe-inline') bloquent le <style> injecté
+ * par JS. setStyleNonce(nonce) pose un nonce GLOBAL (setStyleNonce(null)
+ * réinitialise) ; l'option par appel — 2ᵉ argument de open() { nonce } ou
+ * champ `nonce` de opts — PRIME sur le global. Le nonce est appliqué au
+ * <style id="holaf-modal-style"> AVANT son insertion dans le <head>. Sans
+ * nonce configuré : même id, même CSS, même point d'insertion, aucun attribut
+ * ajouté (comportement d'origine à l'identique). Aucune signature existante ne
+ * change.
+ * v0.4.2 — MODE CSS EXTERNE (additif, STRICTEMENT rétrocompatible) :
+ * alternative propre au nonce pour les hôtes à CSP strict (style-src 'self').
+ * HolafModal.getCss() expose la chaîne CSS complète de la brique (à servir
+ * comme fichier .css statique) ; l'option `injectStyles` (boolean, défaut
+ * true) désactive l'injection du <style> — globalement via
+ * configure({ injectStyles: false }), ou par appel (2ᵉ argument de open()
+ * { injectStyles } ou champ `injectStyles` de opts), l'appel primant sur le
+ * global. Avec injectStyles:false, AUCUNE balise <style> n'est créée ni
+ * insérée (l'hôte charge le CSS via son propre fichier). Défaut inchangé.
+ * v0.5.0 — CATALOGUE DE THÈMES À 2 AXES (additif, STRICTEMENT rétrocompatible) :
+ * le registre passe des 4 presets plats historiques (dark / light / midnight /
+ * slate) aux 10 combinaisons `<famille>-<mode>` : indigo-light, indigo-dark,
+ * midnight-light, midnight-dark, slate-light, slate-dark, emerald-light,
+ * emerald-dark, amber-light, amber-dark. Les 4 noms historiques RESTENT
+ * disponibles et deviennent des ALIAS EXACTS des palettes correspondantes
+ * (dark ≡ indigo-dark, light ≡ indigo-light, midnight ≡ midnight-dark,
+ * slate ≡ slate-dark) — valeurs rigoureusement identiques. Les 10 presets sont
+ * les MIROIRS des presets homonymes de HolafTokens 0.2.0 (mêmes surfaces,
+ * même texte, même accent), embarqués en DONNÉES LITTÉRALES pour que la brique
+ * reste autonome (zéro dépendance runtime) : aucune logique de génération
+ * dupliquée. Objectif : aligner modale ↔ page ↔ toast quelle que soit la
+ * famille/mode choisi. Aucune API existante ne change.
  * Fichier DUAL : module ES (export) + global window.HolafModal — se
  * charge via <script type="module"> ou `import { HolafModal }`.
  *
@@ -33,7 +64,7 @@
 const HolafModal = (function () {
     "use strict";
 
-    const VERSION = "0.4.0";
+    const VERSION = "0.5.0";
 
     // ─── État global du module (partagé par toutes les modales) ──────────────
     // Pile des modales ouvertes : la DERNIÈRE entrée est le « sommet », la
@@ -206,92 +237,240 @@ const HolafModal = (function () {
     }
 
     // ─── Préréglages génériques (enregistrés au chargement de la brique) ────
-    // Contraste des textes ≥ 4.5:1. PAS de --hm-width dans un preset : la
-    // largeur est gouvernée par size/width (un thème ne doit pas pouvoir
-    // casser les classes sm/md/lg/xl).
-    // dark : STRICTEMENT les valeurs par défaut du CSS injecté ci-dessous —
-    // theme:"dark" ≡ aucune option theme (rétrocompatibilité à l'identique).
-    themesRegister("dark", {
-        "--hm-bg": "#1e1e1e",
-        "--hm-bg-secondary": "#27272a",
-        "--hm-bg-input": "#1a1a1a",
-        "--hm-text": "#e4e4e7",
-        "--hm-text-secondary": "#a1a1aa",
-        "--hm-border": "#3f3f46",
-        "--hm-accent": "#6366f1",
-        "--hm-accent-hover": "#818cf8",
-        "--hm-accent-text": "#ffffff",
-        "--hm-danger": "#ef4444",
-        "--hm-danger-hover": "#dc2626",
-        "--hm-danger-text": "#ffffff",
-        "--hm-radius": "12px",
-        "--hm-overlay-bg": "rgba(0, 0, 0, 0.55)",
-        "--hm-font-size": "14px",
-        "--hm-shadow": "0 18px 50px rgba(0, 0, 0, 0.55)",
-        "--hm-busy-bg": "rgba(30, 30, 30, 0.82)",
-    });
-    // light : clair zinc, ombre adoucie, overlay allégé.
-    themesRegister("light", {
-        "--hm-bg": "#ffffff",
-        "--hm-bg-secondary": "#f4f4f5",
-        "--hm-bg-input": "#fafafa",
-        "--hm-text": "#18181b",
-        "--hm-text-secondary": "#52525b",
-        "--hm-border": "#d4d4d8",
-        "--hm-accent": "#4f46e5",
-        "--hm-accent-hover": "#6366f1",
-        "--hm-accent-text": "#ffffff",
-        "--hm-danger": "#dc2626",
-        "--hm-danger-hover": "#b91c1c",
-        "--hm-danger-text": "#ffffff",
-        "--hm-radius": "12px",
-        "--hm-overlay-bg": "rgba(24, 24, 27, 0.35)",
-        "--hm-font-size": "14px",
-        "--hm-shadow": "0 18px 50px rgba(24, 24, 27, 0.18)",
-        "--hm-busy-bg": "rgba(255, 255, 255, 0.82)",
-    });
-    // midnight : bleu nuit profond « layered », accent indigo doux (texte
-    // sombre sur le bouton primaire → contraste ~7:1).
-    themesRegister("midnight", {
-        "--hm-bg": "#10111d",
-        "--hm-bg-secondary": "#181a2c",
-        "--hm-bg-input": "#0c0d17",
-        "--hm-text": "#e2e4f0",
-        "--hm-text-secondary": "#9aa0c3",
-        "--hm-border": "#272a44",
-        "--hm-accent": "#818cf8",
-        "--hm-accent-hover": "#a5b4fc",
-        "--hm-accent-text": "#10111d",
-        "--hm-danger": "#ef4444",
-        "--hm-danger-hover": "#dc2626",
-        "--hm-danger-text": "#ffffff",
-        "--hm-radius": "12px",
-        "--hm-overlay-bg": "rgba(4, 5, 12, 0.65)",
-        "--hm-font-size": "14px",
-        "--hm-shadow": "0 18px 50px rgba(0, 0, 0, 0.6)",
-        "--hm-busy-bg": "rgba(16, 17, 29, 0.85)",
-    });
-    // slate : gris ardoise neutre, accent gris neutre (bouton primaire « soft »)
-    // — le plus polyvalent, lisible sur fond de page de n'importe quelle teinte.
-    themesRegister("slate", {
-        "--hm-bg": "#1f232b",
-        "--hm-bg-secondary": "#292e38",
-        "--hm-bg-input": "#191d24",
-        "--hm-text": "#e6e9ee",
-        "--hm-text-secondary": "#9aa3b2",
-        "--hm-border": "#3a4150",
-        "--hm-accent": "#94a3b8",
-        "--hm-accent-hover": "#b6c2d4",
-        "--hm-accent-text": "#1f232b",
-        "--hm-danger": "#ef4444",
-        "--hm-danger-hover": "#dc2626",
-        "--hm-danger-text": "#ffffff",
-        "--hm-radius": "12px",
-        "--hm-overlay-bg": "rgba(8, 10, 14, 0.55)",
-        "--hm-font-size": "14px",
-        "--hm-shadow": "0 18px 50px rgba(0, 0, 0, 0.5)",
-        "--hm-busy-bg": "rgba(31, 35, 43, 0.85)",
-    });
+    // CATALOGUE À 2 AXES (v0.5.0) : 5 familles (indigo, midnight, slate,
+    // emerald, amber) × 2 modes (light, dark) = 10 presets `<famille>-<mode>`,
+    // puis 4 ALIAS historiques (dark / light / midnight / slate). Contraste des
+    // textes ≥ 4.5:1. PAS de --hm-width dans un preset : la largeur est
+    // gouvernée par size/width (un thème ne doit pas pouvoir casser sm/md/lg/xl).
+    //
+    // PROVENANCE DES VALEURS (DONNÉES LITTÉRALES, aucun calcul runtime) : les
+    // 10 presets sont les MIROIRS des presets homonymes de HolafTokens 0.2.0
+    // (brique fondation, js/holaf-tokens.js), figés ici une fois pour que la
+    // brique reste AUTONOME (zéro dépendance runtime). Mapping :
+    //     --hm-bg             ← surface            --hm-accent        ← accent
+    //     --hm-bg-secondary   ← surface-elev       --hm-accent-hover  ← accent-hover
+    //     --hm-bg-input       ← surface-raised     --hm-accent-text   ← accent-text
+    //     --hm-text           ← text               --hm-danger        ← danger
+    //     --hm-text-secondary ← text-muted         --hm-danger-text   ← danger-text
+    //     --hm-border         ← border             --hm-danger-hover  ← danger-hover
+    //     --hm-danger-hover : présent uniquement dans les presets GÉNÉRÉS de
+    //     HolafTokens ; pour les 4 palettes historiques figées (qui n'ont pas
+    //     de danger-hover côté tokens) on CONSERVE la valeur historique.
+    // --hm-radius / --hm-font-size / --hm-shadow sont propres à la MODALE
+    // (radius 12px, 14px, ombres 0 18px 50px) et non les valeurs de PAGE de
+    // HolafTokens. --hm-overlay-bg / --hm-busy-bg sont DÉRIVÉS du mode : clair
+    // → scrim zinc `rgba(24, 24, 27, 0.35)` + busy 0.82 ; sombre → scrim teinté
+    // du fond à 0.55 + busy 0.85. Les 4 palettes HISTORIQUES conservent leur
+    // overlay/busy d'origine (voir alias ci-dessous).
+    // Les hex GÉNÉRÉS sont repris À L'IDENTIQUE (casse comprise) de
+    // HolafTokens.PRESETS pour que le test de cohérence inter-briques passe.
+    const THEME_PRESETS = {
+        "indigo-light": {
+            "--hm-bg": "#ffffff",
+            "--hm-bg-secondary": "#f4f4f5",
+            "--hm-bg-input": "#fafafa",
+            "--hm-text": "#18181b",
+            "--hm-text-secondary": "#52525b",
+            "--hm-border": "#d4d4d8",
+            "--hm-accent": "#4f46e5",
+            "--hm-accent-hover": "#6366f1",
+            "--hm-accent-text": "#ffffff",
+            "--hm-danger": "#dc2626",
+            "--hm-danger-hover": "#b91c1c",
+            "--hm-danger-text": "#ffffff",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(24, 24, 27, 0.35)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(24, 24, 27, 0.18)",
+            "--hm-busy-bg": "rgba(255, 255, 255, 0.82)",
+        },
+        "indigo-dark": {
+            "--hm-bg": "#1e1e1e",
+            "--hm-bg-secondary": "#27272a",
+            "--hm-bg-input": "#1a1a1a",
+            "--hm-text": "#e4e4e7",
+            "--hm-text-secondary": "#a1a1aa",
+            "--hm-border": "#3f3f46",
+            "--hm-accent": "#6366f1",
+            "--hm-accent-hover": "#818cf8",
+            "--hm-accent-text": "#ffffff",
+            "--hm-danger": "#ef4444",
+            "--hm-danger-hover": "#dc2626",
+            "--hm-danger-text": "#ffffff",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(0, 0, 0, 0.55)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(0, 0, 0, 0.55)",
+            "--hm-busy-bg": "rgba(30, 30, 30, 0.82)",
+        },
+        "midnight-light": {
+            "--hm-bg": "#F6F7FC",
+            "--hm-bg-secondary": "#FFFFFF",
+            "--hm-bg-input": "#E6E8F8",
+            "--hm-text": "#18181B",
+            "--hm-text-secondary": "#75767A",
+            "--hm-border": "#D4D6F3",
+            "--hm-accent": "#5B63D3",
+            "--hm-accent-hover": "#747ADA",
+            "--hm-accent-text": "#ffffff",
+            "--hm-danger": "#DC2626",
+            "--hm-danger-hover": "#E14747",
+            "--hm-danger-text": "#ffffff",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(24, 24, 27, 0.35)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(24, 24, 27, 0.18)",
+            "--hm-busy-bg": "rgba(246, 247, 252, 0.82)",
+        },
+        "midnight-dark": {
+            "--hm-bg": "#10111d",
+            "--hm-bg-secondary": "#181a2c",
+            "--hm-bg-input": "#0c0d17",
+            "--hm-text": "#e2e4f0",
+            "--hm-text-secondary": "#9aa0c3",
+            "--hm-border": "#272a44",
+            "--hm-accent": "#818cf8",
+            "--hm-accent-hover": "#a5b4fc",
+            "--hm-accent-text": "#10111d",
+            "--hm-danger": "#ef4444",
+            "--hm-danger-hover": "#dc2626",
+            "--hm-danger-text": "#ffffff",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(4, 5, 12, 0.65)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(0, 0, 0, 0.6)",
+            "--hm-busy-bg": "rgba(16, 17, 29, 0.85)",
+        },
+        "slate-light": {
+            "--hm-bg": "#F4F6F8",
+            "--hm-bg-secondary": "#FFFFFF",
+            "--hm-bg-input": "#E3E6E9",
+            "--hm-text": "#18181B",
+            "--hm-text-secondary": "#747578",
+            "--hm-border": "#CED3D9",
+            "--hm-accent": "#475569",
+            "--hm-accent-hover": "#636F80",
+            "--hm-accent-text": "#ffffff",
+            "--hm-danger": "#DC2626",
+            "--hm-danger-hover": "#E14747",
+            "--hm-danger-text": "#ffffff",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(24, 24, 27, 0.35)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(24, 24, 27, 0.18)",
+            "--hm-busy-bg": "rgba(244, 246, 248, 0.82)",
+        },
+        "slate-dark": {
+            "--hm-bg": "#1f232b",
+            "--hm-bg-secondary": "#292e38",
+            "--hm-bg-input": "#191d24",
+            "--hm-text": "#e6e9ee",
+            "--hm-text-secondary": "#9aa3b2",
+            "--hm-border": "#3a4150",
+            "--hm-accent": "#94a3b8",
+            "--hm-accent-hover": "#b6c2d4",
+            "--hm-accent-text": "#1f232b",
+            "--hm-danger": "#ef4444",
+            "--hm-danger-hover": "#dc2626",
+            "--hm-danger-text": "#ffffff",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(8, 10, 14, 0.55)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(0, 0, 0, 0.5)",
+            "--hm-busy-bg": "rgba(31, 35, 43, 0.85)",
+        },
+        "emerald-light": {
+            "--hm-bg": "#FFFFFF",
+            "--hm-bg-secondary": "#F0FDF4",
+            "--hm-bg-input": "#CDE9DC",
+            "--hm-text": "#18181B",
+            "--hm-text-secondary": "#79797B",
+            "--hm-border": "#C8E1DA",
+            "--hm-accent": "#047857",
+            "--hm-accent-hover": "#278C6F",
+            "--hm-accent-text": "#ffffff",
+            "--hm-danger": "#DC2626",
+            "--hm-danger-hover": "#DF4645",
+            "--hm-danger-text": "#ffffff",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(24, 24, 27, 0.35)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(24, 24, 27, 0.18)",
+            "--hm-busy-bg": "rgba(255, 255, 255, 0.82)",
+        },
+        "emerald-dark": {
+            "--hm-bg": "#0B1512",
+            "--hm-bg-secondary": "#12201A",
+            "--hm-bg-input": "#173B2D",
+            "--hm-text": "#F4F4F5",
+            "--hm-text-secondary": "#929696",
+            "--hm-border": "#143F30",
+            "--hm-accent": "#34D399",
+            "--hm-accent-hover": "#2FB886",
+            "--hm-accent-text": "#000000",
+            "--hm-danger": "#EF4444",
+            "--hm-danger-hover": "#CE3F3E",
+            "--hm-danger-text": "#000000",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(11, 21, 18, 0.55)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(0, 0, 0, 0.55)",
+            "--hm-busy-bg": "rgba(11, 21, 18, 0.85)",
+        },
+        "amber-light": {
+            "--hm-bg": "#FFFFFF",
+            "--hm-bg-secondary": "#FFFBEB",
+            "--hm-bg-input": "#F4E2C9",
+            "--hm-text": "#18181B",
+            "--hm-text-secondary": "#79797B",
+            "--hm-border": "#EFD9C9",
+            "--hm-accent": "#B45309",
+            "--hm-accent-hover": "#BF6C2B",
+            "--hm-accent-text": "#ffffff",
+            "--hm-danger": "#DC2626",
+            "--hm-danger-hover": "#E14644",
+            "--hm-danger-text": "#ffffff",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(24, 24, 27, 0.35)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(24, 24, 27, 0.18)",
+            "--hm-busy-bg": "rgba(255, 255, 255, 0.82)",
+        },
+        "amber-dark": {
+            "--hm-bg": "#1A1408",
+            "--hm-bg-secondary": "#241C0D",
+            "--hm-bg-input": "#443410",
+            "--hm-text": "#F4F4F5",
+            "--hm-text-secondary": "#989691",
+            "--hm-border": "#4C3A0E",
+            "--hm-accent": "#FBBF24",
+            "--hm-accent-hover": "#DBA721",
+            "--hm-accent-text": "#000000",
+            "--hm-danger": "#EF4444",
+            "--hm-danger-hover": "#D13E3C",
+            "--hm-danger-text": "#000000",
+            "--hm-radius": "12px",
+            "--hm-overlay-bg": "rgba(26, 20, 8, 0.55)",
+            "--hm-font-size": "14px",
+            "--hm-shadow": "0 18px 50px rgba(0, 0, 0, 0.55)",
+            "--hm-busy-bg": "rgba(26, 20, 8, 0.85)",
+        },
+    };
+    Object.keys(THEME_PRESETS).forEach((name) => themesRegister(name, THEME_PRESETS[name]));
+
+    // ─── Alias historiques (valeurs RIGOUREUSEMENT identiques) ───────────────
+    // `indigo` a été FIGÉ DEPUIS les palettes historiques (HolafTokens réutilise
+    // HISTORICAL.dark / HISTORICAL.light telles quelles pour indigo-dark /
+    // indigo-light, et midnight / slate conservent leur mode sombre historique) :
+    // les 4 noms historiques deviennent donc des ALIAS EXACTS.
+    //   dark ≡ indigo-dark · light ≡ indigo-light · midnight ≡ midnight-dark ·
+    //   slate ≡ slate-dark.
+    // `dark` reste STRICTEMENT les valeurs par défaut du CSS injecté ci-dessous
+    // → theme:"dark" ≡ aucune option theme (rétrocompatibilité à l'identique).
+    themesRegister("dark", THEME_PRESETS["indigo-dark"]);
+    themesRegister("light", THEME_PRESETS["indigo-light"]);
+    themesRegister("midnight", THEME_PRESETS["midnight-dark"]);
+    themesRegister("slate", THEME_PRESETS["slate-dark"]);
 
     // ─── Thème global par défaut (VOLATIL — aucune persistance) ─────────────
     // HolafModal.setTheme(...) s'applique à toutes les modales qui ne passent
@@ -402,17 +581,95 @@ body.holaf-modal-open { overflow: hidden; }
 .holaf-modal-alert-icon { font-size: 28px; text-align: center; margin-bottom: 10px; }
 `;
 
-    let cssInjected = false;
-    function ensureCss() {
-        if (cssInjected) return;
+    // ─── Nonce CSP (v0.4.1 — OPTIONNEL, additif) ────────────────────────────
+    // Les hôtes à CSP strict (style-src 'self', SANS 'unsafe-inline')
+    // bloquent un <style> inséré par JS tant qu'il ne porte pas le nonce de la
+    // page. On peut le fournir de deux façons, la seconde primant sur la
+    // première :
+    //   1) globalement : HolafModal.setStyleNonce("<nonce>") ;
+    //      HolafModal.setStyleNonce(null) réinitialise le comportement d'origine.
+    //   2) par appel : open(opts, { nonce }) ou champ `nonce` de opts — une
+    //      valeur null/vide = « aucun nonce » explicite (surcharge le global).
+    // Le nonce est posé sur l'élément AVANT son insertion dans le <head>.
+    // SANS nonce configuré : aucun attribut ajouté, comportement historique.
+    let styleNonce = null;
+
+    // Normalise une valeur de nonce : null/undefined/"" = aucun nonce.
+    function normalizeNonce(value) {
+        if (value === null || value === undefined || value === "") return null;
+        return String(value);
+    }
+
+    // Lit le nonce d'un élément : on privilégie l'IDL `el.nonce`, qui reste
+    // fiable même quand l'attribut est « masqué » après insertion (anti-
+    // exfiltration navigateur) ; repli getAttribute pour les vieux moteurs.
+    function readNonce(el) {
+        if (typeof el.nonce === "string") return normalizeNonce(el.nonce);
+        return normalizeNonce(el.getAttribute("nonce"));
+    }
+
+    // Réglage GLOBAL du nonce ; null/undefined/"" = réinitialisation.
+    function setStyleNonce(nonce) {
+        styleNonce = normalizeNonce(nonce);
+    }
+
+    function ensureCss(nonceOpt) {
         if (typeof document === "undefined") return;
-        if (!document.getElementById(CSS_ID)) {
-            const style = document.createElement("style");
-            style.id = CSS_ID;
-            style.textContent = HOLAF_MODAL_CSS;
-            document.head.appendChild(style);
+        // Nonce effectif : option d'appel (nonceOpt) > réglage global. Un
+        // `undefined` (option absente) laisse donc jouer le réglage global.
+        const effective = nonceOpt === undefined ? styleNonce : normalizeNonce(nonceOpt);
+        let style = document.getElementById(CSS_ID);
+        const current = style ? readNonce(style) : null;
+        // Cas par défaut (aucun nonce des deux côtés) : le style existant est
+        // conservé tel quel — strictement identique à l'historique.
+        if (style && current === effective) return;
+        // Le nonce a changé (configuration tardive ou réinitialisation) : on
+        // recrée l'élément pour que le nonce soit appliqué AVANT l'insertion.
+        if (style && style.parentNode) style.parentNode.removeChild(style);
+        style = document.createElement("style");
+        style.id = CSS_ID;
+        if (effective) style.setAttribute("nonce", effective);
+        style.textContent = HOLAF_MODAL_CSS;
+        document.head.appendChild(style);
+    }
+
+    // ─── Mode CSS externe (v0.4.2 — OPTIONNEL, additif) ─────────────────────
+    // Alternative propre au nonce pour les hôtes à CSP strict (style-src
+    // 'self') : servir le CSS de la brique comme FICHIER .css statique et
+    // demander à la brique de NE PAS injecter son <style>. Le CSS est récupéré
+    // via HolafModal.getCss(), écrit dans un fichier .css servi par l'hôte, et
+    // l'injection est désactivée de deux façons (la seconde primant) :
+    //   1) globalement : HolafModal.configure({ injectStyles: false }) ;
+    //   2) par appel : open(opts, { injectStyles: false }) ou champ
+    //      `injectStyles` de opts — prime sur le réglage global.
+    // Par défaut (true) : comportement historique STRICTEMENT inchangé.
+    let injectStylesGlobal = true;
+
+    // Réglage global de l'injection des styles — `configure` est cohérent avec
+    // HolafToast (extensible à d'autres options le cas échéant).
+    function configure(opts) {
+        opts = opts || {};
+        if (opts.injectStyles !== undefined) {
+            injectStylesGlobal = opts.injectStyles !== false;
         }
-        cssInjected = true;
+    }
+
+    // Injection effective : 2ᵉ argument (callOpts.injectStyles) > champ
+    // opts.injectStyles > réglage global. Seul `false` désactive (toute autre
+    // valeur = actif). Un `undefined` (option absente) laisse jouer le global.
+    function resolveInjectStyles(opts, callOpts) {
+        let value;
+        if (callOpts && callOpts.injectStyles !== undefined) value = callOpts.injectStyles;
+        else if (opts && opts.injectStyles !== undefined) value = opts.injectStyles;
+        else return injectStylesGlobal;
+        return value !== false;
+    }
+
+    // CSS COMPLET de la brique — à écrire dans un fichier .css servi par
+    // l'hôte quand l'injection JS est désactivée (injectStyles: false). Retour
+    // strictement identique au contenu injecté par ensureCss().
+    function getCss() {
+        return HOLAF_MODAL_CSS;
     }
 
     // ─── Scroll-lock avec compteur ───────────────────────────────────────────
@@ -481,7 +738,7 @@ body.holaf-modal-open { overflow: hidden; }
     }
 
     // ─── Noyau : HolafModal.open(options) ────────────────────────────────────
-    function open(opts) {
+    function open(opts, callOpts) {
         opts = opts || {};
         if (typeof document === "undefined") {
             throw new Error("[HolafModal] nécessite un navigateur (document indisponible).");
@@ -497,7 +754,14 @@ body.holaf-modal-open { overflow: hidden; }
             }
         }
 
-        ensureCss();
+        // Nonce CSP effectif : 2ᵉ argument (callOpts.nonce) > champ opts.nonce
+        // > réglage global setStyleNonce. `undefined` = on retombe sur le global.
+        const nonceOpt = (callOpts && Object.prototype.hasOwnProperty.call(callOpts, "nonce"))
+            ? callOpts.nonce
+            : (Object.prototype.hasOwnProperty.call(opts, "nonce") ? opts.nonce : undefined);
+        // Mode CSS externe : injectStyles:false → on n'injecte PAS le <style>
+        // (l'hôte sert le CSS via HolafModal.getCss()). Défaut : injection.
+        if (resolveInjectStyles(opts, callOpts)) ensureCss(nonceOpt);
         installKeyHandler();
 
         // ── Options (valeurs par défaut) ─────────────────────────────────────
@@ -1068,7 +1332,7 @@ body.holaf-modal-open { overflow: hidden; }
                 labels: opts.labels,
                 closeOnOverlay: false,
                 _onResolve: () => resolve(undefined),
-            });
+            }, { nonce: opts.nonce, injectStyles: opts.injectStyles });
         });
     }
 
@@ -1095,7 +1359,7 @@ body.holaf-modal-open { overflow: hidden; }
                 labels: opts.labels,
                 closeOnOverlay: false,
                 _onResolve: (v) => resolve(v === true),
-            });
+            }, { nonce: opts.nonce, injectStyles: opts.injectStyles });
         });
     }
 
@@ -1128,7 +1392,7 @@ body.holaf-modal-open { overflow: hidden; }
                 labels: opts.labels,
                 closeOnOverlay: false,
                 _onResolve: (v) => resolve(typeof v === "string" ? v : null),
-            });
+            }, { nonce: opts.nonce, injectStyles: opts.injectStyles });
             // Entrée dans le champ = valider (comme un <form>).
             input.addEventListener("keydown", (e) => {
                 if (e.key === "Enter") {
@@ -1162,7 +1426,7 @@ body.holaf-modal-open { overflow: hidden; }
             closeOnEscape: false,
             closeOnOverlay: false,
             focusTrap: false,
-        });
+        }, { nonce: opts.nonce, injectStyles: opts.injectStyles });
         return {
             set(msg) {
                 if (msg !== undefined && msg !== null) label.textContent = String(msg);
@@ -1186,6 +1450,14 @@ body.holaf-modal-open { overflow: hidden; }
         // passent pas d'option `theme` — voir README section « Thèmes ».
         setTheme: setTheme,
         clearTheme: clearTheme,
+        // Nonce CSP (v0.4.1) — global, surchargeable par appel : voir ensureCss.
+        setStyleNonce: setStyleNonce,
+        // Mode CSS externe (v0.4.2) : getCss() renvoie le CSS complet de la
+        // brique ; configure({ injectStyles:false }) — ou open(...,
+        // { injectStyles:false }) par appel — désactivent l'injection du
+        // <style> (l'hôte sert alors son propre fichier .css).
+        getCss: getCss,
+        configure: configure,
         // Registre de thèmes (préréglages + customs) :
         //   themes.register(name, vars) — enregistre/remplace (retourne une copie protégée)
         //   themes.get(name)            — copie des variables ou null
