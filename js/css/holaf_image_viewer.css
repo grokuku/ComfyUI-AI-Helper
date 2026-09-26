@@ -617,82 +617,20 @@ body.holaf-standalone-mode .holaf-utility-panel:not(.holaf-floating-window) {
     color: var(--holaf-text-primary);
 }
 
-.holaf-viewer-metadata-label {
-    font-weight: bold;
-    color: var(--holaf-text-primary);
-}
-
-.holaf-viewer-metadata-source {
-    font-size: 0.85em;
-    font-style: italic;
-    color: var(--holaf-text-secondary);
-    margin-left: 5px;
-}
-
-#holaf-viewer-info-content hr {
-    border-color: var(--holaf-border-color);
-    opacity: 0.5;
-    margin: 10px 0;
-}
-
-.holaf-viewer-info-actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 5px;
-    margin-bottom: 10px;
-}
-
-.holaf-viewer-info-button {
-    flex: 1;
-    background-color: var(--holaf-input-background);
-    border: 1px solid var(--holaf-border-color);
-    color: var(--holaf-text-secondary);
-    border-radius: 3px;
-    padding: 4px 8px;
-    font-size: 11px;
-    cursor: pointer;
-    text-align: center;
-    transition: background-color 0.2s, border-color 0.2s, color 0.2s;
-}
-
-.holaf-viewer-info-button:hover:not(:disabled) {
-    background-color: var(--holaf-accent-color);
-    border-color: var(--holaf-accent-color);
-    color: var(--holaf-button-text);
-}
-
-.holaf-viewer-info-button:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-}
-
-.holaf-viewer-metadata-box {
-    background-color: var(--holaf-input-background);
-    border: 1px solid var(--holaf-border-color);
-    border-radius: 4px;
-    padding: 8px;
-    font-size: 11px;
-    white-space: pre-wrap;
-    word-break: break-all;
-    max-height: 140px;
-    overflow-y: auto;
-    color: var(--holaf-text-primary);
-}
-
-/* Override default textarea styles to match the div version */
-textarea.holaf-viewer-metadata-box {
-    font-family: inherit;
-    resize: none;
-    width: 100%;
-    box-sizing: border-box;
-    line-height: 1.4;
-    min-height: 48px;
-    height: auto;
-}
-
-textarea.holaf-viewer-metadata-box:focus {
-    outline: 1px solid var(--holaf-accent-color);
-    outline-offset: -1px;
+/* Volet d'infos : la mécanique générique (états, champs, blocs copiables,
+   auto-resize, copie) est portée par la brique VENDUE
+   js/vendor/holaf/holaf-infopane.js (HolafInfoPane). On ne fait ici que
+   thémer la brique avec les variables --holaf-* du viewer ; les règles
+   #holaf-viewer-info-content p / strong / hr ci-dessus continuent de
+   s'appliquer au DOM généré. */
+#holaf-viewer-info-content .holaf-infopane {
+    --hl-infopane-text: var(--holaf-text-secondary);
+    --hl-infopane-strong: var(--holaf-text-primary);
+    --hl-infopane-border: var(--holaf-border-color);
+    --hl-infopane-input-bg: var(--holaf-input-background);
+    --hl-infopane-accent: var(--holaf-accent-color);
+    --hl-infopane-button-text: var(--holaf-button-text);
+    --hl-infopane-danger: var(--holaf-error-color, #F44336);
 }
 
 #holaf-editor-content {
@@ -899,7 +837,7 @@ video::-webkit-media-controls {
 #holaf-viewer-gallery::-webkit-scrollbar,
 #holaf-viewer-right-pane::-webkit-scrollbar,
 #holaf-viewer-editor-pane::-webkit-scrollbar,
-.holaf-viewer-metadata-box::-webkit-scrollbar {
+.holaf-infopane-text::-webkit-scrollbar {
     width: 8px;
 }
 
@@ -907,7 +845,7 @@ video::-webkit-media-controls {
 #holaf-viewer-gallery::-webkit-scrollbar-track,
 #holaf-viewer-right-pane::-webkit-scrollbar-track,
 #holaf-viewer-editor-pane::-webkit-scrollbar-track,
-.holaf-viewer-metadata-box::-webkit-scrollbar-track {
+.holaf-infopane-text::-webkit-scrollbar-track {
     background: var(--holaf-scrollbar-track);
 }
 
@@ -915,7 +853,7 @@ video::-webkit-media-controls {
 #holaf-viewer-gallery::-webkit-scrollbar-thumb,
 #holaf-viewer-right-pane::-webkit-scrollbar-thumb,
 #holaf-viewer-editor-pane::-webkit-scrollbar-thumb,
-.holaf-viewer-metadata-box::-webkit-scrollbar-thumb {
+.holaf-infopane-text::-webkit-scrollbar-thumb {
     background-color: var(--holaf-scrollbar-thumb);
     border-radius: 4px;
     border: 2px solid var(--holaf-scrollbar-track);

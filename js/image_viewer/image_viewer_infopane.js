@@ -2,30 +2,41 @@
  * Copyright (C) 2025 Holaf
  * Holaf Utilities - Image Viewer Info Pane Module
  *
- * REFACTOR: Uses HolafComfyBridge to support standalone gallery mode.
+ * ADAPTATEUR vers la brique VENDUE js/vendor/holaf/holaf-infopane.js
+ * (HolafInfoPane). Ce fichier ne porte plus la mécanique générique du volet
+ * (états vide/chargement/erreur, champs, blocs copiables, auto-resize des
+ * textarea, bouton copier avec confirmation puis retour, annulation de la
+ * requête précédente via AbortSignal) : elle est désormais dans la brique.
+ *
+ * Il ne garde que le MÉTIER de la galerie du node :
+ *   - l'endpoint /holaf/images/metadata et les sources internal_png /
+ *     external_json / external_txt ;
+ *   - la mise en forme des champs (nom, dossier, chemin d'origine, taille,
+ *     format, modifié, résolution, ratio) ;
+ *   - les blocs prompt/workflow (libellés i18n FR/EN existants) ;
+ *   - le bouton « Load workflow » (comfyApp.loadGraphData ou holafBridge vers
+ *     la fenêtre principale) et sa confirmation via AIH.ask ;
+ *   - le preview synchrone (infos déjà connues de l'item) pour garder
+ *     l'affichage instantané historique avant la réponse des métadonnées ;
+ *   - le scope Ctrl+A (garde-fou contre le handler global de ComfyUI).
+ *
+ * RÈGLE : toute correction GÉNÉRIQUE se fait dans holaf-lib puis se re-vend via
+ * `scripts/holaf` ; ce fichier ne doit contenir que du métier node/ComfyUI.
  */
 
 import "../aih_strings.js";
 import { imageViewerState } from './image_viewer_state.js';
 import { holafBridge } from "../holaf_comfy_bridge.js";
 import { app as comfyApp } from "../holaf_api_compat.js";
-import { escapeHtml } from "../holaf_dom_utils.js";
 import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 import { showToast } from "../aih_toast_bridge.js";
+import { HolafInfoPane } from "../vendor/holaf/holaf-infopane.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
     const I = window.AIH && window.AIH.I18n;
     return I && typeof I.t === "function" ? I.t(key, params) : key;
 };
-
-// Safe access to app (only available in main tab)
-// comfyApp is now provided via holaf_api_compat.js, which uses window.comfyAPI
-// with fallback to legacy import. In standalone mode, the proxy will return
-// undefined for property access, which is handled gracefully.
-
-// Module-level variables to manage state
-let abortController = null;
 
 // FIX: Scope Ctrl+A (Select All) to the focused textarea within the viewer,
 // instead of letting ComfyUI's global handler select the entire page.
@@ -39,237 +50,158 @@ document.addEventListener('keydown', (e) => {
         }
     }
 }, true); // capture: true to intercept before ComfyUI's handler
+
+const INFO_CONTENT_ID = 'holaf-viewer-info-content';
+
+// Instance unique du panneau pour la galerie (recréée si setupInfoPane est
+// rappelé) + dédoublonnage de l'item déjà traité (comportement historique).
+let infoPane = null;
 let lastProcessedPath = null;
 
-/**
- * Auto-resizes a textarea to fit its content, respecting max-height.
- * @param {HTMLTextAreaElement} textarea
- */
-function autoResizeTextarea(textarea) {
-    textarea.style.height = 'auto';
-    const computed = getComputedStyle(textarea);
-    const maxH = parseFloat(computed.maxHeight) || 140;
-    const scrollH = textarea.scrollHeight;
-    textarea.style.height = Math.min(scrollH, maxH) + 'px';
+// ─── Libellés (parité FR/EN via AIH.I18n ; recalculés à chaque show pour
+//     suivre un éventuel changement de langue) ────────────────────────────
+function buildLabels() {
+    return {
+        copy: t('iv.copyPrompt'),
+        copied: t('iv.copied'),
+        copyFailed: t('iv.copyFailed'),
+        loading: t('iv.loadingMetadata'),
+        selectItem: t('iv.selectImageDetails'),
+        notAvailable: t('iv.notAvailable'),
+        error: t('iv.errorLabel'),
+    };
 }
 
-/**
- * Copies text to the clipboard using the best available method.
- * First tries execCommand (user gesture), then clipboard API as fallback.
- * @param {string} text - The text to copy.
- * @returns {Promise<void>}
- */
-function copyTextToClipboard(text) {
-    return new Promise((resolve, reject) => {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.style.position = 'fixed';
-        textarea.style.left = '0';
-        textarea.style.top = '0';
-        textarea.style.opacity = '0';
-        textarea.style.pointerEvents = 'none';
-        textarea.style.width = '1px';
-        textarea.style.height = '1px';
-        document.body.appendChild(textarea);
-        textarea.focus();
-        textarea.select();
+// ─── Champs métier (mêmes libellés que l'ancien rendu) ──────────────────────
+function buildFields(image) {
+    const fields = [];
+    fields.push({ label: t('iv.filename'), value: image.filename, stacked: true });
+    fields.push({ label: t('iv.folder'), value: image.subfolder || '/' });
+    if (image.is_trashed && image.original_path_canon) {
+        fields.push({ label: t('iv.originalPath'), value: image.original_path_canon, stacked: true });
+    }
+    const bytes = Number(image.size_bytes);
+    if (Number.isFinite(bytes)) {
+        fields.push({ label: t('iv.sizeLabel'), value: `${(bytes / 1048576).toFixed(2)} MB` });
+    }
+    if (image.format) {
+        fields.push({ label: t('iv.formatLabel'), value: image.format });
+    }
+    const mtime = Number(image.mtime);
+    if (Number.isFinite(mtime)) {
+        fields.push({ label: t('iv.modified'), value: new Date(mtime * 1000).toLocaleString(), stacked: true });
+    }
+    return fields;
+}
 
-        try {
-            const success = document.execCommand('copy');
-            if (success) {
-                resolve();
-            } else {
-                // execCommand failed, try clipboard API
-                if (navigator.clipboard && navigator.clipboard.writeText) {
-                    navigator.clipboard.writeText(text).then(resolve, reject);
-                } else {
-                    reject(new Error('Copy not supported'));
-                }
-            }
-        } catch (err) {
-            // execCommand threw, try clipboard API
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).then(resolve, reject);
-            } else {
-                reject(err);
-            }
-        } finally {
-            document.body.removeChild(textarea);
-        }
+// Badge de provenance du prompt/du workflow (sources du backend).
+function getSourceLabel(source) {
+    return {
+        "external_txt": t('iv.fromTxt'),
+        "external_json": t('iv.fromJson'),
+        "internal_png": t('iv.fromPng'),
+    }[source] || "";
+}
+
+// ─── Blocs prompt/workflow (le bouton « Load workflow » reste métier) ───────
+async function onLoadWorkflow(workflow) {
+    if (comfyApp && typeof comfyApp.loadGraphData === 'function') {
+        // Onglet principal : chargement direct.
+        comfyApp.loadGraphData(workflow);
+    } else {
+        // Mode autonome/déporté : envoi via le bridge.
+        holafBridge.send('LOAD_WORKFLOW', workflow);
+        showToast({ message: t('iv.workflowSentToMain'), type: "success" });
+    }
+}
+
+function buildBlocks(data) {
+    const blocks = [];
+
+    const promptText = data.prompt ? String(data.prompt).trim() : '';
+    blocks.push({
+        id: 'prompt',
+        label: t('iv.prompt'),
+        source: getSourceLabel(data.prompt_source),
+        text: promptText,
+        copyable: true,
+        copyDisabled: !data.prompt,
+        copyPlacement: 'before',
+        copyLabel: t('iv.copyPrompt'),
+        empty: t('iv.notAvailable'),
+    });
+
+    const workflow = data.workflow;
+    const workflowError = workflow && workflow.error ? String(workflow.error) : null;
+    const canLoad = !!workflow && !workflowError;
+    const workflowBlock = {
+        id: 'workflow',
+        label: t('iv.workflow'),
+        source: getSourceLabel(data.workflow_source),
+        text: canLoad ? JSON.stringify(workflow, null, 2) : '',
+        copyable: canLoad,
+        copyLabel: t('iv.copyWorkflow'),
+        actions: [{
+            id: 'load-workflow',
+            label: t('iv.loadWorkflow'),
+            disabled: !canLoad,
+            confirm: { title: t('iv.loadWorkflowTitle'), message: t('iv.loadWorkflowMsg') },
+            onClick: () => onLoadWorkflow(workflow),
+        }],
+    };
+    if (workflowError) {
+        workflowBlock.error = t('iv.errorWorkflow', { error: workflowError });
+    } else if (!workflow) {
+        workflowBlock.empty = t('iv.noWorkflowFound');
+    }
+    blocks.push(workflowBlock);
+
+    return blocks;
+}
+
+// ─── Preview synchrone : infos déjà connues de l'item (affichage immédiat) ──
+function previewImageInfo(image) {
+    if (!image) return null;
+    return { fields: buildFields(image) };
+}
+
+// ─── Confirmation du chargement de workflow (AIH.ask, comme avant) ──────────
+function confirmLoadWorkflow(req) {
+    return AIH.ask({
+        title: req.title,
+        message: req.message,
+        buttons: [{ text: t('iv.cancel'), value: false }, { text: t('iv.load'), value: true }],
     });
 }
 
-/**
- * Fetches and displays metadata for a given image in the info pane.
- * @param {object|null} image - The image data object, or null to clear the pane.
- */
-async function displayInfoForImage(image) {
-    const infoContentEl = document.getElementById('holaf-viewer-info-content');
-    if (!infoContentEl) return;
-
-    if (abortController) {
-        abortController.abort();
-    }
-    abortController = new AbortController();
-    const signal = abortController.signal;
-
-    if (!image) {
-         infoContentEl.innerHTML = `<p class="holaf-viewer-message">${t('iv.selectImageDetails')}</p>`;
-         return;
-    }
-
-    const sizeInMB = (image.size_bytes / 1048576).toFixed(2);
-    let originalPathInfo = '';
-    if (image.is_trashed && image.original_path_canon) {
-        originalPathInfo = `<p><strong>${t('iv.originalPath')}</strong><br>${escapeHtml(image.original_path_canon)}</p>`;
-    }
-
-    infoContentEl.innerHTML = `<p><strong>${t('iv.filename')}</strong><br>${escapeHtml(image.filename)}</p><p><strong>${t('iv.folder')}</strong> ${escapeHtml(image.subfolder || '/')}</p>${originalPathInfo}<p><strong>${t('iv.sizeLabel')}</strong> ${sizeInMB} MB</p><p><strong>${t('iv.formatLabel')}</strong> ${escapeHtml(image.format)}</p><p><strong>${t('iv.modified')}</strong><br>${new Date(image.mtime * 1000).toLocaleString()}</p><div id="holaf-resolution-container"></div><hr><div id="holaf-metadata-container"><p class="holaf-viewer-message"><em>${t('iv.loadingMetadata')}</em></p></div>`;
-
+// ─── Résolution métier : endpoint /holaf/images/metadata ────────────────────
+async function resolveImageInfo(image, { signal } = {}) {
+    const fields = buildFields(image);
     try {
         const metadataUrl = new URL(window.location.origin);
         metadataUrl.pathname = '/holaf/images/metadata';
         metadataUrl.search = new URLSearchParams({ filename: image.filename, subfolder: image.subfolder || '' });
 
         // HolafFetch : GET JSON parsé ; lève sur non-2xx/non-JSON → mappé sur
-        // l'affichage d'erreur historique dans le catch ci-dessous.
+        // l'affichage d'erreur historique ci-dessous.
         const data = await HolafFetch.get(metadataUrl.href, { signal, cache: 'no-store' });
-        if (signal.aborted) return;
+        if (signal && signal.aborted) return null;
 
-        const finalMetadataContainer = document.getElementById('holaf-metadata-container');
-        if (!finalMetadataContainer) return;
-
-        const resolutionContainer = document.getElementById('holaf-resolution-container');
-        if (resolutionContainer) {
-            let resolutionHTML = '';
-            if (data.width && data.height) resolutionHTML += `<p><strong>${t('iv.resolution')}</strong> ${escapeHtml(data.width)}x${escapeHtml(data.height)} px</p>`;
-            if (data.ratio) resolutionHTML += `<p><strong>${t('iv.ratio')}</strong> ${escapeHtml(data.ratio)}</p>`;
-            resolutionContainer.innerHTML = resolutionHTML;
-        }
-
-        const getSourceLabel = (s) => ({ "external_txt": t('iv.fromTxt'), "external_json": t('iv.fromJson'), "internal_png": t('iv.fromPng') }[s] || "");
-        finalMetadataContainer.innerHTML = '';
-
-        const createButton = (txt, cb, dis = false) => {
-            const b = document.createElement('button');
-            b.className = 'holaf-viewer-info-button';
-            b.textContent = txt;
-            b.disabled = dis;
-            if (!dis) b.onclick = cb;
-            return b;
-        };
-
-        finalMetadataContainer.insertAdjacentHTML('beforeend', `<p><span class="holaf-viewer-metadata-label">${t('iv.prompt')}</span><span class="holaf-viewer-metadata-source">${getSourceLabel(data.prompt_source)}</span></p>`);
-        const promptActions = document.createElement('div');
-        promptActions.className = 'holaf-viewer-info-actions';
-        promptActions.appendChild(createButton(t('iv.copyPrompt'), (e) => {
-            copyTextToClipboard(data.prompt).then(() => {
-                e.target.textContent = t('iv.copied');
-                setTimeout(() => e.target.textContent = t('iv.copyPrompt'), 1500);
-            }).catch(err => {
-                console.error('Copy failed:', err);
-                e.target.textContent = t('iv.copyFailed');
-                setTimeout(() => e.target.textContent = t('iv.copyPrompt'), 2000);
-            });
-        }, !data.prompt));
-        finalMetadataContainer.appendChild(promptActions);
-
-        if (data.prompt) {
-            const promptText = data.prompt.trim();
-            if (promptText) {
-                const promptBox = document.createElement('textarea');
-                promptBox.className = 'holaf-viewer-metadata-box';
-                promptBox.readOnly = true;
-                promptBox.value = promptText;
-                finalMetadataContainer.appendChild(promptBox);
-                requestAnimationFrame(() => autoResizeTextarea(promptBox));
-            } else {
-                const msg = document.createElement('p');
-                msg.className = 'holaf-viewer-message';
-                msg.innerHTML = `<em>${t('iv.notAvailable')}</em>`;
-                finalMetadataContainer.appendChild(msg);
-            }
-        } else {
-            const msg = document.createElement('p');
-            msg.className = 'holaf-viewer-message';
-            msg.innerHTML = `<em>${t('iv.notAvailable')}</em>`;
-            finalMetadataContainer.appendChild(msg);
-        }
-
-        finalMetadataContainer.insertAdjacentHTML('beforeend', `<p style="margin-top:15px;"><span class="holaf-viewer-metadata-label">${t('iv.workflow')}</span><span class="holaf-viewer-metadata-source">${getSourceLabel(data.workflow_source)}</span></p>`);
-        const workflowActions = document.createElement('div');
-        workflowActions.className = 'holaf-viewer-info-actions';
-        
-        // --- BUTTON: Load Workflow with BRIDGE Support ---
-        workflowActions.appendChild(createButton(t('iv.loadWorkflow'), async () => {
-            if (await AIH.ask({
-                    title: t('iv.loadWorkflowTitle'),
-                    message: t('iv.loadWorkflowMsg'),
-                    buttons: [{ text: t('iv.cancel'), value: false }, { text: t('iv.load'), value: true }]
-                })) {
-                    // BRIDGE LOGIC HERE
-                    if (comfyApp && typeof comfyApp.loadGraphData === 'function') {
-                        // We are in the main tab, load directly
-                        comfyApp.loadGraphData(data.workflow);
-                    } else {
-                        // We are in standalone/deported mode, send via bridge
-                        holafBridge.send('LOAD_WORKFLOW', data.workflow);
-                        
-                        showToast({ message: t('iv.workflowSentToMain'), type: "success" });
-                    }
-                }
-        }, !data.workflow || !!data.workflow.error));
-        finalMetadataContainer.appendChild(workflowActions);
-
-        if (data.workflow && !data.workflow.error) {
-            const workflowBox = document.createElement('textarea');
-            workflowBox.className = 'holaf-viewer-metadata-box';
-            workflowBox.readOnly = true;
-            workflowBox.value = JSON.stringify(data.workflow, null, 2);
-            finalMetadataContainer.appendChild(workflowBox);
-            requestAnimationFrame(() => autoResizeTextarea(workflowBox));
-
-            // Add Copy Workflow button
-            const copyWorkflowBtn = document.createElement('button');
-            copyWorkflowBtn.className = 'holaf-viewer-info-button';
-            copyWorkflowBtn.textContent = t('iv.copyWorkflow');
-            copyWorkflowBtn.onclick = (e) => {
-                workflowBox.focus();
-                workflowBox.select();
-                copyTextToClipboard(workflowBox.value).then(() => {
-                    e.target.textContent = t('iv.copied');
-                    setTimeout(() => e.target.textContent = t('iv.copyWorkflow'), 1500);
-                }).catch(err => {
-                    console.error('Copy workflow failed:', err);
-                    e.target.textContent = t('iv.copyFailed');
-                    setTimeout(() => e.target.textContent = t('iv.copyWorkflow'), 2000);
-                });
-            };
-            const copyWfActions = document.createElement('div');
-            copyWfActions.className = 'holaf-viewer-info-actions';
-            copyWfActions.appendChild(copyWorkflowBtn);
-            finalMetadataContainer.appendChild(copyWfActions);
-        } else if (data.workflow && data.workflow.error) {
-            finalMetadataContainer.insertAdjacentHTML('beforeend', `<p class="holaf-viewer-message error"><em>${t('iv.errorWorkflow', { error: escapeHtml(data.workflow.error) })}</em></p>`);
-        } else {
-            finalMetadataContainer.insertAdjacentHTML('beforeend', `<p class="holaf-viewer-message"><em>${t('iv.noWorkflowFound')}</em></p>`);
-        }
+        if (data.width && data.height) fields.push({ label: t('iv.resolution'), value: `${data.width}x${data.height} px` });
+        if (data.ratio) fields.push({ label: t('iv.ratio'), value: data.ratio });
+        return { fields, blocks: buildBlocks(data) };
     } catch (err) {
         // Annulation (nouvelle image affichée) : silencieux, comme avant.
         // (HolafFetch encapsule l'AbortError → on teste le signal, pas err.name.)
-        if (signal.aborted) return;
+        if (signal && signal.aborted) return null;
+        if (err && err.name === 'AbortError') return { fields, blocks: [] };
         if (err instanceof HolafFetchError && err.status >= 400) {
-            // Non-2xx : même rendu que l'ancien test !response.ok
+            // Non-2xx : même message que l'ancien test !response.ok
             // (message du corps JSON s'il existe).
-            const m = document.getElementById('holaf-metadata-container');
-            if (m) m.innerHTML = `<p class="holaf-viewer-message error"><strong>${t('iv.errorLabel')}</strong> ${escapeHtml(err.data?.error || t('iv.unknownError'))}</p>`;
-            return;
+            return { fields, blocks: [], error: err.data?.error || t('iv.unknownError') };
         }
-        if (err.name !== 'AbortError') {
-            console.error("Metadata fetch error:", err);
-            const m = document.getElementById('holaf-metadata-container');
-            if (m) m.innerHTML = `<p class="holaf-viewer-message error"><strong>${t('iv.errorLabel')}</strong> ${t('iv.fetchMetadataFailed')}</p>`;
-        }
+        console.error("Metadata fetch error:", err);
+        return { fields, blocks: [], error: t('iv.fetchMetadataFailed') };
     }
 }
 
@@ -277,13 +209,32 @@ async function displayInfoForImage(image) {
  * Initializes the info pane to subscribe to state changes.
  */
 export function setupInfoPane() {
+    const container = document.getElementById(INFO_CONTENT_ID);
+    if (!container) return;
+
+    if (infoPane) {
+        try { infoPane.destroy(); } catch (e) { /* ignore */ }
+        infoPane = null;
+    }
+    // Retire le message statique initial de l'UI (la brique le remplace).
+    container.textContent = '';
+
+    infoPane = HolafInfoPane.create(container, {
+        labels: buildLabels(),
+        preview: previewImageInfo,
+        resolve: resolveImageInfo,
+        confirm: confirmLoadWorkflow,
+    });
+
     imageViewerState.subscribe(newState => {
         const activeImage = newState.activeImage;
         const activeImagePath = activeImage ? activeImage.path_canon : null;
 
         if (activeImagePath !== lastProcessedPath) {
             lastProcessedPath = activeImagePath;
-            displayInfoForImage(activeImage);
+            // Recalcule les libellés (changement de langue éventuel).
+            infoPane.setLabels(buildLabels());
+            infoPane.show(activeImage);
         }
     });
 }
