@@ -21,9 +21,14 @@
  *   id            : string — identifiant unique ('local', plus tard 'remote').
  *   label         : string — libellé affichable (étape 1 : UI du switch).
  *   capabilities  : { edit, trash, export, extractInject, favorite,
- *                     serverDownload, pollDelta } — booléens descriptifs.
- *                   Les actions absentes (favorite/serverDownload en local) sont
- *                   exposées à `null` et l'étape 1 masquera les boutons.
+ *                     serverDownload, pollDelta, mediaPlayback, preloadFull }
+ *                   — booléens descriptifs. Les actions absentes
+ *                   (favorite/serverDownload en local) sont exposées à `null`
+ *                   et l'étape 1 masquera les boutons.
+ *                   `mediaPlayback` : lecture plein média (vidéo/audio) via
+ *                   resolveMediaUrl. `preloadFull` : le plein média est une URL
+ *                   directement utilisable par <img src> (préchargement possible).
+ *                   Les DEUX à false signalent une source distante (Bearer, blob).
  *   pageSize      : number — taille de fenêtre du tableau creux.
  *   mode          : string — mode de la collection vendue ('window').
  *   itemKey(item) : string|null — clé métier stable (path_canon en local).
@@ -47,10 +52,12 @@
  *   createThumbCache(hooks)                 → instance HolafThumbCache dédiée.
  *   prioritizeThumbnails(paths)             → Promise (fire-and-forget).
  *
- *   resolveMediaUrl(item, {signal}) → string — URL du média plein écran.
- *                                     Synchrone en local (signal ignoré : c'est
- *                                     le comportement historique). Une source
- *                                     distante pourra renvoyer une Promise.
+ *   resolveMediaUrl(item, {signal}) → string | Promise<string|{url, revoke}>.
+ *                                     Synchrone en local (string, signal ignoré :
+ *                                     comportement historique). Une source
+ *                                     distante renvoie une Promise d'un objet
+ *                                     `{ url, revoke }` (objectURL à libérer par
+ *                                     l'hôte au changement / à la fermeture).
  *   resolveInfo(item, {signal})     → Promise<métadonnées brutes>.
  *
  *   deleteImages(paths, {permanent})    → Promise<résultat> (nullable si !trash).
@@ -186,6 +193,8 @@ const localSource = {
         favorite: false,        // pas de favori côté serveur local
         serverDownload: false,  // pas de téléchargement serveur en local
         pollDelta: true,
+        mediaPlayback: true,    // vidéo/audio lus depuis l'URL /holaf/images/full
+        preloadFull: true,      // plein média = URL directe (préchargeable)
     }),
     pageSize: LOCAL_PAGE_SIZE,
     mode: 'window',

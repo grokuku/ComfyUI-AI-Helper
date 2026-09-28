@@ -316,8 +316,8 @@ assert.strictEqual(await src.prioritizeThumbnails(["srv:1"]), null, "priorisatio
 for (const m of ["deleteImages", "restoreImages", "runMetadataOperation", "extractMetadata", "injectMetadata", "prepareExport", "exportChunkUrl", "fetchExportChunk", "emptyTrashcan"]) {
     assert.strictEqual(src[m], null, `action ${m} = null (non supportée)`);
 }
-assert.throws(() => src.resolveMediaUrl({ server_id: 1 }), /étape 4/, "resolveMediaUrl → fail-fast (plein écran)");
-assert.throws(() => src.resolveInfo({ server_id: 1 }), /étape 4/, "resolveInfo → fail-fast (métadonnées)");
+assert.strictEqual(typeof src.resolveMediaUrl, "function", "resolveMediaUrl implémenté (étape 4)");
+assert.strictEqual(typeof src.resolveInfo, "function", "resolveInfo implémenté (étape 4)");
 assert.strictEqual(src.capabilities.edit, false);
 assert.strictEqual(src.capabilities.trash, false);
 assert.strictEqual(src.capabilities.export, false);
@@ -325,7 +325,9 @@ assert.strictEqual(src.capabilities.extractInject, false);
 assert.strictEqual(src.capabilities.favorite, true);
 assert.strictEqual(src.capabilities.serverDownload, true);
 assert.strictEqual(src.capabilities.pollDelta, true);
-ok("null/no-op explicites + resolveMediaUrl/resolveInfo fail-fast + capabilities");
+assert.strictEqual(src.capabilities.mediaPlayback, false, "lecture vidéo/audio désactivée (serveur)");
+assert.strictEqual(src.capabilities.preloadFull, false, "pas de préchargement plein média (Bearer)");
+ok("null/no-op explicites + resolveMediaUrl/resolveInfo implémentés + capabilities");
 
 // fetchDelta = squelette vide (étape 6).
 const delta = await src.fetchDelta({ filters: {}, minMtime: 123 });

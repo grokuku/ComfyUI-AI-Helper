@@ -1038,6 +1038,8 @@ import "./aih_i18n.js";
         "iv.errorWorkflow": "Erreur : {error}",
         "iv.noWorkflowFound": "Aucun workflow trouvé.",
         "iv.fetchMetadataFailed": "Échec de la récupération des métadonnées.",
+        "iv.duration": "Durée :",
+        "iv.codec": "Codec :",
 
         /* Image Viewer Gallery (image_viewer_gallery.js) */
         "iv.viewFullscreen": "Voir en plein écran",
@@ -1046,6 +1048,14 @@ import "./aih_i18n.js";
         "iv.playVideo": "Lire la vidéo",
         "iv.playAudio": "Lire l'audio",
         "iv.editImage": "Modifier l'image",
+        "iv.viewImage": "Voir l'image",
+
+        /* Galerie source SERVEUR (image_viewer_navigation.js, étape 4) */
+        "iv.remotePlaybackUnavailable": "Lecture vidéo/audio indisponible en mode serveur pour l'instant.",
+        "iv.remoteAuthExpired": "Jeton serveur invalide ou expiré. Reconnectez le serveur.",
+        "iv.remoteNotFound": "Média introuvable sur le serveur.",
+        "iv.remoteMediaError": "Impossible de charger le média depuis le serveur.",
+        "iv.remoteEditUnavailable": "Lecture seule : édition indisponible en mode serveur.",
         "iv.selectImage": "Sélectionner l'image",
         "iv.noImagesMatch": "Aucune image ne correspond aux filtres actuels.",
         "iv.benchmarkResult": "<strong>Résultat du benchmark ({threads} threads)</strong><br>Vitesse : {speed} img/s<br>Temps : {time}s",
@@ -2227,6 +2237,8 @@ import "./aih_i18n.js";
         "iv.errorWorkflow": "Error: {error}",
         "iv.noWorkflowFound": "No workflow found.",
         "iv.fetchMetadataFailed": "Failed to fetch metadata.",
+        "iv.duration": "Duration:",
+        "iv.codec": "Codec:",
 
         /* Image Viewer Gallery (image_viewer_gallery.js) */
         "iv.viewFullscreen": "View fullscreen",
@@ -2235,6 +2247,14 @@ import "./aih_i18n.js";
         "iv.playVideo": "Play Video",
         "iv.playAudio": "Play Audio",
         "iv.editImage": "Edit image",
+        "iv.viewImage": "View image",
+
+        /* Server gallery source (image_viewer_navigation.js, step 4) */
+        "iv.remotePlaybackUnavailable": "Video/audio playback is unavailable in server mode for now.",
+        "iv.remoteAuthExpired": "Invalid or expired server token. Please reconnect the server.",
+        "iv.remoteNotFound": "Media not found on the server.",
+        "iv.remoteMediaError": "Failed to load the media from the server.",
+        "iv.remoteEditUnavailable": "Read-only: editing is unavailable in server mode.",
         "iv.selectImage": "Select image",
         "iv.noImagesMatch": "No images match the current filters.",
         "iv.benchmarkResult": "<strong>Benchmark Result ({threads} threads)</strong><br>Speed: {speed} imgs/sec<br>Time: {time}s",

@@ -297,8 +297,11 @@ function updateCell(el, image, ctx) {
         actionIcon.title = t('iv.playAudio');
         if (image.has_edit_file) actionIcon.classList.add('active');
     } else {
-        actionIcon.innerHTML = '✎';
-        actionIcon.title = t('iv.editImage');
+        // Source éditable → icône crayon. Sinon (serveur : edit:false) → icône
+        // loupe : la cellule ouvre la visionneuse, pas l'éditeur.
+        const editEnabled = GallerySource.active().capabilities.edit !== false;
+        actionIcon.innerHTML = editEnabled ? '✎' : '🔍';
+        actionIcon.title = editEnabled ? t('iv.editImage') : t('iv.viewImage');
         if (image.has_edit_file) actionIcon.classList.add('active');
     }
     if (ctx && ctx.refresh) actionIcon.classList.add('active');

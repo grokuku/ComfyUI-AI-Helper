@@ -176,17 +176,36 @@ function confirmLoadWorkflow(req) {
 }
 
 // ─── Résolution métier : endpoint /holaf/images/metadata ────────────────────
+// Durée lisible (mm:ss / h:mm:ss) pour les métadonnées serveur (vidéo/audio).
+function _formatDuration(seconds) {
+    const s = Math.max(0, Math.floor(Number(seconds) || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const two = (v) => String(v).padStart(2, '0');
+    return h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+}
+
 async function resolveImageInfo(image, { signal } = {}) {
     const fields = buildFields(image);
     try {
         // La source active résout l'endpoint de métadonnées (local :
-        // /holaf/images/metadata). HolafFetch : GET JSON parsé ; lève sur
-        // non-2xx/non-JSON → mappé sur l'affichage d'erreur historique ci-dessous.
+        // /holaf/images/metadata ; serveur : /api/media/<id>/metadata normalisé).
+        // HolafFetch : GET JSON parsé ; lève sur non-2xx/non-JSON → mappé sur
+        // l'affichage d'erreur historique ci-dessous.
         const data = await GallerySource.active().resolveInfo(image, { signal });
         if (signal && signal.aborted) return null;
 
         if (data.width && data.height) fields.push({ label: t('iv.resolution'), value: `${data.width}x${data.height} px` });
         if (data.ratio) fields.push({ label: t('iv.ratio'), value: data.ratio });
+        // Durée/codec : présents pour les vidéos/audios serveur (absents en local).
+        if (data.duration_ms != null || data.duration != null) {
+            const secs = (data.duration_ms != null) ? Number(data.duration_ms) / 1000 : Number(data.duration);
+            if (Number.isFinite(secs)) {
+                fields.push({ label: t('iv.duration'), value: _formatDuration(secs) });
+            }
+        }
+        if (data.codec) fields.push({ label: t('iv.codec'), value: String(data.codec) });
         return { fields, blocks: buildBlocks(data) };
     } catch (err) {
         // Annulation (nouvelle image affichée) : silencieux, comme avant.

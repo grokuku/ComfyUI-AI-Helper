@@ -10,6 +10,7 @@
 import "../aih_strings.js";
 import { imageViewerState } from './image_viewer_state.js';
 import { resetTransform, getFullImageUrl } from './image_viewer_navigation.js';
+import { GallerySource } from './image_viewer_source.js';
 import { HolafFetch, HolafFetchError } from '../vendor/holaf/holaf-fetch.js';
 import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
 import {
@@ -233,6 +234,15 @@ export class ImageEditor {
     }
 
     _handleStateChange(state) {
+        // L'éditeur (crop/masques/effets) n'est disponible que si la source
+        // active l'autorise (capacité `edit`). En mode serveur (edit:false),
+        // le panneau reste FERMÉ et aucun appel local (load-edits…) n'est fait.
+        if (GallerySource.active().capabilities.edit === false) {
+            const wasShown = this.panelEl && this.panelEl.style.display !== 'none';
+            if (wasShown && this.activeImage) this._hide();
+            if (this.panelEl) this.panelEl.style.display = 'none';
+            return;
+        }
         if (!this.panelEl) { this.createPanel(); if (!this.panelEl) return; }
         const visible = state.activeImage && state.ui.view_mode === 'zoom';
         const shown = this.panelEl.style.display !== 'none';

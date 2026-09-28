@@ -18,6 +18,7 @@
  * sélecteurs), le VIEWPORT (HolafViewport) et le garde-fou clavier.
  */
 
+import "../aih_strings.js";
 import { imageViewerState } from './image_viewer_state.js';
 import { handleDeletion } from './image_viewer_actions.js';
 import { dialogState } from '../holaf_panel_manager.js';
@@ -31,14 +32,33 @@ import { HolafLightbox } from '../vendor/holaf/holaf-lightbox.js';
 // (vendored), INJECTÉE dans HolafLightbox (zéro import croisé côté brique).
 import { HolafViewport } from '../vendor/holaf/holaf-viewport.js';
 
+// Helper i18n central : traduit via AIH.I18n (clé brute si absente).
+const t = (key, params) => {
+    const I = window.AIH && window.AIH.I18n;
+    return I && typeof I.t === 'function' ? I.t(key, params) : key;
+};
+
+// ── Capacités de la source ACTIVE (local : tout ; serveur : lecture média et
+//    édition désactivées). Centralisées pour que les gardes ci-dessous restent
+//    lisibles et STRICTEMENT neutres en local (caps à true). ──────────────────
+function _activeCapabilities() {
+    try { return GallerySource.active().capabilities || {}; }
+    catch (e) { return {}; }
+}
+function _editEnabled() { return _activeCapabilities().edit !== false; }
+function _fullMediaPlaybackEnabled() { return _activeCapabilities().mediaPlayback !== false; }
+function _preloadFullEnabled() { return _activeCapabilities().preloadFull !== false; }
+
 function _applyEditorPreview(viewer, element) {
+    // L'éditeur n'a de sens qu'avec la capacité edit (mode serveur : jamais).
+    if (!_editEnabled()) return;
     if (viewer && viewer.editor && typeof viewer.editor.applyPreview === 'function') {
         viewer.editor.applyPreview();
     }
 }
 
 async function _handleUnsavedChanges(viewer) {
-    if (!viewer.editor) return 'proceed';
+    if (!viewer.editor || !_editEnabled()) return 'proceed';
 
     // Flush any pending debounced save so it fires with the current image state
     if (viewer.editor._saveTimer) {
@@ -109,6 +129,7 @@ let _loadSerial = 0;
 let _loadDelayTimer = null;
 let _loadingTimer = null;     // Single global loading timer (not one per call)
 let _spinnerEl = null;       // Single global spinner element
+let _mediaMsgEl = null;      // Single global media message overlay (serveur)
 
 function _clearLoadingUI() {
     if (_loadingTimer) {
@@ -119,6 +140,10 @@ function _clearLoadingUI() {
         _spinnerEl.remove();
         _spinnerEl = null;
     }
+    if (_mediaMsgEl) {
+        _mediaMsgEl.remove();
+        _mediaMsgEl = null;
+    }
 }
 
 function _showSpinner(container) {
@@ -127,6 +152,37 @@ function _showSpinner(container) {
     _spinnerEl.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:100;pointer-events:none;font-size:24px;color:rgba(255,255,255,0.7);text-shadow:0 0 8px rgba(0,0,0,0.8);';
     _spinnerEl.innerHTML = '\u23F3';
     container.appendChild(_spinnerEl);
+}
+
+// Overlay message du plein écran (mode serveur) : lecture vidéo/audio
+// indisponible ou erreur de chargement. Un seul à la fois (nettoyé par
+// _clearLoadingUI et à la destruction de la vue).
+function _showMediaMessage(container, key, kind) {
+    if (!container) return;
+    if (_mediaMsgEl) { _mediaMsgEl.remove(); _mediaMsgEl = null; }
+    const el = document.createElement('div');
+    el.className = 'holaf-viewer-media-message';
+    el.dataset.kind = kind || 'info';
+    el.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:120;pointer-events:none;max-width:80%;text-align:center;padding:10px 16px;border-radius:8px;background:rgba(0,0,0,0.72);color:#fff;font-size:14px;line-height:1.4;text-shadow:0 0 6px rgba(0,0,0,0.8);';
+    el.textContent = t(key);
+    container.appendChild(el);
+    _mediaMsgEl = el;
+}
+
+// Statut HTTP de l'erreur de chargement → clé i18n du message.
+function _mediaMessageKey(err) {
+    const status = err && err.status;
+    if (status === 401 || status === 403) return 'iv.remoteAuthExpired';
+    if (status === 404) return 'iv.remoteNotFound';
+    return 'iv.remoteMediaError';
+}
+
+// Échec du chargement d'une IMAGE serveur : pas de spinner infini, message clair.
+function _onMediaLoadError(container, err, signal) {
+    _clearLoadingUI();
+    if (signal && signal.aborted) return;               // annulation → silencieux
+    if (err && err.name === 'AbortError') return;        // ditto
+    _showMediaMessage(container, _mediaMessageKey(err), 'error');
 }
 
 function _updateMediaSource(viewer, image, container, imgEl, videoEl, state, immediate, signal, onReady) {
@@ -145,10 +201,17 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, state, imm
     // destroy() : appelé par la brique avant le rendu suivant et à la fermeture.
     // Il invalide les callbacks en vol (serial++), coupe le spinner et met la
     // vidéo en pause (équivalent de l'ancien nettoyage à la fermeture de vue).
+    // Il LIBÈRE aussi l'objectURL du média serveur éventuellement chargé
+    // (aucune fuite au changement d'image / à la fermeture).
+    let currentRevoke = null;
     const destroy = () => {
         _loadSerial++;
         if (_loadDelayTimer) { clearTimeout(_loadDelayTimer); _loadDelayTimer = null; }
         _clearLoadingUI();
+        if (currentRevoke) {
+            try { currentRevoke(); } catch (e) { /* ignore */ }
+            currentRevoke = null;
+        }
         if (videoEl) {
             try { videoEl.pause(); } catch (e) { /* ignore */ }
             videoEl.onloadedmetadata = null;
@@ -162,10 +225,39 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, state, imm
     const serial = ++_loadSerial; // Each call gets a unique serial
     const isVideo = _isVideoFormat(image);
     const isAudio = _isAudioFormat(image);
-    const url = getFullImageUrl(image);
 
     // Safety check: ensure videoEl exists (it might be missing if UI didn't initialize correctly)
     const hasVideoEl = !!videoEl;
+
+    if ((isVideo || isAudio) && !_fullMediaPlaybackEnabled()) {
+        // ── Mode SERVEUR : vidéo/audio = VIGNETTE SEULEMENT (phase 1). Décision
+        // validée : on ne télécharge JAMAIS le binaire complet et aucun spinner
+        // infini — on affiche la vignette (déjà en cache) + un message explicite.
+        if (hasVideoEl) {
+            try { videoEl.pause(); } catch (e) { /* ignore */ }
+            videoEl.onloadedmetadata = null;
+            videoEl.style.display = 'none';
+            videoEl.src = '';
+        }
+        if (imgEl) {
+            imgEl.style.display = 'block';
+            imgEl.style.filter = '';
+            const thumbUrl = getThumbnailUrl(image.path_canon);
+            if (thumbUrl) {
+                imgEl.onload = () => {
+                    if (serial !== _loadSerial) return;
+                    notifyReady({ width: imgEl.naturalWidth, height: imgEl.naturalHeight });
+                };
+                imgEl.src = thumbUrl;
+                resetTransform(state, imgEl);
+                if (imgEl.complete && imgEl.naturalWidth) {
+                    notifyReady({ width: imgEl.naturalWidth, height: imgEl.naturalHeight });
+                }
+            }
+        }
+        _showMediaMessage(container, 'iv.remotePlaybackUnavailable', 'info');
+        return { el: imgEl, destroy };
+    }
 
     if (isAudio) {
         // Audio: Hide image, show video element as an audio player
@@ -177,7 +269,7 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, state, imm
         // Use the video element for audio playback
         if (hasVideoEl) {
             videoEl.style.display = 'block';
-            videoEl.src = url;
+            videoEl.src = getFullImageUrl(image);
             resetTransform(state, videoEl);
 
             // Audio-specific styling: smaller centered element
@@ -214,7 +306,7 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, state, imm
         videoEl.style.borderRadius = '';
 
         videoEl.style.display = 'block';
-        videoEl.src = url;
+        videoEl.src = getFullImageUrl(image);
         resetTransform(state, videoEl);
 
         // Pose les dimensions de la vidéo sur la brique dès que la metadata est
@@ -256,8 +348,15 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, state, imm
                 resetTransform(state, imgEl);
             }
 
-            // Pre-load full image — guard against stale callbacks from rapid navigation
-            const doLoad = () => {
+            // Résolution de l'URL plein écran : locale = chaîne synchrone (URL
+            // /holaf/images/full) ; serveur = Promise de { url (objectURL),
+            // revoke }. On mémorise revoke pour le libérer au destroy.
+            const finish = (resolved) => {
+                const url = (resolved && typeof resolved === 'object') ? resolved.url : resolved;
+                const revoke = (resolved && typeof resolved === 'object' && typeof resolved.revoke === 'function')
+                    ? resolved.revoke : null;
+                if (serial !== _loadSerial) { if (revoke) revoke(); return; } // périmé → libère
+                currentRevoke = revoke;
                 const loader = new Image();
                 loader.onload = () => {
                     if (serial !== _loadSerial) return; // Stale callback — ignore
@@ -278,6 +377,26 @@ function _updateMediaSource(viewer, image, container, imgEl, videoEl, state, imm
                 // Start spinner 1s after load begins
                 _loadingTimer = setTimeout(() => _showSpinner(container), 1000);
                 loader.src = url;
+            };
+
+            // Pre-load full image — guard against stale callbacks from rapid navigation
+            const doLoad = () => {
+                let resolved;
+                try {
+                    resolved = getFullImageUrl(image);
+                } catch (err) {
+                    _onMediaLoadError(container, err, signal);
+                    return;
+                }
+                if (resolved && typeof resolved.then === 'function') {
+                    // Source distante : erreurs typées (401/404/réseau) → message.
+                    resolved.then(finish).catch((err) => {
+                        if (serial !== _loadSerial) return;
+                        _onMediaLoadError(container, err, signal);
+                    });
+                } else {
+                    finish(resolved);
+                }
             };
             // Delay full-size load when navigating (arrow keys), load immediately when entering view
             if (immediate) {
@@ -361,7 +480,9 @@ function _ensureLightbox(viewer) {
         getId: (item) => GallerySource.active().itemKey(item),
         urlFor: (item) => getFullImageUrl(item),
         renderMedia: (ctx) => _renderMedia(viewer, ctx),
-        shouldPreload: _isMediaImage,
+        // Preload plein média = URL utilisable dans <img src> (local). Une source
+        // distante (Bearer/blob) ne peut pas précharger ainsi → désactivé.
+        shouldPreload: (item) => _isMediaImage(item) && _preloadFullEnabled(),
         preload: 10,
         preloadDebounce: 400,
         getColumnCount: () => (viewer.gallery && typeof viewer.gallery.getColumnCount === 'function')
@@ -406,8 +527,24 @@ function _onLightboxOpen(viewer, mode) {
     if (mode === 'zoom') {
         const galleryEl = document.getElementById('holaf-viewer-gallery');
         if (galleryEl) galleryEl.style.display = 'none';
+        _syncZoomReadOnlyBadge();
     }
     imageViewerState.setState({ ui: { view_mode: mode } });
+}
+
+// Badge « lecture seule » de la vue zoom quand la source active n'autorise pas
+// l'édition (mode serveur). En local, aucun badge (comportement inchangé).
+function _syncZoomReadOnlyBadge() {
+    const zoomView = document.getElementById('holaf-viewer-zoom-view');
+    if (!zoomView) return;
+    const existing = zoomView.querySelector('.holaf-viewer-readonly-badge');
+    if (_editEnabled()) { if (existing) existing.remove(); return; }
+    if (existing) return;
+    const badge = document.createElement('div');
+    badge.className = 'holaf-viewer-readonly-badge';
+    badge.style.cssText = 'position:absolute;bottom:15px;right:15px;z-index:102;padding:6px 12px;border-radius:6px;background:rgba(0,0,0,0.6);color:rgba(255,255,255,0.85);font-size:0.8em;text-shadow:1px 1px 2px black;pointer-events:none;';
+    badge.textContent = t('iv.remoteEditUnavailable');
+    zoomView.appendChild(badge);
 }
 
 function _onLightboxClose(viewer, mode) {

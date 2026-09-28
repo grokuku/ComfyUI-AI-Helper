@@ -12,11 +12,11 @@
  * que TOUS les modules hôtes (holaf_image_viewer.js, image_viewer_data/
  * gallery/navigation/infopane/actions.js) fonctionnent sans branchement.
  *
- * Périmètre ÉTAPE 2 : DONNÉES + VIGNETTES (liste paginée, options de filtres,
- * normalisation d'item, URL/chargement de vignette). Le plein écran et les
- * métadonnées (resolveMediaUrl / resolveInfo) = étape 4 ; les filtres UI dédiés
- * = étape 5 ; le poll/delta = étape 6. Ces méthodes existent déjà (interface
- * complète) mais échouent PROPREMENT en attendant (cf. ci-dessous).
+ * Périmètre ÉTAPES 2 + 4 : DONNÉES + VIGNETTES (étape 2 : liste paginée,
+ * options de filtres, normalisation d'item, URL/chargement de vignette) et
+ * PLEIN ÉCRAN + MÉTADONNÉES (étape 4 : resolveMediaUrl pour les IMAGES,
+ * resolveInfo pour le panneau d'infos). Les filtres UI dédiés = étape 5 ; le
+ * poll/delta = étape 6.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CANAL SERVEUR
@@ -73,6 +73,39 @@
  * Conséquence : l'option « Serveur » ne s'active qu'avec une config complète.
  *
  * ─────────────────────────────────────────────────────────────────────────────
+ * PLEIN ÉCRAN (étape 4)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * resolveMediaUrl(image, {signal}) implémente la résolution du média PLEIN
+ * ÉCRAN. Pour une IMAGE, il télécharge le BINAIRE ORIGINAL via le bridge
+ * (remoteGet('media/<id>/download', {raw:true, signal})) — un `<img src>` ne
+ * peut pas porter le Bearer, donc on récupère un blob puis on renvoie un
+ * objectURL `{ url, revoke }`. L'hôte (image_viewer_navigation.js) appelle
+ * revoke() à chaque changement d'image et à la fermeture de la visionneuse.
+ *
+ *   Endpoint choisi : /download (binaire ORIGINAL) et NON la grande vignette.
+ *   Justification : la vignette serveur est plafonnée à 512 px (inadaptée au
+ *   plein écran) ; le mode LOCAL charge déjà l'original via /holaf/images/full,
+ *   donc la parité de fidélité est conservée. Conséquence : pour une très
+ *   grande image le blob + objectURL restent en mémoire jusqu'à la révocation
+ *   (faite au changement/fermeture), et le téléchargement est annulable via
+ *   signal.
+ *
+ *   Pour un média VIDÉO/AUDIO : lecture DÉSACTIVÉE en phase 1 (décision
+ *   validée : vignette seulement). resolveMediaUrl REFUSE alors AVANT tout
+ *   fetch (aucun binaire complet téléchargé) ; l'hôte affiche la vignette + un
+ *   message. capability `mediaPlayback:false` porte cette règle.
+ *
+ * PANNEAU D'INFOS (étape 4)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * resolveInfo(image, {signal}) appelle GET /api/media/<id>/metadata et NORMALISE
+ * la réponse vers le MÊME schéma que la source locale ({prompt, prompt_source,
+ * workflow, workflow_source, width, height, ratio}) afin que
+ * image_viewer_infopane.js (buildFields/buildBlocks) fonctionne SANS branchement.
+ * Spécificité serveur : `workflow` est une CHAÎNE JSON (`workflow_json`) →
+ * mapRemoteMetadata la PARSE en objet (le bouton « Load workflow » l'exige) ;
+ * une chaîne corrompue devient `{error:'Corrupt workflow JSON'}` (parité locale).
+ * duration/duration_ms/codec sont transmis pour affichage si présents.
+ *
  * CE QUI N'EST PAS ENCORE SUPPORTÉ (documenté, fail-fast ou no-op explicite)
  * ─────────────────────────────────────────────────────────────────────────────
  *   - fetchLastUpdateTime  → null  (poll par tête de page 1 = étape 6) ;
@@ -81,10 +114,8 @@
  *   - fetchDelta           → delta VIDE (squelette ; poll = étape 6) ;
  *   - loadEdits            → null  (pas d'édition serveur) ;
  *   - prioritizeThumbnails → no-op (pas de priorisation serveur) ;
- *   - resolveMediaUrl      → lève (plein écran = étape 4) ;
- *   - resolveInfo          → lève (métadonnées = étape 4) ;
  *   - filters UI (formats, prompt/workflow, corbeille) = étape 5 ;
- *   - delete/restore/extract/inject/export → null (capacités à l'étape 4+).
+ *   - delete/restore/extract/inject/export → null (non supportés).
  * `favorite` et `download` SONT supportés par le serveur et implémentés
  * (capabilities favorite/serverDownload = true), même si l'UI du pack ne les
  * consomme pas encore.
@@ -92,7 +123,7 @@
 
 import { HolafThumbCache } from '../vendor/holaf/holaf-thumbcache.js';
 import { HolafCollection } from '../vendor/holaf/holaf-collection.js';
-import { remoteGet, remotePost, getRemoteConfig } from '../aih_fetch_bridge.js';
+import { remoteGet, remotePost, getRemoteConfig, HolafFetchError } from '../aih_fetch_bridge.js';
 import { GallerySource } from './image_viewer_source.js';
 import { imageViewerState } from './image_viewer_state.js';
 
@@ -157,6 +188,77 @@ export function snapThumbSize(size) {
 export function serverIdFromPath(pathCanon) {
     const m = /^srv:(\d+)$/.exec(String(pathCanon || ''));
     return m ? Number(m[1]) : null;
+}
+
+// Formats vidéo/audio reconnus (mêmes listes que image_viewer_navigation.js).
+// Sert à décider si resolveMediaUrl peut télécharger le binaire (IMAGE) ou
+// refuser (VIDÉO/AUDIO : lecture désactivée en phase 1).
+const REMOTE_VIDEO_FORMATS = ['MP4', 'WEBM', 'MKV', 'AVI', 'MOV', 'M4V'];
+const REMOTE_AUDIO_FORMATS = ['WAV', 'MP3', 'OGG', 'FLAC', 'AAC', 'M4A'];
+
+/**
+ * L'item est-il une IMAGE (donc affichable en plein écran) ? On se fie d'abord
+ * à `kind` (fourni par le serveur), sinon au format MAJUSCULE.
+ * @param {object} image
+ * @returns {boolean}
+ */
+export function isPlayableImage(image) {
+    if (!image) return false;
+    if (image.kind) return image.kind === 'image';
+    const fmt = String(image.format || '').toUpperCase();
+    return !REMOTE_VIDEO_FORMATS.includes(fmt) && !REMOTE_AUDIO_FORMATS.includes(fmt);
+}
+
+/** Erreur d'annulation (AbortError), sans dépendre de DOMException. */
+function _abortError() {
+    try { return new DOMException('aborted', 'AbortError'); }
+    catch (e) { const err = new Error('aborted'); err.name = 'AbortError'; return err; }
+}
+
+/**
+ * Erreur typée de chargement du média, porteuse du statut HTTP (lue par l'hôte
+ * pour choisir le message : 401/403 → jeton, 404 → introuvable, sinon générique).
+ */
+function _mediaError(status) {
+    if (status === 401 || status === 403) return new HolafFetchError('jeton invalide ou expiré', { status });
+    if (status === 404) return new HolafFetchError('média introuvable', { status });
+    return new HolafFetchError('échec du chargement du média', { status });
+}
+
+/**
+ * Normalise les métadonnées serveur (/api/media/<id>/metadata) vers le schéma
+ * attendu par image_viewer_infopane.js (parité avec /holaf/images/metadata).
+ * `workflow` (chaîne JSON côté serveur) est PARSÉ en objet ; une chaîne
+ * corrompue devient `{error:'Corrupt workflow JSON'}` (parité locale).
+ * Exporté pour les tests.
+ * @param {object} data réponse JSON de /metadata
+ * @returns {object}
+ */
+export function mapRemoteMetadata(data) {
+    const d = data || {};
+    let workflow = null;
+    const raw = d.workflow;
+    if (typeof raw === 'string') {
+        const s = raw.trim();
+        if (s) {
+            try { workflow = JSON.parse(s); }
+            catch (e) { workflow = { error: 'Corrupt workflow JSON' }; }
+        }
+    } else if (raw && typeof raw === 'object') {
+        workflow = raw;
+    }
+    return {
+        prompt: d.prompt || '',
+        prompt_source: '',   // le serveur n'expose pas la provenance du prompt
+        workflow,
+        workflow_source: '', // ni celle du workflow
+        width: (d.width != null) ? d.width : null,
+        height: (d.height != null) ? d.height : null,
+        ratio: (d.ratio != null && d.ratio !== '') ? String(d.ratio) : null,
+        duration: (d.duration != null) ? d.duration : null,
+        duration_ms: (d.duration_ms != null) ? d.duration_ms : null,
+        codec: d.codec || null,
+    };
 }
 
 /**
@@ -285,13 +387,21 @@ export function createRemoteSource(overrides = {}) {
         id: REMOTE_SOURCE_ID,
         label: 'Server',
         capabilities: Object.freeze({
-            edit: false,          // pas d'édition serveur
+            edit: false,          // pas d'édition serveur (l'éditeur reste fermé)
             trash: false,         // corbeille UI = étape 5
-            export: false,        // export = étape 4+
-            extractInject: false, // métadonnées = étape 4
+            export: false,        // export non supporté
+            extractInject: false, // pas d'extract/inject serveur
             favorite: true,       // POST /api/media/favorite (bulk)
             serverDownload: true, // GET /api/media/<id>/download
             pollDelta: true,      // poll prévu (tête de page 1, étape 6)
+            // Lecture plein média (vidéo/audio) DÉSACTIVÉE en phase 1 : vignette
+            // seulement. L'hôte n'appelle jamais resolveMediaUrl pour du
+            // vidéo/audio et affiche un message (cf. navigation.js).
+            mediaPlayback: false,
+            // Préchargement du plein média via <img src> impossible : le Bearer
+            // ne peut pas être porté par un élément. L'hôte saute le preload
+            // plein (le plein écran passe par le bridge + objectURL).
+            preloadFull: false,
         }),
         pageSize: overrides.pageSize || REMOTE_PAGE_SIZE,
         mode: 'window',
@@ -440,12 +550,67 @@ export function createRemoteSource(overrides = {}) {
         /** Force des URL de vignette uniques (bypass cache navigateur/blob). */
         setThumbnailCacheBuster(value) { _thumbnailCacheBuster = value || ''; },
 
-        // ── Média / infos (étape 4) — fail-fast documenté ─────────────────
-        resolveMediaUrl(/* image, { signal } */) {
-            throw new Error('[GallerySource:remote] resolveMediaUrl (plein écran) = étape 4.');
+        // ── Média / infos (étape 4) ───────────────────────────────────────
+        /**
+         * URL du média plein écran. Pour une IMAGE, récupère le binaire ORIGINAL
+         * via le bridge (Bearer) et renvoie `{ url, revoke }` : `url` = objectURL,
+         * `revoke()` libère l'objectURL (à appeler au changement d'image / à la
+         * fermeture par l'hôte). Pour un VIDÉO/AUDIO, REFUSE avant tout fetch
+         * (lecture désactivée en phase 1) — l'hôte ne l'appelle d'ailleurs jamais
+         * pour ces formats (capability mediaPlayback:false).
+         *
+         * Erreurs typées (HolafFetchError) : status 401/403 (jeton), 404
+         * (introuvable), 0 (réseau) ; annulation = AbortError (signal).
+         * @param {object} image item normalisé (server_id / path_canon)
+         * @param {{signal?: AbortSignal}} [opts]
+         * @returns {Promise<{url: string, revoke: Function}>}
+         */
+        async resolveMediaUrl(image, { signal = undefined } = {}) {
+            const id = (image && image.server_id != null) ? image.server_id : serverIdFromPath(image && image.path_canon);
+            if (id == null) throw _mediaError(404);
+            if (!isPlayableImage(image)) {
+                // Vidéo/audio : AUCUN téléchargement du binaire complet.
+                throw new HolafFetchError('lecture vidéo/audio indisponible en mode serveur', { status: -1 });
+            }
+            if (signal && signal.aborted) throw _abortError();
+
+            let resp;
+            try {
+                resp = await remoteGet(REMOTE_ENDPOINTS.download(id), { raw: true, signal });
+            } catch (err) {
+                if (signal && signal.aborted) throw _abortError();
+                throw err;
+            }
+            if (signal && signal.aborted) throw _abortError();
+            if (!resp || resp.ok === false) throw _mediaError(resp ? resp.status : 0);
+
+            let blob;
+            try {
+                blob = await resp.blob();
+            } catch (err) {
+                if (signal && signal.aborted) throw _abortError();
+                throw _mediaError(0);
+            }
+            if (signal && signal.aborted) throw _abortError();
+
+            const url = URL.createObjectURL(blob);
+            return { url, revoke: () => { try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ } } };
         },
-        resolveInfo(/* image, { signal } */) {
-            throw new Error('[GallerySource:remote] resolveInfo (métadonnées) = étape 4.');
+
+        /**
+         * Métadonnées détaillées pour le panneau d'infos : GET
+         * /api/media/<id>/metadata → mapRemoteMetadata() (schéma local).
+         * `workflow` (chaîne JSON) est parsé pour que « Load workflow » marche.
+         * @param {object} image item normalisé
+         * @param {{signal?: AbortSignal}} [opts]
+         * @returns {Promise<object|null>}
+         */
+        async resolveInfo(image, { signal = undefined } = {}) {
+            const id = (image && image.server_id != null) ? image.server_id : serverIdFromPath(image && image.path_canon);
+            if (id == null) throw _mediaError(404);
+            const data = await remoteGet(REMOTE_ENDPOINTS.metadata(id), { signal });
+            if (signal && signal.aborted) return null;
+            return mapRemoteMetadata(data);
         },
 
         // ── Actions ───────────────────────────────────────────────────────
