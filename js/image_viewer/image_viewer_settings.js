@@ -10,6 +10,7 @@ import { HolafPanelManager } from "../holaf_panel_manager.js";
 import { HOLAF_THEMES } from "../holaf_themes.js";
 import { HolafFetch } from "../vendor/holaf/holaf-fetch.js";
 import { imageViewerState } from "./image_viewer_state.js";
+import { normalizeSourceId } from "./image_viewer_source_switch.js";
 
 let saveTimeout;
 const DEBOUNCE_DELAY = 750;
@@ -91,6 +92,8 @@ export async function loadSettings(viewer) {
             },
             ui: {
                 theme: validTheme ? fetchedSettings.theme : HOLAF_THEMES[0].name,
+                // Clé absente (installations existantes) ou invalide → 'local'.
+                gallery_source: normalizeSourceId(toString(fetchedSettings.gallery_source, 'local')),
                 thumbnail_fit: toString(fetchedSettings.thumbnail_fit, 'cover'),
                 thumbnail_size: toNumber(fetchedSettings.thumbnail_size, 150),
                 export_format: toString(fetchedSettings.export_format, 'png'),

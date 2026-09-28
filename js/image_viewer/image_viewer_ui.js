@@ -9,6 +9,14 @@ import { imageViewerState } from './image_viewer_state.js';
 import * as Navigation from './image_viewer_navigation.js';
 import { HolafFetch } from '../vendor/holaf/holaf-fetch.js';
 import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
+import {
+    SOURCE_LOCAL,
+    SOURCE_REMOTE,
+    applySourceSwitch,
+    getRemoteStatus,
+    normalizeSourceId,
+    describeRemoteHost,
+} from './image_viewer_source_switch.js';
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -103,6 +111,8 @@ class ImageViewerUI {
 
         if (!this.elements.searchInput) return;
 
+        this._renderSourceGroup(state);
+
         const currentText = filters.filename_search || filters.prompt_search || filters.workflow_search || '';
 
         if (this.elements.searchInput.value !== currentText && (currentText !== '' || this.elements.searchInput.value !== '')) {
@@ -144,6 +154,15 @@ class ImageViewerUI {
         pane.id = 'holaf-viewer-left-pane';
         pane.className = 'holaf-viewer-pane';
         pane.innerHTML = `
+            <div class="holaf-viewer-filter-group" id="holaf-viewer-source-group">
+                <h4 id="holaf-viewer-source-title">${t('iv.source')}</h4>
+                <div class="holaf-viewer-toggle-button-group" id="holaf-viewer-source-buttons" role="radiogroup" aria-labelledby="holaf-viewer-source-title">
+                    <button type="button" role="radio" class="holaf-viewer-toggle-button" id="holaf-viewer-source-local">${t('iv.sourceLocal')}</button>
+                    <button type="button" role="radio" class="holaf-viewer-toggle-button" id="holaf-viewer-source-remote">${t('iv.sourceRemote')}</button>
+                </div>
+                <div id="holaf-viewer-source-note" class="holaf-viewer-source-note"></div>
+            </div>
+
             <div class="holaf-viewer-filter-group">
                 <h4>${t('iv.uiSearch')}</h4>
                 <input type="search" id="holaf-viewer-search-input" placeholder="${t('iv.searchPlaceholder')}" class="holaf-viewer-search-bar">
@@ -267,6 +286,12 @@ class ImageViewerUI {
     _cacheElements() {
         this.elements.searchInput = this.elements.leftPane.querySelector('#holaf-viewer-search-input');
 
+        this.elements.sourceButtons = {
+            local: this.elements.leftPane.querySelector('#holaf-viewer-source-local'),
+            remote: this.elements.leftPane.querySelector('#holaf-viewer-source-remote'),
+        };
+        this.elements.sourceNote = this.elements.leftPane.querySelector('#holaf-viewer-source-note');
+
         this.elements.scopeButtons = {
             filename: this.elements.leftPane.querySelector('#holaf-search-scope-filename'),
             prompt: this.elements.leftPane.querySelector('#holaf-search-scope-prompt'),
@@ -295,6 +320,11 @@ class ImageViewerUI {
 
     _setupEventListeners() {
         const viewer = this.callbacks.getViewer();
+
+        if (this.elements.sourceButtons) {
+            this.elements.sourceButtons.local.onclick = () => this._handleSourceSelect(SOURCE_LOCAL);
+            this.elements.sourceButtons.remote.onclick = () => this._handleSourceSelect(SOURCE_REMOTE);
+        }
 
         const jumpNewestBtn = this.elements.centerPane.querySelector('#holaf-viewer-jump-newest');
         if (jumpNewestBtn) {
@@ -526,6 +556,70 @@ class ImageViewerUI {
         zoomImage.onclick = (e) => e.stopPropagation();
 
         Navigation.setupZoomAndPan(viewer.zoomViewState, zoomView, zoomImage);
+    }
+
+    /**
+     * Rend l'état du switch de source : sélection, garde-fou « serveur non
+     * configuré » (option grisée + guidage AIH ▸ Paramètres serveur) et, si la
+     * source active est 'remote', l'indice de l'hôte configuré.
+     * @param {object} state — instantané d'imageViewerState.
+     */
+    _renderSourceGroup(state) {
+        const buttons = this.elements.sourceButtons;
+        if (!buttons || !buttons.local || !buttons.remote) return;
+
+        const currentId = normalizeSourceId(state && state.ui ? state.ui.gallery_source : SOURCE_LOCAL);
+        const remote = getRemoteStatus();
+
+        buttons.local.classList.toggle('active', currentId === SOURCE_LOCAL);
+        buttons.remote.classList.toggle('active', currentId === SOURCE_REMOTE);
+        buttons.local.setAttribute('aria-checked', String(currentId === SOURCE_LOCAL));
+        buttons.remote.setAttribute('aria-checked', String(currentId === SOURCE_REMOTE));
+
+        // Garde-fou : pas de serveur/token → option Serveur désactivée (grisée)
+        // avec guidage vers le menu AIH (titre + note visible).
+        buttons.remote.disabled = !remote.configured;
+        buttons.remote.title = remote.configured ? t('iv.sourceRemoteTitle') : t('iv.sourceRemoteDisabled');
+
+        let note = '';
+        if (!remote.configured) {
+            note = t('iv.sourceRemoteDisabled');
+        } else if (currentId === SOURCE_REMOTE) {
+            note = t('iv.sourceRemoteHost', { host: describeRemoteHost(remote.serverUrl) });
+        } else if (!remote.hasProvider) {
+            // Étape 2 non livrée : provider 'remote' non enregistré.
+            note = t('iv.sourceRemoteUnavailable');
+        }
+        if (this.elements.sourceNote) this.elements.sourceNote.textContent = note;
+    }
+
+    /**
+     * Bascule demandée par l'utilisateur. Le refus est PROPRE : aucun état
+     * modifié, message explicite (garde-fou non configuré ou étape 2 non livrée).
+     * @param {string} targetId — SOURCE_LOCAL | SOURCE_REMOTE.
+     */
+    async _handleSourceSelect(targetId) {
+        try {
+            const viewer = this.callbacks.getViewer();
+            const result = await applySourceSwitch(viewer, targetId);
+            if (!result.ok) {
+                const key = result.reason === 'not-configured'
+                    ? 'iv.sourceRemoteDisabled'
+                    : result.reason === 'not-implemented'
+                        ? 'iv.sourceRemoteUnavailable'
+                        : 'iv.sourceSwitchError';
+                const message = key === 'iv.sourceSwitchError'
+                    ? t(key, { message: (result.error && result.error.message) || '' })
+                    : t(key);
+                bridgeShowToast({ message, type: 'warning' });
+            }
+        } catch (error) {
+            console.error('[Holaf ImageViewer] Source switch failed:', error);
+            bridgeShowToast({ message: t('iv.sourceSwitchError', { message: error.message }), type: 'error' });
+        }
+        // Re-synchronise le contrôle sur l'état réel (refus → la sélection
+        // affichée revient sur la source active).
+        this._render(imageViewerState.getState());
     }
 
     _renderActiveTags(tags) {

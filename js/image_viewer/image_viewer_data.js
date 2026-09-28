@@ -36,7 +36,26 @@ const source = GallerySource.active();
 
 export const PAGE_SIZE = source.pageSize;
 
-const collection = source.createCollection();
+// Collection courante, ancrée sur le provider ACTIF au moment de l'import.
+// `let` (et non `const`) : rebindSourceCollection() la recrée lors d'une
+// bascule de source (étape 2) — c'est le seul point de recréation.
+let collection = source.createCollection();
+
+/**
+ * Ré-ancre la collection sur la source ACTIVE du registre (GallerySource).
+ * À appeler APRÈS GallerySource.setActive(id) et après le vidage du cache de
+ * l'ancienne collection (resetWindowCache). Étape 1 : jamais atteint en
+ * pratique ('remote' non enregistré → bascule refusée en amont) ; requis par
+ * l'étape 2.
+ * NOTE étape 2 : PAGE_SIZE reste la constante d'import (500 des deux côtés
+ * aujourd'hui) ; si le provider serveur change de taille de fenêtre, il faudra
+ * aussi revoir les lecteurs qui importent PAGE_SIZE.
+ * @returns {object} la nouvelle collection.
+ */
+export function rebindSourceCollection() {
+    collection = GallerySource.active().createCollection();
+    return collection;
+}
 
 // Ré-ancre la brique sur l'état de l'hôte (tableau images par référence).
 function _bind(state) {

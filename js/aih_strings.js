@@ -797,6 +797,16 @@ import "./aih_i18n.js";
         "iv.exportQueueComplete": "<strong>File d'export terminée :</strong><br>{count} fichier(s) téléchargé(s).",
         "iv.downloadFailed": "<strong>Échec du téléchargement :</strong><br>{filename}<br><small>{error}</small>",
 
+        /* Image Viewer UI (image_viewer_ui.js) — switch de source (étape 1) */
+        "iv.source": "Source",
+        "iv.sourceLocal": "Local",
+        "iv.sourceRemote": "Serveur",
+        "iv.sourceRemoteTitle": "Afficher la galerie du serveur AIH (serveur configuré requis)",
+        "iv.sourceRemoteDisabled": "Serveur non configuré — configurez-le dans AIH ▸ Paramètres serveur.",
+        "iv.sourceRemoteUnavailable": "Source serveur non disponible dans cette version.",
+        "iv.sourceRemoteHost": "Serveur : {host}",
+        "iv.sourceSwitchError": "Échec du changement de source : {message}",
+
         /* Image Viewer UI (image_viewer_ui.js) */
         "iv.uiSearch": "Recherche",
         "iv.searchPlaceholder": "Rechercher nom de fichier, prompt, workflow...",
@@ -1975,6 +1985,16 @@ import "./aih_i18n.js";
         "iv.exportingStatus": "Exporting ({done}/{total}): {name}",
         "iv.exportQueueComplete": "<strong>Export Queue Complete:</strong><br>{count} file(s) downloaded.",
         "iv.downloadFailed": "<strong>Download Failed:</strong><br>{filename}<br><small>{error}</small>",
+
+        /* Image Viewer UI (image_viewer_ui.js) — source switch (step 1) */
+        "iv.source": "Source",
+        "iv.sourceLocal": "Local",
+        "iv.sourceRemote": "Server",
+        "iv.sourceRemoteTitle": "Browse the AIH server gallery (requires a configured server)",
+        "iv.sourceRemoteDisabled": "Server not configured — set it up in AIH ▸ Server settings.",
+        "iv.sourceRemoteUnavailable": "Server source is not available in this version.",
+        "iv.sourceRemoteHost": "Server: {host}",
+        "iv.sourceSwitchError": "Failed to switch source: {message}",
 
         /* Image Viewer UI (image_viewer_ui.js) */
         "iv.uiSearch": "Search",

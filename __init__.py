@@ -1077,6 +1077,7 @@ async def image_viewer_save_ui_settings_route(request: web.Request):
             keys_to_save = [
                 'panel_is_fullscreen', 'thumbnail_fit', 'thumbnail_size', 'theme', 
                 'export_format', 'export_include_meta', 'export_meta_method',
+                'gallery_source',
                 'search_text', 'search_scope_name', 'search_scope_prompt', 'search_scope_workflow',
                 'workflow_filter_internal', 'workflow_filter_external'
             ]

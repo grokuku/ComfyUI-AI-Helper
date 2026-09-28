@@ -1025,6 +1025,28 @@ video::-webkit-media-controls {
     font-weight: bold;
 }
 
+.holaf-viewer-toggle-button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    border-color: var(--holaf-border-color);
+}
+
+.holaf-viewer-toggle-button:disabled:hover {
+    border-color: var(--holaf-border-color);
+}
+
+/* Note d'aide du switch de source (garde-fou / hôte serveur) */
+.holaf-viewer-source-note {
+    margin-top: 6px;
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--holaf-text-secondary);
+}
+
+.holaf-viewer-source-note:empty {
+    display: none;
+}
+
 .holaf-viewer-edit-icon {
     position: absolute;
     top: 5px;

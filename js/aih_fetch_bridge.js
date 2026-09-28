@@ -52,6 +52,17 @@ function resolveConfig() {
 }
 
 /**
+ * Lecture seule de la config serveur courante (serverUrl + apiKey), SANS
+ * requête réseau. Utilisé par le garde-fou du switch de source galerie
+ * (image_viewer_source_switch.js) pour savoir si le serveur est configuré.
+ * @returns {{serverUrl: string, apiKey: string}} valeurs brutes résolues.
+ */
+export function getRemoteConfig() {
+    const cfg = resolveConfig();
+    return { serverUrl: cfg.serverUrl, apiKey: cfg.apiKey };
+}
+
+/**
  * Requête vers le serveur distant Holaf.
  * @param {string} path  Chemin relatif (préfixé par /api/) ou URL absolue.
  * @param {object} opts  Options forwardées à HolafFetch.request :
@@ -96,6 +107,7 @@ if (typeof window !== "undefined") {
         remotePost,
         remoteDelete,
         remoteRequest,
+        getRemoteConfig,
     };
 }
 

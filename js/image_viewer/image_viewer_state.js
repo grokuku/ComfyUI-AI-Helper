@@ -38,6 +38,10 @@ class ImageViewerState {
             // État de l'interface et des préférences
             ui: {
                 theme: "Graphite Orange",
+                // Source de la galerie : 'local' (dossier output ComfyUI) ou
+                // 'remote' (serveur AIH, étape 2). Persistée via save-settings
+                // (clé gallery_source, whitelist backend __init__.py).
+                gallery_source: 'local',
                 thumbnail_fit: 'cover',
                 thumbnail_size: 150,
                 export_format: 'png',

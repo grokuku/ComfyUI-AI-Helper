@@ -24,6 +24,7 @@ import { HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { holafExtUrl } from './holaf_ext_base.js';
 import * as Settings from './image_viewer/image_viewer_settings.js';
 import { GallerySource } from './image_viewer/image_viewer_source.js';
+import { reconcileStoredSource } from './image_viewer/image_viewer_source_switch.js';
 import { UI, createThemeMenu } from './image_viewer/image_viewer_ui.js';
 import { initGallery, syncGallery, refreshThumbnailInGallery, forceRelayout, refreshAfterIncremental } from './image_viewer/image_viewer_gallery.js';
 import { PAGE_SIZE, setWindowLoaded, resetWindowCache, forEachLoadedImage, insertImagesAtTop, removeImagesByPaths } from './image_viewer/image_viewer_data.js';
@@ -105,6 +106,9 @@ const holafImageViewer = {
         }
 
         await this.loadSettings();
+        // Source persistée : applique 'remote' s'il est disponible, sinon repli
+        // propre sur 'local' (serveur non configuré ou provider étape 2 absent).
+        await reconcileStoredSource(this);
         await this.loadAndPopulateFilters(true);
     },
 
