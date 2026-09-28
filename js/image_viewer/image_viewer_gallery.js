@@ -82,18 +82,37 @@ const AUDIO_FORMATS = ['WAV', 'MP3', 'OGG', 'FLAC', 'AAC', 'M4A'];
 // La SOURCE ACTIVE (GallerySource) construit la factory (URL de vignette +
 // HolafFetch) ; gallery.js ne fournit que les hooks dépendants du DOM/UI
 // (onPending → marqueur « pending » de la grille) et le rendu DOM.
-const thumbCache = GallerySource.active().createThumbCache({
-    concurrency: currentConcurrencyLimit,
-    // 202 : marquer la cellule "pending" (placeholder gris) au lieu d'une image cassée.
-    onPending: (image) => {
-        if (grid) grid.markPending(image.path_canon);
-    },
-    // Les échecs terminaux sont gérés PAR REQUÊTE (overlay sur la cellule) dans
-    // loadThumbnail() ; onError n'est qu'un filet de sécurité.
-    onError: () => {},
-    visibleDebounceMs: PRIORITIZE_DEBOUNCE_MS,
-    visibleFlushThreshold: PRIORITIZE_FLUSH_THRESHOLD,
-});
+//
+// Basculable : le cache est DÉDIÉ à la source active (local : URL same-origin ;
+// remote : /api/media/<id>/thumbnail + Bearer via blob). Sur un switch, il est
+// RECRÉÉ (rebindThumbCache) pour que les vignettes repartent avec le bon
+// transport — sinon le cache local resterait branché sur une source serveur.
+function buildThumbCache() {
+    return GallerySource.active().createThumbCache({
+        concurrency: currentConcurrencyLimit,
+        // 202 : marquer la cellule "pending" (placeholder gris) au lieu d'une image cassée.
+        onPending: (image) => {
+            if (grid) grid.markPending(image.path_canon);
+        },
+        // Les échecs terminaux sont gérés PAR REQUÊTE (overlay sur la cellule) dans
+        // loadThumbnail() ; onError n'est qu'un filet de sécurité.
+        onError: () => {},
+        visibleDebounceMs: PRIORITIZE_DEBOUNCE_MS,
+        visibleFlushThreshold: PRIORITIZE_FLUSH_THRESHOLD,
+    });
+}
+let thumbCache = buildThumbCache();
+let thumbCacheSourceId = GallerySource.activeId();
+
+/** Recrée le cache de vignettes si la source active a changé (switch de source). */
+function rebindThumbCache() {
+    const current = GallerySource.activeId();
+    if (current === thumbCacheSourceId) return false;
+    try { thumbCache.clear(); } catch (e) { /* un cache qui refuse de se vider ne bloque pas */ }
+    thumbCache = buildThumbCache();
+    thumbCacheSourceId = current;
+    return true;
+}
 
 // Shim de compatibilité : les call-sites historiques lisent `thumbnailCache`.
 const thumbnailCache = {
@@ -266,7 +285,13 @@ function updateCell(el, image, ctx) {
         actionIcon.innerHTML = '🎥';
         actionIcon.title = t('iv.playVideo');
         if (image.has_edit_file) actionIcon.classList.add('active');
-        el._hoverCleanup = attachVideoHoverListeners(el, image);
+        // Aperçu au survol = édition/serveur de fichiers locaux (loadEdits +
+        // « full »). La source serveur (étape 2 = vignettes seulement) ne le
+        // supporte pas (capabilities.edit === false) : pas d'aperçu, seule la
+        // vignette est affichée (lecture vidéo = étape 4).
+        if (GallerySource.active().capabilities.edit) {
+            el._hoverCleanup = attachVideoHoverListeners(el, image);
+        }
     } else if (isAudio) {
         actionIcon.innerHTML = '\uD83C\uDFB5';
         actionIcon.title = t('iv.playAudio');
@@ -651,6 +676,10 @@ function makeGridSource() {
 // --- Functions to be exported ---
 
 function initGallery(viewer) {
+    // Le cache de vignettes doit correspondre à la source active au moment où la
+    // grille est créée (sinon setSource() rendrait des cellules avec le mauvais
+    // transport de vignette).
+    rebindThumbCache();
     viewerInstance = viewer;
     galleryEl = document.getElementById("holaf-viewer-gallery");
 
@@ -712,6 +741,12 @@ function renderVisibleItems() {
 }
 
 function syncGallery(viewer, images) {
+    // Switch de source éventuel : le cache de vignettes doit suivre la source
+    // active (transport local same-origin vs serveur /api/media + Bearer).
+    // AVANT initGallery : HolafGrid.setSource() peut rendre des cellules dès sa
+    // création (updateCell → loadThumbnail) — le cache doit déjà être le bon.
+    rebindThumbCache();
+
     if (!galleryEl) initGallery(viewer);
 
     viewerInstance = viewer;

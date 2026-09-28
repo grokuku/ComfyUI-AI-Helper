@@ -10,8 +10,9 @@
 //      et compose le corps attendu (retrait des filtres internes, limit/offset,
 //      skip_count, min_mtime, force…) ;
 //   4. contrôles négatifs : setActive inconnue → lève ; unregister('local') →
-//      active() lève (pas de repli silencieux) ; le squelette 'remote' n'est
-//      PAS enregistré et lève « non implémenté » ;
+//      active() lève (pas de repli silencieux) ; le provider 'remote' (étape 2)
+//      n'est PAS enregistré sans serveur configuré (aucune config ici) et
+//      l'import de son module ne bascule pas la source active ;
 //   5. les actions non supportées en local (favorite/download) sont null.
 //
 // Aucune dépendance jsdom : un `window` minimal (location.origin) suffit aux
@@ -222,12 +223,15 @@ assert.strictEqual(GallerySource.active().id, "local", "retour à local");
 GallerySource.unregister("dummy");
 assert.ok(!GallerySource.has("dummy"));
 
-// Le squelette remote existe mais n'est PAS enregistré (étape 2).
-const remote = createRemoteSource();
+// Provider remote (étape 2) : implémenté, mais NON enregistré sans serveur
+// configuré — aucune config AIH ici → le registre reste sur 'local' seul.
+const remote = createRemoteSource({ serverUrl: "https://aih.example.com", apiKey: "tok" });
 assert.strictEqual(remote.id, "remote");
-assert.ok(!GallerySource.has("remote"), "le squelette 'remote' n'est PAS enregistré");
-assert.throws(() => remote.fetchPage({}), /non implémenté/, "remote.fetchPage → fail-fast (étape 2)");
-assert.strictEqual(GallerySource.active().id, "local", "l'import du squelette ne bascule pas la source");
-ok("setActive/register/unregister validés, remote non activable, active() par défaut préservé");
+assert.ok(!GallerySource.has("remote"), "'remote' n'est PAS enregistré sans serveur configuré");
+assert.strictEqual(remote.itemKey({ id: 7 }), "srv:7", "clé métier serveur = srv:<id>");
+assert.strictEqual(remote.capabilities.trash, false, "pas de corbeille serveur (étape 2)");
+assert.strictEqual(typeof remote.fetchPage, "function", "fetchPage implémenté (plus de fail-fast)");
+assert.strictEqual(GallerySource.active().id, "local", "l'import du provider ne bascule pas la source");
+ok("setActive/register/unregister validés, remote enregistré seulement si configuré, active() par défaut préservé");
 
 console.log(`\n✅ Test registre de sources (contrat étape 0) : ${n} groupes PASSENT`);

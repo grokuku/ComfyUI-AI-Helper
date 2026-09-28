@@ -19,18 +19,17 @@
  *     (la grille est re-rendue par loadFilteredImages → syncGallery).
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * ÉTAT ÉTAPE 1 (temporaire, à lever à l'étape 2)
+ * ÉTAT ÉTAPE 2 (livré)
  * ─────────────────────────────────────────────────────────────────────────────
- * Le provider 'remote' (image_viewer_source_remote.js) n'est PAS enregistré.
- * Conséquence : même serveur configuré, `evaluateSourceSwitch('remote')` refuse
- * avec reason 'not-implemented' → l'UI affiche « source serveur non disponible
- * dans cette version » et NE BASCULE PAS. À l'étape 2 :
- *   1. enregistrer le provider dans GallerySource (`GallerySource.register('remote', …)`)
- *      au chargement de image_viewer_source_remote.js ;
- *   2. aucune autre modification n'est requise ici : le garde-fou `hasProvider`
- *      ouvre alors la bascule pour de vrai ;
- *   3. vérifier PAGE_SIZE / rebindSourceCollection côté image_viewer_data.js si
- *      le pageSize du serveur diffère (aujourd'hui 500 des deux côtés).
+ * Le provider 'remote' (image_viewer_source_remote.js) est désormais IMPLÉMENTÉ
+ * et ENREGISTRÉ au chargement SI le serveur est configuré (serverUrl + token).
+ * Le garde-fou `hasProvider` de ce module ouvre donc la bascule pour de vrai :
+ *   - serveur configuré → 'remote' enregistré → `evaluateSourceSwitch('remote')`
+ *     accepte et `applySourceSwitch` bascule réellement ;
+ *   - serveur NON configuré → provider absent → refus 'not-configured' (grisé).
+ * Aucune modification du garde-fou n'a été nécessaire (il lisait déjà le
+ * registre). PAGE_SIZE (image_viewer_data.js) est réaligné sur le pageSize de
+ * la source active (local 500 ↔ serveur 200) par rebindSourceCollection().
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * REASONS DE REFUS (contrat stable pour l'UI)
@@ -38,7 +37,8 @@
  *   'not-configured' : serveur/token absents → option « Serveur » grisée,
  *                      guidage « AIH ▸ Paramètres serveur ».
  *   'not-implemented': serveur configuré mais provider 'remote' non enregistré
- *                      (étape 2 pas encore livrée).
+ *                      (ne survient plus qu'au chargement si la config est
+ *                      incomplète — sinon le provider est enregistré à l'étape 2).
  *   'error'          : échec technique pendant la bascule (rollback effectué).
  */
 

@@ -78,7 +78,7 @@ export function updateActionButtonsState(viewer) {
     const btnImport = document.getElementById('holaf-viewer-btn-import');
 
     const hasSelection = targetImages.length > 0;
-    const hasPngSelection = hasSelection && targetImages.some(img => img.format.toLowerCase() === 'png');
+    const hasPngSelection = hasSelection && targetImages.some(img => (img.format || '').toLowerCase() === 'png');
 
     let canRestore = false;
     if (hasSelection) {
@@ -86,11 +86,19 @@ export function updateActionButtonsState(viewer) {
     }
     const canPerformNonTrashActions = hasSelection && targetImages.every(img => !img.is_trashed);
 
-    if (btnDelete) btnDelete.disabled = !canPerformNonTrashActions;
-    if (btnRestore) btnRestore.disabled = !canRestore;
-    if (btnExtract) btnExtract.disabled = !canPerformNonTrashActions || !hasPngSelection;
-    if (btnInject) btnInject.disabled = !canPerformNonTrashActions || !hasPngSelection;
-    if (btnExport) btnExport.disabled = !canPerformNonTrashActions;
+    // Capacités de la source ACTIVE (local : tout supporté ; serveur étape 2 :
+    // trash/extractInject/export = false → boutons désactivés, pas d'appel à
+    // une action `null` qui lèverait un TypeError).
+    const caps = GallerySource.active().capabilities || {};
+    const canTrash = caps.trash !== false;
+    const canExtractInject = caps.extractInject !== false;
+    const canExport = caps.export !== false;
+
+    if (btnDelete) btnDelete.disabled = !canTrash || !canPerformNonTrashActions;
+    if (btnRestore) btnRestore.disabled = !canTrash || !canRestore;
+    if (btnExtract) btnExtract.disabled = !canExtractInject || !canPerformNonTrashActions || !hasPngSelection;
+    if (btnInject) btnInject.disabled = !canExtractInject || !canPerformNonTrashActions || !hasPngSelection;
+    if (btnExport) btnExport.disabled = !canExport || !canPerformNonTrashActions;
     if (btnImport) btnImport.disabled = true;
 }
 

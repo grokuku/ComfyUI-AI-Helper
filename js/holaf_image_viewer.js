@@ -24,6 +24,9 @@ import { HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { holafExtUrl } from './holaf_ext_base.js';
 import * as Settings from './image_viewer/image_viewer_settings.js';
 import { GallerySource } from './image_viewer/image_viewer_source.js';
+// Effet de bord : enregistre la source 'remote' SI le serveur AIH est configuré
+// (serverUrl + token). Sinon le garde-fou de l'étape 1 garde l'option grisée.
+import './image_viewer/image_viewer_source_remote.js';
 import { reconcileStoredSource } from './image_viewer/image_viewer_source_switch.js';
 import { UI, createThemeMenu } from './image_viewer/image_viewer_ui.js';
 import { initGallery, syncGallery, refreshThumbnailInGallery, forceRelayout, refreshAfterIncremental } from './image_viewer/image_viewer_gallery.js';

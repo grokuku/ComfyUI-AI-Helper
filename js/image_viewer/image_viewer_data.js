@@ -10,9 +10,10 @@
  * (holaf_image_viewer.js, image_viewer_gallery.js, image_viewer_navigation.js).
  *
  * La brique est générique : ici on la configure VIA LA SOURCE ACTIVE
- * (GallerySource, image_viewer_source.js) — étape 0 : source 'local', donc
- * valeurs historiques inchangées :
- *   - pageSize : PAGE_SIZE (500)
+ * (GallerySource, image_viewer_source.js) — au chargement la source est 'local'
+ * (valeurs historiques inchangées) puis rebindSourceCollection() réaligne la
+ * collection ET PAGE_SIZE sur la source basculée :
+ *   - pageSize : pageSize de la source active (local 500, serveur 200)
  *   - mode     : 'window' (accès aléatoire par fenêtres)
  *   - getId    : item.path_canon (clé métier)
  *   - sortKey  : item.mtime (tri DESC pour l'insertion en tête)
@@ -30,11 +31,15 @@
 import { GallerySource } from './image_viewer_source.js';
 
 // La source active fournit la configuration de la collection (pageSize, mode,
-// clé métier, clé de tri). Étape 0 : la source est 'local' → valeurs
-// historiques inchangées (pageSize 500, mode 'window', getId = path_canon).
+// clé métier, clé de tri). Au chargement : la source est 'local' → valeurs
+// historiques (pageSize 500, mode 'window', getId = path_canon).
 const source = GallerySource.active();
 
-export const PAGE_SIZE = source.pageSize;
+// `let` + liaison ESM live : rebindSourceCollection() met à jour PAGE_SIZE lors
+// d'une bascule de source (local 500 ↔ serveur 200). Les importateurs
+// (holaf_image_viewer.js, image_viewer_gallery.js) voient donc la valeur de la
+// source ACTIVE, alignée sur le pageSize de la collection recréée.
+export let PAGE_SIZE = source.pageSize;
 
 // Collection courante, ancrée sur le provider ACTIF au moment de l'import.
 // `let` (et non `const`) : rebindSourceCollection() la recrée lors d'une
@@ -44,16 +49,17 @@ let collection = source.createCollection();
 /**
  * Ré-ancre la collection sur la source ACTIVE du registre (GallerySource).
  * À appeler APRÈS GallerySource.setActive(id) et après le vidage du cache de
- * l'ancienne collection (resetWindowCache). Étape 1 : jamais atteint en
- * pratique ('remote' non enregistré → bascule refusée en amont) ; requis par
- * l'étape 2.
- * NOTE étape 2 : PAGE_SIZE reste la constante d'import (500 des deux côtés
- * aujourd'hui) ; si le provider serveur change de taille de fenêtre, il faudra
- * aussi revoir les lecteurs qui importent PAGE_SIZE.
+ * l'ancienne collection (resetWindowCache). Appelé par applySourceSwitch lors
+ * d'une bascule de source (étape 2 : local ↔ serveur).
+ * La fenêtre change de taille selon la source (local 500, serveur 200) : on
+ * aligne PAGE_SIZE (liaison ESM live) sur le pageSize du nouveau provider pour
+ * que les lecteurs (fetchWindow → limit, calculs de fenêtre) restent cohérents.
  * @returns {object} la nouvelle collection.
  */
 export function rebindSourceCollection() {
-    collection = GallerySource.active().createCollection();
+    const next = GallerySource.active();
+    collection = next.createCollection();
+    PAGE_SIZE = next.pageSize;
     return collection;
 }
 
