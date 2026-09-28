@@ -20,9 +20,10 @@ const t = (key, params) => {
 
 import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { holafBridge } from "./holaf_comfy_bridge.js";
-import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
+import { HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { holafExtUrl } from './holaf_ext_base.js';
 import * as Settings from './image_viewer/image_viewer_settings.js';
+import { GallerySource } from './image_viewer/image_viewer_source.js';
 import { UI, createThemeMenu } from './image_viewer/image_viewer_ui.js';
 import { initGallery, syncGallery, refreshThumbnailInGallery, forceRelayout, refreshAfterIncremental } from './image_viewer/image_viewer_gallery.js';
 import { PAGE_SIZE, setWindowLoaded, resetWindowCache, forEachLoadedImage, insertImagesAtTop, removeImagesByPaths } from './image_viewer/image_viewer_data.js';
@@ -357,7 +358,7 @@ const holafImageViewer = {
         })) {
             try {
                 // La brique lève sur non-2xx → catch (même écran que l'ancien else).
-                const result = await HolafFetch.post("/holaf/images/empty-trashcan");
+                const result = await GallerySource.active().emptyTrashcan();
 
                 AIH.ask({
                     title: t("iv.trashEmptiedTitle"),
@@ -432,7 +433,7 @@ const holafImageViewer = {
         try {
             // La brique lève sur non-2xx/non-JSON. Poll toutes les 2 s : on
             // garde l'ancien retour silencieux sur échec HTTP (pas de spam console).
-            const data = await HolafFetch.get('/holaf/images/last-update-time', { cache: 'no-store' })
+            const data = await GallerySource.active().fetchLastUpdateTime()
                 .catch((e) => {
                     if (e instanceof HolafFetchError && e.status >= 400) return null;
                     throw e;
@@ -459,7 +460,7 @@ const holafImageViewer = {
             // Identical signatures skip the filter DOM rebuild entirely.
             // Ancien comportement : !filterResponse.ok → vérification de signature
             // simplement sautée (le poll continue) ; erreur réseau → catch global.
-            const filterData = await HolafFetch.get('/holaf/images/filter-options', { cache: 'no-store' })
+            const filterData = await GallerySource.active().fetchFilterOptions()
                 .catch((e) => {
                     if (e instanceof HolafFetchError && e.status >= 400) return null;
                     throw e;
@@ -674,7 +675,7 @@ const holafImageViewer = {
         try {
             // La brique lève sur non-2xx/non-JSON → catch : message d'erreur
             // dans le panneau des filtres (comportement inchangé).
-            const data = await HolafFetch.get('/holaf/images/filter-options', { cache: 'no-store' });
+            const data = await GallerySource.active().fetchFilterOptions();
 
             const state = imageViewerState.getState();
             imageViewerState.setState({ status: { lastDbUpdateTime: data.last_update_time || state.status.lastDbUpdateTime } });
@@ -784,16 +785,11 @@ const holafImageViewer = {
 
     async _fetchFilteredImages(limit = null, offset = 0) {
         const { filters } = imageViewerState.getState();
-        const payload = { ...filters };
-        delete payload.locked_folders;
 
-        if (limit != null) {
-            payload.limit = limit;
-            payload.offset = offset;
-        }
-
-        // POST JSON + parse gérés par la brique (lève sur non-2xx/non-JSON).
-        const data = await HolafFetch.post('/holaf/images/list', { body: payload })
+        // La source active construit le corps (retrait des filtres internes,
+        // limit/offset) et POST /holaf/images/list ; on ne mappe ici que
+        // l'erreur d'affichage historique.
+        const data = await GallerySource.active().fetchPage({ offset, limit, filters })
             .catch((e) => {
                 // Message historique conservé : « HTTP error <status> » est
                 // affiché dans la zone de chargement par loadFilteredImages().
@@ -813,12 +809,10 @@ const holafImageViewer = {
      */
     async _fetchIncrementalImages(minMtime) {
         const { filters } = imageViewerState.getState();
-        const payload = { ...filters };
-        delete payload.locked_folders;
-        payload.min_mtime = minMtime;
-        // POST JSON + parse gérés par la brique (lève sur non-2xx/non-JSON →
-        // catch de checkForUpdates, trace console inchangée).
-        return HolafFetch.post('/holaf/images/list', { body: payload });
+        // La source active construit le corps (retrait locked_folders + min_mtime)
+        // et POST /holaf/images/list (lève sur non-2xx/non-JSON → catch de
+        // checkForUpdates, trace console inchangée).
+        return GallerySource.active().fetchDelta({ filters, minMtime });
     },
 
     /**
@@ -1042,18 +1036,15 @@ const holafImageViewer = {
 
         try {
             for (let i = 0; i < totalChunks; i++) {
-                const url = new URL(window.location.origin);
-                url.pathname = '/holaf/images/export-chunk';
-                url.search = new URLSearchParams({
-                    export_id: export_id,
-                    file_path: path,
-                    chunk_index: i,
-                    chunk_size: DOWNLOAD_CHUNK_SIZE
-                });
-
+                // La source active construit l'URL /holaf/images/export-chunk.
                 // raw:true → Response brute : lecture arrayBuffer() inchangée.
                 // (En mode brut la brique ne lève pas sur non-2xx → test .ok conservé.)
-                const response = await HolafFetch.get(url, { raw: true });
+                const response = await GallerySource.active().fetchExportChunk({
+                    exportId: export_id,
+                    filePath: path,
+                    chunkIndex: i,
+                    chunkSize: DOWNLOAD_CHUNK_SIZE,
+                });
                 if (!response.ok) throw new Error(`HTTP error ${response.status} for chunk ${i}`);
 
                 const chunk = await response.arrayBuffer();
@@ -1113,7 +1104,7 @@ const holafImageViewer = {
         }
         try {
             // La brique lève sur non-2xx → catch vide historique (poll silencieux).
-            const stats = await HolafFetch.get('/holaf/images/thumbnail-stats');
+            const stats = await GallerySource.active().fetchThumbnailStats();
 
             const allGenerated = stats.generated_thumbnails_count >= stats.total_db_count;
             imageViewerState.setState({
@@ -1243,7 +1234,7 @@ const holafImageViewer = {
     async _updateViewerActivity(isActive) {
         // Fire-and-forget (heartbeat) : la brique lève sur non-2xx → .catch()
         // vide pour éviter toute unhandled rejection.
-        HolafFetch.post('/holaf/images/viewer-activity', { body: { active: isActive } })
+        GallerySource.active().reportViewerActivity(isActive)
             .catch(() => {});
     },
 };

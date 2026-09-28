@@ -23,6 +23,7 @@ import { handleDeletion } from './image_viewer_actions.js';
 import { dialogState } from '../holaf_panel_manager.js';
 import { getThumbnailUrl } from './image_viewer_gallery.js';
 import { getImageAt } from './image_viewer_data.js';
+import { GallerySource } from './image_viewer_source.js';
 // Brique vendue : visionneuse générique (machine à états, nav, préchargement,
 // clavier, délégation viewport). L'hôte ne garde que les adaptateurs.
 import { HolafLightbox } from '../vendor/holaf/holaf-lightbox.js';
@@ -92,24 +93,9 @@ async function _ensureImageLoaded(viewer, index) {
 }
 
 export function getFullImageUrl(image) {
-    if (!image) return "";
-    // Use the dedicated /holaf/images/full route (streams the ORIGINAL file with
-    // immutable cache headers). path_canon is preferred (matches the DB key and is
-    // security-checked server-side); filename/subfolder/type is kept as a fallback.
-    // mtime is included as a cache-buster so the immutable cache stays correct when
-    // the file changes.
-    const url = new URL(window.location.origin);
-    url.pathname = '/holaf/images/full';
-    const params = { mtime: image.mtime || image.thumb_hash || '' };
-    if (image.path_canon) {
-        params.path_canon = image.path_canon;
-    } else {
-        params.filename = image.filename;
-        params.subfolder = image.subfolder || '';
-        params.type = 'output';
-    }
-    url.search = new URLSearchParams(params);
-    return url.href;
+    // Délégué à la source active : l'URL du média plein écran (endpoint
+    // /holaf/images/full + cache-buster mtime) vit désormais dans le provider.
+    return GallerySource.active().resolveMediaUrl(image);
 }
 
 /**
@@ -372,7 +358,7 @@ function _ensureLightbox(viewer) {
     lb = HolafLightbox.create({
         host: document.body,
         zIndex: 10999, // bande z actuelle de l'overlay plein écran du pack
-        getId: (item) => (item ? item.path_canon : null),
+        getId: (item) => GallerySource.active().itemKey(item),
         urlFor: (item) => getFullImageUrl(item),
         renderMedia: (ctx) => _renderMedia(viewer, ctx),
         shouldPreload: _isMediaImage,

@@ -28,9 +28,10 @@ import "../aih_strings.js";
 import { imageViewerState } from './image_viewer_state.js';
 import { holafBridge } from "../holaf_comfy_bridge.js";
 import { app as comfyApp } from "../holaf_api_compat.js";
-import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
+import { HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 import { showToast } from "../aih_toast_bridge.js";
 import { HolafInfoPane } from "../vendor/holaf/holaf-infopane.js";
+import { GallerySource } from "./image_viewer_source.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -178,13 +179,10 @@ function confirmLoadWorkflow(req) {
 async function resolveImageInfo(image, { signal } = {}) {
     const fields = buildFields(image);
     try {
-        const metadataUrl = new URL(window.location.origin);
-        metadataUrl.pathname = '/holaf/images/metadata';
-        metadataUrl.search = new URLSearchParams({ filename: image.filename, subfolder: image.subfolder || '' });
-
-        // HolafFetch : GET JSON parsé ; lève sur non-2xx/non-JSON → mappé sur
-        // l'affichage d'erreur historique ci-dessous.
-        const data = await HolafFetch.get(metadataUrl.href, { signal, cache: 'no-store' });
+        // La source active résout l'endpoint de métadonnées (local :
+        // /holaf/images/metadata). HolafFetch : GET JSON parsé ; lève sur
+        // non-2xx/non-JSON → mappé sur l'affichage d'erreur historique ci-dessous.
+        const data = await GallerySource.active().resolveInfo(image, { signal });
         if (signal && signal.aborted) return null;
 
         if (data.width && data.height) fields.push({ label: t('iv.resolution'), value: `${data.width}x${data.height} px` });

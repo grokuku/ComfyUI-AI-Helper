@@ -19,8 +19,9 @@
  * UPDATE (brique): Le cache LRU, la file bornée, la dédup in-flight, le prefetch,
  *       le timeout + retries bornés, le protocole 202 + Retry-After et la
  *       priorisation des vignettes visibles sont délégués à la brique PUR-JS
- *       vendor/holaf/holaf-thumbcache.js ; ce module ne garde que l'adaptateur
- *       (URL + HolafFetch) et le rendu DOM (placeholder -> <img>).
+ *       vendor/holaf/holaf-thumbcache.js ; la source active (GallerySource,
+ *       image_viewer_source.js) porte l'URL + HolafFetch et ce module ne garde
+ *       que les hooks DOM et le rendu (placeholder -> <img>).
  * UPDATE (brique): Le layout virtualisé (sizer + surface absolus, colonnes/gap/
  *       buffer), le pool de cellules recyclées + squelettes, le resize avec
  *       ancrage de rangée, la sélection mono/multi (shift/ctrl) et le
@@ -36,11 +37,11 @@
 
 import "../aih_strings.js";
 import { imageViewerState } from "./image_viewer_state.js";
-import { HolafFetch } from "../vendor/holaf/holaf-fetch.js";
 import { HolafThumbCache } from "../vendor/holaf/holaf-thumbcache.js";
 import { HolafGrid } from "../vendor/holaf/holaf-virtual-grid.js";
 import { showToast } from "../aih_toast_bridge.js";
 import { showFullscreenView, getFullImageUrl } from './image_viewer_navigation.js';
+import { GallerySource } from './image_viewer_source.js';
 import {
     PAGE_SIZE, getWindowStart, isWindowLoaded, isWindowLoading,
     getLoadingPromise, registerLoading, unregisterLoading,
@@ -55,7 +56,6 @@ const t = (key, params) => {
 };
 
 // --- Configuration ---
-const FETCH_TIMEOUT_MS = 30000; // 30 seconds timeout per image
 const HOVER_DELAY_MS = 100; // Slight delay before playing video to prevent crazy flashing when moving mouse fast
 
 // Debounce for backend thumbnail prioritization (rapid scrolling must not spam it)
@@ -75,50 +75,15 @@ let isBenchmarking = false;
 const VIDEO_FORMATS = ['MP4', 'WEBM', 'MKV', 'AVI', 'MOV', 'M4V'];
 const AUDIO_FORMATS = ['WAV', 'MP3', 'OGG', 'FLAC', 'AAC', 'M4A'];
 
-// --- HOLAF THUMB CACHE (brique holaf-thumbcache) ---
+// --- HOLAF THUMB CACHE (brique holaf-thumbcache, via la source active) ---
 // Le cache LRU, la file bornée, la dédup in-flight, le prefetch, le timeout +
 // retries bornés, le protocole 202 + Retry-After et la priorisation des
 // vignettes visibles sont gérés par la brique PUR-JS holaf-thumbcache.
-// gallery.js ne garde QUE l'adaptateur (construction d'URL + HolafFetch) et le
-// rendu DOM (placeholder -> <img>, overlay d'erreur).
-const THUMBNAIL_CACHE_CAPACITY = 2000;
-// Bound consecutive timeouts per thumbnail: transient server-side DB contention
-// must not leave a permanent "Timeout" overlay on an otherwise valid item.
-const MAX_THUMBNAIL_TIMEOUT_RETRIES = 4;
-
-function buildThumbnailUrl(image, { forceReload = false } = {}) {
-    const imageUrl = new URL(window.location.origin);
-    imageUrl.pathname = '/holaf/images/thumbnail';
-    let cacheBuster = image.thumb_hash ? image.thumb_hash : (image.mtime || '');
-    if (benchmarkCacheBuster) cacheBuster += `_${benchmarkCacheBuster}`;
-    const params = {
-        filename: image.filename,
-        subfolder: image.subfolder,
-        path_canon: image.path_canon,
-        mtime: cacheBuster,
-    };
-    if (forceReload) params.t = new Date().getTime();
-    imageUrl.search = new URLSearchParams(params);
-    return imageUrl.href;
-}
-
-const thumbCache = HolafThumbCache.create({
-    capacity: THUMBNAIL_CACHE_CAPACITY,
+// La SOURCE ACTIVE (GallerySource) construit la factory (URL de vignette +
+// HolafFetch) ; gallery.js ne fournit que les hooks dépendants du DOM/UI
+// (onPending → marqueur « pending » de la grille) et le rendu DOM.
+const thumbCache = GallerySource.active().createThumbCache({
     concurrency: currentConcurrencyLimit,
-    strategy: 'blob', // createObjectURL + revoke à l'éviction/clear/destroy
-    getId: (image) => image && image.path_canon,
-    // raw:true → Response brute : statut 202 + Retry-After + blob gérés par la
-    // brique ; signal + priority forwardés. timeout:0 → un seul garde-temps,
-    // tenu par la brique (retries bornés homogènes).
-    load: (image, { signal, priority }) =>
-        HolafFetch.get(buildThumbnailUrl(image, { forceReload: !!image._forceReload }), {
-            raw: true,
-            signal,
-            timeout: 0,
-            priority: priority >= HolafThumbCache.PRIORITY_HIGH ? 'high' : 'low',
-        }),
-    retry: { max: MAX_THUMBNAIL_TIMEOUT_RETRIES, delayMs: 3000 },
-    timeoutMs: FETCH_TIMEOUT_MS,
     // 202 : marquer la cellule "pending" (placeholder gris) au lieu d'une image cassée.
     onPending: (image) => {
         if (grid) grid.markPending(image.path_canon);
@@ -126,11 +91,6 @@ const thumbCache = HolafThumbCache.create({
     // Les échecs terminaux sont gérés PAR REQUÊTE (overlay sur la cellule) dans
     // loadThumbnail() ; onError n'est qu'un filet de sécurité.
     onError: () => {},
-    // Priorisation backend : la brique absorbe le débounce + le flush anticipé,
-    // on ne garde que le transport (POST fire-and-forget).
-    onPrioritize: (paths) => {
-        HolafFetch.post('/holaf/images/prioritize-thumbnails', { body: { paths_canon: paths } }).catch(() => {});
-    },
     visibleDebounceMs: PRIORITIZE_DEBOUNCE_MS,
     visibleFlushThreshold: PRIORITIZE_FLUSH_THRESHOLD,
 });
@@ -165,6 +125,7 @@ window.holaf.runBenchmark = (concurrency = 6) => {
     currentConcurrencyLimit = concurrency;
     thumbCache.setConcurrency(concurrency);
     benchmarkCacheBuster = `bench_${Date.now()}`; // Unique ID to bypass browser cache
+    GallerySource.active().setThumbnailCacheBuster(benchmarkCacheBuster);
     isBenchmarking = true;
     thumbnailCache.clear(); // Clear cache for fair test
 
@@ -225,6 +186,7 @@ function checkBenchmarkCompletion() {
             // Reset benchmark state
             isBenchmarking = false;
             benchmarkCacheBuster = '';
+            GallerySource.active().setThumbnailCacheBuster('');
 
             showToast({
                 message: t('iv.benchmarkResult', { threads: currentConcurrencyLimit, speed, time: duration.toFixed(2) }),
@@ -344,7 +306,7 @@ function loadThumbnail(el, image, forceReload = false) {
     const pathCanon = image.path_canon;
 
     // Force reload (édition d'image) : purge la valeur cachée puis recharge (le
-    // paramètre `t` est ajouté par buildThumbnailUrl via `_forceReload`).
+    // paramètre `t` est ajouté par la source (buildThumbnailUrl) via `_forceReload`).
     if (forceReload) {
         thumbCache.invalidate(pathCanon);
         const oldImg = el.querySelector('img');
@@ -547,16 +509,17 @@ async function fetchWindow(start) {
     const existing = getLoadingPromise(start);
     if (existing) return existing;
     const state = imageViewerState.getState();
-    const filters = { ...state.filters };
-    delete filters.locked_folders;
     const controller = new AbortController();
     const promise = (async () => {
         try {
             const tStart = performance.now();
-            // POST JSON + parse gérés par la brique (lève sur non-2xx → catch).
-            const data = await HolafFetch.post('/holaf/images/list', {
-                body: { ...filters, limit: PAGE_SIZE, offset: start, skip_count: true },
-                signal: controller.signal
+            // POST JSON + parse gérés par la source active (lève sur non-2xx → catch).
+            const data = await GallerySource.active().fetchPage({
+                offset: start,
+                limit: PAGE_SIZE,
+                filters: state.filters,
+                signal: controller.signal,
+                skipCount: true,
             });
             const tFetch = performance.now();
             const tParse = tFetch; // parse JSON inclus dans l'attente de la brique
@@ -590,7 +553,7 @@ function attachVideoHoverListeners(placeholder, image) {
         if (image.has_edit_file) {
             try {
                 // La brique lève sur non-2xx → catch identique (warning console).
-                const result = await HolafFetch.get(`/holaf/images/load-edits?path_canon=${encodeURIComponent(image.path_canon)}`);
+                const result = await GallerySource.active().loadEdits(image.path_canon);
                 if (!placeholder.isConnected || placeholder._hoverGeneration !== generation) return;
                 if (result.status === 'ok') editData = result.edits;
             } catch (e) {

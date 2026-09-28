@@ -14,8 +14,9 @@
 import "../aih_strings.js";
 import { dialogState } from "../holaf_panel_manager.js";
 import { imageViewerState } from "./image_viewer_state.js";
-import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
+import { HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
 import { showToast, updateToast, hideToast } from "../aih_toast_bridge.js";
+import { GallerySource } from "./image_viewer_source.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -135,10 +136,9 @@ export async function handleDeletion(viewer, permanent = false, imagesToProcess 
     if (!confirmed) return false;
 
     try {
-        const apiUrl = permanent ? "/holaf/images/delete-permanently" : "/holaf/images/delete";
-        // HolafFetch lève sur non-2xx (→ catch ci-dessous) ; tous les 2xx
+        // La brique lève sur non-2xx (→ catch ci-dessous) ; tous les 2xx
         // (dont 207 multi-status) suivent le chemin de succès historique.
-        const result = await HolafFetch.post(apiUrl, { body: { paths_canon: pathsToDelete } });
+        const result = await GallerySource.active().deleteImages(pathsToDelete, { permanent });
 
         let finalMessage = result.message || t('iv.operationProcessed');
         let dialogTitle = t("iv.operationComplete");
@@ -240,7 +240,7 @@ export async function handleRestore(viewer) {
         try {
             // HolafFetch lève sur non-2xx (→ catch ci-dessous) ; tous les 2xx
             // (dont 207 multi-status) suivent le chemin de succès historique.
-            const result = await HolafFetch.post("/holaf/images/restore", { body: { paths_canon: pathsToRestore } });
+            const result = await GallerySource.active().restoreImages(pathsToRestore);
 
             AIH.ask({
                 title: t("iv.restoreOperation"),
@@ -312,8 +312,7 @@ async function processNextConflict(viewer, operation) {
 
     if (choice === 'overwrite') {
         try {
-            const apiUrl = `/holaf/images/${operation}-metadata`;
-            const result = await HolafFetch.post(apiUrl, { body: { paths_canon: [conflict.path], force: true } });
+            const result = await GallerySource.active().runMetadataOperation(operation, [conflict.path], { force: true });
             if (result.results?.failures?.length > 0) {
                 const errorMsg = result.results?.failures[0]?.error || result.message || t('iv.unknownErrorDuringOverwrite');
                 AIH.ask({ title: t('iv.errorOverwriting', { filename }), message: errorMsg, parentElement: document.body });
@@ -363,7 +362,7 @@ export async function handleExtractMetadata(viewer) {
     try {
         // La brique lève sur non-2xx → catch ci-dessous (même boîte de dialogue
         // « API error », avec le message du corps JSON s'il existe).
-        const result = await HolafFetch.post('/holaf/images/extract-metadata', { body: { paths_canon: pathsToProcess, force: false } });
+        const result = await GallerySource.active().extractMetadata(pathsToProcess);
 
         viewer.conflictQueue = result.results?.conflicts || [];
         viewer.isProcessingConflicts = false;
@@ -431,7 +430,7 @@ export async function handleInjectMetadata(viewer) {
     try {
         // La brique lève sur non-2xx → catch ci-dessous (même boîte de dialogue
         // « API error », avec le message du corps JSON s'il existe).
-        const result = await HolafFetch.post('/holaf/images/inject-metadata', { body: { paths_canon: pathsToProcess, force: false } });
+        const result = await GallerySource.active().injectMetadata(pathsToProcess);
 
         viewer.conflictQueue = result.results?.conflicts || [];
         viewer.isProcessingConflicts = false;
@@ -851,7 +850,7 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
             // (transcodes ffmpeg vidéo/audio, batchs nombreux, tout est traité
             // AVANT la réponse). L'ancien fetch n'avait aucun timeout : le
             // défaut 30 s de la brique coupait les exports longs.
-            const result = await HolafFetch.post('/holaf/images/prepare-export', { body: payload, timeout: 0 });
+            const result = await GallerySource.active().prepareExport(payload);
 
             if (result.status !== 'ok') {
                 throw new Error(result.message || t('iv.failedToPrepareExport'));
@@ -862,7 +861,6 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
                  showToast({ message: errorMessage, type: 'error', duration: 0, html: true });
             }
 
-            const manifestUrl = `/holaf/images/export-chunk?export_id=${result.export_id}&file_path=manifest.json&chunk_index=0&chunk_size=1000000`;
             // FIX(vague 11) : la route export-chunk sert TOUS les fichiers
             // (manifest.json inclus) en application/octet-stream. En mode JSON
             // la brique refuse ce content-type (throw « réponse non-JSON »)
@@ -871,7 +869,12 @@ function _showExportOptionsDialog(viewer, imagesToExport) {
             // l'ancien fetch ; la brique lève toujours sur réseau/timeout, et le
             // test .ok ajoute la détection d'erreur HTTP (que l'ancien code
             // avalait en « noNewFiles »).
-            const manifestResponse = await HolafFetch.get(manifestUrl, { raw: true });
+            const manifestResponse = await GallerySource.active().fetchExportChunk({
+                exportId: result.export_id,
+                filePath: 'manifest.json',
+                chunkIndex: 0,
+                chunkSize: 1000000,
+            });
             if (!manifestResponse.ok) {
                 throw new Error(`HTTP error ${manifestResponse.status} (manifest)`);
             }

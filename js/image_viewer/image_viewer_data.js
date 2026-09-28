@@ -9,7 +9,9 @@
  * (PAGE_SIZE + les fonctions ci-dessous) pour ne toucher à AUCUN call-site
  * (holaf_image_viewer.js, image_viewer_gallery.js, image_viewer_navigation.js).
  *
- * La brique est générique : ici on la configure pour la galerie locale
+ * La brique est générique : ici on la configure VIA LA SOURCE ACTIVE
+ * (GallerySource, image_viewer_source.js) — étape 0 : source 'local', donc
+ * valeurs historiques inchangées :
  *   - pageSize : PAGE_SIZE (500)
  *   - mode     : 'window' (accès aléatoire par fenêtres)
  *   - getId    : item.path_canon (clé métier)
@@ -25,16 +27,16 @@
  * correction se fait dans holaf-lib puis se re-vend via `scripts/holaf`.
  */
 
-import { HolafCollection } from '../vendor/holaf/holaf-collection.js';
+import { GallerySource } from './image_viewer_source.js';
 
-export const PAGE_SIZE = 500;
+// La source active fournit la configuration de la collection (pageSize, mode,
+// clé métier, clé de tri). Étape 0 : la source est 'local' → valeurs
+// historiques inchangées (pageSize 500, mode 'window', getId = path_canon).
+const source = GallerySource.active();
 
-const collection = HolafCollection.create({
-    pageSize: PAGE_SIZE,
-    mode: 'window',
-    getId: (item) => item && item.path_canon,
-    sortKey: (item) => (item && item.mtime) || 0,
-});
+export const PAGE_SIZE = source.pageSize;
+
+const collection = source.createCollection();
 
 // Ré-ancre la brique sur l'état de l'hôte (tableau images par référence).
 function _bind(state) {
