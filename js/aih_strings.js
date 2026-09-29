@@ -175,6 +175,12 @@ import "./aih_i18n.js";
         "mb.conflictTitle": "⚠️ Conflit",
         "mb.conflictMsg": "Le fichier \"{name}\" existe déjà localement avec un contenu différent.\n\nVoulez-vous écraser le fichier local ?",
         "mb.downloadCancelledConflict": "⏹️ Download annulé (conflit)",
+        "mb.workflowFilterCount": "Modèles du workflow ({count})",
+        "mb.workflowFilterTitle": "N'afficher que les modèles référencés par le workflow ouvert (listes locale et distante)",
+        "mb.workflowEmpty": "Aucun modèle détecté dans le workflow (ou aucun workflow ouvert)",
+        "mb.workflowNoMatch": "Aucun modèle du workflow ne correspond à ces filtres",
+        "mb.workflowSummary": "{total} modèle(s) du workflow · local {local} · distant {remote} · <span class=\"mb-wf-missing\">manquant en distant : {missing}</span>",
+        "mb.workflowCapped": "⚠️ liste distante tronquée (plafond de chargement atteint)",
 
         /* Workflow Share (aih_workflow_share.js) */
         "wf.title": "📤  Workflows",
@@ -1394,6 +1400,12 @@ import "./aih_i18n.js";
         "mb.conflictTitle": "⚠️ Conflict",
         "mb.conflictMsg": "The file \"{name}\" already exists locally with different content.\n\nDo you want to overwrite the local file?",
         "mb.downloadCancelledConflict": "⏹️ Download cancelled (conflict)",
+        "mb.workflowFilterCount": "Workflow models ({count})",
+        "mb.workflowFilterTitle": "Show only models referenced by the current workflow (local and remote lists)",
+        "mb.workflowEmpty": "No model detected in the workflow (or no workflow open)",
+        "mb.workflowNoMatch": "No workflow model matches these filters",
+        "mb.workflowSummary": "{total} workflow model(s) · local {local} · remote {remote} · <span class=\"mb-wf-missing\">missing remote: {missing}</span>",
+        "mb.workflowCapped": "⚠️ remote list truncated (load cap reached)",
 
         /* Workflow Share (aih_workflow_share.js) */
         "wf.title": "📤  Workflows",

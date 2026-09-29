@@ -12,6 +12,22 @@ import "./aih_dialog.js";
 import "./aih_strings.js";
 import { remoteRequest } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
+import {
+    collectWorkflowModelNames,
+    buildWorkflowNameIndex,
+    filterModelItems,
+    filterModelsByWorkflow,
+    countWorkflowMatches,
+} from "./aih_model_workflow.js";
+
+// ─── Budget de pagination du filtre « workflow » ────────────────────────────
+// Le filtre distant est appliqué CÔTÉ CLIENT (le proxy serveur ne connaît pas
+// la liste des modèles du workflow). Quand le filtre est actif, on charge donc
+// automatiquement les pages successives jusqu'à épuisement du catalogue, dans
+// la limite de ce plafond (page de 200 modèles → 4000 modèles max). Au-delà,
+// un bandeau prévient que la liste peut être partielle.
+var WF_REMOTE_PAGE_LIMIT = 200;
+var WF_REMOTE_MAX_PAGES = 20;
 
 (function () {
     "use strict";
@@ -82,6 +98,20 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             "}",
             ".mb-filter-search input:focus {",
             "  border-color: var(--aih-accent, #D8700D);",
+            "}",
+            /* Filtre « modèles du workflow » + récapitulatif */
+            ".mb-filters .mb-filter-workflow {",
+            "  font-weight: 600;",
+            "}",
+            ".mb-workflow-summary {",
+            "  width: 100%;",
+            "  font-size: 10px;",
+            "  color: #888;",
+            "  padding: 1px 2px 0;",
+            "}",
+            ".mb-workflow-summary .mb-wf-missing {",
+            "  color: #f87171;",
+            "  font-weight: 600;",
             "}",
             /* Panneaux */
             ".mb-panels {",
@@ -327,10 +357,12 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
     }
 
     function getActiveTypeFilters() {
-        var checked = document.querySelectorAll('.mb-filter-checkbox.active');
+        // NB : on exclut le toggle « modèles du workflow » (dataset.type absent) :
+        // il a sa propre classe mb-filter-workflow et son propre état.
+        var checked = document.querySelectorAll('.mb-filter-checkbox.active:not(.mb-filter-workflow)');
         var types = [];
         checked.forEach(function (el) {
-            types.push(el.dataset.type);
+            if (el.dataset && el.dataset.type) types.push(el.dataset.type);
         });
         return types.length ? types : null;
     }
@@ -347,23 +379,91 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         return val || null;
     }
 
-    // ─── Filtre les items locaux depuis le cache (type + search) ───────────────
-    function filterLocalItems(items, types, search) {
-        if (!items) return [];
-        var result = items.slice();
-        if (types && types.length) {
-            result = result.filter(function (i) {
-                return types.indexOf(getEffectiveType(i)) >= 0;
-            });
+    // ─── Filtre « modèles du workflow courant » ─────────────────────────────
+    // L'extraction vit dans aih_model_workflow.js (pur, testé). Ici on ne fait
+    // que résoudre l'app ComfyUI et mémoriser le résultat par modale.
+    //
+    // RAFRAÎCHISSEMENT : recalculé (a) à l'ouverture du navigateur et (b) à
+    // chaque ACTIVATION du bouton (le workflow a pu changer entre deux
+    // ouvertures). Pas de listener sur les évènements du graphe ComfyUI : une
+    // modification du workflow pendant que la fenêtre est OUVERTE n'est pas
+    // reflétée tant que le bouton n'est pas re-cliqué ou la fenêtre rouverte.
+    function getComfyApp() {
+        try {
+            return (typeof window !== 'undefined' &&
+                (window.app || (window.comfyAPI && window.comfyAPI.app && window.comfyAPI.app.app))) || null;
+        } catch (e) {
+            return null;
         }
-        if (search) {
-            var q = search.toLowerCase();
-            result = result.filter(function (i) {
-                var name = (i.name || i.filename || '').toLowerCase();
-                return name.indexOf(q) >= 0;
-            });
+    }
+
+    function refreshWorkflowModels(m) {
+        var names = [];
+        try { names = collectWorkflowModelNames(getComfyApp()); } catch (e) { names = []; }
+        m._workflowModelNames = names;
+        m._workflowIndex = buildWorkflowNameIndex(names);
+        return names;
+    }
+
+    // Index du workflow si le filtre est actif, sinon null (= pas de filtre).
+    function getWorkflowIndex(m) {
+        if (!m._workflowFilterActive) return null;
+        if (!m._workflowIndex) m._workflowIndex = buildWorkflowNameIndex(m._workflowModelNames || []);
+        return m._workflowIndex;
+    }
+
+    function workflowFilterLabelText(m) {
+        var count = (m._workflowModelNames || []).length;
+        return t('mb.workflowFilterCount', { count: count });
+    }
+
+    // Clé i18n du message « liste vide » : distingue « aucun modèle détecté
+    // dans le workflow » de « aucun résultat avec ces filtres ».
+    function _emptyFilteredKey(m, fallbackKey) {
+        if (!m._workflowFilterActive) return fallbackKey;
+        return (m._workflowModelNames || []).length === 0
+            ? 'mb.workflowEmpty'
+            : 'mb.workflowNoMatch';
+    }
+
+    // Met à jour le libellé (avec compteur) du toggle.
+    function updateWorkflowFilterLabel(m) {
+        if (!m._workflowFilterEl) return;
+        var txt = m._workflowFilterEl.querySelector('.mb-filter-workflow-text');
+        if (txt) txt.textContent = workflowFilterLabelText(m);
+    }
+
+    // Récapitulatif « présent local / distant / manquant » (affiché uniquement
+    // quand le filtre workflow est actif). Valeur ajoutée du partage : montre
+    // d'un coup d'œil ce qu'il reste à uploader/télécharger.
+    function updateWorkflowSummary(m) {
+        var el = m._workflowSummaryEl;
+        if (!el) return;
+        if (!m._workflowFilterActive) {
+            el.style.display = 'none';
+            el.textContent = '';
+            return;
         }
-        return result;
+        var names = m._workflowModelNames || [];
+        var idx = m._workflowIndex || buildWorkflowNameIndex(names);
+        var total = names.length;
+        var localCount = countWorkflowMatches(_localModelsCache || m._localItems || [], idx);
+        var remoteCount = countWorkflowMatches(m._remoteItems || [], idx);
+        var missing = Math.max(0, total - remoteCount);
+        el.style.display = '';
+        el.innerHTML = t('mb.workflowSummary', {
+            total: total, local: localCount, remote: remoteCount, missing: missing,
+        }) + (m._wfRemoteCapped ? ' ' + t('mb.workflowCapped') : '');
+    }
+
+    // ─── Filtre les items locaux depuis le cache (type + search + workflow) ────
+    function filterLocalItems(items, types, search, workflowIndex) {
+        return filterModelItems(items, {
+            types: types,
+            search: search,
+            workflowIndex: workflowIndex,
+            getType: getEffectiveType,
+        });
     }
 
     // ─── Helpers multi-sélection ───────────────────────────────────────────────
@@ -645,6 +745,16 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         m._remotePage = 1;
         m._remoteHasMore = true;
         m._currentUser = null;
+        // Filtre « modèles du workflow » : état initial inactif ; l'extraction
+        // est faite ici (ouverture du navigateur) puis à chaque activation.
+        m._workflowFilterActive = false;
+        m._workflowModelNames = [];
+        m._workflowIndex = buildWorkflowNameIndex([]);
+        m._workflowFilterEl = null;
+        m._workflowSummaryEl = null;
+        m._remoteLimit = 50;
+        m._wfRemoteCapped = false;
+        refreshWorkflowModels(m);
 
         // Récupérer le rôle de l'utilisateur (pour les actions admin)
         _fetchAihApi('auth/me')
@@ -652,8 +762,10 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             .then(function (data) {
                 if (data && data.role) {
                     m._currentUser = { role: data.role };
-                    // Re-rendre le panneau distant si déjà chargé
-                    if (m._remoteItems && m._remoteItems.length) {
+                    // Re-rendre le panneau distant si déjà chargé (page 1
+                    // uniquement : évite tout doublon quand le filtre workflow
+                    // a auto-chargé plusieurs pages).
+                    if (m._remoteItems && m._remoteItems.length && (m._remotePage || 1) === 1) {
                         renderRemotePanel(m, { items: m._remoteItems });
                     }
                 }
@@ -672,6 +784,10 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
         // Infinite scroll sur le panneau distant
         m._remoteList.addEventListener('scroll', function () {
+            // En filtre workflow, le chargement des pages est piloté en boucle
+            // (loadRemoteModels) : on neutralise le scroll pour éviter un
+            // double incrément de page.
+            if (m._workflowFilterActive) return;
             if (m._remoteLoading || !m._remoteHasMore) return;
             var el = m._remoteList;
             if (el.scrollTop + el.clientHeight >= el.scrollHeight - 60) {
@@ -746,7 +862,7 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             if (e.target.tagName === 'A') {
                 e.preventDefault();
                 var action = e.target.dataset.action;
-                var checkboxes = container.querySelectorAll('.mb-filter-checkbox');
+                var checkboxes = container.querySelectorAll('.mb-filter-checkbox:not(.mb-filter-workflow)');
                 checkboxes.forEach(function (label) {
                     var cb = label.querySelector('input[type="checkbox"]');
                     if (action === 'all') {
@@ -769,6 +885,50 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             }
         });
         container.appendChild(selectAllSpan);
+
+        // Filtre « modèles du workflow courant » (toggle, cumulable avec les
+        // types et la recherche). Placé à côté des filtres existants.
+        var wfLabel = document.createElement('label');
+        wfLabel.className = 'mb-filter-checkbox mb-filter-workflow' + (m._workflowFilterActive ? ' active' : '');
+        wfLabel.style.setProperty('--mb-color', '#38bdf8');
+        wfLabel.title = t('mb.workflowFilterTitle');
+        var wfCb = document.createElement('input');
+        wfCb.type = 'checkbox';
+        wfCb.checked = !!m._workflowFilterActive;
+        wfLabel.appendChild(wfCb);
+        var wfDot = document.createElement('span');
+        wfDot.textContent = '🧩';
+        wfDot.style.marginRight = '2px';
+        wfLabel.appendChild(wfDot);
+        var wfText = document.createElement('span');
+        wfText.className = 'mb-filter-workflow-text';
+        wfText.textContent = workflowFilterLabelText(m);
+        wfLabel.appendChild(wfText);
+        wfLabel.addEventListener('click', function (e) {
+            e.preventDefault();
+            var isActive = wfLabel.classList.toggle('active');
+            wfCb.checked = isActive;
+            m._workflowFilterActive = isActive;
+            if (isActive) {
+                // Recalcul à l'activation : le workflow a pu changer depuis l'ouverture.
+                refreshWorkflowModels(m);
+            }
+            updateWorkflowFilterLabel(m);
+            m._remotePage = 1;
+            m._remoteHasMore = true;
+            m._wfRemoteCapped = false;
+            loadLocalModels(m);
+            loadRemoteModels(m);
+        });
+        container.appendChild(wfLabel);
+        m._workflowFilterEl = wfLabel;
+
+        // Récapitulatif (affiché seulement quand le filtre workflow est actif).
+        var summary = document.createElement('div');
+        summary.className = 'mb-workflow-summary';
+        summary.style.display = m._workflowFilterActive ? '' : 'none';
+        container.appendChild(summary);
+        m._workflowSummaryEl = summary;
 
         // Champs de recherche
         var searchGroup = document.createElement('div');
@@ -806,10 +966,11 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
     function loadLocalModels(m, forceRefresh) {
         var types = getActiveTypeFilters();
         var search = getSearchQuery();
+        var wfIndex = getWorkflowIndex(m);
 
         // Cache : si déjà chargé et pas de force refresh, filtrer depuis le cache
         if (_localModelsCache && !forceRefresh) {
-            var filtered = filterLocalItems(_localModelsCache, types, search);
+            var filtered = filterLocalItems(_localModelsCache, types, search, wfIndex);
             m._localItems = _localModelsCache; // pour isLocalByFingerprint (liste complète)
             renderLocalPanel(m, filtered);
             return;
@@ -855,8 +1016,8 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
                 _localModelsCache = flatItems;  // mise en cache
                 m._localItems = flatItems;       // pour isLocalByFingerprint
 
-                // Filtrer selon les filtres actifs
-                var filtered = filterLocalItems(flatItems, types, search);
+                // Filtrer selon les filtres actifs (types + recherche + workflow)
+                var filtered = filterLocalItems(flatItems, types, search, wfIndex);
                 renderLocalPanel(m, filtered);
             })
             .catch(function (err) {
@@ -873,8 +1034,14 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         var types = getActiveTypeFilters();
         var search = getRemoteSearchQuery();
         var page = m._remotePage || 1;
+        var wfActive = !!m._workflowFilterActive;
+        // Le filtre workflow est CLIENT : quand il est actif, on charge tout le
+        // catalogue (pages de 200, plafonné) pour ne pas rater un modèle au-delà
+        // de la première page. Sinon pagination historique (50).
+        var limit = wfActive ? WF_REMOTE_PAGE_LIMIT : 50;
+        m._remoteLimit = limit;
 
-        var url = '/api/aih/models/remote?page=' + page + '&limit=50';
+        var url = '/api/aih/models/remote?page=' + page + '&limit=' + limit;
         // N'envoyer le filtre type que si certains types sont DESACTIVES.
         // Quand tous sont actifs, pas de filtre = tout afficher.
         if (types && types.length && types.length < MODEL_TYPES.length) {
@@ -891,6 +1058,17 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             .then(function (data) {
                 renderRemotePanel(m, data);
                 m._remoteLoading = false;
+                // Filtre workflow actif : enchaîner les pages jusqu'à épuisement
+                // (ou plafond), pour que la liste filtrée soit complète.
+                if (wfActive && m._remoteHasMore) {
+                    if (page < WF_REMOTE_MAX_PAGES) {
+                        m._remotePage = page + 1;
+                        loadRemoteModels(m);
+                    } else {
+                        m._wfRemoteCapped = true;
+                        updateWorkflowSummary(m);
+                    }
+                }
             })
             .catch(function (err) {
                 m._remoteLoading = false;  // TOUJOURS réinitialiser
@@ -906,7 +1084,8 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         list.innerHTML = "";
 
         if (!items || items.length === 0) {
-            list.innerHTML = '<div class="mb-empty">' + t('mb.noLocal') + '</div>';
+            list.innerHTML = '<div class="mb-empty">' + t(_emptyFilteredKey(m, 'mb.noLocal')) + '</div>';
+            updateWorkflowSummary(m);
             return;
         }
 
@@ -1052,6 +1231,8 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
             list.appendChild(div);
         });
+
+        updateWorkflowSummary(m);
     }
 
     // ─── renderRemotePanel ─────────────────────────────────────────────────────
@@ -1064,9 +1245,10 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         // Si data a une structure paginée
         if (data.items && Array.isArray(data.items)) {
             items = data.items;
-            m._remoteHasMore = items.length >= (data.limit || 50);
+            var lim = data.limit || m._remoteLimit || 50;
+            m._remoteHasMore = items.length >= lim;
             if (data.total !== undefined) {
-                m._remoteHasMore = (page * (data.limit || 50)) < data.total;
+                m._remoteHasMore = (page * lim) < data.total;
             }
         } else if (Array.isArray(data)) {
             items = data;
@@ -1076,29 +1258,39 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         if (page === 1) {
             list.innerHTML = "";
         }
+        // Retire l'indicateur « charger plus » de la page précédente (évite
+        // l'accumulation de spinners pendant le chargement automatique du
+        // filtre workflow).
+        var prevMore = list.querySelector ? list.querySelector('.mb-load-more') : null;
+        if (prevMore && prevMore.parentNode) prevMore.parentNode.removeChild(prevMore);
+
+        // Filtre « modèles du workflow » : appliqué CÔTÉ CLIENT (le proxy serveur
+        // ne connaît pas le workflow). m._remoteItems garde les items COMPLETS
+        // (matching local + compteur « présente en distant ») ; la liste AFFICHÉE
+        // ne montre que les correspondances.
+        var wfIndex = getWorkflowIndex(m);
 
         // Stocker les items distants pour le matching local
-        var flatItems;
+        var globalOffset;
         if (page === 1) {
             m._remoteItems = items.slice();
-            flatItems = items;
+            globalOffset = 0;
         } else {
+            globalOffset = (m._remoteItems || []).length;
             m._remoteItems = (m._remoteItems || []).concat(items);
-            flatItems = items;
         }
+        var displayItems = filterModelsByWorkflow(items, wfIndex);
 
-        if (items.length === 0 && page === 1) {
-            list.innerHTML = '<div class="mb-empty">' + t('mb.noRemote') + '</div>';
+        if (displayItems.length === 0 && page === 1 && !m._remoteHasMore) {
+            list.innerHTML = '<div class="mb-empty">' + t(_emptyFilteredKey(m, 'mb.noRemote')) + '</div>';
+            updateWorkflowSummary(m);
             return;
         }
 
         // Variable pour le Shift+Click
         if (typeof m._lastCheckedIndex === 'undefined') m._lastCheckedIndex = -1;
 
-        // Offset d'index pour la pagination (index global dans m._remoteItems)
-        var globalOffset = (page - 1) * 50;
-
-        items.forEach(function (item, idx) {
+        displayItems.forEach(function (item, idx) {
             var globalIdx = globalOffset + idx;
             var div = document.createElement('div');
             div.className = 'mb-item';
@@ -1287,12 +1479,14 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         // Indicateur de chargement pour la page suivante
         if (m._remoteHasMore) {
             var loadMore = document.createElement('div');
-            loadMore.className = 'mb-loading';
+            loadMore.className = 'mb-loading mb-load-more';
             loadMore.style.padding = '12px';
             loadMore.style.borderBottom = 'none';
             loadMore.innerHTML = '<span class="mb-loading-spinner"></span> ' + t('mb.scrollMore');
             list.appendChild(loadMore);
         }
+
+        updateWorkflowSummary(m);
     }
 
     // ─── getEffectiveType ───────────────────────────────────────────────────────
