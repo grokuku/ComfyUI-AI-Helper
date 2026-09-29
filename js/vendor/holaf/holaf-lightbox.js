@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafLightbox · version 0.1.0
+ * Holaf UI — Brique HolafLightbox · version 0.2.0
  * ─────────────────────────────────────────────────────────────────────────────
  * Visionneuse plein écran / inline GÉNÉRIQUE et INSTANCIABLE (zéro état de
  * module hors le <style> partagé). Elle ne connaît QUE :
@@ -40,12 +40,34 @@
  * Fichier DUAL : classe ES (export) + global window.HolafLightbox — se charge
  * via <script type="module"> ou `import { HolafLightbox }`.
  *
+ * CAPACITÉS OPT-IN (défaut = comportement 0.1.0 STRICTEMENT inchangé) :
+ *   - DIAPORAMA (`slideshow: true | { duration, transition, random, loop,
+ *     keyboard }`) : startSlideshow/stopSlideshow/toggleSlideshow/
+ *     pauseSlideshow/resumeSlideshow/isSlideshow/isSlideshowPaused +
+ *     événements `slideshowstart`/`slideshowstop`/`slideshowtick`
+ *     (`slideshowpause`/`slideshowresume` en plus) ; barre d'espace en plein
+ *     écran = démarre puis play/pause ; une flèche change l'image
+ *     IMMÉDIATEMENT et réarme le minuteur ; `random` sans répétition
+ *     consécutive ; `loop` ou arrêt en fin ;
+ *   - CROSSFADE (`transition: ms`, défaut 0) : fondu enchaîné avec VRAIE
+ *     superposition de deux couches (la sortante est conservée jusqu'à la fin
+ *     du fondu) ; la brique gère les couches, le contrat renderMedia ne change
+ *     pas (chaque rendu reçoit une couche fraîche comme `container`) ;
+ *   - CHROME DISCRET (`chrome: { icons, autoHide, idleDelay, fadeDuration }`) :
+ *     icônes seules (aucun libellé visible), masquage après inactivité de la
+ *     souris (idleDelay, défaut 3000 ms — même curseur posé sur un icône),
+ *     réapparition au moindre mouvement, transitions d'opacité douces.
+ *
+ * CLIC SIMPLE = PLEIN ÉCRAN : la brique expose `openFullscreen(item)` ; côté
+ * grille, l'hôte active `activateOnClick` + `onActivate` (cf. README §8) ou
+ * branche son propre clic sur ses vignettes.
+ *
  * VOLONTAIREMENT ABSENT (reste à l'hôte) : édition d'image (crop/masque), la
  * source réseau concrète (URLs, cache), la grille elle-même (HolafGrid), la
  * visibilité de la galerie.
  * ═════════════════════════════════════════════════════════════════════════ */
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 const HolafLightbox = (function () {
     "use strict";
@@ -132,9 +154,33 @@ const HolafLightbox = (function () {
     z-index: 100;
 }
 @keyframes holaf-lightbox-spin { to { transform: rotate(360deg); } }
+/* Couches CROSSFADE (opt-in) : chaque rendu vit dans sa propre couche, ce qui
+   permet une vraie superposition sortant/entrant pendant le fondu. */
+.holaf-lightbox-layer {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+/* Chrome discret (opt-in) : masquage/affichage par opacité, jamais de pop.
+   Le conteneur porte .holaf-lightbox-chrome-auto ; la classe
+   .holaf-lightbox-chrome-hidden est basculée par la brique après inactivité.
+   Les contrôles hôtes qui veulent participer utilisent .holaf-lightbox-nav. */
+.holaf-lightbox-chrome-auto .holaf-lightbox-nav {
+    opacity: 1;
+    transition: opacity var(--hl-chrome-fade, 300ms) ease;
+}
+.holaf-lightbox-chrome-auto.holaf-lightbox-chrome-hidden .holaf-lightbox-nav {
+    opacity: 0;
+    pointer-events: none;
+}
 @media (prefers-reduced-motion: reduce) {
     .holaf-lightbox-spinner { animation: none; }
     .holaf-lightbox-content--image { transition: none; }
+    .holaf-lightbox-chrome-auto .holaf-lightbox-nav { transition: none; }
 }
 `;
 
@@ -207,6 +253,54 @@ const HolafLightbox = (function () {
         return item.full || item.url || item.src || item.path || null;
     }
 
+    // Glyphes par défaut du chrome « icônes seules » (opt-in chrome.icons).
+    const ICON_GLYPHS = { prev: "‹", next: "›", close: "✖" };
+
+    // Défauts des capacités opt-in.
+    const DEFAULT_SLIDESHOW_DURATION = 4000; // ms entre deux images
+    const DEFAULT_CHROME_IDLE_DELAY = 3000;  // ms d'inactivité souris
+    const DEFAULT_CHROME_FADE = 300;         // ms de transition d'opacité
+    const CROSSFADE_READY_FALLBACK = 1000;   // ms avant fondu sans onReady
+
+    function timeMs(value, fallback) {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 0) return fallback;
+        return Math.round(n);
+    }
+
+    // `slideshow: true | { duration, transition, random, loop, keyboard }`.
+    // Absent/false/null → null (aucune capacité diaporama).
+    function normalizeSlideshow(value) {
+        if (value === undefined || value === null || value === false) return null;
+        const v = (value && typeof value === "object") ? value : {};
+        return {
+            duration: timeMs(v.duration, DEFAULT_SLIDESHOW_DURATION),
+            // transition null = hérite (instance `transition`, sinon 0).
+            transition: (v.transition === undefined || v.transition === null)
+                ? null : timeMs(v.transition, 0),
+            random: v.random === true,
+            loop: v.loop === true,
+            keyboard: v.keyboard !== false,
+        };
+    }
+
+    // Défauts neutres du chrome : sans option, RIEN de nouveau (libellés texte,
+    // chrome toujours visible).
+    function normalizeChrome(value) {
+        const cfg = {
+            icons: false,
+            autoHide: false,
+            idleDelay: DEFAULT_CHROME_IDLE_DELAY,
+            fadeDuration: DEFAULT_CHROME_FADE,
+        };
+        if (!value || typeof value !== "object") return cfg;
+        if (value.icons !== undefined) cfg.icons = value.icons === true;
+        if (value.autoHide !== undefined) cfg.autoHide = value.autoHide === true;
+        if (value.idleDelay !== undefined) cfg.idleDelay = timeMs(value.idleDelay, DEFAULT_CHROME_IDLE_DELAY);
+        if (value.fadeDuration !== undefined) cfg.fadeDuration = timeMs(value.fadeDuration, DEFAULT_CHROME_FADE);
+        return cfg;
+    }
+
     function fn(v) { return typeof v === "function" ? v : null; }
     function isNode(obj) { return !!(obj && typeof obj === "object" && obj.nodeType === 1); }
 
@@ -227,6 +321,24 @@ const HolafLightbox = (function () {
             this._modes = Array.isArray(o.modes) ? o.modes.slice() : ["zoom", "fullscreen"];
             this._labels = Object.assign({}, DEFAULT_LABELS, o.labels || {});
             this._shouldHandleKey = fn(o.shouldHandleKey) || (() => true);
+
+            // Diaporama (OPT-IN) : `slideshow: true | { duration, transition,
+            // random, loop, keyboard }`. Absent → aucune capacité (comportement
+            // strictement identique à la 0.1.0).
+            this._slideshowCfg = normalizeSlideshow(o.slideshow);
+            this._slideshow = {
+                active: false,
+                paused: false,
+                cfg: null,
+                timer: null,
+                token: 0,
+            };
+
+            // Crossfade (OPT-IN) : durée en ms ; 0 (défaut) = coupe franche.
+            this._transition = timeMs(o.transition, 0);
+
+            // Chrome discret (OPT-IN) : défauts neutres (aucun effet).
+            this._chromeDefaults = normalizeChrome(o.chrome);
 
             this._getColumnCount = fn(o.getColumnCount) || (() => (typeof o.columns === "number" ? o.columns : 1));
             this._getIndex = fn(o.getIndex);
@@ -251,6 +363,11 @@ const HolafLightbox = (function () {
                 resume: fn(o.onResume),
                 beforeNavigate: fn(o.beforeNavigate),
                 viewport: fn(o.onViewport),
+                slideshowstart: fn(o.onSlideshowStart),
+                slideshowstop: fn(o.onSlideshowStop),
+                slideshowtick: fn(o.onSlideshowTick),
+                slideshowpause: fn(o.onSlideshowPause),
+                slideshowresume: fn(o.onSlideshowResume),
             };
 
             // Source.
@@ -433,9 +550,43 @@ const HolafLightbox = (function () {
                 spinner: null,
                 nav: null,
                 ownsContainer: !provided,
+                // Crossfade (opt-in) : couche courante + sortante en fondu.
+                layer: null,
+                outgoing: null,
+                fadeMs: 0,
+                fadeTimer: null,
+                fadeStartTimer: null,
+                fadeStarted: false,
+                readySeq: 0,
+                // Chrome discret (opt-in).
+                chromeCfg: null,
+                chromeAuto: false,
+                chromeHidden: false,
+                chromeTimer: null,
+                chromeMoveHandler: null,
             };
-            const wantChrome = (cfg.chrome !== undefined) ? !!cfg.chrome : !provided;
+            // Chrome : `chrome` = booléen (construire ou non) ou objet
+            // { build, icons, autoHide, idleDelay, fadeDuration } (OPT-IN —
+            // sans option, libellés texte et chrome toujours visible).
+            const chromeOpts = (cfg.chrome && typeof cfg.chrome === "object") ? cfg.chrome : null;
+            const wantChrome = (cfg.chrome === undefined)
+                ? !provided
+                : ((typeof cfg.chrome === "boolean") ? cfg.chrome : (chromeOpts.build !== false));
+            const chromeCfg = {
+                icons: this._chromeDefaults.icons,
+                autoHide: this._chromeDefaults.autoHide,
+                idleDelay: this._chromeDefaults.idleDelay,
+                fadeDuration: this._chromeDefaults.fadeDuration,
+            };
+            if (chromeOpts) {
+                if (chromeOpts.icons !== undefined) chromeCfg.icons = chromeOpts.icons === true;
+                if (chromeOpts.autoHide !== undefined) chromeCfg.autoHide = chromeOpts.autoHide === true;
+                if (chromeOpts.idleDelay !== undefined) chromeCfg.idleDelay = timeMs(chromeOpts.idleDelay, chromeCfg.idleDelay);
+                if (chromeOpts.fadeDuration !== undefined) chromeCfg.fadeDuration = timeMs(chromeOpts.fadeDuration, chromeCfg.fadeDuration);
+            }
+            view.chromeCfg = chromeCfg;
             if (wantChrome) this._buildChrome(view);
+            if (view.chromeCfg.autoHide) this._installChromeAutoHide(view);
             this._hideView(view);
             return view;
         }
@@ -458,20 +609,24 @@ const HolafLightbox = (function () {
         _buildChrome(view) {
             const parent = view.container;
             const labels = this._labels;
-            const make = (cls, label, handler) => {
+            const icons = !!(view.chromeCfg && view.chromeCfg.icons);
+            const make = (cls, key, handler) => {
+                const label = labels[key];
                 const b = document.createElement("button");
                 b.type = "button";
                 b.className = "holaf-lightbox-nav " + cls;
-                b.textContent = label;
+                // Mode icônes (opt-in) : aucun libellé VISIBLE ; le libellé
+                // reste accessible (title + aria-label).
+                b.textContent = icons ? (ICON_GLYPHS[key] || label) : label;
                 b.title = label;
                 b.setAttribute("aria-label", label);
                 b.addEventListener("click", (e) => { e.stopPropagation(); handler(); });
                 return b;
             };
             view.nav = {
-                prev: make("holaf-lightbox-nav--prev", labels.prev, () => this.navigate(-1)),
-                next: make("holaf-lightbox-nav--next", labels.next, () => this.navigate(1)),
-                close: make("holaf-lightbox-nav--close", labels.close, () => this.back()),
+                prev: make("holaf-lightbox-nav--prev", "prev", () => this.navigate(-1)),
+                next: make("holaf-lightbox-nav--next", "next", () => this.navigate(1)),
+                close: make("holaf-lightbox-nav--close", "close", () => this.back()),
             };
             parent.appendChild(view.nav.prev);
             parent.appendChild(view.nav.next);
@@ -485,8 +640,75 @@ const HolafLightbox = (function () {
             this._hideSpinner(view);
         }
 
-        _showView(view) { if (view.container) view.container.style.display = view.display; }
-        _hideView(view) { if (view.container) view.container.style.display = "none"; }
+        // ── Chrome discret (OPT-IN) ─────────────────────────────────────────
+        // Auto-masquage après `idleDelay` ms d'immobilité (même curseur posé sur
+        // un icône) et réapparition au moindre mouvement. Les contrôles hôtes
+        // qui portent .holaf-lightbox-nav dans le conteneur participent aussi.
+        _installChromeAutoHide(view) {
+            const container = view.container;
+            if (!container || !container.classList || typeof container.addEventListener !== "function") return;
+            view.chromeAuto = true;
+            view.chromeHidden = false;
+            container.classList.add("holaf-lightbox-chrome-auto");
+            if (container.style && typeof container.style.setProperty === "function") {
+                container.style.setProperty("--hl-chrome-fade", view.chromeCfg.fadeDuration + "ms");
+            }
+            const onMove = () => this._pokeChrome(view);
+            view.chromeMoveHandler = onMove;
+            container.addEventListener("mousemove", onMove);
+            container.addEventListener("mouseenter", onMove);
+            container.addEventListener("touchstart", onMove, { passive: true });
+        }
+
+        _teardownChromeAutoHide(view) {
+            const container = view.container;
+            if (view.chromeTimer) { clearTimeout(view.chromeTimer); view.chromeTimer = null; }
+            if (view.chromeMoveHandler && container && typeof container.removeEventListener === "function") {
+                container.removeEventListener("mousemove", view.chromeMoveHandler);
+                container.removeEventListener("mouseenter", view.chromeMoveHandler);
+                container.removeEventListener("touchstart", view.chromeMoveHandler);
+            }
+            view.chromeMoveHandler = null;
+            if (container && container.classList) {
+                container.classList.remove("holaf-lightbox-chrome-auto", "holaf-lightbox-chrome-hidden");
+            }
+            view.chromeAuto = false;
+            view.chromeHidden = false;
+        }
+
+        _pokeChrome(view) {
+            if (!view.chromeAuto) return;
+            this._setChromeHidden(view, false);
+            this._armChromeTimer(view);
+        }
+
+        _setChromeHidden(view, hidden) {
+            if (!view.chromeAuto || !view.container || !view.container.classList) return;
+            if (view.chromeHidden === hidden) return;
+            view.chromeHidden = hidden;
+            view.container.classList.toggle("holaf-lightbox-chrome-hidden", hidden);
+        }
+
+        _armChromeTimer(view) {
+            if (!view.chromeAuto || view.chromeCfg.idleDelay <= 0) return;
+            if (view.chromeTimer) clearTimeout(view.chromeTimer);
+            view.chromeTimer = setTimeout(() => {
+                view.chromeTimer = null;
+                if (view.chromeAuto) this._setChromeHidden(view, true);
+            }, view.chromeCfg.idleDelay);
+        }
+
+        _showView(view) {
+            if (view.container) view.container.style.display = view.display;
+            if (view.chromeAuto) {
+                this._setChromeHidden(view, false);
+                this._armChromeTimer(view);
+            }
+        }
+        _hideView(view) {
+            if (view.container) view.container.style.display = "none";
+            if (view.chromeTimer) { clearTimeout(view.chromeTimer); view.chromeTimer = null; }
+        }
 
         _showSpinner(view) { if (view.spinner) view.spinner.style.display = "block"; }
         _hideSpinner(view) { if (view.spinner) view.spinner.style.display = "none"; }
@@ -569,6 +791,8 @@ const HolafLightbox = (function () {
             if (mode === undefined) return false;
             const view = this._views[mode];
             if (view) this._destroyView(view);
+            // Fermer la vue au sommet termine le diaporama (raison exposée).
+            if (this._slideshow.active) this.stopSlideshow("close");
             this._applyVisibility();
             if (!opts.silent) {
                 this._emit("close", { mode });
@@ -628,21 +852,72 @@ const HolafLightbox = (function () {
                 await this._renderView(this._views[top], item, { immediate: false });
             }
             this._preloadNext();
+            // Navigation MANUELLE pendant un diaporama : l'image change
+            // immédiatement et le minuteur est RÉARMÉ (flèche = accélérer /
+            // revenir en arrière). L'avance automatique passe `slideshow:true`
+            // et réarme elle-même. En pause, on ne réarme pas.
+            if (!opts.slideshow && this._slideshow.active && !this._slideshow.paused) {
+                this._armSlideshowTimer();
+            }
             return true;
         }
 
         // ── Rendu média (renderer injecté) + garde serial ────────────────────
+        // Durée de fondu effective du rendu : le diaporama actif prime (s'il a
+        // une transition), puis la config de vue, puis l'option `transition`.
+        _renderFadeMs(view) {
+            const s = this._slideshow;
+            if (s.active && s.cfg && s.cfg.transition !== null && s.cfg.transition !== undefined) {
+                return s.cfg.transition;
+            }
+            if (view.config && view.config.transition !== undefined) {
+                return timeMs(view.config.transition, this._transition);
+            }
+            return this._transition;
+        }
+
         async _renderView(view, item, opts) {
             if (this._destroyed) return;
             opts = opts || {};
             const seq = ++view.renderSeq;
+            const fadeMs = this._renderFadeMs(view);
+            view.fadeMs = fadeMs;
+            view.fadeStarted = false;
 
-            // Annule l'appel précédent (et le signal associé).
-            if (view.abort) { try { view.abort.abort(); } catch (e) { /* ignore */ } }
-            if (view.renderResult && typeof view.renderResult.destroy === "function") {
-                try { view.renderResult.destroy(); } catch (e) { console.error("[HolafLightbox] destroy :", e); }
+            // Annule l'appel précédent (et le signal associé). En CROSSFADE
+            // (opt-in), l'ancien rendu est CONSERVÉ comme couche sortante
+            // jusqu'à la fin du fondu ; sinon il est détruit immédiatement
+            // (comportement 0.1.0 strictement inchangé).
+            const prevAbort = view.abort;
+            const prevResult = view.renderResult;
+            if (fadeMs > 0) {
+                this._flushCrossfade(view);
+            } else {
+                // Pas de fondu pour CE rendu : on termine un éventuel fondu en
+                // cours et on détruit le rendu précédent immédiatement
+                // (comportement 0.1.0 strictement inchangé).
+                this._flushCrossfade(view);
+                if (prevAbort) { try { prevAbort.abort(); } catch (e) { /* ignore */ } }
+                if (prevResult && typeof prevResult.destroy === "function") {
+                    try { prevResult.destroy(); } catch (e) { console.error("[HolafLightbox] destroy :", e); }
+                }
+                // Une couche résiduelle (transition désactivée en cours de route)
+                // ne doit jamais rester orpheline dans la surface.
+                this._discardLayer(view.layer);
+                view.layer = null;
             }
             view.renderResult = null;
+
+            // En CROSSFADE, chaque rendu reçoit une couche fraîche comme
+            // `container` (contrat renderMedia inchangé : signature identique)
+            // — c'est la brique qui gère les couches.
+            let container = view.surface;
+            if (fadeMs > 0) {
+                container = document.createElement("div");
+                container.className = "holaf-lightbox-layer";
+                container.style.opacity = "0";
+                view.surface.appendChild(container);
+            }
 
             const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
             view.abort = ctrl;
@@ -652,14 +927,16 @@ const HolafLightbox = (function () {
 
             const onReady = (payload) => {
                 if (seq !== view.renderSeq) return; // callback périmé — ignoré
+                view.readySeq = seq;
                 this._hideSpinner(view);
                 this._readyView(view, item, payload);
+                if (view.fadeMs > 0) this._beginCrossfade(view, seq);
             };
 
             let result;
             try {
                 result = await this._renderMedia({
-                    container: view.surface,
+                    container,
                     item,
                     mode: view.mode,
                     onReady,
@@ -672,6 +949,12 @@ const HolafLightbox = (function () {
             } catch (err) {
                 if (seq === view.renderSeq) {
                     this._hideSpinner(view);
+                    if (fadeMs > 0) {
+                        // Le rendu entrant a échoué : on jette sa couche et
+                        // l'ancien rendu (conservé pour le fondu) reste affiché.
+                        this._discardLayer(container);
+                        view.renderResult = prevResult;
+                    }
                     this._emit("error", { mode: view.mode, item, error: err });
                     this._h("error", view.mode, item, err);
                 }
@@ -683,6 +966,57 @@ const HolafLightbox = (function () {
                 if (result && typeof result.destroy === "function") {
                     try { result.destroy(); } catch (e) { /* ignore */ }
                 }
+                if (fadeMs > 0) this._discardLayer(container);
+                return;
+            }
+
+            if (fadeMs > 0) {
+                // Promotion : l'ancien rendu (s'il existe) devient la couche
+                // sortante — son abort/destroy ne partent qu'à la fin du fondu.
+                // S'il a été rendu SANS fondu (transition activée en cours de
+                // route), son élément est emballé dans une couche à la volée.
+                if (prevResult && !view.layer) {
+                    const prevEl = (prevResult.el) || (prevResult.elements && prevResult.elements[0]) || null;
+                    if (prevEl && isNode(prevEl) && prevEl.parentNode === view.surface) {
+                        const wrap = document.createElement("div");
+                        wrap.className = "holaf-lightbox-layer";
+                        view.surface.appendChild(wrap);
+                        wrap.appendChild(prevEl);
+                        view.layer = wrap;
+                    }
+                }
+                if (prevResult && view.layer) {
+                    view.outgoing = { layer: view.layer, result: prevResult, abort: prevAbort };
+                } else if (prevResult) {
+                    // Rien à croiser (rendu sans élément) → libération immédiate.
+                    if (prevAbort) { try { prevAbort.abort(); } catch (e) { /* ignore */ } }
+                    if (typeof prevResult.destroy === "function") {
+                        try { prevResult.destroy(); } catch (e) { /* ignore */ }
+                    }
+                }
+                view.layer = container;
+                view.renderResult = result || null;
+                const el = (result && result.el) || (result && result.elements && result.elements[0]) || null;
+                if (el && isNode(el)) {
+                    view.element = el;
+                    this._ensureViewport(view, el);
+                }
+                if (!view.outgoing) {
+                    // Premier rendu de la vue : rien à croiser → affichage direct.
+                    container.style.opacity = "1";
+                } else if (view.readySeq === seq) {
+                    // onReady a déjà été appelé pendant renderMedia (hôte synchrone)
+                    // → le fondu peut démarrer tout de suite.
+                    this._beginCrossfade(view, seq);
+                } else {
+                    // Le fondu démarre à onReady (média prêt) avec un repli borné
+                    // si l'hôte ne signale jamais la disponibilité.
+                    if (view.fadeStartTimer) clearTimeout(view.fadeStartTimer);
+                    view.fadeStartTimer = setTimeout(() => {
+                        view.fadeStartTimer = null;
+                        this._beginCrossfade(view, seq);
+                    }, Math.max(CROSSFADE_READY_FALLBACK, fadeMs));
+                }
                 return;
             }
 
@@ -692,6 +1026,62 @@ const HolafLightbox = (function () {
                 view.element = el;
                 this._ensureViewport(view, el);
             }
+        }
+
+        // ── Crossfade (OPT-IN) : deux couches superposées pendant le fondu ────
+        _discardLayer(layer) {
+            if (layer && layer.parentNode) layer.parentNode.removeChild(layer);
+        }
+
+        _destroyOutgoing(outgoing) {
+            if (!outgoing) return;
+            if (outgoing.abort) { try { outgoing.abort.abort(); } catch (e) { /* ignore */ } }
+            if (outgoing.result && typeof outgoing.result.destroy === "function") {
+                try { outgoing.result.destroy(); } catch (e) { console.error("[HolafLightbox] destroy :", e); }
+            }
+            this._discardLayer(outgoing.layer);
+        }
+
+        // Termine immédiatement tout fondu en cours (rendu suivant, fermeture) :
+        // aucune couche orpheline, aucun timer vivant.
+        _flushCrossfade(view) {
+            if (view.fadeStartTimer) { clearTimeout(view.fadeStartTimer); view.fadeStartTimer = null; }
+            if (view.fadeTimer) { clearTimeout(view.fadeTimer); view.fadeTimer = null; }
+            const outgoing = view.outgoing;
+            view.outgoing = null;
+            if (outgoing) this._destroyOutgoing(outgoing);
+            if (view.layer && view.layer.style) view.layer.style.opacity = "1";
+        }
+
+        _beginCrossfade(view, seq) {
+            if (this._destroyed || seq !== view.renderSeq) return;
+            if (view.fadeStarted) return;
+            if (!view.outgoing || !view.layer) return;
+            view.fadeStarted = true;
+            if (view.fadeStartTimer) { clearTimeout(view.fadeStartTimer); view.fadeStartTimer = null; }
+            const ms = Math.max(1, Math.round(view.fadeMs));
+            const prevLayer = view.outgoing.layer;
+            const inLayer = view.layer;
+            const easing = "opacity " + ms + "ms ease";
+            if (prevLayer && prevLayer.style) {
+                prevLayer.style.transition = easing;
+                prevLayer.style.opacity = "1";
+            }
+            if (inLayer && inLayer.style) {
+                inLayer.style.transition = easing;
+                inLayer.style.opacity = "0";
+                // Force un reflow pour que la transition parte bien de 0 (sinon
+                // le navigateur peut appliquer les deux états dans la même frame).
+                void inLayer.offsetWidth;
+                inLayer.style.opacity = "1";
+                if (prevLayer && prevLayer.style) prevLayer.style.opacity = "0";
+            }
+            view.fadeTimer = setTimeout(() => {
+                view.fadeTimer = null;
+                const outgoing = view.outgoing;
+                view.outgoing = null;
+                if (outgoing) this._destroyOutgoing(outgoing);
+            }, ms + 60);
         }
 
         _readyView(view, item, payload) {
@@ -805,6 +1195,153 @@ const HolafLightbox = (function () {
             return false;
         }
 
+        // ── Diaporama (OPT-IN) ───────────────────────────────────────────────
+        // Sans l'option `slideshow`, aucune de ces méthodes n'a d'effet : elles
+        // renvoient false et la barre d'espace reste libre (comportement 0.1.0).
+
+        /**
+         * Démarre (ou relance) le diaporama. `opts` écrase la configuration
+         * d'instance : { duration, transition, random, loop }.
+         */
+        startSlideshow(opts) {
+            if (this._destroyed || !this._slideshowCfg) return false;
+            if (!this._stack.length) return false;
+            const base = this._slideshowCfg;
+            const o = opts || {};
+            const cfg = {
+                duration: timeMs(o.duration, base.duration),
+                transition: (o.transition !== undefined && o.transition !== null)
+                    ? timeMs(o.transition, 0)
+                    : base.transition,
+                random: (o.random === undefined) ? base.random : (o.random === true),
+                loop: (o.loop === undefined) ? base.loop : (o.loop === true),
+            };
+            const s = this._slideshow;
+            const wasActive = s.active;
+            s.active = true;
+            s.paused = false;
+            s.cfg = cfg;
+            this._armSlideshowTimer();
+            if (!wasActive) {
+                const payload = {
+                    duration: cfg.duration,
+                    transition: (cfg.transition === null) ? this._transition : cfg.transition,
+                    random: cfg.random,
+                    loop: cfg.loop,
+                    index: this._currentIndex(),
+                    item: this.current(),
+                };
+                this._emit("slideshowstart", payload);
+                this._h("slideshowstart", payload);
+            }
+            return true;
+        }
+
+        /** Arrête le diaporama. `reason` : 'manual' (défaut), 'end', 'close',
+         * 'destroy'. */
+        stopSlideshow(reason) {
+            const s = this._slideshow;
+            if (!s.active) return false;
+            s.active = false;
+            s.paused = false;
+            s.cfg = null;
+            this._clearSlideshowTimer();
+            const payload = {
+                reason: (typeof reason === "string" && reason) ? reason : "manual",
+                index: this._currentIndex(),
+                item: this.current(),
+            };
+            this._emit("slideshowstop", payload);
+            this._h("slideshowstop", payload);
+            return true;
+        }
+
+        pauseSlideshow() {
+            const s = this._slideshow;
+            if (!s.active || s.paused) return false;
+            s.paused = true;
+            this._clearSlideshowTimer();
+            const payload = { index: this._currentIndex(), item: this.current() };
+            this._emit("slideshowpause", payload);
+            this._h("slideshowpause", payload);
+            return true;
+        }
+
+        resumeSlideshow() {
+            const s = this._slideshow;
+            if (!s.active || !s.paused) return false;
+            s.paused = false;
+            this._armSlideshowTimer();
+            const payload = { index: this._currentIndex(), item: this.current() };
+            this._emit("slideshowresume", payload);
+            this._h("slideshowresume", payload);
+            return true;
+        }
+
+        /** Play/pause : démarre si arrêté, sinon bascule pause/reprise. */
+        toggleSlideshow(opts) {
+            const s = this._slideshow;
+            if (!s.active) return this.startSlideshow(opts);
+            return s.paused ? this.resumeSlideshow() : this.pauseSlideshow();
+        }
+
+        isSlideshow() { return this._slideshow.active; }
+
+        isSlideshowPaused() { return this._slideshow.active && this._slideshow.paused; }
+
+        _clearSlideshowTimer() {
+            const s = this._slideshow;
+            s.token += 1;
+            if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+        }
+
+        _armSlideshowTimer(delay) {
+            const s = this._slideshow;
+            if (!s.active || s.paused) return;
+            const ms = timeMs(delay, s.cfg ? s.cfg.duration : 0);
+            if (ms <= 0) return;
+            this._clearSlideshowTimer();
+            const token = s.token;
+            s.timer = setTimeout(() => {
+                s.timer = null;
+                if (token !== s.token || !s.active || s.paused) return;
+                this._slideshowAdvance();
+            }, ms);
+        }
+
+        async _slideshowAdvance() {
+            const s = this._slideshow;
+            if (!s.active || s.paused) return;
+            const total = this._getTotal();
+            if (total <= 0) { this._armSlideshowTimer(); return; }
+            const cur = this._currentIndex();
+            let next;
+            let dir;
+            if (s.cfg.random) {
+                if (total <= 1) { this._armSlideshowTimer(); return; }
+                next = cur;
+                for (let i = 0; i < 10 && next === cur; i++) {
+                    next = Math.floor(Math.random() * total);
+                }
+                if (next === cur || !Number.isFinite(next)) next = (cur + 1) % total;
+                dir = next > cur ? 1 : -1;
+            } else {
+                next = cur + 1;
+                if (next >= total) {
+                    if (!s.cfg.loop) { this.stopSlideshow("end"); return; }
+                    next = 0;
+                }
+                dir = 1;
+            }
+            const payload = { index: cur, item: this.current(), nextIndex: next, direction: dir };
+            this._emit("slideshowtick", payload);
+            this._h("slideshowtick", payload);
+            const ok = await this._goTo(next, dir, { slideshow: true });
+            if (!s.active || s.paused) return;
+            if (!ok) { this.stopSlideshow("end"); return; }
+            this._armSlideshowTimer();
+        }
+
         // ── Préchargement ────────────────────────────────────────────────────
         preload() { return this._preload; }
 
@@ -895,6 +1432,16 @@ const HolafLightbox = (function () {
                     }
                     return true;
                 }
+                case " ":
+                case "Spacebar":
+                    // Diaporama (OPT-IN) : espace EN PLEIN ÉCRAN démarre le
+                    // diaporama puis fait play/pause. Sans l'option, la touche
+                    // n'est PAS consommée (comportement 0.1.0 inchangé).
+                    if (!this._slideshowCfg || this._slideshowCfg.keyboard === false) return false;
+                    if (this._topMode() !== "fullscreen") return false;
+                    e.preventDefault();
+                    this.toggleSlideshow();
+                    return true;
                 case "ArrowLeft":
                     e.preventDefault();
                     this.navigate(-1);
@@ -966,12 +1513,17 @@ const HolafLightbox = (function () {
         // ── Cycle de vie ─────────────────────────────────────────────────────
         _destroyView(view) {
             view.renderSeq += 1;
+            // Fin immédiate d'un éventuel fondu : couche sortante détruite,
+            // timers coupés — aucune couche orpheline.
+            this._flushCrossfade(view);
             if (view.abort) { try { view.abort.abort(); } catch (e) { /* ignore */ } view.abort = null; }
             if (view.renderResult && typeof view.renderResult.destroy === "function") {
                 try { view.renderResult.destroy(); } catch (e) { /* ignore */ }
             }
             view.renderResult = null;
             view.element = null;
+            this._discardLayer(view.layer);
+            view.layer = null;
             if (view.viewport) this._destroyViewport(view);
             this._hideSpinner(view);
             this._hideView(view);
@@ -979,6 +1531,7 @@ const HolafLightbox = (function () {
 
         _teardownView(view) {
             this._destroyView(view);
+            this._teardownChromeAutoHide(view);
             if (view.ownsContainer && view.container && view.container.parentNode) {
                 view.container.parentNode.removeChild(view.container);
             }
@@ -990,6 +1543,7 @@ const HolafLightbox = (function () {
             if (this._destroyed) return;
             this._destroyed = true;
 
+            this.stopSlideshow("destroy");
             if (this._preloadTimer) { clearTimeout(this._preloadTimer); this._preloadTimer = null; }
             this._cancelPreloads();
 
