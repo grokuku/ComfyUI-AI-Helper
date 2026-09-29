@@ -1047,6 +1047,28 @@ video::-webkit-media-controls {
     display: none;
 }
 
+/* ─── Visibilité par source (étape 5) ──────────────────────────────────────
+   Le DOM local ET le DOM serveur coexistent dans le pane gauche ; seul le jeu
+   pertinent pour la source active est affiché. `data-src` ∈ local|remote|both
+   sur chaque groupe/contrôle ; _applySourceVisibility (image_viewer_ui.js)
+   pose .holaf-src-hidden sur les éléments hors source. */
+.holaf-src-hidden {
+    display: none !important;
+}
+
+/* Sélecteur (TYPE / TRI) de la source serveur. */
+.holaf-viewer-select {
+    width: 100%;
+    background-color: var(--holaf-input-background);
+    border: 1px solid var(--holaf-border-color);
+    color: var(--holaf-text-primary);
+    border-radius: 3px;
+    padding: 4px;
+    font-size: 12px;
+    box-sizing: border-box;
+    cursor: pointer;
+}
+
 .holaf-viewer-edit-icon {
     position: absolute;
     top: 5px;

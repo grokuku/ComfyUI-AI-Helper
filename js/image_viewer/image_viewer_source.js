@@ -38,8 +38,11 @@
  *   fetchPage({offset, limit,     → Promise<{images, total_count, ...}>.
  *              filters, signal,
  *              skipCount})
- *   fetchDelta({filters,          → Promise<{images, removed_path_canons, ...}>.
- *               minMtime, signal})
+ *   fetchDelta({filters,          → Promise<{images, removed_path_canons, …}>.
+ *               minMtime,          Local : images > minMtime (delta min_mtime).
+ *               cursor,            Serveur (étape 6) : tête de page 1 comparée à
+ *               signal})           cursor {ids, total} → nouveaux en images,
+ *                                  resync_reason pour une resynchro complète.
  *   fetchFilterOptions({signal})  → Promise<options filtres (subfolders…)>.
  *   fetchLastUpdateTime({signal}) → Promise<{last_update}> (poll).
  *   fetchThumbnailStats({signal}) → Promise<{generated_thumbnails_count,…}>.

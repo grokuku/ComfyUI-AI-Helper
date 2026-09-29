@@ -26,7 +26,8 @@ import * as Settings from './image_viewer/image_viewer_settings.js';
 import { GallerySource } from './image_viewer/image_viewer_source.js';
 // Effet de bord : enregistre la source 'remote' SI le serveur AIH est configuré
 // (serverUrl + token). Sinon le garde-fou de l'étape 1 garde l'option grisée.
-import './image_viewer/image_viewer_source_remote.js';
+// REMOTE_POLL_LIMIT : taille de la tête lue à chaque tick du poll serveur.
+import { REMOTE_POLL_LIMIT } from './image_viewer/image_viewer_source_remote.js';
 import { reconcileStoredSource } from './image_viewer/image_viewer_source_switch.js';
 import { UI, createThemeMenu } from './image_viewer/image_viewer_ui.js';
 import { initGallery, syncGallery, refreshThumbnailInGallery, forceRelayout, refreshAfterIncremental } from './image_viewer/image_viewer_gallery.js';
@@ -41,6 +42,13 @@ import { imageViewerState } from './image_viewer/image_viewer_state.js';
 const STATS_REFRESH_INTERVAL_MS = 2000;
 const DOWNLOAD_CHUNK_SIZE = 5 * 1024 * 1024;
 const FILTER_REFRESH_INTERVAL_MS = 2000;
+// Intervalle du poll SERVEUR (étape 6 ; le poll LOCAL historique reste à 2 s).
+//   10 s : même compromis que la galerie web (GALLERY_POLL_MS = 10 000). La
+//   requête de tête est minuscule et bornée (REMOTE_POLL_LIMIT items), soit
+//   ~6 requêtes/min — négligeable devant les vignettes — et assez court pour
+//   qu'un média poussé par le node « AIH save media » apparaisse presque en
+//   direct (délai de détection ≤ 10 s + debounce d'application 1,2 s).
+const REMOTE_POLL_INTERVAL_MS = 10000;
 // [NEW] Delay before reloading gallery after a filter click
 const FILTER_DEBOUNCE_DELAY_MS = 300; 
 // Debounce before applying an incremental delta (new/removed images) in place.
@@ -76,6 +84,15 @@ const holafImageViewer = {
     _showCheckTimer: null,
     _statsDeferTimer: null,
     _statsDeferralScheduled: false,
+
+    // --- Poll SERVEUR (étape 6) ---
+    remotePollTimer: null,          // timer du prochain tick (jamais deux à la fois)
+    _remotePollActive: false,       // poll serveur démarré (source remote + panneau visible)
+    _remotePollInFlight: false,     // une requête de tête est en vol
+    _remotePollPendingResync: false,// resynchronisation demandée, différée si perturbante
+    _remotePollAbort: null,         // AbortController du tick en cours
+    _remotePollMutationSeq: 0,      // mutations locales (reload/insert/remove)
+    _visibilityPollBound: false,    // listener visibilitychange branché une seule fois
 
     // --- Robust Filtering State ---
     isLoading: false,
@@ -116,9 +133,11 @@ const holafImageViewer = {
     },
 
     async show() {
+        let optionsLoaded = false;
         if (!this.panelElements) {
             this.createPanel();
             await this.loadAndPopulateFilters(false, true);
+            optionsLoaded = true;
         }
 
         const panelIsVisible = this.panelElements?.panelEl && this.panelElements.panelEl.style.display === "flex";
@@ -135,14 +154,19 @@ const holafImageViewer = {
             this.panelElements.panelEl.style.display = "flex";
             HolafPanelManager.bringToFront(this.panelElements.panelEl);
 
-
+            // Compteurs de filtres SERVEUR (dossiers/tags) rafraîchis à
+            // l'OUVERTURE du panneau : 2 GET d'options seulement, la liste des
+            // médias est rechargée juste après par triggerFilterChange. En
+            // mode local, comportement historique conservé (aucun refresh ici).
+            if (!optionsLoaded) await this._refreshRemoteFilterCountsIfOpen();
 
             // Immediate load on show, no debounce needed here
             this.triggerFilterChange(true); 
 
-            if (!this.filterRefreshIntervalId) {
-                this.filterRefreshIntervalId = setInterval(() => this.checkForUpdates(), FILTER_REFRESH_INTERVAL_MS);
-            }
+            // Le poll suit la source ACTIVE : local = intervalle 2 s historique
+            // (last-update-time), serveur = poll de tête 10 s (étape 6).
+            this._bindVisibilityPollGuard();
+            this._syncSourcePolling();
 
             // Refresh as soon as a ComfyUI workflow execution finishes: new images
             // are written to the output folder and the gallery should pick them up
@@ -203,6 +227,8 @@ const holafImageViewer = {
                 clearTimeout(this._resyncDebounceTimer);
                 this._resyncDebounceTimer = null;
             }
+            // Poll serveur (étape 6) : arrêt + requête en vol annulée.
+            this._stopRemotePoll();
             this._statsDeferralScheduled = false;
             this._updateViewerActivity(false);
             Navigation.stopPlayback(this);
@@ -395,8 +421,15 @@ const holafImageViewer = {
 
     // --- CRITICAL FIX: Debounced Filter Trigger ---
     triggerFilterChange(immediate = false) {
-        this._saveCurrentFilterState();
-        
+        // Les filtres sont PERSISTÉS PAR SOURCE : en mode serveur, on ne relit
+        // PAS le DOM local (masqué, vidé par loadAndPopulateFilters) — sinon
+        // folder_filters/format_filters/dates LOCAUX seraient écrasés à chaque
+        // changement de filtre serveur. La source serveur persiste ses propres
+        // clés via state.ui.remote_* (cf. image_viewer_ui.js).
+        if (GallerySource.activeId() !== 'remote') {
+            this._saveCurrentFilterState();
+        }
+
         // Clear any pending triggers
         if (this.filterDebounceTimer) {
             clearTimeout(this.filterDebounceTimer);
@@ -431,6 +464,12 @@ const holafImageViewer = {
     },
 
     async checkForUpdates() {
+        if (GallerySource.activeId() === 'remote') {
+            // Source serveur : pas d'endpoint « last-update-time » — le delta de
+            // tête prend le relais (étape 6). Appelé par execution_success ou le
+            // check différé de show() : un seul chemin, jamais deux.
+            return this.checkRemoteUpdates();
+        }
         if (this.isLoading) return;
         // Skip update check if user is actively scrolling the gallery
         // to avoid JSON.parse of large payloads blocking the main thread
@@ -568,6 +607,9 @@ const holafImageViewer = {
         });
         if (result.mode !== 'patched') return result;
 
+        // Insertion/retrait en place = mutation locale (cf. curseur du poll serveur).
+        this._remotePollMutationSeq = (this._remotePollMutationSeq || 0) + 1;
+
         const state = imageViewerState.getState();
         const newTotal = Math.max(0, oldTotal + result.inserted - result.removed);
 
@@ -589,6 +631,297 @@ const holafImageViewer = {
         refreshAfterIncremental(this);
         this.updateStatusBar(newTotal, imageViewerState.getState().status.totalImageCount);
         return result;
+    },
+
+    // ───────────────────────────────────────────────────────────────────────
+    // AUTO-RAFRAÎCHISSEMENT SERVEUR (étape 6)
+    // ───────────────────────────────────────────────────────────────────────
+
+    /** Le panneau est-il visible (display !== 'none') ? */
+    _isPanelVisible() {
+        const el = this.panelElements && this.panelElements.panelEl;
+        return !!(el && el.style.display !== 'none');
+    },
+
+    /**
+     * Branche UNE fois le garde de visibilité (visibilitychange). Onglet masqué :
+     * le poll serveur est mis en pause (aucune requête inutile) ; au retour, il
+     * reprend ET fait un contrôle immédiat. Le poll LOCAL n'est PAS concerné :
+     * son comportement 2 s historique est strictement inchangé.
+     */
+    _bindVisibilityPollGuard() {
+        if (this._visibilityPollBound) return;
+        if (typeof document === 'undefined') return;
+        this._visibilityPollBound = true;
+        this._onVisibilityPollChange = () => {
+            if (document.hidden) {
+                this._stopRemotePoll();
+                return;
+            }
+            if (GallerySource.activeId() !== 'remote') return;
+            this._syncSourcePolling();
+            if (this._remotePollActive) this.checkRemoteUpdates();
+        };
+        document.addEventListener('visibilitychange', this._onVisibilityPollChange);
+    },
+
+    /**
+     * Démarre/arrête le poll adapté à la source ACTIVE et à l'état du panneau :
+     *   - 'remote' : le poll local 2 s (last-update-time) est arrêté — sans
+     *     objet côté serveur — et le poll de tête serveur (10 s) démarre, sauf
+     *     onglet masqué ou panneau caché (relancé par show()/visibilitychange) ;
+     *   - 'local'  : le poll serveur est arrêté et l'intervalle 2 s historique
+     *     est (re)mis en place s'il ne tourne pas déjà — comportement inchangé.
+     * Idempotent : un double appel ne crée jamais deux timers.
+     */
+    _syncSourcePolling() {
+        const remoteActive = GallerySource.activeId() === 'remote';
+        const hidden = typeof document !== 'undefined' && document.hidden;
+        if (remoteActive) {
+            if (this.filterRefreshIntervalId) {
+                clearInterval(this.filterRefreshIntervalId);
+                this.filterRefreshIntervalId = null;
+            }
+            if (this._isPanelVisible() && !hidden) this._startRemotePoll();
+            else this._stopRemotePoll();
+            return;
+        }
+        this._stopRemotePoll();
+        if (this._isPanelVisible() && !this.filterRefreshIntervalId) {
+            this.filterRefreshIntervalId = setInterval(() => this.checkForUpdates(), FILTER_REFRESH_INTERVAL_MS);
+        }
+    },
+
+    /** Démarre le poll serveur (idempotent ; ne fait rien sans source remote). */
+    _startRemotePoll() {
+        if (this._remotePollActive) return;
+        if (GallerySource.activeId() !== 'remote') return;
+        this._remotePollActive = true;
+        this._scheduleRemotePoll();
+    },
+
+    /**
+     * Arrête le poll serveur ET annule la requête en vol éventuelle. Les données
+     * d'un tick interrompu ne sont jamais appliquées (AbortError → catch muet).
+     */
+    _stopRemotePoll() {
+        this._remotePollActive = false;
+        if (this.remotePollTimer) {
+            clearTimeout(this.remotePollTimer);
+            this.remotePollTimer = null;
+        }
+        if (this._remotePollAbort) {
+            try { this._remotePollAbort.abort(); } catch (e) { /* ignore */ }
+        }
+    },
+
+    /** (Re)programme le prochain tick serveur (jamais deux timers en parallèle). */
+    _scheduleRemotePoll() {
+        if (!this._remotePollActive) return;
+        if (this.remotePollTimer) return; // un tick est déjà planifié → pas d'empilement
+        this.remotePollTimer = setTimeout(() => this._remotePollTick(), REMOTE_POLL_INTERVAL_MS);
+        // Node (tests headless) : unref() pour ne pas maintenir la boucle.
+        if (this.remotePollTimer && typeof this.remotePollTimer.unref === 'function') {
+            this.remotePollTimer.unref();
+        }
+    },
+
+    /**
+     * Corps d'un tick planifié : exécute le contrôle puis replanifie TOUJOURS
+     * (même après une erreur) tant que le poll est actif. Jamais deux ticks
+     * concurrents (le contrôle s'auto-garde via _remotePollInFlight).
+     * @returns {Promise<object>} résultat du contrôle.
+     */
+    _remotePollTick() {
+        this.remotePollTimer = null;
+        return this.checkRemoteUpdates().finally(() => this._scheduleRemotePoll());
+    },
+
+    /**
+     * Un tick du poll SERVEUR : lit la TÊTE de page 1 (mêmes filtres et même tri
+     * que la vue courante) et réconcilie la collection en place.
+     *
+     * Garde-fous :
+     *   - jamais pendant un chargement (isLoading) ni pendant un scroll actif ;
+     *   - jamais deux requêtes concurrentes (_remotePollInFlight) ;
+     *   - une resynchronisation en attente est rejouée en priorité ;
+     *   - une réponse arrivée après une mutation locale est PÉRIMÉE (jetée) ;
+     *   - toute erreur est avalée : le prochain tick réessaie (le poll ne meurt
+     *     jamais d'une erreur réseau).
+     * Le scroll, la sélection et la visionneuse ne suspendent JAMAIS le tick :
+     * l'insertion est faite en place quand on est en haut, sinon le delta devient
+     * « pendingNewImages » (toast) sans toucher à la vue.
+     */
+    async checkRemoteUpdates() {
+        if (GallerySource.activeId() !== 'remote') return { action: 'none' };
+        if (this.isLoading || this._isGalleryScrolling) return { action: 'skipped' };
+        if (this._remotePollInFlight) return { action: 'skipped' };
+        // Resynchronisation demandée par un tick précédent : on la rejoue si
+        // elle ne perturbe plus rien, sinon on réessaiera au tick suivant.
+        if (this._remotePollPendingResync) {
+            await this._maybeRunRemoteResync();
+            return { action: 'pending-resync' };
+        }
+
+        const state = imageViewerState.getState();
+        const cursor = this._remotePollCursor(state);
+        if (cursor.ids.length === 0 && cursor.total > 0) {
+            // Total connu mais fenêtre de tête vide : rien à comparer → resync.
+            this._remotePollPendingResync = true;
+            await this._maybeRunRemoteResync();
+            return { action: 'pending-resync' };
+        }
+
+        // État des mutations locales AU DÉPART de la requête (cf. mutSeq).
+        const seq = this._remotePollMutationSeq || 0;
+        this._remotePollInFlight = true;
+        this._remotePollAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        try {
+            const delta = await GallerySource.active().fetchDelta({
+                filters: state.filters,
+                cursor,
+                signal: this._remotePollAbort ? this._remotePollAbort.signal : undefined,
+            });
+            // Une mutation LOCALE (reload, suppression, insertion) est survenue
+            // pendant la requête : la réponse décrit l'état d'AVANT → jetée.
+            // Sans ce garde-fou, notre propre suppression (total local déjà
+            // décrémenté) serait relue comme une suppression hors-bande et
+            // déclencherait un rechargement complet injustifié.
+            if (seq !== (this._remotePollMutationSeq || 0)) return { action: 'stale' };
+            return await this._applyRemotePollDelta(delta);
+        } catch (e) {
+            // Erreur réseau/HTTP : silencieuse (un serveur injoignable ne doit
+            // pas inonder la console toutes les 10 s), le tick suivant réessaie.
+            return { action: 'error' };
+        } finally {
+            this._remotePollInFlight = false;
+            this._remotePollAbort = null;
+        }
+    },
+
+    /**
+     * Curseur du poll : ids des premiers items chargés (préfixe contigu, borné à
+     * la taille de tête lue) + total local. Le provider compare la tête serveur
+     * à ces ids : ceux qui les précèdent sont NOUVEAUX.
+     */
+    _remotePollCursor(state) {
+        const ids = [];
+        const images = (state && state.images) || [];
+        for (let i = 0; i < images.length && ids.length < REMOTE_POLL_LIMIT; i++) {
+            const img = images[i];
+            if (!img) break; // trou : la fenêtre de tête s'arrête ici
+            const key = GallerySource.active().itemKey(img);
+            if (key) ids.push(key);
+        }
+        const total = (typeof state.totalCount === 'number' && state.totalCount > 0)
+            ? state.totalCount
+            : ((state.status && state.status.totalImageCount) || 0);
+        return { ids, total };
+    },
+
+    /**
+     * Réconcilie le delta renvoyé par le provider serveur :
+     *   - resync_reason → resynchronisation complète, DIFFÉRÉE si elle
+     *     perturberait l'utilisateur (sélection/visionneuse/scroll/chargement) ;
+     *   - nouveaux items → insertion en tête SANS recharger la liste, soit tout
+     *     de suite si la vue est en haut (debounce 1,2 s anti-rafale), soit en
+     *     « pendingNewImages » + toast si l'utilisateur est scrollé ailleurs ;
+     *   - aucun changement → seul le compteur est éventuellement rafraîchi.
+     * @returns {Promise<{action:string, count?:number}>}
+     */
+    async _applyRemotePollDelta(delta) {
+        if (!delta) return { action: 'none' };
+
+        if (delta.resync_reason) {
+            this._remotePollPendingResync = true;
+            await this._maybeRunRemoteResync();
+            return { action: 'reload-deferred' };
+        }
+
+        const newImages = Array.isArray(delta.images) ? delta.images : [];
+        if (newImages.length === 0) {
+            if (Number.isFinite(delta.total_count)) {
+                const status = imageViewerState.getState().status;
+                if (delta.total_count !== status.totalImageCount) {
+                    this.updateStatusBar(imageViewerState.getState().totalCount, delta.total_count);
+                }
+            }
+            return { action: 'none' };
+        }
+
+        const g = document.getElementById('holaf-viewer-gallery');
+        const isAtTop = g ? (g.scrollTop < g.clientHeight) : true;
+        if (!isAtTop) {
+            // Scrolé ailleurs : on n'insère RIEN en tête (le contenu glisserait
+            // sous les yeux) — la nouveauté est signalée, la liste reste stable.
+            imageViewerState.setState({ status: { pendingNewImages: true } });
+            showToast({ message: t("iv.newImagesDetected"), type: "info" });
+            return { action: 'pending', count: newImages.length };
+        }
+
+        // Debounce : coalesce les rafales de « nouveaux » (batch de génération).
+        // Le delta est appliqué EN PLACE (insertTop), sans loadFilteredImages()
+        // ni resetWindowCache() : fenêtres chargées et vignettes conservées.
+        if (this._resyncDebounceTimer) clearTimeout(this._resyncDebounceTimer);
+        this._resyncDebounceTimer = setTimeout(() => {
+            this._resyncDebounceTimer = null;
+            this._applyIncrementalDelta(delta).then(() => {
+                // Le total du serveur est AUTORITAIRE : il rafraîchit le compteur
+                // « X / total » (le mode serveur n'a pas de stats de vignettes).
+                if (Number.isFinite(delta.total_count)) {
+                    this.updateStatusBar(imageViewerState.getState().totalCount, delta.total_count);
+                }
+            }).catch((e) => {
+                console.error("[Holaf ImageViewer] Remote delta failed, full reload:", e);
+                this.loadFilteredImages();
+            });
+        }, INCREMENTAL_APPLY_DEBOUNCE_MS);
+        return { action: 'inserted', count: newImages.length };
+    },
+
+    /**
+     * Une resynchronisation complète peut-elle s'exécuter SANS perturber ?
+     * Non si : chargement en cours, scroll actif, sélection non vide,
+     * visionneuse ouverte (view_mode ≠ 'gallery') ou liste scrollée (un reload
+     * remonterait la vue en haut). Sinon oui → loadFilteredImages().
+     */
+    _canRunRemoteResync() {
+        if (this.isLoading || this._isGalleryScrolling) return false;
+        const state = imageViewerState.getState();
+        if (state.selectedImages && state.selectedImages.length > 0) return false;
+        if (state.ui && state.ui.view_mode && state.ui.view_mode !== 'gallery') return false;
+        const galleryEl = document.getElementById('holaf-viewer-gallery');
+        if (galleryEl && galleryEl.scrollTop > 0) return false;
+        return true;
+    },
+
+    /**
+     * Rejoue la resynchronisation en attente si elle est sans perturbation ;
+     * sinon elle reste en attente (rejouée au tick suivant / retour d'onglet).
+     * @returns {Promise<boolean>} true si un rechargement complet vient d'être lancé.
+     */
+    async _maybeRunRemoteResync() {
+        if (!this._remotePollPendingResync) return false;
+        if (!this._canRunRemoteResync()) return false;
+        this._remotePollPendingResync = false;
+        await this.loadFilteredImages();
+        return true;
+    },
+
+    /**
+     * Compteurs de filtres SERVEUR (dossiers/tags + counts) : rafraîchis à
+     * l'OUVERTURE du panneau (2 GET d'options, PAS de rechargement de liste).
+     * Choix : pas de rafraîchissement à chaque tick — reconstruire les listes
+     * pendant que l'utilisateur les manipule volerait le focus ; la vérité des
+     * compteurs reste rafraîchie à l'ouverture, à la bascule de source et à
+     * chaque changement manuel de filtres (loadAndPopulateFilters).
+     * @returns {Promise<boolean>} true si un refresh a été lancé.
+     */
+    async _refreshRemoteFilterCountsIfOpen() {
+        if (GallerySource.activeId() !== 'remote') return false;
+        if (!this._isPanelVisible()) return false;
+        await this.loadAndPopulateFilters(false, true);
+        return true;
     },
 
     _performFullReset(resetLocks) {
@@ -709,73 +1042,83 @@ const holafImageViewer = {
                 const foldersEl = document.getElementById('holaf-viewer-folders-filter');
                 const formatsEl = document.getElementById('holaf-viewer-formats-filter');
 
-                if (foldersEl) foldersEl.innerHTML = '';
-                if (formatsEl) formatsEl.innerHTML = '';
+                if (GallerySource.activeId() === 'remote') {
+                    // Source SERVEUR (étape 5) : options mappées par le provider
+                    // remote → listes DÉDIÉES (dossiers/tags + comptes). Le DOM
+                    // local (masqué) reste VIDE : les filtres locaux (folder_filters/
+                    // format_filters) ne sont donc jamais pollués en mode serveur.
+                    if (foldersEl) foldersEl.innerHTML = '';
+                    if (formatsEl) formatsEl.innerHTML = '';
+                    UI.populateRemoteFilterOptions(data);
+                } else {
+                    if (foldersEl) foldersEl.innerHTML = '';
+                    if (formatsEl) formatsEl.innerHTML = '';
 
-                const onFilterChange = () => this.triggerFilterChange();
+                    const onFilterChange = () => this.triggerFilterChange();
 
-                const { folder_filters, format_filters } = state.filters;
-                const hasSavedFolderFilters = folder_filters !== null;
-                const hasSavedFormatFilters = format_filters !== null;
+                    const { folder_filters, format_filters } = state.filters;
+                    const hasSavedFolderFilters = folder_filters !== null;
+                    const hasSavedFormatFilters = format_filters !== null;
 
-                const allFolderData = data.subfolders.filter(f => f.path !== 'trashcan');
-                const trashData = data.subfolders.find(f => f.path === 'trashcan');
+                    const allFolderData = data.subfolders.filter(f => f.path !== 'trashcan');
+                    const trashData = data.subfolders.find(f => f.path === 'trashcan');
 
-                if (foldersEl) {
-                    allFolderData.forEach(folderData => {
-                        const id = folderData.path;
-                        const isChecked = !hasSavedFolderFilters || folder_filters.includes(id);
-                        const label = id === 'root' ? `(root) (${folderData.count})` : `${id} (${folderData.count})`;
-                        foldersEl.appendChild(this.createFilterItem(`folder-filter-${id}`, label, isChecked, onFilterChange, id));
-                    });
-
-                    if (trashData) {
-                        const separator = document.createElement('div');
-                        separator.className = 'holaf-viewer-trash-separator';
-                        foldersEl.appendChild(separator);
-
-                        const isTrashChecked = hasSavedFolderFilters && folder_filters.includes('trashcan');
-
-                        const trashCheckboxItem = this.createFilterItem('folder-filter-trashcan', t('iv.trashcan'), isTrashChecked, (e) => {
-                            const otherFolderCheckboxes = foldersEl.querySelectorAll('input[type="checkbox"]:not(#folder-filter-trashcan)');
-                            if (e.target.checked) {
-                                this._lastFolderFilterState = [...otherFolderCheckboxes].filter(cb => cb.checked).map(cb => cb.id);
-                                otherFolderCheckboxes.forEach(cb => { cb.checked = false; cb.disabled = true; });
-                            } else {
-                                otherFolderCheckboxes.forEach(cb => {
-                                    cb.disabled = false;
-                                    if (this._lastFolderFilterState && this._lastFolderFilterState.includes(cb.id)) {
-                                        cb.checked = true;
-                                    }
-                                });
-                            }
-                            onFilterChange();
+                    if (foldersEl) {
+                        allFolderData.forEach(folderData => {
+                            const id = folderData.path;
+                            const isChecked = !hasSavedFolderFilters || folder_filters.includes(id);
+                            const label = id === 'root' ? `(root) (${folderData.count})` : `${id} (${folderData.count})`;
+                            foldersEl.appendChild(this.createFilterItem(`folder-filter-${id}`, label, isChecked, onFilterChange, id));
                         });
 
-                        const trashContainer = trashCheckboxItem;
-                        trashContainer.style.display = 'flex';
-                        trashContainer.style.justifyContent = 'space-between';
-                        trashContainer.style.alignItems = 'center';
+                        if (trashData) {
+                            const separator = document.createElement('div');
+                            separator.className = 'holaf-viewer-trash-separator';
+                            foldersEl.appendChild(separator);
 
-                        const emptyTrashBtn = document.createElement('button');
-                        emptyTrashBtn.textContent = t('iv.empty');
-                        emptyTrashBtn.title = t('iv.emptyTrashTitle');
-                        emptyTrashBtn.style.cssText = 'font-size: 10px; padding: 2px 6px; margin-left: 10px; background-color: var(--holaf-error-color, #802020); color: var(--holaf-button-text, white); border: 1px solid var(--holaf-border-color, #c03030); cursor: pointer; border-radius: 4px;';
-                        emptyTrashBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this._handleEmptyTrash(); };
-                        trashContainer.appendChild(emptyTrashBtn);
-                        foldersEl.appendChild(trashContainer);
+                            const isTrashChecked = hasSavedFolderFilters && folder_filters.includes('trashcan');
 
-                        if (trashCheckboxItem && trashCheckboxItem.querySelector('input').checked) {
-                            foldersEl.querySelectorAll('input[type="checkbox"]:not(#folder-filter-trashcan)').forEach(cb => cb.disabled = true);
+                            const trashCheckboxItem = this.createFilterItem('folder-filter-trashcan', t('iv.trashcan'), isTrashChecked, (e) => {
+                                const otherFolderCheckboxes = foldersEl.querySelectorAll('input[type="checkbox"]:not(#folder-filter-trashcan)');
+                                if (e.target.checked) {
+                                    this._lastFolderFilterState = [...otherFolderCheckboxes].filter(cb => cb.checked).map(cb => cb.id);
+                                    otherFolderCheckboxes.forEach(cb => { cb.checked = false; cb.disabled = true; });
+                                } else {
+                                    otherFolderCheckboxes.forEach(cb => {
+                                        cb.disabled = false;
+                                        if (this._lastFolderFilterState && this._lastFolderFilterState.includes(cb.id)) {
+                                            cb.checked = true;
+                                        }
+                                    });
+                                }
+                                onFilterChange();
+                            });
+
+                            const trashContainer = trashCheckboxItem;
+                            trashContainer.style.display = 'flex';
+                            trashContainer.style.justifyContent = 'space-between';
+                            trashContainer.style.alignItems = 'center';
+
+                            const emptyTrashBtn = document.createElement('button');
+                            emptyTrashBtn.textContent = t('iv.empty');
+                            emptyTrashBtn.title = t('iv.emptyTrashTitle');
+                            emptyTrashBtn.style.cssText = 'font-size: 10px; padding: 2px 6px; margin-left: 10px; background-color: var(--holaf-error-color, #802020); color: var(--holaf-button-text, white); border: 1px solid var(--holaf-border-color, #c03030); cursor: pointer; border-radius: 4px;';
+                            emptyTrashBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this._handleEmptyTrash(); };
+                            trashContainer.appendChild(emptyTrashBtn);
+                            foldersEl.appendChild(trashContainer);
+
+                            if (trashCheckboxItem && trashCheckboxItem.querySelector('input').checked) {
+                                foldersEl.querySelectorAll('input[type="checkbox"]:not(#folder-filter-trashcan)').forEach(cb => cb.disabled = true);
+                            }
                         }
                     }
-                }
 
-                if (formatsEl) {
-                    data.formats.forEach(format => {
-                        const isChecked = !hasSavedFormatFilters || format_filters.includes(format);
-                        formatsEl.appendChild(this.createFilterItem(`format-filter-${format}`, format, isChecked, onFilterChange));
-                    });
+                    if (formatsEl) {
+                        data.formats.forEach(format => {
+                            const isChecked = !hasSavedFormatFilters || format_filters.includes(format);
+                            formatsEl.appendChild(this.createFilterItem(`format-filter-${format}`, format, isChecked, onFilterChange));
+                        });
+                    }
                 }
             }
 
@@ -784,8 +1127,12 @@ const holafImageViewer = {
             }
         } catch (e) {
             console.error("[Holaf ImageViewer] Failed to load filter options:", e);
-            if (this.panelElements && document.getElementById('holaf-viewer-folders-filter')) {
-                document.getElementById('holaf-viewer-folders-filter').innerHTML = `<p class="holaf-viewer-message error">${t('iv.errorLoadingFilters')}</p>`;
+            const remoteActive = GallerySource.activeId() === 'remote';
+            const errorEl = remoteActive
+                ? document.getElementById('holaf-viewer-remote-folders-filter')
+                : document.getElementById('holaf-viewer-folders-filter');
+            if (this.panelElements && errorEl) {
+                errorEl.innerHTML = `<p class="holaf-viewer-message error">${t('iv.errorLoadingFilters')}</p>`;
             }
         }
     },
@@ -842,6 +1189,9 @@ const holafImageViewer = {
         if (this.isLoading) return; 
         
         this.isLoading = true;
+        // Tout rechargement complet est une MUTATION LOCALE : un tick de poll
+        // serveur démarré avant décrit un état périmé (cf. checkRemoteUpdates).
+        this._remotePollMutationSeq = (this._remotePollMutationSeq || 0) + 1;
         this._loadingMore = false;
 
         try {

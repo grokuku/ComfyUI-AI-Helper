@@ -12,11 +12,37 @@
  * que TOUS les modules hôtes (holaf_image_viewer.js, image_viewer_data/
  * gallery/navigation/infopane/actions.js) fonctionnent sans branchement.
  *
- * Périmètre ÉTAPES 2 + 4 : DONNÉES + VIGNETTES (étape 2 : liste paginée,
- * options de filtres, normalisation d'item, URL/chargement de vignette) et
- * PLEIN ÉCRAN + MÉTADONNÉES (étape 4 : resolveMediaUrl pour les IMAGES,
- * resolveInfo pour le panneau d'infos). Les filtres UI dédiés = étape 5 ; le
- * poll/delta = étape 6.
+ * Périmètre ÉTAPES 2 + 4 + 5 + 6 : DONNÉES + VIGNETTES (étape 2 : liste
+ * paginée, options de filtres, normalisation d'item, URL/chargement de
+ * vignette), PLEIN ÉCRAN + MÉTADONNÉES (étape 4 : resolveMediaUrl pour les
+ * IMAGES, resolveInfo pour le panneau d'infos), FILTRES SERVEUR (étape 5 :
+ * buildMediaListQuery exhaustif + fetchFilterOptions dossiers/tags avec
+ * comptes, lus depuis state.ui.remote_*) et AUTO-RAFRAÎCHISSEMENT (étape 6 :
+ * fetchDelta = lecture de la TÊTE de page 1 + diff contre un curseur, pour
+ * insérer les nouveaux médias SANS recharger la liste — cf. ci-dessous).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * DELTA DU POLL SERVEUR (étape 6)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Le serveur n'a PAS d'endpoint « last-update-time » (contrairement au local) :
+ * le poll serveur relit donc la TÊTE de la page 1 (mêmes filtres et même tri
+ * que la vue courante, borné à REMOTE_POLL_LIMIT items) puis compare les ids
+ * reçus au curseur fourni par l'hôte (`cursor.ids` = premiers ids de la
+ * collection locale, `cursor.total` = total local).
+ *
+ *   - NOUVEAUX médias (tri « created_at_desc », le défaut) : les k items qui
+ *     précèdent le premier id CONNU sont neufs → `images: head.slice(0, k)`.
+ *     La cohérence est EXIGÉE : hausse du total === k (sinon des suppressions
+ *     se sont glissées dans le lot → `resync_reason`).
+ *   - SUPPRESSION HORS-BANDE : impossible de savoir QUELS ids ont disparu (le
+ *     total baisse, la page n'en dit pas plus) → `resync_reason: 'removed'`.
+ *     C'est l'hôte qui diffère la resynchronisation complète tant qu'elle
+ *     perturberait (sélection, visionneuse, scroll, action en cours).
+ *   - Cas ambigus (trop de nouveaux pour la tête lue `overflow`, tête connue
+ *     disparue `top-missing`, tri non-descendant `sort`, local vide `no-cursor`)
+ *     → `resync_reason` également.
+ * Un `resync_reason` non nul est un ORDRE de resynchroniser ; `images` est
+ * alors vide. Sinon `images` est le delta à insérer en tête tel quel.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CANAL SERVEUR
@@ -108,14 +134,16 @@
  *
  * CE QUI N'EST PAS ENCORE SUPPORTÉ (documenté, fail-fast ou no-op explicite)
  * ─────────────────────────────────────────────────────────────────────────────
- *   - fetchLastUpdateTime  → null  (poll par tête de page 1 = étape 6) ;
+ *   - fetchLastUpdateTime  → null  (pas de « last-update-time » serveur : le
+ *                                   poll passe par fetchDelta/tête de page 1) ;
  *   - fetchThumbnailStats  → null  (pas de stats/priorisation côté serveur) ;
  *   - reportViewerActivity → no-op (pas de heartbeat serveur) ;
- *   - fetchDelta           → delta VIDE (squelette ; poll = étape 6) ;
  *   - loadEdits            → null  (pas d'édition serveur) ;
  *   - prioritizeThumbnails → no-op (pas de priorisation serveur) ;
- *   - filters UI (formats, prompt/workflow, corbeille) = étape 5 ;
  *   - delete/restore/extract/inject/export → null (non supportés).
+ *   - filtres serveur (kind, dossiers OU, tags OU, favoris, dates, q nom de
+ *     fichier, tri) = étape 5, IMPLÉMENTÉS ; formats/prompt/workflow search
+ *     n'existent pas côté serveur et ne sont jamais émis.
  * `favorite` et `download` SONT supportés par le serveur et implémentés
  * (capabilities favorite/serverDownload = true), même si l'UI du pack ne les
  * consomme pas encore.
@@ -125,7 +153,7 @@ import { HolafThumbCache } from '../vendor/holaf/holaf-thumbcache.js';
 import { HolafCollection } from '../vendor/holaf/holaf-collection.js';
 import { remoteGet, remotePost, getRemoteConfig, HolafFetchError } from '../aih_fetch_bridge.js';
 import { GallerySource } from './image_viewer_source.js';
-import { imageViewerState } from './image_viewer_state.js';
+import { imageViewerState, REMOTE_FILTER_UI_KEYS } from './image_viewer_state.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ENDPOINTS & PARAMÈTRES DE LA SOURCE SERVEUR
@@ -143,9 +171,25 @@ export const REMOTE_ENDPOINTS = Object.freeze({
 
 // Le serveur borne la pagination à 200 (route GET /api/media) → mode 'window'.
 export const REMOTE_PAGE_SIZE = 200;
+
+// Items lus à chaque tick du poll serveur (tête de page 1). Même ordre de
+// grandeur que la galerie web (GALLERY_POLL_LIMIT = 30) : assez pour couvrir
+// plusieurs ajouts d'un coup (node « AIH save media », rafale de génération) et
+// pour retrouver la tête connue ; au-delà, la comparaison est ambiguë →
+// resynchronisation DIFFÉRÉE par l'hôte (resync_reason 'overflow'). Requête
+// minuscule (~30 items JSON) toutes les 10 s : négligeable devant les vignettes.
+export const REMOTE_POLL_LIMIT = 30;
 // Tailles de vignette autorisées côté serveur (snap vers le HAUT côté pack :
 // la taille d'affichage du pack va de 80 à 300 px, cf. image_viewer_ui.js).
 export const REMOTE_THUMB_SIZES = Object.freeze([128, 256, 512]);
+
+// Valeurs de filtre proposées par l'UI serveur (étape 5). Ce sont des listes de
+// VALEURS ; les libellés traduits vivent dans js/aih_strings.js (l'UI les
+// mappe). `sort` par défaut = 'created_at_desc' (≡ tri historique, non émis).
+export const REMOTE_KIND_VALUES = Object.freeze(['image', 'video', 'audio']);
+export const REMOTE_SORT_VALUES = Object.freeze([
+    'created_at_desc', 'created_at_asc', 'name_asc', 'name_desc', 'size_desc', 'size_asc',
+]);
 const REMOTE_THUMB_DEFAULT_SIZE = 150; // taille d'affichage par défaut du pack
 const REMOTE_THUMB_CACHE_CAPACITY = 1000;
 const REMOTE_THUMB_TIMEOUT_MS = 30000;
@@ -296,53 +340,131 @@ export function normalizeItem(raw) {
 }
 
 /**
- * Mappe l'état de filtres de l'hôte (state.filters) + les clés génériques vers
- * les paramètres de GET /api/media. Clés acceptées (générique → hôte) :
- *   subfolders/subfolder ← folder_filters ( 'root' → '' ; 'trashcan' → status )
- *   kind, tags ← tags_filter, q ← filename_search, from ← startDate,
- *   to ← endDate, status, favorite, sort.
- * Les filtres NON supportés (formats, prompt/workflow, bool_filters) sont
- * volontairement ignorés (filtres UI dédiés = étape 5).
+ * Filtres EFFECTIFS de la source serveur : l'état persisté (state.ui.remote_*)
+ * puis l'appel explicite qui prime clé par clé. Même fusion que fetchPage et
+ * fetchDelta (une seule définition → aucune divergence possible).
+ * @param {object|null} [filters]
+ * @returns {object}
+ */
+export function mergeRemoteFilters(filters) {
+    return { ...readRemoteFilters(), ...(filters || {}) };
+}
+
+/**
+ * Tri effectif de la vue serveur, même priorité que `buildMediaListQuery` :
+ * remote_sort → sort générique → 'created_at_desc' (défaut serveur).
+ * @param {object|null} [filters] déjà fusionnés (cf. mergeRemoteFilters)
+ * @returns {string}
+ */
+export function effectiveRemoteSort(filters) {
+    const f = filters || {};
+    if (Object.prototype.hasOwnProperty.call(f, 'remote_sort')) {
+        const s = String(f.remote_sort || '');
+        return s || 'created_at_desc';
+    }
+    if (f.sort != null && f.sort !== '') return String(f.sort);
+    return 'created_at_desc';
+}
+
+/**
+ * Lit les filtres de la source SERVEUR depuis `state.ui` (clés remote_*).
+ * Ne recopie que les clés réellement PRÉSENTES : sur un état non initialisé
+ * (aucune clé remote_*) il renvoie `{}`, laissant `buildMediaListQuery`
+ * retomber sur les clés génériques/locales fournies par l'appelant.
+ * @param {object} [stateOverride] instantané d'état (tests), sinon l'état réel.
+ * @returns {object}
+ */
+export function readRemoteFilters(stateOverride) {
+    let ui;
+    if (stateOverride && stateOverride.ui) {
+        ui = stateOverride.ui;
+    } else {
+        try { ui = imageViewerState.getState().ui || {}; } catch (e) { ui = {}; }
+    }
+    const out = {};
+    for (const key of REMOTE_FILTER_UI_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(ui, key)) out[key] = ui[key];
+    }
+    return out;
+}
+
+/**
+ * Mappe un objet de filtres vers les paramètres de GET /api/media.
+ *
+ * PRIORITÉ : les clés DÉDIÉES de la source serveur (remote_*) sont
+ * autoritatives quand elles sont présentes ; sinon on retombe sur les clés
+ * génériques puis sur les clés de l'hôte local (compat ascendante : les appels
+ * directs/tests peuvent fournir folder_filters, tags_filter, filename_search…).
+ *
+ * Les filtres NON supportés par le serveur (formats, prompt/workflow search,
+ * bool_filters, locked_folders) ne sont JAMAIS émis.
  * @param {object|null} filters
  * @returns {URLSearchParams}
  */
 export function buildMediaListQuery(filters) {
     const f = filters || {};
+    const has = (key) => Object.prototype.hasOwnProperty.call(f, key);
     const params = new URLSearchParams();
 
-    // Dossiers : folder_filters (hôte) ou subfolders (générique). 'root' → ''
-    // (racine serveur) ; 'trashcan' → bascule le statut sur 'trashed'.
-    let status = f.status || null;
-    const folders = Array.isArray(f.folder_filters) ? f.folder_filters
-        : (Array.isArray(f.subfolders) ? f.subfolders : null);
-    if (folders) {
+    // Statut (corbeille) : remote_status prioritaire, sinon générique.
+    let status = (has('remote_status') && f.remote_status !== '')
+        ? String(f.remote_status)
+        : ((f.status != null && f.status !== '') ? String(f.status) : null);
+
+    // TYPE (kind) : remote_kind prioritaire. 'all'/'' = pas de filtre.
+    const rawKind = has('remote_kind') ? f.remote_kind : f.kind;
+    const kind = (typeof rawKind === 'string') ? rawKind.trim().toLowerCase() : '';
+    if (kind && kind !== 'all') params.append('kind', kind);
+
+    // DOSSIERS (OU) : remote_subfolders prioritaire. 'root' → '' (racine) ;
+    // 'trashcan' → bascule le statut sur 'trashed' (entrée Corbeille).
+    const folders = has('remote_subfolders') ? f.remote_subfolders
+        : (Array.isArray(f.subfolders) ? f.subfolders
+            : (Array.isArray(f.folder_filters) ? f.folder_filters : null));
+    if (Array.isArray(folders)) {
         for (const folder of folders) {
             if (folder === 'trashcan') { status = status || 'trashed'; continue; }
-            params.append('subfolders', folder === 'root' ? '' : String(folder));
+            params.append('subfolders', (folder === 'root') ? '' : String(folder));
         }
     } else if (typeof f.subfolder === 'string' && f.subfolder !== '') {
         params.append('subfolder', f.subfolder === 'root' ? '' : f.subfolder);
     }
 
-    if (f.kind) params.append('kind', String(f.kind));
+    // TAGS (OU) : remote_tags prioritaire.
+    const tags = has('remote_tags') ? f.remote_tags
+        : (Array.isArray(f.tags) ? f.tags : (Array.isArray(f.tags_filter) ? f.tags_filter : null));
+    if (Array.isArray(tags)) for (const tag of tags) params.append('tags', String(tag));
 
-    const tags = Array.isArray(f.tags_filter) ? f.tags_filter
-        : (Array.isArray(f.tags) ? f.tags : null);
-    if (tags) for (const tag of tags) params.append('tags', String(tag));
-
-    const q = (f.filename_search != null) ? f.filename_search : f.q;
+    // RECHERCHE (nom de fichier uniquement côté serveur).
+    const q = has('remote_q') ? f.remote_q
+        : ((f.filename_search != null) ? f.filename_search : f.q);
     if (q) params.append('q', String(q));
 
-    const from = (f.startDate != null && f.startDate !== '') ? f.startDate : f.from;
+    // DATES (created_at).
+    const from = has('remote_from') ? f.remote_from
+        : ((f.startDate != null && f.startDate !== '') ? f.startDate : f.from);
     if (from) params.append('from', String(from));
-    const to = (f.endDate != null && f.endDate !== '') ? f.endDate : f.to;
+    const to = has('remote_to') ? f.remote_to
+        : ((f.endDate != null && f.endDate !== '') ? f.endDate : f.to);
     if (to) params.append('to', String(to));
 
-    if (f.favorite === true || f.favorite === 1 || f.favorite === '1') params.append('favorite', '1');
-    else if (f.favorite === false || f.favorite === 0 || f.favorite === '0') params.append('favorite', '0');
+    // FAVORIS : la clé dédiée est un booléen (true → ?favorite=1) ; à défaut
+    // on honore le tri-état générique favorite (true/1 → 1, false/0 → 0).
+    if (has('remote_favorite')) {
+        if (f.remote_favorite === true || f.remote_favorite === 1 || f.remote_favorite === '1') {
+            params.append('favorite', '1');
+        }
+    } else if (f.favorite === true || f.favorite === 1 || f.favorite === '1') {
+        params.append('favorite', '1');
+    } else if (f.favorite === false || f.favorite === 0 || f.favorite === '0') {
+        params.append('favorite', '0');
+    }
 
     if (status) params.append('status', String(status));
-    if (f.sort) params.append('sort', String(f.sort));
+
+    // TRI : le défaut serveur ('created_at_desc') n'est PAS émis (URL minimale).
+    const sort = has('remote_sort') ? f.remote_sort : f.sort;
+    if (sort && sort !== 'created_at_desc') params.append('sort', String(sort));
 
     return params;
 }
@@ -434,7 +556,11 @@ export function createRemoteSource(overrides = {}) {
             const params = new URLSearchParams();
             params.set('page', String(page));
             params.set('limit', String(lim));
-            for (const [k, v] of buildMediaListQuery(filters)) params.append(k, v);
+            // Filtres de la source serveur (state.ui remote_*) : ils
+            // s'appliquent PAR DÉFAUT, mais un appel explicite (tests/direct)
+            // prime sur l'état persisté (merge readRemoteFilters ← filters).
+            const effective = mergeRemoteFilters(filters);
+            for (const [k, v] of buildMediaListQuery(effective)) params.append(k, v);
 
             const data = await remoteGet(`${REMOTE_ENDPOINTS.list}?${params.toString()}`, { signal });
             const rawItems = (data && Array.isArray(data.items)) ? data.items : [];
@@ -454,34 +580,138 @@ export function createRemoteSource(overrides = {}) {
         },
 
         /**
-         * Delta incrémental : SQUELETTE (étape 6). Le poll serveur passera par
-         * la tête de page 1 + comparaison de mtime ; ici on renvoie un delta
-         * vide (aucune régression : fetchLastUpdateTime() renvoie null, donc
-         * checkForUpdates ne sollicite jamais fetchDelta).
+         * Delta du poll serveur (étape 6). Lit la TÊTE de la page 1 avec les
+         * mêmes filtres et le même tri que la vue courante (fetchPage : limite
+         * REMOTE_POLL_LIMIT, offset 0), puis la compare au curseur local.
+         *
+         * @param {object} [opts]
+         * @param {object|null} [opts.filters] filtres explicites (l'état
+         *        remote_* reste prioritaire, cf. mergeRemoteFilters).
+         * @param {{ids?: string[], total?: number}|null} [opts.cursor] tête
+         *        locale : ids des premiers items chargés + total local.
+         * @param {AbortSignal} [opts.signal]
+         * @returns {Promise<{
+         *   images: Array,             // nouveaux items à insérer en tête
+         *   removed_path_canons: Array,// TOUJOURS vide : ids de suppression inconnus
+         *   total_count: number,       // total serveur AUTORITAIRE
+         *   total_prev: number, total_delta: number,
+         *   new_count: number, head_count: number,
+         *   resync_reason: (string|null) // 'removed'|'overflow'|… → resync hôte
+         * }>}
          */
-        fetchDelta(/* { filters, minMtime, signal } */) {
-            return Promise.resolve({ images: [], removed_path_canons: [], total_count: null, last_update: 0 });
+        async fetchDelta({ filters = null, cursor = null, signal = undefined } = {}) {
+            const cur = cursor || {};
+            const prevIds = new Set((Array.isArray(cur.ids) ? cur.ids : []).filter(Boolean));
+            const prevTotal = (Number.isFinite(Number(cur.total)) && Number(cur.total) > 0)
+                ? Number(cur.total) : 0;
+            const sortedDesc = effectiveRemoteSort(mergeRemoteFilters(filters)) === 'created_at_desc';
+
+            const page = await provider.fetchPage({ offset: 0, limit: REMOTE_POLL_LIMIT, filters, signal });
+            const head = Array.isArray(page.images) ? page.images : [];
+            const total = Number.isFinite(Number(page.total_count)) ? Number(page.total_count) : head.length;
+            const headCount = head.length;
+
+            const result = {
+                images: [],
+                removed_path_canons: [], // suppression seulement déductible du total
+                total_count: total,
+                total_prev: prevTotal,
+                total_delta: total - prevTotal,
+                new_count: 0,
+                head_count: headCount,
+                resync_reason: null,
+            };
+
+            // La comparaison de tête n'a de sens que triée du PLUS RÉCENT au plus
+            // ancien (id DESC). Un autre tri (nom, taille…) peut intercaler les
+            // nouveaux n'importe où dans la liste → tout changement de total exige
+            // une resynchronisation complète (différée par l'hôte).
+            if (!sortedDesc) {
+                result.resync_reason = (total !== prevTotal) ? 'sort' : null;
+                return result;
+            }
+
+            // Collection locale vide : toute la tête est candidate à l'insertion.
+            if (prevIds.size === 0) {
+                if (prevTotal > 0) return { ...result, resync_reason: 'no-cursor' };
+                if (total === 0 || headCount === 0) return result;
+                if (total <= headCount) {
+                    return { ...result, images: head.slice(0, total), new_count: total };
+                }
+                return { ...result, resync_reason: 'overflow' };
+            }
+
+            // Position du premier item de la tête DÉJÀ connu localement. Tout ce
+            // qui le précède (indices 0..k-1) est plus récent → nouveau.
+            let firstKnown = -1;
+            for (let i = 0; i < headCount; i++) {
+                const key = provider.itemKey(head[i]);
+                if (key && prevIds.has(key)) { firstKnown = i; break; }
+            }
+
+            const growth = total - prevTotal;
+            if (firstKnown === 0) {
+                // Tête inchangée : une hausse malgré tout = ajouts + retraits
+                // mêlés ; une baisse = suppression hors-bande. Dans les deux cas
+                // il faut resynchroniser (jamais patcher à l'aveugle).
+                if (growth !== 0) result.resync_reason = (growth < 0) ? 'removed' : 'mixed';
+                return result;
+            }
+            if (firstKnown > 0) {
+                // k nouveaux précèdent la tête connue. On exige que la hausse du
+                // total colle EXACTEMENT (sinon des suppressions se cachent dans
+                // le lot : insert + remove ne se réconcilient pas en un patch).
+                if (growth === firstKnown) {
+                    return { ...result, images: head.slice(0, firstKnown), new_count: firstKnown };
+                }
+                return { ...result, resync_reason: (growth < 0) ? 'removed' : 'mixed' };
+            }
+            // Tête connue introuvable : page pleine → trop de nouveaux pour la
+            // borne lue ; page incomplète → l'ancienne tête a disparu (retrait
+            // ou filtre modifié hors de notre vue). Les deux → resync.
+            if (headCount >= REMOTE_POLL_LIMIT) return { ...result, resync_reason: 'overflow' };
+            return { ...result, resync_reason: 'top-missing' };
         },
 
         /**
-         * Options des filtres pour l'UI existante. Mapping minimal :
-         *   - dossiers : GET /api/media/folders → [{path, count}] ('' → 'root') ;
-         *   - tags     : GET /api/media/tags     → [tag, …] ;
-         *   - formats  : [] (pas d'endpoint ; filtres UI = étape 5) ;
+         * Options des filtres pour l'UI du pane gauche (étape 5).
+         *   - dossiers : GET /api/media/folders?status= → [{path, count}]
+         *     ('' → 'root') ;
+         *   - tags     : GET /api/media/tags?status= → ['ciel', …] + tags_detail
+         *     ([{tag, count}]) pour les comptes ;
+         *   - formats  : [] (pas de notion de format serveur) ;
+         *   - kinds/sorts : valeurs proposées par l'UI (REMOTE_KIND_VALUES /
+         *     REMOTE_SORT_VALUES) ;
          *   - last_update_time : 0 (non supporté).
+         * `status` (optionnel) permet de refléter la vue courante
+         * ('' → vivants, 'trashed' → corbeille) ; par défaut, lu depuis
+         * state.ui.remote_status.
          */
-        async fetchFilterOptions({ signal = undefined } = {}) {
+        async fetchFilterOptions({ signal = undefined, status = undefined } = {}) {
+            let currentStatus = status;
+            if (currentStatus == null) {
+                try { currentStatus = imageViewerState.getState().ui.remote_status || ''; }
+                catch (e) { currentStatus = ''; }
+            }
+            const withStatus = (base) => currentStatus
+                ? `${base}${base.includes('?') ? '&' : '?'}status=${encodeURIComponent(currentStatus)}`
+                : base;
+
             const [folders, tags] = await Promise.all([
-                remoteGet(REMOTE_ENDPOINTS.folders, { signal }),
-                remoteGet(REMOTE_ENDPOINTS.tags, { signal }),
+                remoteGet(withStatus(REMOTE_ENDPOINTS.folders), { signal }),
+                remoteGet(withStatus(REMOTE_ENDPOINTS.tags), { signal }),
             ]);
+            const tagList = ((tags && tags.tags) || []).map((x) => ({ tag: x.tag, count: x.count }));
             return {
                 subfolders: ((folders && folders.folders) || []).map((f) => ({
                     path: (f.subfolder === '' || f.subfolder == null) ? 'root' : f.subfolder,
                     count: f.count,
                 })),
                 formats: [],
-                tags: ((tags && tags.tags) || []).map((x) => x.tag),
+                tags: tagList.map((x) => x.tag),
+                tags_detail: tagList,
+                kinds: REMOTE_KIND_VALUES.slice(),
+                sorts: REMOTE_SORT_VALUES.slice(),
                 last_update_time: 0,
                 total: (folders && folders.total) || 0,
             };

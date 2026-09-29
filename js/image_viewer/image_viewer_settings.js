@@ -9,7 +9,7 @@
 import { HolafPanelManager } from "../holaf_panel_manager.js";
 import { HOLAF_THEMES } from "../holaf_themes.js";
 import { HolafFetch } from "../vendor/holaf/holaf-fetch.js";
-import { imageViewerState } from "./image_viewer_state.js";
+import { imageViewerState, REMOTE_FILTER_UI_KEYS } from "./image_viewer_state.js";
 import { normalizeSourceId } from "./image_viewer_source_switch.js";
 
 let saveTimeout;
@@ -94,6 +94,19 @@ export async function loadSettings(viewer) {
                 theme: validTheme ? fetchedSettings.theme : HOLAF_THEMES[0].name,
                 // Clé absente (installations existantes) ou invalide → 'local'.
                 gallery_source: normalizeSourceId(toString(fetchedSettings.gallery_source, 'local')),
+                // Filtres source SERVEUR (étape 5) : chargés avec leurs défauts
+                // si absents (compat installations existantes). Les tableaux
+                // JSON (remote_subfolders/remote_tags) passent par toArray,
+                // comme folder_filters.
+                remote_kind: toString(fetchedSettings.remote_kind, ''),
+                remote_subfolders: toArray(fetchedSettings.remote_subfolders, []),
+                remote_tags: toArray(fetchedSettings.remote_tags, []),
+                remote_from: toString(fetchedSettings.remote_from, ''),
+                remote_to: toString(fetchedSettings.remote_to, ''),
+                remote_q: toString(fetchedSettings.remote_q, ''),
+                remote_favorite: toBoolean(fetchedSettings.remote_favorite, false),
+                remote_status: toString(fetchedSettings.remote_status, ''),
+                remote_sort: toString(fetchedSettings.remote_sort, 'created_at_desc'),
                 thumbnail_fit: toString(fetchedSettings.thumbnail_fit, 'cover'),
                 thumbnail_size: toNumber(fetchedSettings.thumbnail_size, 150),
                 export_format: toString(fetchedSettings.export_format, 'png'),
@@ -133,7 +146,9 @@ export function saveSettings(viewer, newSettings) {
         // --- FIX : Vérifier que la clé existe bien dans l'état ---
         if (key in currentState.filters) {
             filtersUpdate[key] = newSettings[key];
-        } else if (key in currentState.ui) {
+        } else if (key in currentState.ui || REMOTE_FILTER_UI_KEYS.includes(key)) {
+            // Les clés de filtres serveur (remote_*) sont acceptées même si
+            // elles ne sont pas encore matérialisées dans l'état (robustesse).
             uiUpdate[key] = newSettings[key];
         } else if (['x', 'y', 'width', 'height', 'panel_is_fullscreen'].includes(key) || 
                    ['panel_x', 'panel_y', 'panel_width', 'panel_height'].includes(key)) {

@@ -121,6 +121,8 @@ export function describeRemoteHost(serverUrl, maxLength = 40) {
 /** Arrêt de tout le travail périodique/retardé de la source quittée. */
 function _stopViewerActivity(viewer) {
     if (!viewer) return;
+    // Poll SERVEUR (étape 6) : timer + requête en vol annulés avant le swap.
+    if (typeof viewer._stopRemotePoll === 'function') viewer._stopRemotePoll();
     const clearIntervalId = (key) => {
         if (viewer[key]) clearInterval(viewer[key]);
         viewer[key] = null;
@@ -207,6 +209,11 @@ export async function applySourceSwitch(viewer, targetId) {
     // Source courante portée par l'état (indépendamment du viewer injecté) :
     // l'UI re-rend le contrôle depuis l'état, la persistance suit ci-dessous.
     imageViewerState.setState({ ui: { gallery_source: decision.id } });
+
+    // Poll adapté à la NOUVELLE source : local → intervalle 2 s historique ;
+    // serveur → poll de tête 10 s (le poll de la source quittée vient d'être
+    // arrêté par _stopViewerActivity).
+    if (typeof viewer._syncSourcePolling === 'function') viewer._syncSourcePolling();
 
     if (viewer && typeof viewer.saveSettings === 'function') {
         viewer.saveSettings({ gallery_source: decision.id });

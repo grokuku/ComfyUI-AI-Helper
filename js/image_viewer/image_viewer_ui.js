@@ -111,6 +111,10 @@ class ImageViewerUI {
 
         if (!this.elements.searchInput) return;
 
+        // Bascule d'affichage local ↔ serveur (le DOM local reste en place).
+        this._applySourceVisibility(state);
+        this._renderRemoteFilters(state);
+
         this._renderSourceGroup(state);
 
         const currentText = filters.filename_search || filters.prompt_search || filters.workflow_search || '';
@@ -154,7 +158,7 @@ class ImageViewerUI {
         pane.id = 'holaf-viewer-left-pane';
         pane.className = 'holaf-viewer-pane';
         pane.innerHTML = `
-            <div class="holaf-viewer-filter-group" id="holaf-viewer-source-group">
+            <div class="holaf-viewer-filter-group" id="holaf-viewer-source-group" data-src="both">
                 <h4 id="holaf-viewer-source-title">${t('iv.source')}</h4>
                 <div class="holaf-viewer-toggle-button-group" id="holaf-viewer-source-buttons" role="radiogroup" aria-labelledby="holaf-viewer-source-title">
                     <button type="button" role="radio" class="holaf-viewer-toggle-button" id="holaf-viewer-source-local">${t('iv.sourceLocal')}</button>
@@ -163,7 +167,73 @@ class ImageViewerUI {
                 <div id="holaf-viewer-source-note" class="holaf-viewer-source-note"></div>
             </div>
 
-            <div class="holaf-viewer-filter-group">
+            <!-- ═══ Filtres SERVEUR (étape 5) — classes .src-remote ═══
+                 Convention : le DOM LOCAL reste en place ; ces groupes ne sont
+                 affichés QUE si la source active est 'remote' (visibilité gérée
+                 par _applySourceVisibility via l'attribut data-src du pane). -->
+            <div class="holaf-viewer-filter-group" data-src="remote" id="holaf-viewer-remote-type-group">
+                <h4>${t('iv.type')}</h4>
+                <select id="holaf-viewer-remote-kind" class="holaf-viewer-select">
+                    <option value="">${t('iv.kindAll')}</option>
+                    <option value="image">${t('iv.kindImages')}</option>
+                    <option value="video">${t('iv.kindVideos')}</option>
+                    <option value="audio">${t('iv.kindAudio')}</option>
+                </select>
+            </div>
+
+            <div class="holaf-viewer-filter-group" data-src="remote">
+                <h4>${t('iv.uiSearch')}</h4>
+                <input type="search" id="holaf-viewer-remote-search" placeholder="${t('iv.searchRemotePlaceholder')}" class="holaf-viewer-search-bar">
+            </div>
+
+            <div class="holaf-viewer-filter-group" data-src="remote">
+                <h4>${t('iv.dateRange')}</h4>
+                <div class="holaf-viewer-date-range-container">
+                    <div class="holaf-viewer-date-input-group"><label for="holaf-viewer-remote-date-start">${t('iv.from')}</label><input type="date" id="holaf-viewer-remote-date-start"></div>
+                    <div class="holaf-viewer-date-input-group"><label for="holaf-viewer-remote-date-end">${t('iv.to')}</label><input type="date" id="holaf-viewer-remote-date-end"></div>
+                </div>
+            </div>
+
+            <div class="holaf-viewer-filter-group holaf-viewer-scrollable-section" data-src="remote">
+                <div class="holaf-viewer-filter-header">
+                    <h4>${t('iv.folders')}</h4>
+                    <div class="holaf-viewer-folder-actions">
+                        <a href="#" id="holaf-viewer-remote-folders-select-all">${t('iv.all')}</a><span class="holaf-folder-separator">/</span><a href="#" id="holaf-viewer-remote-folders-select-none">${t('iv.none')}</a>
+                    </div>
+                </div>
+                <div id="holaf-viewer-remote-folders-filter" class="holaf-viewer-filter-list"><p class="holaf-viewer-message"><em>${t('iv.loading')}</em></p></div>
+                <div class="holaf-viewer-trash-separator"></div>
+                <div class="holaf-viewer-filter-item" id="holaf-viewer-remote-trash-item">
+                    <input type="checkbox" id="holaf-viewer-remote-trash">
+                    <label for="holaf-viewer-remote-trash">${t('iv.trashcanReadonly')}</label>
+                </div>
+            </div>
+
+            <div class="holaf-viewer-filter-group" data-src="remote">
+                <h4>${t('iv.tagsAny')}</h4>
+                <div id="holaf-viewer-remote-tags-filter" class="holaf-viewer-filter-list"><p class="holaf-viewer-message"><em>${t('iv.loading')}</em></p></div>
+            </div>
+
+            <div class="holaf-viewer-filter-group" data-src="remote">
+                <div class="holaf-viewer-filter-item">
+                    <input type="checkbox" id="holaf-viewer-remote-favorite">
+                    <label for="holaf-viewer-remote-favorite">${t('iv.favoritesOnly')}</label>
+                </div>
+            </div>
+
+            <div class="holaf-viewer-filter-group" data-src="remote">
+                <h4>${t('iv.sort')}</h4>
+                <select id="holaf-viewer-remote-sort" class="holaf-viewer-select">
+                    <option value="created_at_desc">${t('iv.sortNewest')}</option>
+                    <option value="created_at_asc">${t('iv.sortOldest')}</option>
+                    <option value="name_asc">${t('iv.sortNameAsc')}</option>
+                    <option value="name_desc">${t('iv.sortNameDesc')}</option>
+                    <option value="size_desc">${t('iv.sortSizeDesc')}</option>
+                    <option value="size_asc">${t('iv.sortSizeAsc')}</option>
+                </select>
+            </div>
+
+            <div class="holaf-viewer-filter-group" data-src="local">
                 <h4>${t('iv.uiSearch')}</h4>
                 <input type="search" id="holaf-viewer-search-input" placeholder="${t('iv.searchPlaceholder')}" class="holaf-viewer-search-bar">
                 <div class="holaf-viewer-scope-buttons" style="display: flex; gap: 5px; margin-top: 8px;">
@@ -173,7 +243,7 @@ class ImageViewerUI {
                 </div>
             </div>
             
-            <div class="holaf-viewer-filter-group">
+            <div class="holaf-viewer-filter-group" data-src="local">
                 <h4>${t('iv.dateRange')}</h4>
                 <div class="holaf-viewer-date-range-container">
                     <div class="holaf-viewer-date-input-group"><label for="holaf-viewer-date-start">${t('iv.from')}</label><input type="date" id="holaf-viewer-date-start"></div>
@@ -181,7 +251,7 @@ class ImageViewerUI {
                 </div>
             </div>
             
-            <div class="holaf-viewer-filter-group">
+            <div class="holaf-viewer-filter-group" data-src="local">
                 <h4>${t('iv.workflowAvailability')}</h4>
                 <div id="holaf-viewer-workflow-filters" class="holaf-viewer-button-grid" style="display: flex; gap: 5px;">
                     <button class="holaf-viewer-toggle-button" id="holaf-wf-filter-internal" data-source="internal_png">${t('iv.internal')}</button>
@@ -189,7 +259,7 @@ class ImageViewerUI {
                 </div>
             </div>
 
-            <div class="holaf-viewer-filter-group">
+            <div class="holaf-viewer-filter-group" data-src="local">
                 <h4>${t('iv.tags')}</h4>
                 <div id="holaf-viewer-tags-filter-container">
                     <div id="holaf-viewer-active-tags" class="holaf-viewer-active-tags-container"></div>
@@ -198,7 +268,7 @@ class ImageViewerUI {
                 </div>
             </div>
             
-            <div class="holaf-viewer-filter-group holaf-viewer-scrollable-section">
+            <div class="holaf-viewer-filter-group holaf-viewer-scrollable-section" data-src="local">
                 <div class="holaf-viewer-filter-header">
                     <h4>${t('iv.folders')}</h4>
                     <div class="holaf-viewer-folder-actions">
@@ -208,11 +278,11 @@ class ImageViewerUI {
                 <div id="holaf-viewer-folders-filter" class="holaf-viewer-filter-list"><p class="holaf-viewer-message"><em>${t('iv.loading')}</em></p></div>
             </div>
             <div class="holaf-viewer-fixed-sections">
-                <div class="holaf-viewer-filter-group">
+                <div class="holaf-viewer-filter-group" data-src="local">
                     <h4>${t('iv.formats')}</h4>
                     <div id="holaf-viewer-formats-filter" class="holaf-viewer-filter-list"></div>
                 </div>
-                <div class="holaf-viewer-actions-group">
+                <div class="holaf-viewer-actions-group" data-src="both">
                     <h4>${t('iv.actions')}</h4>
                     <div class="holaf-viewer-actions-buttons-container">
                          <div class="holaf-viewer-action-button-row">
@@ -228,11 +298,11 @@ class ImageViewerUI {
                             <button id="holaf-viewer-btn-reset-filters" class="holaf-viewer-action-button" title="${t('iv.resetTitle')}">${t('iv.reset')}</button>
                         </div>
                         <div class="holaf-viewer-action-button-row">
-                            <button id="holaf-viewer-btn-regen-thumbs" class="holaf-viewer-action-button" title="${t('iv.regenThumbsTitle')}">${t('iv.regenThumbs')}</button>
+                            <button id="holaf-viewer-btn-regen-thumbs" class="holaf-viewer-action-button" data-src="local" title="${t('iv.regenThumbsTitle')}">${t('iv.regenThumbs')}</button>
                         </div>
                     </div>
                 </div>
-                <div class="holaf-viewer-display-options">
+                <div class="holaf-viewer-display-options" data-src="both">
                     <h4>${t('iv.displayOptions')}</h4>
                     <div class="holaf-viewer-filter-list">
                        <div class="holaf-viewer-filter-item"><input type="checkbox" id="holaf-viewer-thumb-fit-toggle"><label for="holaf-viewer-thumb-fit-toggle">${t('iv.contained')}</label></div>
@@ -303,6 +373,17 @@ class ImageViewerUI {
         this.elements.tagInput = this.elements.leftPane.querySelector('#holaf-viewer-tag-input');
         this.elements.activeTagsContainer = this.elements.leftPane.querySelector('#holaf-viewer-active-tags');
 
+        // Filtres de la source SERVEUR (étape 5).
+        this.elements.remoteKind = this.elements.leftPane.querySelector('#holaf-viewer-remote-kind');
+        this.elements.remoteSearchInput = this.elements.leftPane.querySelector('#holaf-viewer-remote-search');
+        this.elements.remoteDateStart = this.elements.leftPane.querySelector('#holaf-viewer-remote-date-start');
+        this.elements.remoteDateEnd = this.elements.leftPane.querySelector('#holaf-viewer-remote-date-end');
+        this.elements.remoteFoldersList = this.elements.leftPane.querySelector('#holaf-viewer-remote-folders-filter');
+        this.elements.remoteTagsList = this.elements.leftPane.querySelector('#holaf-viewer-remote-tags-filter');
+        this.elements.remoteTrash = this.elements.leftPane.querySelector('#holaf-viewer-remote-trash');
+        this.elements.remoteFavorite = this.elements.leftPane.querySelector('#holaf-viewer-remote-favorite');
+        this.elements.remoteSort = this.elements.leftPane.querySelector('#holaf-viewer-remote-sort');
+
         this.elements.workflowButtonsContainer = this.elements.leftPane.querySelector('#holaf-viewer-workflow-filters');
         this.elements.workflowButtons = {
             internal: this.elements.leftPane.querySelector('#holaf-wf-filter-internal'),
@@ -346,6 +427,13 @@ class ImageViewerUI {
         }
 
         this.elements.leftPane.querySelector('#holaf-viewer-btn-reset-filters').onclick = () => {
+            // RESET limité à la source ACTIVE : le mode local conserve son
+            // comportement (verrous, scopes) ; le serveur a son propre reset.
+            const sourceId = normalizeSourceId(imageViewerState.getState().ui.gallery_source);
+            if (sourceId === SOURCE_REMOTE) {
+                this._resetRemoteFilters();
+                return;
+            }
             this.scopeState = { filename: true, prompt: false, workflow: false };
             this.callbacks.onResetFilters();
         };
@@ -494,6 +582,8 @@ class ImageViewerUI {
             }
         };
 
+        this._setupRemoteFilterListeners();
+
         this.elements.leftPane.querySelector('#holaf-viewer-folders-select-all').onclick = (e) => {
             e.preventDefault();
             const { locked_folders } = imageViewerState.getState().filters;
@@ -556,6 +646,241 @@ class ImageViewerUI {
         zoomImage.onclick = (e) => e.stopPropagation();
 
         Navigation.setupZoomAndPan(viewer.zoomViewState, zoomView, zoomImage);
+    }
+
+    /**
+     * Affiche/masque les groupes de filtres selon la source ACTIVE.
+     * Chaque groupe porte `data-src` = 'local' | 'remote' | 'both'. On pose
+     * l'attribut `data-source` sur le pane ET la classe `.holaf-src-hidden` sur
+     * les éléments non pertinents (CSS : display:none!important). Le DOM local
+     * n'est jamais retiré : en mode serveur il est simplement masqué.
+     * @param {object} state - instantané d'imageViewerState.
+     * @returns {string} source normalisée ('local' | 'remote').
+     */
+    _applySourceVisibility(state) {
+        const sourceId = normalizeSourceId(state && state.ui ? state.ui.gallery_source : SOURCE_LOCAL);
+        const root = this.elements.leftPane;
+        if (root) {
+            root.dataset.source = sourceId;
+            root.querySelectorAll('[data-src]').forEach((el) => {
+                const src = el.dataset.src;
+                const show = (src === 'both' || src === sourceId);
+                el.classList.toggle('holaf-src-hidden', !show);
+            });
+        }
+        return sourceId;
+    }
+
+    /**
+     * Répercute les filtres serveur persistés (state.ui.remote_*) sur les
+     * contrôles du pane. Idempotent, sans effet de bord.
+     * @param {object} state
+     */
+    _renderRemoteFilters(state) {
+        const e = this.elements;
+        const ui = (state && state.ui) || {};
+
+        if (e.remoteKind) e.remoteKind.value = ui.remote_kind || '';
+        if (e.remoteSort) e.remoteSort.value = ui.remote_sort || 'created_at_desc';
+        if (e.remoteFavorite) e.remoteFavorite.checked = ui.remote_favorite === true;
+        if (e.remoteTrash) e.remoteTrash.checked = ui.remote_status === 'trashed';
+        if (e.remoteDateStart) e.remoteDateStart.value = ui.remote_from || '';
+        if (e.remoteDateEnd) e.remoteDateEnd.value = ui.remote_to || '';
+        if (e.remoteSearchInput) {
+            const v = ui.remote_q || '';
+            if (e.remoteSearchInput.value !== v) e.remoteSearchInput.value = v;
+        }
+
+        const folders = Array.isArray(ui.remote_subfolders) ? ui.remote_subfolders : [];
+        if (e.remoteFoldersList) {
+            e.remoteFoldersList.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+                const item = cb.closest('.holaf-viewer-filter-item');
+                cb.checked = !!(item && folders.includes(item.dataset.folderId));
+            });
+        }
+
+        const tags = Array.isArray(ui.remote_tags) ? ui.remote_tags : [];
+        if (e.remoteTagsList) {
+            e.remoteTagsList.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+                const item = cb.closest('.holaf-viewer-filter-item');
+                cb.checked = !!(item && tags.includes(item.dataset.tag));
+            });
+        }
+
+        this._syncRemoteTrashState();
+    }
+
+    /** Corbeille serveur active → dossiers en lecture seule (grisés). */
+    _syncRemoteTrashState() {
+        const e = this.elements;
+        if (!e.remoteFoldersList || !e.remoteTrash) return;
+        const trashed = e.remoteTrash.checked;
+        e.remoteFoldersList.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+            cb.disabled = trashed;
+        });
+    }
+
+    /**
+     * Remplit les listes de dossiers et de tags serveur (depuis
+     * fetchFilterOptions du provider remote). Les comptes sont affichés.
+     * @param {object} data - options renvoyées par le provider ('subfolders',
+     *                        'tags', 'tags_detail', …).
+     */
+    populateRemoteFilterOptions(data) {
+        const opts = data || {};
+
+        const foldersEl = this.elements.remoteFoldersList;
+        if (foldersEl) {
+            foldersEl.innerHTML = '';
+            const folders = Array.isArray(opts.subfolders) ? opts.subfolders : [];
+            if (folders.length === 0) {
+                foldersEl.innerHTML = `<p class="holaf-viewer-message"><em>${t('iv.noFolders')}</em></p>`;
+            } else {
+                folders.forEach((f) => {
+                    const id = f.path;
+                    const label = id === 'root' ? `(root) (${f.count})` : `${id} (${f.count})`;
+                    foldersEl.appendChild(this._createRemoteCheckItem(`remote-folder-filter-${id}`, 'folderId', id, label));
+                });
+            }
+        }
+
+        const tagsEl = this.elements.remoteTagsList;
+        if (tagsEl) {
+            tagsEl.innerHTML = '';
+            const details = Array.isArray(opts.tags_detail)
+                ? opts.tags_detail
+                : (Array.isArray(opts.tags) ? opts.tags.map((tag) => ({ tag, count: null })) : []);
+            if (details.length === 0) {
+                tagsEl.innerHTML = `<p class="holaf-viewer-message"><em>${t('iv.noTags')}</em></p>`;
+            } else {
+                details.forEach((x) => {
+                    const label = (x.count != null) ? `${x.tag} (${x.count})` : x.tag;
+                    tagsEl.appendChild(this._createRemoteCheckItem(`remote-tag-filter-${x.tag}`, 'tag', x.tag, label));
+                });
+            }
+        }
+
+        this._renderRemoteFilters(imageViewerState.getState());
+    }
+
+    /**
+     * Crée un item à case à cocher pour une liste serveur (dossier/tag).
+     * Le `change` est géré par DÉLÉGATION sur le conteneur (cf.
+     * _setupRemoteFilterListeners) → pas de handler par case.
+     * @param {string} id
+     * @param {string} dataKey - 'folderId' | 'tag' (clé dataset lue au collect).
+     * @param {string} value
+     * @param {string} label
+     */
+    _createRemoteCheckItem(id, dataKey, value, label) {
+        const container = document.createElement('div');
+        container.className = 'holaf-viewer-filter-item';
+        container.dataset[dataKey] = value;
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.id = id;
+
+        const labelEl = document.createElement('label');
+        labelEl.htmlFor = id;
+        labelEl.textContent = label;
+
+        container.append(checkbox, labelEl);
+        return container;
+    }
+
+    /**
+     * Branche les contrôles de filtres serveur (état `state.ui.remote_*`).
+     * Aucune interaction avec les filtres locaux (state.filters).
+     */
+    _setupRemoteFilterListeners() {
+        const e = this.elements;
+        if (e.remoteKind) e.remoteKind.onchange = () => this._saveRemoteFilters({ remote_kind: e.remoteKind.value });
+        if (e.remoteSort) e.remoteSort.onchange = () => this._saveRemoteFilters({ remote_sort: e.remoteSort.value });
+        if (e.remoteFavorite) e.remoteFavorite.onchange = () => this._saveRemoteFilters({ remote_favorite: e.remoteFavorite.checked });
+        if (e.remoteSearchInput) e.remoteSearchInput.oninput = () => this._saveRemoteFilters({ remote_q: e.remoteSearchInput.value });
+        if (e.remoteDateStart) e.remoteDateStart.onchange = () => this._saveRemoteFilters({ remote_from: e.remoteDateStart.value });
+        if (e.remoteDateEnd) e.remoteDateEnd.onchange = () => this._saveRemoteFilters({ remote_to: e.remoteDateEnd.value });
+        if (e.remoteTrash) {
+            e.remoteTrash.onchange = () => {
+                this._saveRemoteFilters({ remote_status: e.remoteTrash.checked ? 'trashed' : '' });
+                this._syncRemoteTrashState();
+            };
+        }
+        if (e.remoteFoldersList) e.remoteFoldersList.onchange = () => this._saveRemoteFolders();
+        if (e.remoteTagsList) e.remoteTagsList.onchange = () => this._saveRemoteTags();
+
+        const allLink = this.elements.leftPane.querySelector('#holaf-viewer-remote-folders-select-all');
+        const noneLink = this.elements.leftPane.querySelector('#holaf-viewer-remote-folders-select-none');
+        if (allLink) allLink.onclick = (ev) => { ev.preventDefault(); this._setRemoteFoldersAll(true); };
+        if (noneLink) noneLink.onclick = (ev) => { ev.preventDefault(); this._setRemoteFoldersAll(false); };
+    }
+
+    /** Persiste un patch de filtres serveur + déclenche le rechargement. */
+    _saveRemoteFilters(patch, immediate = false) {
+        const viewer = this.callbacks.getViewer();
+        if (viewer && typeof viewer.saveSettings === 'function') {
+            viewer.saveSettings(patch);
+        } else {
+            imageViewerState.setState({ ui: patch });
+        }
+        this.callbacks.onFilterChange(immediate);
+    }
+
+    _collectRemoteFolders() {
+        if (!this.elements.remoteFoldersList) return [];
+        return Array.from(this.elements.remoteFoldersList.querySelectorAll('input[type="checkbox"]:checked'))
+            .map((cb) => cb.closest('.holaf-viewer-filter-item')?.dataset.folderId)
+            .filter((id) => id != null);
+    }
+
+    _saveRemoteFolders() {
+        this._saveRemoteFilters({ remote_subfolders: this._collectRemoteFolders() });
+    }
+
+    _collectRemoteTags() {
+        if (!this.elements.remoteTagsList) return [];
+        return Array.from(this.elements.remoteTagsList.querySelectorAll('input[type="checkbox"]:checked'))
+            .map((cb) => cb.closest('.holaf-viewer-filter-item')?.dataset.tag)
+            .filter((tag) => tag != null);
+    }
+
+    _saveRemoteTags() {
+        this._saveRemoteFilters({ remote_tags: this._collectRemoteTags() });
+    }
+
+    _setRemoteFoldersAll(checked) {
+        if (!this.elements.remoteFoldersList) return;
+        this.elements.remoteFoldersList.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+            if (!cb.disabled) cb.checked = checked;
+        });
+        this._saveRemoteFolders();
+    }
+
+    /**
+     * RESET des filtres SERVEUR uniquement (la source locale n'est PAS touchée).
+     * Remet les clés remote_* à leurs défauts et déclenche un rechargement.
+     */
+    _resetRemoteFilters() {
+        const patch = {
+            remote_kind: '',
+            remote_subfolders: [],
+            remote_tags: [],
+            remote_from: '',
+            remote_to: '',
+            remote_q: '',
+            remote_favorite: false,
+            remote_status: '',
+            remote_sort: 'created_at_desc',
+        };
+        const viewer = this.callbacks.getViewer();
+        if (viewer && typeof viewer.saveSettings === 'function') {
+            viewer.saveSettings(patch);
+        } else {
+            imageViewerState.setState({ ui: patch });
+        }
+        if (this.elements.remoteSearchInput) this.elements.remoteSearchInput.value = '';
+        this.callbacks.onFilterChange(true);
     }
 
     /**

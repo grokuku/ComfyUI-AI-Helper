@@ -98,7 +98,7 @@ const remoteMod = await import("./image_viewer/image_viewer_source_remote.js");
 const switchMod = await import("./image_viewer/image_viewer_source_switch.js");
 const { imageViewerState } = await import("./image_viewer/image_viewer_state.js");
 const dataMod = await import("./image_viewer/image_viewer_data.js");
-const { normalizeItem, snapThumbSize, serverIdFromPath, extOfFilename, mtimeFromCreatedAt, createRemoteSource, ensureRemoteSourceRegistered, isRemoteConfigured, REMOTE_PAGE_SIZE } = remoteMod;
+const { normalizeItem, snapThumbSize, serverIdFromPath, extOfFilename, mtimeFromCreatedAt, createRemoteSource, ensureRemoteSourceRegistered, isRemoteConfigured, REMOTE_PAGE_SIZE, buildMediaListQuery, readRemoteFilters } = remoteMod;
 
 function mediaItem(over = {}) {
     return {
@@ -173,7 +173,7 @@ const src = createRemoteSource(); // config via getRemoteConfig (localStorage)
 captured.length = 0;
 fetchRoutes = { "/api/media?": () => jsonResponse({ items: [mediaItem({ id: 1 }), mediaItem({ id: 2 })], total: 57, page: 1, limit: 200 }) };
 
-let page = await src.fetchPage({ offset: 0, limit: 200, filters: { folder_filters: ["root"] } });
+let page = await src.fetchPage({ offset: 0, limit: 200, filters: { remote_subfolders: ["root"] } });
 let u = new URL(captured.at(-1).url);
 assert.strictEqual(u.origin, SERVER_URL, "serverUrl résolu depuis la config");
 assert.strictEqual(u.pathname, "/api/media");
@@ -199,31 +199,63 @@ assert.strictEqual(u.searchParams.get("limit"), "200", "limit borné à 200");
 assert.strictEqual(u.searchParams.get("page"), "1");
 ok("page = floor(offset/limit)+1 ; limit borné à 200");
 
-// Chaque filtre mappé → query exacte.
+// Fallback GÉNÉRIQUE/lOCAL de buildMediaListQuery (compat ascendante) : utilisé
+// quand aucune clé remote_* n'est fournie (appels directs/tests).
+{
+    const q = buildMediaListQuery({ folder_filters: ["a/b", "root", "trashcan"], tags_filter: ["ciel", "mer"], filename_search: "chat", startDate: "2024-01-01", endDate: "2024-12-31", favorite: true, sort: "name_asc" });
+    assert.deepStrictEqual(q.getAll("subfolders"), ["a/b", ""], "fallback folder_filters → subfolders OU");
+    assert.strictEqual(q.get("status"), "trashed", "fallback 'trashcan' → status=trashed");
+    assert.deepStrictEqual(q.getAll("tags"), ["ciel", "mer"]);
+    assert.strictEqual(q.get("q"), "chat");
+    assert.strictEqual(q.get("from"), "2024-01-01");
+    assert.strictEqual(q.get("to"), "2024-12-31");
+    assert.strictEqual(q.get("favorite"), "1");
+    assert.strictEqual(q.get("sort"), "name_asc");
+}
+ok("buildMediaListQuery : fallback générique/local (folder_filters/tags_filter/filename_search…)");
+
+// Chaque filtre mappé (clés DÉDIÉES remote_*) → query exacte.
 captured.length = 0;
 await src.fetchPage({
     offset: 0, limit: 200,
     filters: {
-        folder_filters: ["a/b", "root", "trashcan"],
-        tags_filter: ["ciel", "mer"],
-        filename_search: "chat",
-        startDate: "2024-01-01",
-        endDate: "2024-12-31",
-        favorite: true,
-        sort: "name_asc",
+        remote_subfolders: ["a/b", "root", "trashcan"],
+        remote_tags: ["ciel", "mer"],
+        remote_q: "chat",
+        remote_from: "2024-01-01",
+        remote_to: "2024-12-31",
+        remote_favorite: true,
+        remote_sort: "name_asc",
+        remote_kind: "image",
     },
 });
 u = new URL(captured.at(-1).url);
 assert.deepStrictEqual(u.searchParams.getAll("subfolders"), ["a/b", ""], "dossiers OU (racine = '')");
 assert.strictEqual(u.searchParams.get("status"), "trashed", "'trashcan' → status=trashed");
 assert.deepStrictEqual(u.searchParams.getAll("tags"), ["ciel", "mer"], "tags OU");
-assert.strictEqual(u.searchParams.get("q"), "chat", "q ← filename_search");
-assert.strictEqual(u.searchParams.get("from"), "2024-01-01", "from ← startDate");
-assert.strictEqual(u.searchParams.get("to"), "2024-12-31", "to ← endDate");
+assert.strictEqual(u.searchParams.get("kind"), "image", "kind ← remote_kind");
+assert.strictEqual(u.searchParams.get("q"), "chat", "q ← remote_q");
+assert.strictEqual(u.searchParams.get("from"), "2024-01-01", "from ← remote_from");
+assert.strictEqual(u.searchParams.get("to"), "2024-12-31", "to ← remote_to");
 assert.strictEqual(u.searchParams.get("favorite"), "1");
 assert.strictEqual(u.searchParams.get("sort"), "name_asc");
 assert.ok(!u.search.includes("locked_folders") && !u.search.includes("format_filters"), "filtres internes/non supportés absents");
 ok("mapping exact de kind/dossiers/tags/q/dates/favori/tri (filtres internes exclus)");
+
+// Contrôle négatif : en mode serveur, les clés LOCALES sont ignorées dès que
+// les clés remote_* sont présentes (séparation stricte des filtres par source).
+captured.length = 0;
+await src.fetchPage({
+    offset: 0, limit: 200,
+    filters: { folder_filters: ["local-x"], tags_filter: ["local-tag"], filename_search: "local-q", startDate: "2000-01-01" },
+});
+u = new URL(captured.at(-1).url);
+assert.strictEqual(u.searchParams.getAll("subfolders").length, 0, "folder_filters local ignoré (remote_subfolders prime)");
+assert.strictEqual(u.searchParams.getAll("tags").length, 0, "tags_filter local ignoré (remote_tags prime)");
+assert.strictEqual(u.searchParams.get("q"), null, "filename_search local ignoré (remote_q prime)");
+assert.strictEqual(u.searchParams.get("from"), null, "startDate local ignoré (remote_from prime)");
+assert.deepStrictEqual(readRemoteFilters().remote_subfolders, [], "readRemoteFilters lit les défauts remote_*");
+ok("contrôle négatif : filtres locaux ignorés en présence des clés remote_*");
 
 // Pas de config → remoteGet refuse proprement (aucune requête).
 setConfig(false);
@@ -329,11 +361,25 @@ assert.strictEqual(src.capabilities.mediaPlayback, false, "lecture vidéo/audio 
 assert.strictEqual(src.capabilities.preloadFull, false, "pas de préchargement plein média (Bearer)");
 ok("null/no-op explicites + resolveMediaUrl/resolveInfo implémentés + capabilities");
 
-// fetchDelta = squelette vide (étape 6).
-const delta = await src.fetchDelta({ filters: {}, minMtime: 123 });
-assert.deepStrictEqual(delta.images, [], "delta vide (poll = étape 6)");
-assert.ok(Array.isArray(delta.removed_path_canons));
-ok("fetchDelta : squelette vide documenté");
+// fetchDelta (étape 6) : tête de page 1 + diff contre le curseur.
+captured.length = 0;
+fetchRoutes = {
+    "/api/media?": () => jsonResponse({
+        items: [mediaItem({ id: 9, filename: "neuf.png" }), mediaItem({ id: 8, filename: "huit.png" })],
+        total: 2, page: 1, limit: 30,
+    }),
+};
+const delta = await src.fetchDelta({ filters: {}, cursor: { ids: ["srv:8"], total: 1 } });
+const du = new URL(captured.at(-1).url);
+assert.strictEqual(du.pathname, "/api/media");
+assert.strictEqual(du.searchParams.get("page"), "1", "tête = page 1");
+assert.strictEqual(du.searchParams.get("limit"), "30", "borne de tête (REMOTE_POLL_LIMIT)");
+assert.strictEqual(delta.images.length, 1, "1 nouveau média (srv:9)");
+assert.strictEqual(delta.images[0].path_canon, "srv:9", "item normalisé");
+assert.strictEqual(delta.total_count, 2, "total serveur autoritaire");
+assert.strictEqual(delta.resync_reason, null, "diff cohérent → pas de resync");
+assert.deepStrictEqual(delta.removed_path_canons, [], "retraits individuels inconnus");
+ok("fetchDelta : tête page 1 + nouveaux vs curseur (contrat étape 6)");
 
 // favorite / download = réellement supportés (endpoints serveur).
 captured.length = 0;

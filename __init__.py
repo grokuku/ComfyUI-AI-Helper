@@ -1079,7 +1079,11 @@ async def image_viewer_save_ui_settings_route(request: web.Request):
                 'export_format', 'export_include_meta', 'export_meta_method',
                 'gallery_source',
                 'search_text', 'search_scope_name', 'search_scope_prompt', 'search_scope_workflow',
-                'workflow_filter_internal', 'workflow_filter_external'
+                'workflow_filter_internal', 'workflow_filter_external',
+                # Filtres de la source serveur (étape 5) — persistés séparément
+                # du mode local : la clé absente retombe sur les défauts côté JS.
+                'remote_kind', 'remote_from', 'remote_to', 'remote_q',
+                'remote_favorite', 'remote_status', 'remote_sort'
             ]
             for key in keys_to_save:
                 if key in data:
@@ -1099,6 +1103,12 @@ async def image_viewer_save_ui_settings_route(request: web.Request):
             # --- CORRECTIF : Ajouter la sauvegarde de locked_folders ---
             if 'locked_folders' in data and isinstance(data['locked_folders'], list):
                 cp.set(s, 'locked_folders', json.dumps(data['locked_folders'])) # Store as JSON string
+            # Filtres serveur multi-valeurs (étape 5) : tableaux stockés en JSON,
+            # comme folder_filters/format_filters (relus par toArray côté JS).
+            if 'remote_subfolders' in data and isinstance(data['remote_subfolders'], list):
+                cp.set(s, 'remote_subfolders', json.dumps(data['remote_subfolders']))
+            if 'remote_tags' in data and isinstance(data['remote_tags'], list):
+                cp.set(s, 'remote_tags', json.dumps(data['remote_tags']))
 
             with open(holaf_config.get_config_path(), 'w') as cf: cp.write(cf)
         reload_global_config() # Reload to reflect changes in the live CONFIG

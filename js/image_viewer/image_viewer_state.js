@@ -1,6 +1,40 @@
 // js/image_viewer/image_viewer_state.js
 
 /**
+ * Valeurs PAR DÉFAUT des filtres de la source SERVEUR (étape 5).
+ *
+ * Décision de design : les filtres sont PERSISTÉS SÉPARÉMENT par source — le
+ * mode local garde ses clés historiques (state.filters), le mode serveur a les
+ * siennes, stockées sous `state.ui.remote_*` (jamais envoyées au backend local,
+ * cf. image_viewer_source.js/_requestFilters) afin que les deux jeux de filtres
+ * ne se contaminent pas. Le RESET ne touche que la source active.
+ *
+ * - remote_kind       : 'image' | 'video' | 'audio' | '' ('' = tout)
+ * - remote_subfolders : tableau de dossiers (''/'root' = racine ; 'trashcan'
+ *                       force le statut corbeille) — mapping `?subfolders=` (OU)
+ * - remote_tags       : tableau de tags — mapping `?tags=` (OU)
+ * - remote_from/_to   : plage `created_at` ('' = pas de borne)
+ * - remote_q          : recherche sur le NOM DE FICHIER ('' = pas de recherche)
+ * - remote_favorite   : bascule favoris (true → `?favorite=1`)
+ * - remote_status     : 'trashed' pour la corbeille, '' sinon
+ * - remote_sort       : tri serveur (défaut 'created_at_desc' ≡ historique)
+ */
+export const REMOTE_FILTER_DEFAULTS = Object.freeze({
+    remote_kind: '',
+    remote_subfolders: Object.freeze([]),
+    remote_tags: Object.freeze([]),
+    remote_from: '',
+    remote_to: '',
+    remote_q: '',
+    remote_favorite: false,
+    remote_status: '',
+    remote_sort: 'created_at_desc',
+});
+
+/** Noms (whitelist) des clés de filtres serveur portées par `state.ui`. */
+export const REMOTE_FILTER_UI_KEYS = Object.freeze(Object.keys(REMOTE_FILTER_DEFAULTS));
+
+/**
  * Classe de gestion d'état centralisée pour l'Image Viewer.
  * Utilise un modèle simple de publication/abonnement (pub/sub).
  */
@@ -42,6 +76,9 @@ class ImageViewerState {
                 // 'remote' (serveur AIH, étape 2). Persistée via save-settings
                 // (clé gallery_source, whitelist backend __init__.py).
                 gallery_source: 'local',
+                // Filtres de la source SERVEUR (étape 5), persistés séparément
+                // sous des clés remote_* (cf. REMOTE_FILTER_DEFAULTS ci-dessus).
+                ...REMOTE_FILTER_DEFAULTS,
                 thumbnail_fit: 'cover',
                 thumbnail_size: 150,
                 export_format: 'png',

@@ -807,6 +807,26 @@ import "./aih_i18n.js";
         "iv.sourceRemoteHost": "Serveur : {host}",
         "iv.sourceSwitchError": "Échec du changement de source : {message}",
 
+        /* Image Viewer UI (image_viewer_ui.js) — filtres SERVEUR (étape 5) */
+        "iv.type": "Type",
+        "iv.kindAll": "Tout",
+        "iv.kindImages": "Images",
+        "iv.kindVideos": "Vidéos",
+        "iv.kindAudio": "Audio",
+        "iv.searchRemotePlaceholder": "Rechercher un nom de fichier...",
+        "iv.tagsAny": "Tags (logique OU)",
+        "iv.favoritesOnly": "Favoris uniquement",
+        "iv.trashcanReadonly": "🗑️ Corbeille (lecture seule)",
+        "iv.sort": "Tri",
+        "iv.sortNewest": "Plus récents",
+        "iv.sortOldest": "Plus anciens",
+        "iv.sortNameAsc": "Nom (A→Z)",
+        "iv.sortNameDesc": "Nom (Z→A)",
+        "iv.sortSizeDesc": "Taille (décroissante)",
+        "iv.sortSizeAsc": "Taille (croissante)",
+        "iv.noFolders": "Aucun dossier.",
+        "iv.noTags": "Aucun tag.",
+
         /* Image Viewer UI (image_viewer_ui.js) */
         "iv.uiSearch": "Recherche",
         "iv.searchPlaceholder": "Rechercher nom de fichier, prompt, workflow...",
@@ -2005,6 +2025,26 @@ import "./aih_i18n.js";
         "iv.sourceRemoteUnavailable": "Server source is not available in this version.",
         "iv.sourceRemoteHost": "Server: {host}",
         "iv.sourceSwitchError": "Failed to switch source: {message}",
+
+        /* Image Viewer UI (image_viewer_ui.js) — server filters (step 5) */
+        "iv.type": "Type",
+        "iv.kindAll": "All",
+        "iv.kindImages": "Images",
+        "iv.kindVideos": "Videos",
+        "iv.kindAudio": "Audio",
+        "iv.searchRemotePlaceholder": "Search a filename...",
+        "iv.tagsAny": "Tags (OR logic)",
+        "iv.favoritesOnly": "Favorites only",
+        "iv.trashcanReadonly": "🗑️ Trash (read-only)",
+        "iv.sort": "Sort",
+        "iv.sortNewest": "Newest first",
+        "iv.sortOldest": "Oldest first",
+        "iv.sortNameAsc": "Name (A→Z)",
+        "iv.sortNameDesc": "Name (Z→A)",
+        "iv.sortSizeDesc": "Size (descending)",
+        "iv.sortSizeAsc": "Size (ascending)",
+        "iv.noFolders": "No folders.",
+        "iv.noTags": "No tags.",
 
         /* Image Viewer UI (image_viewer_ui.js) */
         "iv.uiSearch": "Search",
