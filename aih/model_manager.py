@@ -48,6 +48,7 @@ import os
 import json
 import logging
 import hashlib
+import shutil
 import time
 
 try:
@@ -109,6 +110,82 @@ _upload_progress = {}
 
 # Progression des downloads : upload_id → {bytes_recv, bytes_total, speed_mbs, start}
 _download_progress = {}
+
+# Annulations demandées pour les downloads en cours : set d'``upload_id``.
+# Posé par POST /api/aih/models/download/cancel et consommé par la boucle de
+# transfert, qui abandonne et nettoie le fichier partiel (jamais de .part ni de
+# fichier tronqué laissé dans le dossier ComfyUI).
+_download_cancel = set()
+
+
+class DownloadCancelled(Exception):
+    """Annulation utilisateur pendant un transfert (partiel nettoyé)."""
+
+
+def request_download_cancel(upload_id):
+    """Demande l'annulation du download en cours pour ``upload_id``.
+
+    Idempotent ; un upload_id sans download actif est simplement ignoré (le
+    drapeau est réinitialisé au démarrage du prochain download du même id).
+    """
+    if not upload_id:
+        return False
+    _download_cancel.add(str(upload_id))
+    return True
+
+
+def _format_backend_error(resp):
+    """Message d'erreur backend lisible : JSON ``error``/``detail`` sinon texte.
+
+    Convention maison du backend : ``error`` (Flask) ; ``detail`` couvre les
+    proxies FastAPI. Toujours suffixé du statut HTTP pour le diagnostic.
+    """
+    msg = ''
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            msg = str(data.get('error') or data.get('detail') or '')
+    except Exception:
+        msg = ''
+    if not msg:
+        try:
+            msg = (getattr(resp, 'text', '') or '')[:200]
+        except Exception:
+            msg = ''
+    msg = msg.strip()
+    return f"HTTP {resp.status_code}: {msg}" if msg else f"HTTP {resp.status_code}"
+
+
+def _download_http_error(resp):
+    """Erreur explicite pour un statut non-ok (404 = absent côté serveur).
+
+    Un modèle jamais uploadé (ou supprimé) côté serveur doit produire un
+    message compréhensible, pas un « HTTP 404 » brut.
+    """
+    if resp.status_code == 404:
+        return "Modèle introuvable côté serveur (jamais uploadé ou supprimé)"
+    return _format_backend_error(resp)
+
+
+def _cleanup_partial(path):
+    """Supprime un fichier partiel de download. Ne lève jamais."""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        logging.warning(f"[AIH] Nettoyage du fichier partiel impossible ({path}): {e}")
+
+
+def _replace_download_file(tmp_path, dest_path):
+    """Remplace la destination par le fichier téléchargé (atomique si possible)."""
+    try:
+        os.replace(tmp_path, dest_path)
+    except OSError:
+        # Windows : MoveFileEx échoue si la destination est ouverte par un autre
+        # process (ComfyUI qui charge un modèle). Repli non atomique.
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        os.rename(tmp_path, dest_path)
 
 
 # ── Timeout des étapes SYNCHRONES côté serveur (/files/complete, download) ──
@@ -694,8 +771,17 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
     Download un model depuis le serveur AIH et le sauvegarde dans le dossier local.
     Si dest_path est fourni, sauvegarde a cet emplacement exact (chemin relatif
     au dossier du type). Sinon, sauvegarde dans le dossier par defaut du type.
-    Retourne {success, path} ou {success: False, error}.
+    Retourne {success, path} ou {success: False, error[, cancelled: True]}.
     Import paramiko paresseux (uniquement en mode SFTP direct).
+
+    Garanties :
+      - le transfert s'ecrit dans ``<dest>.part`` puis REMPLACE la destination :
+        jamais de modele tronque ou de 0 octet visible dans models/ (un
+        fichier partiel charge par un workflow fait planter ComfyUI) ;
+      - le partiel est nettoye en cas d'echec ou d'annulation ;
+      - progression publiee pendant tout le transfert (``_download_progress``)
+        et annulation cooperative via ``request_download_cancel`` ;
+      - refus AVANT le transfert si le disque ne peut pas accueillir le fichier.
     """
     import requests
 
@@ -706,6 +792,10 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
     auth_headers = {}
     if api_key:
         auth_headers["Authorization"] = f"Bearer {api_key}"
+
+    # Un download RELANCÉ pour le même upload_id ne doit pas hériter d'une
+    # annulation posée juste avant : le drapeau est à usage unique.
+    _download_cancel.discard(upload_id)
 
     # Déterminer le dossier de destination selon le type
     dirs = _get_model_dirs()
@@ -759,20 +849,44 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
     if not (dest_real == dest_dir_real or dest_real.startswith(dest_dir_real + os.sep)):
         return {'success': False, 'error': 'Invalid destination path'}
 
+    # Le dossier cible peut ne pas encore exister (categorie jamais utilisee).
+    try:
+        os.makedirs(os.path.dirname(dest_path) or dest_dir, exist_ok=True)
+    except OSError as e:
+        return {'success': False, 'error': f'Dossier de destination invalide: {e}'}
+
     # 1. Récupérer la config de download (SFTP direct ou HTTP fallback)
     try:
         info_resp = requests.get(f"{api_url}/files/{upload_id}/download-info",
                                  headers=auth_headers, timeout=30)
         if not info_resp.ok:
-            try: err_msg = info_resp.text[:200]
-            except Exception: err_msg = ''
-            return {'success': False, 'error': f'HTTP {info_resp.status_code}: {err_msg}'}
+            return {'success': False, 'error': _download_http_error(info_resp)}
         info = info_resp.json()
     except Exception as e:
         return {'success': False, 'error': f'Download-info failed: {e}'}
 
     sftp_cfg = info.get('sftp')
     file_size = info.get('size', 0)
+
+    # 1b. Refuser AVANT le transfert si le disque ne peut pas accueillir le
+    # fichier (13,5 Go) : un disque plein a mi-transfert casse ComfyUI, pas
+    # seulement le download. Best effort : mesure impossible = pas de blocage.
+    if file_size and file_size > 0:
+        try:
+            free = shutil.disk_usage(os.path.dirname(dest_path) or dest_dir).free
+            needed = int(file_size * 1.02) + 32 * 1024 * 1024
+            if free < needed:
+                return {'success': False, 'error': (
+                    f"Espace disque insuffisant dans {dest_dir} : "
+                    f"{free / 1073741824:.1f} Go libres, {file_size / 1073741824:.1f} Go requis")}
+        except OSError:
+            pass
+
+    # Le transfert ecrit dans un fichier .part puis REMPLACE la destination :
+    # jamais de modele tronque/0 octet visible dans models/ (un workflow qui
+    # charge un fichier partiel fait planter ComfyUI).
+    tmp_path = dest_path + '.part'
+    _cleanup_partial(tmp_path)
 
     if sftp_cfg:
         # ── Mode direct SFTP : paramiko sftp.get() ──
@@ -782,30 +896,40 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
         }
         try:
             ssh = _sftp_connect(sftp_cfg)
-            sftp = ssh.open_sftp()
-            sftp.sftp_chunk_size = 2 * 1024 * 1024
+            try:
+                sftp = ssh.open_sftp()
+                sftp.sftp_chunk_size = 2 * 1024 * 1024
 
-            full_remote = sftp_cfg['base_path'].rstrip('/') + '/' + sftp_cfg['remote_path']
+                full_remote = sftp_cfg['base_path'].rstrip('/') + '/' + sftp_cfg['remote_path']
 
-            # Callback de progression
-            def _dl_cb(sent, total):
-                now = time.time()
-                elapsed = now - _download_progress[upload_id]['start']
-                speed = (sent / 1048576) / elapsed if elapsed > 0 else 0
-                _download_progress[upload_id].update({
-                    'bytes_recv': sent,
-                    'speed_mbs': round(speed, 1),
-                })
+                # Callback de progression + point d'annulation (une exception
+                # levée ici est propagée par paramiko et interrompt le transfert).
+                def _dl_cb(sent, total):
+                    if upload_id in _download_cancel:
+                        raise DownloadCancelled()
+                    now = time.time()
+                    elapsed = now - _download_progress[upload_id]['start']
+                    speed = (sent / 1048576) / elapsed if elapsed > 0 else 0
+                    _download_progress[upload_id].update({
+                        'bytes_recv': sent,
+                        'speed_mbs': round(speed, 1),
+                    })
 
-            sftp.get(full_remote, dest_path, callback=_dl_cb)
-            sftp.close()
-            ssh.close()
-            _download_progress.pop(upload_id, None)
+                sftp.get(full_remote, tmp_path, callback=_dl_cb)
+                sftp.close()
+            finally:
+                ssh.close()
+            _replace_download_file(tmp_path, dest_path)
             logging.info(f"[AIH] Direct SFTP download OK: {full_remote} → {dest_path}")
             return {'success': True, 'path': dest_path}
+        except DownloadCancelled:
+            return {'success': False, 'cancelled': True, 'error': 'Téléchargement annulé'}
         except Exception as e:
-            _download_progress.pop(upload_id, None)
             return {'success': False, 'error': f'SFTP download failed: {e}'}
+        finally:
+            _download_progress.pop(upload_id, None)
+            _download_cancel.discard(upload_id)
+            _cleanup_partial(tmp_path)
     else:
         # ── Mode HTTP fallback (storage local) ──
         try:
@@ -816,35 +940,51 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
             resp = requests.get(f"{api_url}/files/{upload_id}/download",
                                headers=auth_headers, stream=True,
                                timeout=_server_side_timeout(file_size if file_size else 0))
-            if not resp.ok:
-                try: err_msg = resp.text[:200]
-                except Exception: err_msg = ''
-                return {'success': False, 'error': f'HTTP {resp.status_code}: {err_msg}'}
+            try:
+                if not resp.ok:
+                    return {'success': False, 'error': _download_http_error(resp)}
 
-            total = int(resp.headers.get('Content-Length', 0))
-            _download_progress[upload_id] = {
-                'bytes_recv': 0, 'bytes_total': total,
-                'speed_mbs': 0.0, 'start': time.time(), 'last_time': time.time(),
-            }
+                total = int(resp.headers.get('Content-Length', 0))
+                _download_progress[upload_id] = {
+                    'bytes_recv': 0, 'bytes_total': total or file_size,
+                    'speed_mbs': 0.0, 'start': time.time(), 'last_time': time.time(),
+                }
 
-            received = 0
-            with open(dest_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
-                    f.write(chunk)
-                    received += len(chunk)
-                    now = time.time()
-                    chunk_elapsed = now - _download_progress[upload_id].get('last_time', now)
-                    chunk_mb = len(chunk) / 1048576
-                    speed = chunk_mb / chunk_elapsed if chunk_elapsed > 0 else 0
-                    _download_progress[upload_id].update({
-                        'bytes_recv': received,
-                        'speed_mbs': round(speed, 1),
-                        'last_time': now,
-                    })
+                received = 0
+                with open(tmp_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                        if upload_id in _download_cancel:
+                            raise DownloadCancelled()
+                        f.write(chunk)
+                        received += len(chunk)
+                        now = time.time()
+                        chunk_elapsed = now - _download_progress[upload_id].get('last_time', now)
+                        chunk_mb = len(chunk) / 1048576
+                        speed = chunk_mb / chunk_elapsed if chunk_elapsed > 0 else 0
+                        _download_progress[upload_id].update({
+                            'bytes_recv': received,
+                            'speed_mbs': round(speed, 1),
+                            'last_time': now,
+                        })
 
-            _download_progress.pop(upload_id, None)
+                expected = total or file_size
+                if expected and received < expected:
+                    raise IOError(f'Transfert incomplet: {received} octets recus sur {expected}')
+            finally:
+                # Libère la connexion même en cas d'annulation/erreur.
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+            _replace_download_file(tmp_path, dest_path)
             logging.info(f"[AIH] Downloaded {filename} → {dest_path}")
             return {'success': True, 'path': dest_path}
+        except DownloadCancelled:
+            return {'success': False, 'cancelled': True, 'error': 'Téléchargement annulé'}
         except Exception as e:
+            return {'success': False, 'error': f'Transfert interrompu : {e}'}
+        finally:
             _download_progress.pop(upload_id, None)
-            return {'success': False, 'error': str(e)}
+            _download_cancel.discard(upload_id)
+            _cleanup_partial(tmp_path)

@@ -243,8 +243,12 @@ console.log("4. Verrou statique sur les appels de transfert longs");
         assert.strictEqual(seen, expected, `${rel}: ${expected} appels upload/download longs attendus, ${seen} trouvés`);
     };
     checkFile("./aih_workflow_share.js", 3);
-    checkFile("./02_aih_model_browser.js", 5);
-    ok("aih_workflow_share.js (3) + 02_aih_model_browser.js (5) : timeout: 0 sur chaque transfert long");
+    // 02_aih_model_browser.js : 2 uploads + 1 download. Les 3 appels download
+    // (downloadFile, downloadRemoteModel, retryDownload) ont été CENTRALISÉS
+    // dans _downloadRequest (progression live + annulation) : un seul site
+    // d'appel, toujours avec timeout: 0 — l'invariant par appel est inchangé.
+    checkFile("./02_aih_model_browser.js", 3);
+    ok("aih_workflow_share.js (3) + 02_aih_model_browser.js (3) : timeout: 0 sur chaque transfert long");
 }
 
 HolafFetch.configure({ timeout: null }); // restaure le défaut (hygiène)

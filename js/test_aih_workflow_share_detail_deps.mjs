@@ -82,6 +82,7 @@ let workflow = null;           // workflow renvoyé par GET /api/workflows/<id>
 let installedNodes = [];       // réponse /api/aih/custom-nodes
 let installBehaviour = "ok";   // "ok" | "already" (400) | "boom" (500)
 let downloadDelayMs = 0;       // ralentit les downloads pour observer le compteur
+let remoteItems = [];          // réponse /api/aih/models/remote (résolution par nom)
 const downloadCalls = [];
 const installCalls = [];
 const toastTexts = [];
@@ -124,6 +125,9 @@ window.fetch = globalThis.fetch = async (url, init) => {
         return jsonResponse({ success: true });
     }
     if (u.includes("/api/aih/models/list")) return jsonResponse({});
+    if (u.includes("/api/aih/models/remote")) {
+        return jsonResponse({ items: remoteItems, total: remoteItems.length });
+    }
     if (u.includes("/api/aih/models/fingerprint")) return jsonResponse({ head: "h", tail: "t" });
     if (/\/object_info\/CheckpointLoaderSimple/.test(u)) {
         return jsonResponse({ CheckpointLoaderSimple: { inputs: { required: { ckpt_name: [[]] } } } });
@@ -177,6 +181,11 @@ const modelCb = (name) => Array.from(window.document.querySelectorAll('.wf-dep-c
     .find((cb) => cb.dataset.name === name);
 const loadStatus = () => (window.document.getElementById("wf-load-status") || {}).textContent || "";
 const bodyText = () => window.document.body.textContent;
+const baseFor = (cb) => {
+    const d = cb && cb.closest ? cb.closest("div") : null;
+    const b = d ? d.querySelector(".wf-dep-basepath") : null;
+    return b ? b.textContent : "";
+};
 
 // openWorkflowManager définit window._wfOpenDetail (global) une seule fois.
 window.openWorkflowManager();
@@ -212,7 +221,21 @@ console.log("1. BUG A — workflow complet (unet + clip avec upload_id) : 8/8 t�
         assert.strictEqual(cb.checked, true, m.name + " coché (non installé localement)");
         assert.strictEqual(cb.dataset.uploadId, m.upload_id, m.name + " porte son upload_id");
     }
+    // LE champ « dossier de destination » doit être VISIBLE pour l'unet et le
+    // clip (typeToFolder contient bien unet/clip) — c'est exactement ce que la
+    // capture utilisateur ne montrait pas.
+    assert.strictEqual(baseFor(modelCb("Krea2-Turbo-int8-ConvRot.safetensors")), "unet/",
+        "dossier de destination « unet/ » affiché pour l'unet");
+    assert.strictEqual(baseFor(modelCb("qwen3-vl-4b-heritic_int8.safetensors")), "clip/",
+        "dossier de destination « clip/ » affiché pour le clip");
+    assert.ok(modelCb("Krea2-Turbo-int8-ConvRot.safetensors").closest("div").querySelector(".wf-dep-path"),
+        "champ de nom de fichier (dest_path) présent pour l'unet");
     window.document.getElementById("wf-load-btn").click();
+    // Les 8 lignes sont listées IMMÉDIATEMENT (téléchargements + non
+    // téléchargeables) — c'est le « 8/8 présents dans la liste ».
+    const allNames = MODELS_ALL_WITH_UPLOAD.map((m) => m.name).concat(LORAS.map((l) => l.name));
+    await waitFor(() => allNames.every((nm) => bodyText().includes(nm)),
+        "8/8 lignes présentes dans le panneau de téléchargement");
     await waitFor(() => downloadCalls.length >= 8, "8 Téléchargements émis (" + downloadCalls.length + ")");
     assert.ok(/Téléchargement de 8 model\(s\)/.test(loadStatus()),
         "compteur réel : « Téléchargement de 8 model(s) » (obtenu « " + loadStatus() + " »)");
@@ -275,6 +298,55 @@ console.log("2. BUG A — unet + clip sans upload_id : signalés clairement, jam
     assert.ok(bodyText().includes("Krea2-Turbo-int8-ConvRot.safetensors"),
         "l'entrée non téléchargeable est NOMMÉE dans le panneau (ligne visible)");
     ok("2 entrées sans upload_id → signalées (liste + panneau + compteur), 6 téléchargés");
+}
+
+/* ══ 2bis. RÉSOLUTION PAR NOM — upload_id absent mais fichier sur le serveur ═ */
+console.log("2bis. upload_id absent MAIS fichier trouvé sur le serveur → résolu et téléchargé");
+{
+    installedNodes = [];
+    downloadDelayMs = 250;
+    // Le workflow ne porte PAS l'upload_id, mais la liste distante (route
+    // locale /api/aih/models/remote) contient les 2 fichiers. L'homonyme de
+    // type incompatible doit être IGNORÉ (jamais un fichier d'un autre type).
+    remoteItems = [
+        { filename: "Krea2-Turbo-int8-ConvRot.safetensors", type: "unet", size: 13.5e9, upload_id: "u-unet-remote" },
+        { filename: "qwen3-vl-4b-heritic_int8.safetensors", type: "clip", size: 4.6e9, upload_id: "u-clip-remote" },
+        { filename: "Krea2-Turbo-int8-ConvRot.safetensors", type: "lora", size: 1, upload_id: "u-wrong-type" },
+    ];
+    const modelsNoRef = MODELS_ALL_WITH_UPLOAD.map((m) =>
+        (m.type === "unet" || m.type === "clip") ? { name: m.name, type: m.type, size: m.size } : m
+    );
+    await openDetail({
+        id: 42, name: "Krea 2", author: "moi", version: 1, likes: 0, downloads: 0,
+        required_nodes: [],
+        required_models: modelsNoRef,
+        required_loras: LORAS,
+    });
+
+    const unetCb = modelCb("Krea2-Turbo-int8-ConvRot.safetensors");
+    const clipCb = modelCb("qwen3-vl-4b-heritic_int8.safetensors");
+    assert.strictEqual(unetCb.dataset.uploadId, "u-unet-remote",
+        "upload_id de l'unet résolu PAR NOM (+ type) — homonyme lora ignoré");
+    assert.strictEqual(clipCb.dataset.uploadId, "u-clip-remote", "upload_id du clip résolu par nom");
+    assert.ok(bodyText().includes("réf. serveur retrouvée"), "badge « réf. serveur retrouvée » affiché");
+    assert.strictEqual(baseFor(unetCb), "unet/", "dossier unet/ affiché après résolution");
+    assert.strictEqual(baseFor(clipCb), "clip/", "dossier clip/ affiché après résolution");
+
+    window.document.getElementById("wf-load-btn").click();
+    await waitFor(() => downloadCalls.length >= 8, "8/8 téléchargements émis après résolution (" + downloadCalls.length + ")");
+    await sleep(1600);
+    downloadDelayMs = 0;
+    remoteItems = [];
+
+    assert.strictEqual(downloadCalls.length, 8, "8/8 TÉLÉCHARGÉS malgré l'upload_id absent du workflow");
+    const unetDl = downloadCalls.find((d) => d.type === "unet");
+    const clipDl = downloadCalls.find((d) => d.type === "clip");
+    assert.strictEqual(unetDl.upload_id, "u-unet-remote", "l'unet est téléchargé via l'upload_id résolu");
+    assert.strictEqual(unetDl.dest_path, "Krea2-Turbo-int8-ConvRot.safetensors", "dest_path unet conservé");
+    assert.strictEqual(clipDl.upload_id, "u-clip-remote", "le clip est téléchargé via l'upload_id résolu");
+    assert.ok(!downloadCalls.some((d) => d.upload_id === "u-wrong-type"),
+        "jamais l'homonyme d'un type incompatible");
+    ok("2 unet/clip sans upload_id → résolus par nom+type, 8/8 téléchargés au bon dossier");
 }
 
 /* ══ 3. BUG B — alias du même dépôt détectés « déjà installé » + SKIP ═════ */
@@ -520,8 +592,10 @@ console.log("10. Verrous statiques et parité i18n");
     assert.ok(/nodeMatchesInstalledIndex/.test(src),
         "mutation : la détection doit utiliser l'index normalisé (alias reconnus)");
     // Mutation B2 : la boucle d'installation doit SKIPPER les installés.
-    assert.ok(/nodeMatchesInstalledIndex\(installedIndex, nname, nurl\)/.test(src),
-        "mutation : la boucle d'installation doit consulter l'état « déjà installé »");
+    assert.ok(/nodeMatchesInstalledIndex\(installedIndex, nname, nurl, ntypes\)/.test(src),
+        "mutation : la boucle d'installation doit consulter l'état « déjà installé » (mêmes signaux que le badge, classes incluses)");
+    assert.ok(/JSON\.parse\(decodeURIComponent\(ncb\.dataset\.nodeTypes/.test(src),
+        "mutation : les classes de nodes (node_types) doivent être relues depuis la case pour le skip");
     assert.ok(/dataset\.installed === '1'/.test(src),
         "mutation : la case déjà installée doit porter data-installed et être sautée");
     // Mutation B3 : message d'erreur réel.
@@ -561,6 +635,32 @@ console.log("10. Verrous statiques et parité i18n");
     assert.ok(/for section in config\.sections\(\)/.test(cnm),
         "mutation : _read_git_url doit lire un remote non-origin (remote réel du dossier)");
 
+    // Mutation G1 : la version du module est VÉRIFIABLE (constante + sonde).
+    assert.ok(/var AIH_WF_SHARE_BUILD = "wf-share-/.test(src),
+        "mutation : marqueur de build présent dans le module");
+    assert.ok(/window\.AIH_WF_SHARE = \{/.test(src),
+        "mutation : build exposée sur window.AIH_WF_SHARE (DevTools)");
+    assert.ok(/function checkServedBuildFreshness/.test(src) && /cache: "no-store"/.test(src),
+        "mutation : sonde de fraîcheur (fichier servi ≠ build exécutée)");
+    assert.ok(/id="wf-stale-banner"/.test(src) && /wf\.staleBuild/.test(src),
+        "mutation : bandeau « version obsolète » affiché si le serveur sert une autre build");
+    assert.ok(/wf\.buildLabel/.test(src), "mutation : build affichée dans l'UI");
+    // Mutation H1 : résolution par NOM de la référence serveur.
+    assert.ok(/function resolveRemoteUploadId/.test(src) && /function remoteTypeCompatible/.test(src),
+        "mutation : résolution upload_id par nom (unet/clip sans upload_id)");
+    assert.ok((src.match(/resolveRemoteUploadId\(/g) || []).length >= 3,
+        "mutation : résolution tentée au rendu ET dans la boucle de chargement");
+    assert.ok(/\/api\/aih\/models\/remote\?search=/.test(src),
+        "mutation : la résolution interroge la route locale (proxy) de liste distante");
+    // Mutation I1 : FIN de chargement explicite (progression + récapitulatif).
+    assert.ok(/wf\.dlProgress/.test(src) && /wf\.dlDoneTitle/.test(src) && /wf\.dlRecap/.test(src),
+        "mutation : progression globale + récapitulatif final du panneau");
+    assert.ok(/stats\.noref\+\+/.test(src) && /stats\.already\+\+/.test(src) &&
+        /stats\.downloaded\+\+/.test(src) && /stats\.failed\+\+/.test(src),
+        "mutation : le récap distingue téléchargés / déjà présents / non téléchargeables / échecs");
+    assert.ok(/panel\.dataset\.state = "done"/.test(src),
+        "mutation : état final 'done' posé sur le panneau");
+
     // Parité i18n stricte FR/EN des clés ajoutées.
     const enIdx = strings.indexOf("const EN = {");
     assert.ok(enIdx > 0, "bloc EN localisé");
@@ -571,6 +671,8 @@ console.log("10. Verrous statiques et parité i18n");
         "wf.alreadyInstalledMatch", "wf.matchReasonFolder", "wf.matchReasonUrl",
         "wf.matchReasonNode", "wf.matchReasonServer", "wf.forceInstallHint",
         "wf.alreadyInstalledMsg", "wf.alreadyInstalledSummary",
+        "wf.buildLabel", "wf.staleBuild", "wf.dlProgress", "wf.dlDoneTitle",
+        "wf.dlRecap", "wf.dlRecapToast", "wf.depResolved",
     ];
     for (const key of keys) {
         const token = '"' + key + '"';

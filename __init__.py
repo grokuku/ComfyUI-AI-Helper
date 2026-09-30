@@ -439,6 +439,34 @@ try:
 except Exception as e:
     print(f"🔴 [Holaf-Init] Failed to register CSRF protection middleware: {e}")
 
+# Register extension-assets no-cache middleware globally. Les assets du pack
+# (/extensions/<dossier de l'extension>/**) sont servis par le serveur
+# statique de ComfyUI SANS Cache-Control : un navigateur pouvait exécuter un
+# JS PÉRIMÉ après une mise à jour du pack — cause prouvée des correctifs
+# « livrés » qui semblaient inactifs (ancien aih_workflow_share.js encore
+# exécuté). La revalidation forcée (ETag/Last-Modified) est déclarative et
+# sans état : 304 sans corps si le fichier n'a pas changé.
+try:
+    from aih.routes import extension_assets_no_cache_headers as _ext_nocache
+
+    _HOLAF_EXT_DIR_NAME = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+
+    @web.middleware
+    async def holaf_extension_nocache_middleware(request: web.Request, handler):
+        response = await handler(request)
+        try:
+            _ext_nocache(response.headers, request.path, _HOLAF_EXT_DIR_NAME)
+        except Exception:
+            pass
+        return response
+
+    app = server.PromptServer.instance.app
+    app.middlewares.append(holaf_extension_nocache_middleware)
+    print(f"🔵 [Holaf-Init] Extension assets no-cache middleware registered "
+          f"(/extensions/{_HOLAF_EXT_DIR_NAME}/).")
+except Exception as e:
+    print(f"🔴 [Holaf-Init] Failed to register extension no-cache middleware: {e}")
+
 # --- PROFILER ROUTES & HOOKS ---
 if profiler_engine:
     # 1. Routes

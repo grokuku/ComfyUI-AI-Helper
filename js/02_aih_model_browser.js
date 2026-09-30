@@ -274,6 +274,27 @@ var WF_REMOTE_MAX_PAGES = 20;
             "  color: #888;",
             "  flex-shrink: 0;",
             "}",
+            ".mb-progress-cancel {",
+            "  flex-shrink: 0;",
+            "  width: 20px;",
+            "  height: 20px;",
+            "  line-height: 1;",
+            "  padding: 0;",
+            "  border: 1px solid #555;",
+            "  border-radius: 4px;",
+            "  background: transparent;",
+            "  color: #aaa;",
+            "  font-size: 11px;",
+            "  cursor: pointer;",
+            "}",
+            ".mb-progress-cancel:hover {",
+            "  border-color: #dc2626;",
+            "  color: #f87171;",
+            "}",
+            ".mb-progress-cancel:disabled {",
+            "  opacity: 0.5;",
+            "  cursor: default;",
+            "}",
             ".mb-loading-spinner {",
             "  display: inline-block;",
             "  width: 14px;",
@@ -551,19 +572,15 @@ var WF_REMOTE_MAX_PAGES = 20;
                 return;
             }
 
-            var progressEl = showProgress(m, displayName);
+            var progressEl = showProgress(m, displayName, { cancelable: true });
 
-            // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
-            HolafFetch.post('/api/aih/models/download', {
-                body: {
-                    upload_id: uploadId,
-                    filename: displayName,
-                    type: fileType,
-                    dest_path: destSubdir,
-                },
-                // Téléchargement LONG (modèle de plusieurs Go) : pas de plafond client de 30 s.
-                timeout: 0,
-            })
+            // Progression live + bouton d'annulation (voir _downloadRequest).
+            _downloadRequest({
+                upload_id: uploadId,
+                filename: displayName,
+                type: fileType,
+                dest_path: destSubdir,
+            }, progressEl)
                 .then(function (data) {
                     if (data.status === 'ok' || data.success) {
                         if (data.conflict) {
@@ -573,6 +590,10 @@ var WF_REMOTE_MAX_PAGES = 20;
                         }
                         updateProgress(progressEl, 100, t('mb.downloadDone'));
                         resolve();
+                    } else if (data.cancelled) {
+                        // Annulation utilisateur : message dédié, pas « ❌ Erreur ».
+                        updateProgress(progressEl, 0, t('mb.downloadCancelled'));
+                        reject(new Error(t('mb.downloadCancelled')));
                     } else {
                         updateProgress(progressEl, 0, t('mb.errorPrefix') + (data.error || data.message || t('aih.unknown')));
                         reject(new Error(data.error || t('aih.failed')));
@@ -1567,19 +1588,15 @@ var WF_REMOTE_MAX_PAGES = 20;
             return;
         }
 
-        var progressEl = showProgress(m, filename);
+        var progressEl = showProgress(m, filename, { cancelable: true });
 
-        // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
-        HolafFetch.post('/api/aih/models/download', {
-            body: {
-                upload_id: uploadId,
-                filename: filename,
-                type: fileType || 'model',
-                dest_path: destSubdir || '',
-            },
-            // Téléchargement LONG (modèle de plusieurs Go) : pas de plafond client de 30 s.
-            timeout: 0,
-        })
+        // Progression live + bouton d'annulation (voir _downloadRequest).
+        _downloadRequest({
+            upload_id: uploadId,
+            filename: filename,
+            type: fileType || 'model',
+            dest_path: destSubdir || '',
+        }, progressEl)
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
                     if (data.conflict) {
@@ -1592,6 +1609,9 @@ var WF_REMOTE_MAX_PAGES = 20;
                     m._remoteHasMore = true;
                     loadLocalModels(m, true);
                     loadRemoteModels(m);
+                } else if (data.cancelled) {
+                    // Annulation utilisateur : message dédié, pas « ❌ Erreur ».
+                    updateProgress(progressEl, 0, t('mb.downloadCancelled'));
                 } else {
                     updateProgress(progressEl, 0, t('mb.errorPrefix') + (data.error || data.message || t('aih.unknown')));
                 }
@@ -1640,12 +1660,8 @@ var WF_REMOTE_MAX_PAGES = 20;
             conflict_resolution: resolution,
         };
 
-        // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
-        HolafFetch.post('/api/aih/models/download', {
-            body: body,
-            // Téléchargement LONG (modèle de plusieurs Go) : pas de plafond client de 30 s.
-            timeout: 0,
-        })
+        // Progression live + bouton d'annulation (voir _downloadRequest).
+        _downloadRequest(body, progressEl)
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
                     updateProgress(progressEl, 100, t('mb.downloadDone'));
@@ -1653,6 +1669,9 @@ var WF_REMOTE_MAX_PAGES = 20;
                     m._remoteHasMore = true;
                     loadLocalModels(m, true);
                     loadRemoteModels(m);
+                } else if (data.cancelled) {
+                    // Annulation utilisateur : message dédié, pas « ❌ Erreur ».
+                    updateProgress(progressEl, 0, t('mb.downloadCancelled'));
                 } else {
                     updateProgress(progressEl, 0, t('mb.errorPrefix') + (data.error || data.message || t('aih.unknown')));
                 }
@@ -1663,7 +1682,7 @@ var WF_REMOTE_MAX_PAGES = 20;
     }
 
     // ─── showProgress / updateProgress ─────────────────────────────────────────
-    function showProgress(m, filename) {
+    function showProgress(m, filename, opts) {
         var container = m.modal.querySelector('#mb-progress');
         if (!container) return null;
         container.style.display = 'block';
@@ -1689,6 +1708,19 @@ var WF_REMOTE_MAX_PAGES = 20;
         pctSpan.textContent = '0%';
         row.appendChild(pctSpan);
 
+        // Bouton d'annulation (downloads seulement) : posé masqué, activé par
+        // _downloadRequest qui connaît l'upload_id.
+        var cancelBtn = null;
+        if (opts && opts.cancelable) {
+            cancelBtn = document.createElement('button');
+            cancelBtn.type = 'button';
+            cancelBtn.className = 'mb-progress-cancel';
+            cancelBtn.textContent = '\u2715';
+            cancelBtn.title = t('mb.cancelDownload');
+            cancelBtn.style.display = 'none';
+            row.appendChild(cancelBtn);
+        }
+
         container.appendChild(row);
 
         // Scroll en bas pour voir la progression
@@ -1699,6 +1731,8 @@ var WF_REMOTE_MAX_PAGES = 20;
             fill: fill,
             pctSpan: pctSpan,
             nameSpan: nameSpan,
+            baseName: filename || t('mb.file'),
+            cancelBtn: cancelBtn,
         };
     }
 
@@ -1709,6 +1743,95 @@ var WF_REMOTE_MAX_PAGES = 20;
         if (text) {
             progressEl.nameSpan.textContent = text;
         }
+    }
+
+    // ─── Download : progression live + annulation ──────────────────────────────
+    // Le serveur publie la progression dans /api/aih/models/download/progress
+    // pendant TOUT le transfert (un modèle de 13,5 Go dure des dizaines de
+    // minutes — sans polling l'UI semble figée). Un seul appel en vol à la
+    // fois (jamais d'empilement), arrêt dès que la requête est réglée. Le
+    // bouton ✕ pose une annulation coopérative côté serveur : le transfert
+    // s'arrête, le fichier partiel est nettoyé.
+    var DOWNLOAD_POLL_MS = 800;
+
+    function _pollDownloadProgress(progressEl, uploadId) {
+        if (!progressEl || !uploadId) return function () {};
+        var stopped = false;
+        var inFlight = false;
+        var timer = setInterval(function () {
+            if (stopped || inFlight) return;
+            inFlight = true;
+            var release = function () { inFlight = false; };
+            // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+            HolafFetch.get('/api/aih/models/download/progress?upload_id=' + encodeURIComponent(uploadId))
+                .then(function (p) {
+                    release();
+                    if (stopped || !p || typeof p.percent !== 'number') return;
+                    progressEl.fill.style.width = p.percent + '%';
+                    progressEl.pctSpan.textContent = Math.round(p.percent) + '%';
+                    if (!progressEl.baseName) return;
+                    if (p.bytes_recv > 0 && p.speed_mbs > 0) {
+                        progressEl.nameSpan.textContent = progressEl.baseName + ' · ' + p.speed_mbs + ' MB/s';
+                    } else if (!p.bytes_recv) {
+                        // Aucun octet encore reçu : le backend précharge le
+                        // fichier du stockage vers son temp (peut durer des
+                        // minutes sur 13,5 Go) — l'UI doit le DIRE au lieu de
+                        // rester muette à 0 %.
+                        progressEl.nameSpan.textContent = progressEl.baseName + ' · ' + t('mb.downloadPreparing');
+                    }
+                })
+                .catch(release);
+        }, DOWNLOAD_POLL_MS);
+        return function stop() {
+            stopped = true;
+            clearInterval(timer);
+        };
+    }
+
+    function _settleProgress(progressEl, cancelled) {
+        if (!progressEl) return;
+        if (progressEl.cancelBtn) progressEl.cancelBtn.style.display = 'none';
+        if (cancelled) {
+            updateProgress(progressEl, 0, t('mb.downloadCancelled'));
+            progressEl.row.style.opacity = '0.6';
+        }
+    }
+
+    function _downloadRequest(body, progressEl) {
+        var stopPoll = _pollDownloadProgress(progressEl, body.upload_id);
+        if (progressEl && progressEl.cancelBtn) {
+            progressEl.cancelBtn.style.display = 'inline-block';
+            progressEl.cancelBtn.onclick = function (e) {
+                e.stopPropagation();
+                progressEl.cancelBtn.disabled = true;
+                progressEl.cancelBtn.textContent = '…';
+                HolafFetch.post('/api/aih/models/download/cancel', {
+                    body: { upload_id: body.upload_id },
+                    timeout: 0,
+                }).catch(function () {});
+            };
+        }
+        // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
+        return HolafFetch.post('/api/aih/models/download', {
+            body: body,
+            // Téléchargement LONG (modèle de plusieurs Go) : pas de plafond client de 30 s.
+            timeout: 0,
+        })
+            .then(function (data) {
+                stopPoll();
+                _settleProgress(progressEl, false);
+                return data;
+            })
+            .catch(function (err) {
+                stopPoll();
+                // Annulation coopérative : le serveur répond 400 +
+                // {cancelled: true} → message dédié, pas une « erreur » brute.
+                if (err && err.data && err.data.cancelled) {
+                    _settleProgress(progressEl, true);
+                    return { success: false, cancelled: true, error: t('mb.downloadCancelled') };
+                }
+                throw err;
+            });
     }
 
 })();

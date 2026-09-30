@@ -22,6 +22,74 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     return I && typeof I.t === "function" ? I.t(key, params) : key;
   };
 
+  // ── Version du module — VÉRIFIABLE par l'utilisateur ─────────────────────
+  // Le pack est servi par ComfyUI sous /extensions/<dossier>/... sans
+  // cache-busting : un navigateur a pu exécuter un aih_workflow_share.js
+  // PÉRIMÉ après la mise à jour du pack (cause prouvée des correctifs
+  // « livrés » qui semblaient inactifs). Cette constante :
+  //   - est loguée au chargement du module ;
+  //   - est exposée sur window.AIH_WF_SHARE (DevTools : taper AIH_WF_SHARE) ;
+  //   - est affichée dans la fenêtre Workflows (bandeau bas) ;
+  //   - est comparée au fichier RÉELLEMENT servi (fetch cache: no-store) pour
+  //     afficher un bandeau rouge « version obsolète — Ctrl+Shift+R ».
+  // ⚠️ Incrémenter à CHAQUE livraison de ce fichier.
+  var AIH_WF_SHARE_BUILD = "wf-share-2026-09-30-r5";
+
+  var AIH_WF_SHARE_BUILD_RX = /AIH_WF_SHARE_BUILD\s*=\s*["']([^"']+)["']/;
+
+  function buildFromSource(text) {
+    var m = AIH_WF_SHARE_BUILD_RX.exec(String(text == null ? "" : text));
+    return m ? m[1] : "";
+  }
+
+  // Vérifie que le fichier SERVI est bien cette version (et non une copie en
+  // cache). Résultat mémoïsé pour la session : null (vérification impossible),
+  // false (obsolète) ou true (à jour). ``urlOverride`` n'est utilisé que par
+  // les tests (pour forcer une nouvelle sonde sur une URL http simulée).
+  var _servedBuildProbe = null;
+  function checkServedBuildFreshness(urlOverride) {
+    if (_servedBuildProbe && !urlOverride) return _servedBuildProbe;
+    var run = (async function () {
+      try {
+        var importUrl = (typeof import.meta !== "undefined" && import.meta && import.meta.url) ? import.meta.url : "";
+        var url = urlOverride || importUrl;
+        if (!/^https?:/i.test(url)) return null; // file:// (tests) ou contexte sans URL
+        var sep = url.indexOf("?") >= 0 ? "&" : "?";
+        var res = await fetch(url + sep + "aih_build_probe=" + Date.now(), { cache: "no-store" });
+        if (!res || !res.ok) return null;
+        var served = buildFromSource(await res.text());
+        var stale = served !== AIH_WF_SHARE_BUILD;
+        if (window.AIH_WF_SHARE) {
+          window.AIH_WF_SHARE.servedBuild = served;
+          window.AIH_WF_SHARE.stale = stale;
+        }
+        if (stale) {
+          console.error("[AIH] Workflow Share OBSOLÈTE — exécuté " + AIH_WF_SHARE_BUILD
+            + ", servi " + (served || "(sans marqueur)") + " — Ctrl+Shift+R requis. " + url);
+        }
+        return stale;
+      } catch (e) {
+        return null;
+      }
+    })();
+    if (urlOverride || !_servedBuildProbe) _servedBuildProbe = run;
+    return run;
+  }
+
+  if (typeof window !== "undefined") {
+    window.AIH_WF_SHARE = {
+      build: AIH_WF_SHARE_BUILD,
+      url: (typeof import.meta !== "undefined" && import.meta && import.meta.url) ? import.meta.url : "",
+      stale: null,
+      servedBuild: null,
+      check: checkServedBuildFreshness,
+    };
+  }
+  try {
+    console.log("[AIH] Workflow Share build " + AIH_WF_SHARE_BUILD
+      + " — " + (window.AIH_WF_SHARE ? window.AIH_WF_SHARE.url : ""));
+  } catch (e) { /* console indisponible : jamais bloquant */ }
+
   // ── Helpers ──
 
   function getApp() {
@@ -520,7 +588,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
 
   // ── Custom nodes : detection des URLs git (via endpoint ComfyUI) ──
 
-  async function getInstalledCustomNodes() {
+  async function getInstalledCustomNodes(strict) {
     try {
       var data = await HolafFetch.request('/api/aih/custom-nodes');
       if (!data.nodes || data.nodes.length === 0) {
@@ -531,6 +599,10 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
       return data.nodes || [];
     } catch(e) {
       console.warn('[AIH] /aih/custom-nodes HTTP ' + (e.status||'') + (e.body ? ' ' + (typeof e.body === 'string' ? e.body : '') : '') + ' — route non enregistree ou erreur serveur');
+      // strict : l'appelant VEUT distinguer « 0 pack » d'un échec réseau et
+      // pourra réessayer — sans quoi un index vide figé ferait réinstaller des
+      // packs pourtant présents.
+      if (strict) throw e;
       return [];
     }
   }
@@ -626,15 +698,21 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
 
   // Message d'erreur d'installation LISIBLE : le serveur pack renvoie
   // {success:false, message:"Node 'X' already installed"} en 400 ; HolafFetch
-  // attache ce corps à err.data. On préfère data.message/data.error au
-  // « erreur serveur (statut 400) » générique, pour un message clair.
+  // attache ce corps à err.data (et err.body pour un corps NON-JSON). On
+  // préfère data.message/data.error/data.detail au « erreur serveur (statut
+  // 400) » générique de la brique, puis le corps brut texte (serveur/proxy
+  // qui répond du texte), pour un message TOUJOURS exploitable.
   function installErrorMessage(e) {
     if (!e) return t("aih.failed");
     var d = e.data || e.body;
     if (d && typeof d === "object") {
       if (typeof d.message === "string" && d.message) return d.message;
       if (typeof d.error === "string" && d.error) return d.error;
+      if (typeof d.detail === "string" && d.detail) return d.detail;
     }
+    // Corps brut (réponse non-JSON : proxy, erreur aiohttp, page…) : la brique
+    // laisse e.body en texte — on le préfère lui aussi au message générique.
+    if (typeof e.body === "string" && e.body.trim()) return e.body.trim().slice(0, 300);
     return e.message || t("aih.failed");
   }
 
@@ -825,6 +903,63 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     }
   }
 
+  // ── Résolution de secours d'une référence serveur PAR NOM DE FICHIER ──
+  // Un workflow publié AVANT le correctif d'upload (gros unet/clip coupés par
+  // les anciens timeouts 30/60 s) peut lister une dépendance SANS upload_id
+  // alors que le fichier est bien présent côté serveur (upload ultérieur,
+  // autre workflow…). On interroge la liste distante via la route LOCALE du
+  // pack (/api/aih/models/remote, proxy authentifié) et on ne retient qu'une
+  // correspondance EXACTE : nom identique, type compatible, et — si les deux
+  // tailles sont connues — taille identique (jamais un homonyme d'un autre
+  // contenu). Retourne {upload_id, size} ou null. Jamais bloquant.
+  function remoteTypeCompatible(jsType, remoteType) {
+    var a = String(jsType == null ? "" : jsType).toLowerCase();
+    var b = String(remoteType == null ? "" : remoteType).toLowerCase();
+    if (!a || !b) return true;
+    if (a === b) return true;
+    // Le backend peut stocker un unet sous « diffusion_model » (table
+    // diffusion_models côté ComfyUI, type_to_cat et _ALL_MODEL_CATEGORIES du
+    // pack) alors que le workflow détecte « unet » : sans cette équivalence,
+    // la résolution par nom échouait et le fichier était déclaré NON
+    // téléchargeable alors qu'il était bien sur le serveur.
+    var equiv = { model: "checkpoint", checkpoint: "model", unet: "diffusion_model", diffusion_model: "unet" };
+    return equiv[a] === b || equiv[b] === a;
+  }
+
+  async function resolveRemoteUploadId(entry) {
+    var name = String((entry && entry.name) || "").trim();
+    if (!name) return null;
+    var base = name.split("/").pop();
+    var wantType = (entry && entry.type) || "";
+    var wantSize = Number(entry && entry.size) || 0;
+    try {
+      var data = await HolafFetch.request(
+        "/api/aih/models/remote?search=" + encodeURIComponent(base) + "&limit=50&sort=created_at&order=desc",
+        // Borné : si le serveur AIH ne répond pas en 8 s, on rend la main
+        // (jamais une liste de dépendances figée par un réseau lent).
+        { timeout: 8000 }
+      );
+      var items = (data && data.items) || [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i] || {};
+        var fname = String(it.filename == null ? "" : it.filename).trim();
+        if (!fname) continue;
+        var fbase = fname.split("/").pop() || "";
+        if (fname.toLowerCase() !== name.toLowerCase() &&
+            fbase.toLowerCase() !== base.toLowerCase()) continue;
+        if (!remoteTypeCompatible(wantType, it.type)) continue;
+        var itSize = Number(it.size) || 0;
+        if (wantSize > 0 && itSize > 0 && itSize !== wantSize) continue;
+        if (!it.upload_id) continue;
+        return { upload_id: it.upload_id, size: itSize };
+      }
+      return null;
+    } catch (e) {
+      console.warn("[AIH] Résolution upload_id par nom impossible: " + name, e);
+      return null;
+    }
+  }
+
   async function uploadModelToServer(filepath, fileType, overwrite) {
     // Demande au Python d'uploader le fichier directement depuis le filesystem
     try {
@@ -934,6 +1069,9 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     function render() {
       body.innerHTML =
         '<div style="display:flex;flex-direction:column;gap:10px;min-height:350px;">' +
+        // Bandeau « version obsolète » : rempli seulement si la sonde de
+        // fraîcheur détecte un fichier servi différent de cette build.
+        '<div id="wf-stale-banner" style="display:none;font-size:11px;color:#f87171;background:rgba(220,38,38,0.12);border:1px solid #7f1d1d;border-radius:6px;padding:6px 8px;"></div>' +
         // Tab bar
         '<div style="display:flex;gap:0;border-bottom:1px solid #444;">' +
         '<button id="wf-tab-share" style="flex:1;padding:8px;border:none;border-bottom:2px solid ' +
@@ -946,7 +1084,24 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
         (currentTab === "browse" ? "600" : "400") + ';cursor:pointer;">' + t('wf.tabBrowse') + '</button>' +
         '</div>' +
         '<div id="wf-tab-content" style="flex:1;"></div>' +
+        // Version VISIBLE : l'utilisateur peut confirmer d'un coup d'œil que le
+        // navigateur exécute bien la nouvelle build (cf. cache/obsolescence).
+        '<div style="font-size:10px;color:#555;text-align:right;">' + esc(t('wf.buildLabel', { build: AIH_WF_SHARE_BUILD })) + '</div>' +
         '</div>';
+
+      // Sonde de fraîcheur : si le fichier réellement SERVI ne contient pas le
+      // même marqueur de build, on affiche un bandeau explicite (jamais un
+      // correctif silencieusement inactif).
+      checkServedBuildFreshness().then(function (stale) {
+        if (!stale) return;
+        var banner = body.querySelector("#wf-stale-banner");
+        if (!banner) return;
+        banner.style.display = "block";
+        banner.textContent = t("wf.staleBuild", {
+          running: AIH_WF_SHARE_BUILD,
+          served: (window.AIH_WF_SHARE && window.AIH_WF_SHARE.servedBuild) || "?",
+        });
+      });
 
       body.querySelector("#wf-tab-share").onclick = function () { currentTab = "share"; renderTab(); updateTabStyles(); };
       body.querySelector("#wf-tab-browse").onclick = function () { currentTab = "browse"; renderTab(); updateTabStyles(); };
@@ -1443,7 +1598,8 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
             '<div style="display:flex;gap:8px;">' +
             '<button id="wf-load-btn" style="flex:1;padding:10px;border:none;border-radius:6px;background:var(--aih-accent, #D8700D);color:#fff;font-size:13px;font-weight:600;cursor:pointer;">' + t('wf.loadWorkflow') + '</button>' +
             '<button id="wf-close-btn" style="padding:10px 16px;border:1px solid #555;border-radius:6px;background:transparent;color:#999;font-size:13px;cursor:pointer;">' + t('dialog.close') + '</button></div>' +
-            '<div id="wf-load-status" style="font-size:11px;color:#888;display:none;margin-top:8px;"></div>';
+            '<div id="wf-load-status" style="font-size:11px;color:#888;display:none;margin-top:8px;"></div>' +
+            '<div id="wf-detail-build" style="font-size:10px;color:#555;text-align:right;margin-top:4px;">' + esc(t('wf.buildLabel', { build: AIH_WF_SHARE_BUILD })) + '</div>';
 
           detailBody.innerHTML = html;
           detailBody.querySelector("#wf-close-btn").onclick = function() { _dm.close(); };
@@ -1465,9 +1621,15 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
           var _installedIndexPromise = null;
           function getInstalledIndex() {
             if (!_installedIndexPromise) {
-              _installedIndexPromise = getInstalledCustomNodes()
+              _installedIndexPromise = getInstalledCustomNodes(true)
                 .then(function (list) { return buildInstalledNodeIndex(list); })
-                .catch(function () { return buildInstalledNodeIndex([]); });
+                .catch(function () {
+                  // Échec réseau/route : NE PAS mémoriser un index vide (sinon
+                  // le bouton « Charger le workflow » réutiliserait ce vide et
+                  // réinstallerait des packs présents). L'appel suivant réessaie.
+                  _installedIndexPromise = null;
+                  return buildInstalledNodeIndex([]);
+                });
             }
             return _installedIndexPromise;
           }
@@ -1501,7 +1663,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   // recocher FORCE l'installation (filet « already installed » en
                   // secours). Sinon cochée par défaut.
                   depHtml += '<label style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid #3a3a3e;cursor:pointer;font-size:12px;color:' + (installed ? '#34d399' : '#ccc') + ';">' +
-                    '<input type="checkbox" class="wf-dep-cb"' + (installed ? '' : ' checked') + ' data-type="node" data-name="' + esc(n.name) + '" data-url="' + esc(n.url || '') + '"' + (installed ? ' data-installed="1" data-installed-reason="' + esc(reason) + '" title="' + esc(t('wf.forceInstallHint')) + '"' : '') + ' style="accent-color:var(--aih-accent, #D8700D);">' +
+                    '<input type="checkbox" class="wf-dep-cb"' + (installed ? '' : ' checked') + ' data-type="node" data-name="' + esc(n.name) + '" data-url="' + esc(n.url || '') + '"' + ' data-node-types="' + esc(encodeURIComponent(JSON.stringify(n.node_types || []))) + '"' + (installed ? ' data-installed="1" data-installed-reason="' + esc(reason) + '" title="' + esc(t('wf.forceInstallHint')) + '"' : '') + ' style="accent-color:var(--aih-accent, #D8700D);">' +
                     '<span style="flex:1;">' + esc(n.name) +
                     (nodeCount > 1 ? ' (' + t('wf.nodeCount', { count: nodeCount }) + ') ' : '') +
                     (installed ? ' <span style="color:#34d399;">' + t('wf.alreadyInstalledMatch', { reason: reason }) + '</span>' : '') +
@@ -1514,6 +1676,31 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
               if (allDeps.models.length) {
                 if (allDeps.nodes.length) depHtml += '<div style="border-top:1px solid #444;"></div>';
                 depHtml += '<div style="background:#3a3a3e;padding:6px 10px;border-bottom:1px solid #444;"><span style="font-size:11px;color:var(--aih-accent, #D8700D);font-weight:600;">' + t('wf.models') + '</span></div>';
+                // Références serveur absentes : résolution PAR NOM en PARALLÈLE
+                // (le fichier peut déjà être sur le serveur sans que le
+                // workflow publié porte son upload_id — cas réel des 2 gros
+                // unet/clip publiés avant le correctif d'upload). Un échec
+                // laisse la ligne « non téléchargeable » avec sa raison.
+                var missingRefs = [];
+                for (var mi = 0; mi < allDeps.models.length; mi++) {
+                  if (localModels.indexOf(allDeps.models[mi].name) < 0 && !allDeps.models[mi].upload_id) {
+                    missingRefs.push(allDeps.models[mi]);
+                  }
+                }
+                if (missingRefs.length) {
+                  var resolvedRefs = await Promise.all(missingRefs.map(function (mm) {
+                    return resolveRemoteUploadId(mm);
+                  }));
+                  for (var ri = 0; ri < missingRefs.length; ri++) {
+                    if (resolvedRefs[ri] && resolvedRefs[ri].upload_id) {
+                      missingRefs[ri].upload_id = resolvedRefs[ri].upload_id;
+                      missingRefs[ri]._resolved_ref = true;
+                      if ((!missingRefs[ri].size || !Number(missingRefs[ri].size)) && resolvedRefs[ri].size) {
+                        missingRefs[ri].size = resolvedRefs[ri].size;
+                      }
+                    }
+                  }
+                }
                 for (var i = 0; i < allDeps.models.length; i++) {
                   var m = allDeps.models[i];
                   var installed = localModels.indexOf(m.name) >= 0;
@@ -1521,10 +1708,10 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   depHtml += '<div style="padding:6px 10px;border-bottom:1px solid #3a3a3e;font-size:12px;color:' + (installed ? '#34d399' : '#ccc') + ';">' +
                     '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;">' +
                     '<input type="checkbox" class="wf-dep-cb"' + (installed ? '' : ' checked') + ' data-type="model" data-model-type="' + esc(m.type || 'model') + '" data-name="' + esc(m.name) + '" ' + (hasFile ? 'data-upload-id="' + esc(m.upload_id) + '"' : '') + ' style="accent-color:var(--aih-accent, #D8700D);">' +
-                    '<span style="flex:1;">' + esc(m.name) + (installed ? t('wf.alreadyInstalled') : '') + (!installed && !hasFile ? ' <span style="color:#f87171;">' + t('wf.depNoServerRef') + '</span>' : '') + '</span>' +
+                    '<span style="flex:1;">' + esc(m.name) + (installed ? t('wf.alreadyInstalled') : '') + (!installed && hasFile && m._resolved_ref ? ' <span style="color:#38bdf8;">' + t('wf.depResolved') + '</span>' : '') + (!installed && !hasFile ? ' <span style="color:#f87171;">' + t('wf.depNoServerRef') + '</span>' : '') + '</span>' +
                     '<span style="font-size:10px;color:#666;">' + (m.type || t('wf.modelType')) + '</span></label>';
                   if (!installed && hasFile) {
-                    var typeToFolder = {'checkpoint':'checkpoints','lora':'loras','vae':'vae','clip':'clip','clip_vision':'clip_vision','controlnet':'controlnet','unet':'unet','unet_gguf':'unet_gguf','upscale':'upscale_models','gligen':'gligen','hypernetwork':'hypernetworks','text_encoder':'text_encoders','style_model':'style_models','model':'checkpoints'};
+                    var typeToFolder = {'checkpoint':'checkpoints','lora':'loras','vae':'vae','clip':'clip','clip_vision':'clip_vision','controlnet':'controlnet','unet':'unet','unet_gguf':'unet_gguf','upscale':'upscale_models','gligen':'gligen','hypernetwork':'hypernetworks','text_encoder':'text_encoders','style_model':'style_models','diffusion_model':'diffusion_models','embedding':'embeddings','config':'configs','model':'checkpoints'};
                     var modelBase = (typeToFolder[m.type] || 'checkpoints') + '/';
                     depHtml += '<div style="display:flex;align-items:center;gap:4px;margin-top:4px;">' +
                       '<span class="wf-dep-basepath" style="font-size:10px;color:#666;font-family:monospace;white-space:nowrap;flex-shrink:0;">' + esc(modelBase) + '</span>' +
@@ -1537,6 +1724,25 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
               if (allDeps.loras.length) {
                 if (allDeps.nodes.length || allDeps.models.length) depHtml += '<div style="border-top:1px solid #444;"></div>';
                 depHtml += '<div style="background:#3a3a3e;padding:6px 10px;border-bottom:1px solid #444;"><span style="font-size:11px;color:#a78bfa;font-weight:600;">' + t('wf.loras') + '</span></div>';
+                // Même résolution de secours par nom pour les loras sans upload_id
+                // (parallèle, bornée à 8 s par requête).
+                var missingLoraRefs = [];
+                for (var li = 0; li < allDeps.loras.length; li++) {
+                  if (localLoras.indexOf(allDeps.loras[li].name) < 0 && !allDeps.loras[li].upload_id) {
+                    missingLoraRefs.push(allDeps.loras[li]);
+                  }
+                }
+                if (missingLoraRefs.length) {
+                  var resolvedLRefs = await Promise.all(missingLoraRefs.map(function (ll) {
+                    return resolveRemoteUploadId({ name: ll.name, type: 'lora', size: ll.size });
+                  }));
+                  for (var lri = 0; lri < missingLoraRefs.length; lri++) {
+                    if (resolvedLRefs[lri] && resolvedLRefs[lri].upload_id) {
+                      missingLoraRefs[lri].upload_id = resolvedLRefs[lri].upload_id;
+                      missingLoraRefs[lri]._resolved_ref = true;
+                    }
+                  }
+                }
                 for (var i = 0; i < allDeps.loras.length; i++) {
                   var l = allDeps.loras[i];
                   var installed = localLoras.indexOf(l.name) >= 0;
@@ -1544,7 +1750,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   depHtml += '<div style="padding:6px 10px;border-bottom:1px solid #3a3a3e;font-size:12px;color:' + (installed ? '#34d399' : '#ccc') + ';">' +
                     '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;">' +
                     '<input type="checkbox" class="wf-dep-cb"' + (installed ? '' : ' checked') + ' data-type="lora" data-name="' + esc(l.name) + '" ' + (hasFile ? 'data-upload-id="' + esc(l.upload_id) + '"' : '') + ' style="accent-color:var(--aih-accent, #D8700D);">' +
-                    '<span style="flex:1;">' + esc(l.name) + (installed ? t('wf.alreadyInstalled') : '') + (!installed && !hasFile ? ' <span style="color:#f87171;">' + t('wf.depNoServerRef') + '</span>' : '') + '</span></label>';
+                    '<span style="flex:1;">' + esc(l.name) + (installed ? t('wf.alreadyInstalled') : '') + (!installed && hasFile && l._resolved_ref ? ' <span style="color:#38bdf8;">' + t('wf.depResolved') + '</span>' : '') + (!installed && !hasFile ? ' <span style="color:#f87171;">' + t('wf.depNoServerRef') + '</span>' : '') + '</span></label>';
                   if (!installed && hasFile) {
                     depHtml += '<div style="display:flex;align-items:center;gap:4px;margin-top:4px;">' +
                       '<span class="wf-dep-basepath" style="font-size:10px;color:#666;font-family:monospace;white-space:nowrap;flex-shrink:0;">loras/</span>' +
@@ -1610,8 +1816,14 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
             var panel = document.createElement("div");
             panel.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#1e1e24;border-radius:12px;box-shadow:0 16px 48px rgba(0,0,0,0.6);width:440px;max-height:70vh;z-index:100001;display:flex;flex-direction:column;overflow:hidden;";
             var header = document.createElement("div");
-            header.style.cssText = "padding:12px 16px;border-bottom:1px solid #333;font-size:14px;font-weight:600;color:#e2e8f0;cursor:grab;user-select:none;";
-            header.textContent = title || t("wf.downloadTitle");
+            header.style.cssText = "padding:12px 16px;border-bottom:1px solid #333;font-size:14px;font-weight:600;color:#e2e8f0;cursor:grab;user-select:none;display:flex;align-items:center;justify-content:space-between;gap:8px;";
+            var headerTitle = document.createElement("span");
+            headerTitle.textContent = title || t("wf.downloadTitle");
+            // Progression GLOBALE du lot (N/M) — visible en permanence.
+            var countEl = document.createElement("span");
+            countEl.style.cssText = "font-size:11px;font-weight:600;color:#888;font-family:monospace;white-space:nowrap;";
+            header.appendChild(headerTitle);
+            header.appendChild(countEl);
             panel.appendChild(header);
             makeDraggable(panel, {
               handle: header,
@@ -1629,14 +1841,47 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
             var body = document.createElement("div");
             body.style.cssText = "padding:12px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:8px;";
             panel.appendChild(body);
+            // Barre de progression GLOBALE (fine, sous l'en-tête).
+            var globalBar = document.createElement("div");
+            globalBar.style.cssText = "height:4px;background:rgba(255,255,255,0.08);flex-shrink:0;";
+            var globalFill = document.createElement("div");
+            globalFill.style.cssText = "height:100%;width:0%;background:var(--aih-accent, #D8700D);transition:width 0.3s ease;";
+            globalBar.appendChild(globalFill);
+            panel.insertBefore(globalBar, body);
+            // Bandeau de FIN (récapitulatif) — masqué tant que le lot tourne.
+            var summaryEl = document.createElement("div");
+            summaryEl.style.cssText = "display:none;padding:8px 16px;border-top:1px solid #333;font-size:11px;text-align:center;line-height:1.5;";
+            panel.appendChild(summaryEl);
             var footer = document.createElement("div");
             footer.style.cssText = "padding:10px 16px;border-top:1px solid #333;display:flex;justify-content:flex-end;";
             panel.appendChild(footer);
             document.body.appendChild(panel);
             var rows = {};
+            // Compteurs du récapitulatif final (jamais un échec masqué) :
+            // téléchargés / déjà présents / non téléchargeables / échecs, plus
+            // la progression terminés/total.
+            var stats = { total: 0, finished: 0, downloaded: 0, already: 0, noref: 0, failed: 0, state: "running" };
+            function updateProgress() {
+              countEl.textContent = t("wf.dlProgress", { done: stats.finished, total: stats.total });
+              var pct = stats.total > 0 ? Math.round((stats.finished * 100) / stats.total) : 0;
+              globalFill.style.width = pct + "%";
+            }
+            function renderSummary() {
+              summaryEl.style.display = "block";
+              summaryEl.style.color = stats.failed > 0 ? "#f87171" : (stats.noref > 0 ? "#fbbf24" : "#34d399");
+              summaryEl.textContent = "\u2705 " + t("wf.dlDoneTitle") + " \u2014 " + t("wf.dlRecap", {
+                downloaded: stats.downloaded,
+                already: stats.already,
+                noref: stats.noref,
+                failed: stats.failed,
+              });
+            }
+            updateProgress();
             return {
               panel: panel,
               addRow: function(fileName, sizeBytes, uploadId) {
+                stats.total++;
+                updateProgress();
                 var sizeMB = sizeBytes > 0 ? (sizeBytes / 1048576).toFixed(1) + " MB" : "";
                 var row = document.createElement("div");
                 row.style.cssText = "display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:6px 8px;border-radius:6px;background:#2a2a2e;";
@@ -1663,6 +1908,34 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                 row.appendChild(bar);
                 row.appendChild(speedEl);
                 row.appendChild(sizeEl);
+                // Bouton d'annulation : le transfert tourne CÔTÉ SERVEUR (un
+                // modèle de plusieurs Go) — sans ✕, l'utilisateur devrait
+                // attendre la fin ou recharger la page, et le transfert
+                // continuerait dans le vide. Masqué dès que la ligne est réglée.
+                var cancelBtn = null;
+                if (uploadId) {
+                  cancelBtn = document.createElement("button");
+                  cancelBtn.type = "button";
+                  cancelBtn.className = "wf-dl-cancel";
+                  cancelBtn.textContent = "\u2715";
+                  cancelBtn.title = t("mb.cancelDownload");
+                  cancelBtn.style.cssText = "flex-shrink:0;width:20px;height:20px;line-height:1;padding:0;border:1px solid #555;border-radius:4px;background:transparent;color:#aaa;font-size:11px;cursor:pointer;";
+                  cancelBtn.onclick = (function(uid, btn) {
+                    return function(e) {
+                      e.stopPropagation();
+                      btn.disabled = true;
+                      btn.textContent = "\u2026";
+                      // Route locale /api/aih/* → même brique que les
+                      // transferts (aucun plafond client sur ce POST bref).
+                      HolafFetch.request('/api/aih/models/download/cancel', {
+                        method: 'POST',
+                        body: { upload_id: uid },
+                        timeout: 0,
+                      }).catch(function() {});
+                    };
+                  })(uploadId, cancelBtn);
+                  row.appendChild(cancelBtn);
+                }
                 body.appendChild(row);
                 // Polling de progression
                 var pollInterval = null;
@@ -1677,16 +1950,21 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                       .catch(function(){});
                   }, 500);
                 }
-                rows[fileName] = { row: row, fill: fill, status: statusEl, speedEl: speedEl, pollInterval: pollInterval };
+                rows[fileName] = { row: row, fill: fill, status: statusEl, speedEl: speedEl, pollInterval: pollInterval, settled: false, cancelBtn: cancelBtn };
               },
-              setResult: function(fileName, success, errorMsg) {
+              setResult: function(fileName, success, errorMsg, kind) {
                 var r = rows[fileName];
-                if (!r) return;
+                if (!r || r.settled) return;
+                r.settled = true;
+                stats.finished++;
                 if (r.pollInterval) { clearInterval(r.pollInterval); r.pollInterval = null; }
+                if (r.cancelBtn) { r.cancelBtn.style.display = "none"; }
                 if (success === 'skipped') {
                   // Non téléchargé (aucune référence serveur, déjà local, ou
                   // conservé) : état NEUTRE + raison explicite — jamais un faux
-                  // succès ni un skip muet.
+                  // succès ni un skip muet. `kind` distingue « non
+                  // téléchargeable » (noref) de « déjà présent » (already).
+                  if (kind === 'noref') stats.noref++; else stats.already++;
                   r.status.textContent = "\u23ed";
                   r.fill.style.background = "#6b7280";
                   r.fill.style.animation = "none";
@@ -1699,12 +1977,14 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                     r.row.appendChild(skipEl);
                   }
                 } else if (success) {
+                  stats.downloaded++;
                   r.status.textContent = "\u2705";
                   r.fill.style.background = "#16a34a";
                   r.fill.style.animation = "none";
                   r.fill.style.width = "100%";
                   r.row.style.background = "rgba(22,163,74,0.15)";
                 } else {
+                  stats.failed++;
                   r.status.textContent = "\u274c";
                   r.fill.style.background = "#dc2626";
                   r.fill.style.animation = "none";
@@ -1717,13 +1997,36 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                     r.row.appendChild(errEl);
                   }
                 }
+                updateProgress();
+                if (stats.state === "done") renderSummary();
               },
               done: function() {
-                var closeBtn = document.createElement("button");
-                closeBtn.textContent = t("dialog.close");
-                closeBtn.style.cssText = "padding:6px 16px;border:1px solid #555;border-radius:6px;background:transparent;color:#999;font-size:12px;cursor:pointer;";
-                closeBtn.onclick = function() { panel.remove(); };
-                footer.appendChild(closeBtn);
+                // État FINAL explicite : titre « Téléchargement terminé »,
+                // récapitulatif chiffré toujours affiché (jamais masquer un
+                // échec ni un non-téléchargeable) et bouton « Fermer ».
+                if (stats.state !== "done") {
+                  stats.state = "done";
+                  panel.dataset.state = "done";
+                  headerTitle.textContent = t("wf.dlDoneTitle");
+                  renderSummary();
+                  var closeBtn = document.createElement("button");
+                  closeBtn.textContent = t("dialog.close");
+                  closeBtn.style.cssText = "padding:6px 16px;border:1px solid #555;border-radius:6px;background:transparent;color:#999;font-size:12px;cursor:pointer;";
+                  closeBtn.onclick = function() { panel.remove(); };
+                  footer.appendChild(closeBtn);
+                }
+                return {
+                  total: stats.total, finished: stats.finished,
+                  downloaded: stats.downloaded, already: stats.already,
+                  noref: stats.noref, failed: stats.failed,
+                };
+              },
+              stats: function() {
+                return {
+                  total: stats.total, finished: stats.finished,
+                  downloaded: stats.downloaded, already: stats.already,
+                  noref: stats.noref, failed: stats.failed,
+                };
               },
               close: function() { panel.remove(); }
             };
@@ -1891,8 +2194,22 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                 // `:checked` + data-installed="1" ⇒ l'utilisateur a RECOCHÉ un
                 // node détecté installé ⇒ forçage : on ne le saute pas.
                 var forced = ncb.dataset.installed === '1';
-                if (!forced && nodeMatchesInstalledIndex(installedIndex, nname, nurl)) {
+                // MÊME détection que le badge affiché : le signal « classes de
+                // nodes » (node_types) fait partie de l'index. Il était OMIS ici
+                // (seuls URL/dossier étaient testés) alors que le rendu, lui,
+                // badge sur les classes → un pack reconnu uniquement par ses
+                // classes était quand même installé (400 « already installed »).
+                var ntypes = [];
+                try { ntypes = JSON.parse(decodeURIComponent(ncb.dataset.nodeTypes || "")) || []; }
+                catch (eNt) { ntypes = []; }
+                if (!forced && nodeMatchesInstalledIndex(installedIndex, nname, nurl, ntypes)) {
                   nodesSkippedInstalled++;
+                  // Détection d'installation ABSENTE au rendu (index en panne,
+                  // pack apparu depuis…) mais POSITIVE au chargement : on
+                  // RÉALIGNE l'UI sur l'état réel — case décochée + badge +
+                  // raison — au lieu de laisser une case cochée pour un pack
+                  // déjà installé (aucune tentative, aucun échec).
+                  if (ncb.dataset.installed !== '1') markNodeInstalled(ncb);
                   console.log('[AIH] Node déjà installé, skip: ' + nname);
                   continue;
                 }
@@ -1967,26 +2284,36 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   });
                 } catch(e) { return null; }
               }
-              var skippedDeps = [];  // deps cochées mais NON téléchargées : {name, reason}
+              var skippedDeps = [];  // deps cochées mais NON téléchargées : {name, kind, reason}
               for (var i = 0; i < cbs.length; i++) {
                 var cb = cbs[i];
                 var dtype = cb.dataset.type;
                 var origName = cb.dataset.name;
                 var uploadId = cb.dataset.uploadId;
                 if (dtype !== 'model' && dtype !== 'lora') continue;
-                // Référence serveur absente (upload_id manquant) : l'entrée est
-                // listée dans le workflow mais n'est PAS téléchargeable. On le
-                // DIT explicitement — plus jamais de skip silencieux (c'était
-                // la cause « 8 annoncés / 6 téléchargés »).
+                var modelType = dtype === 'lora' ? 'lora' : (cb.dataset.modelType || 'model');
+                // Dernier filet : si le rendu n'a pas pu résoudre la référence
+                // par nom (liste distante momentanément indisponible), on
+                // retente ICI avant de déclarer l'entrée non téléchargeable.
                 if (!uploadId) {
-                  skippedDeps.push({ name: origName, reason: t('wf.depSkippedNoRef') });
+                  var lateRef = await resolveRemoteUploadId({ name: origName, type: modelType, size: 0 });
+                  if (lateRef && lateRef.upload_id) {
+                    uploadId = lateRef.upload_id;
+                    cb.dataset.uploadId = uploadId;
+                  }
+                }
+                // Référence serveur TOUJOURS absente (upload_id manquant) :
+                // l'entrée est listée dans le workflow mais n'est PAS
+                // téléchargeable. On le DIT explicitement — plus jamais de
+                // skip silencieux (cause « 8 annoncés / 6 téléchargés »).
+                if (!uploadId) {
+                  skippedDeps.push({ name: origName, kind: 'noref', reason: t('wf.depSkippedNoRef') });
                   continue;
                 }
                 var depDiv = cb.closest('div');
                 var pathInput = depDiv ? depDiv.querySelector('.wf-dep-path') : null;
                 var newPath = pathInput ? pathInput.value.trim() : origName;
                 if (!newPath) newPath = origName;
-                var modelType = dtype === 'lora' ? 'lora' : (cb.dataset.modelType || 'model');
 
                 // Get server fingerprint + size for this upload
                 var serverFp = null;
@@ -2023,7 +2350,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   }
                 }
                 if (alreadyLocal) {
-                  skippedDeps.push({ name: origName, reason: t('wf.depSkippedAlreadyLocal', { name: alreadyLocalName }) });
+                  skippedDeps.push({ name: origName, kind: 'already', reason: t('wf.depSkippedAlreadyLocal', { name: alreadyLocalName }) });
                   continue;
                 }
 
@@ -2049,7 +2376,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                     if (conflictResult.action === 'keep') {
                       // Skip download, use local file
                       downloadResults[origName] = newPath;
-                      skippedDeps.push({ name: origName, reason: t('wf.depSkippedKept') });
+                      skippedDeps.push({ name: origName, kind: 'already', reason: t('wf.depSkippedKept') });
                       console.log('[AIH] Conflict resolved: keep local for ' + origName);
                       continue;
                     } else if (conflictResult.action === 'suffix') {
@@ -2084,16 +2411,20 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                 var dlQueue = toDownload.slice();
                 var dlActive = 0;
 
-                // Lignes NON téléchargées D'ABORD (visibles même sans download) :
-                // chaque ligne porte sa raison — jamais un skip muet.
+                // TOUTES les lignes sont ajoutées AVANT tout résultat (non
+                // téléchargées D'ABORD, puis téléchargements en attente) : la
+                // progression globale « N/M » est donc exacte dès l'ouverture.
                 for (var si2 = 0; si2 < skippedDeps.length; si2++) {
                   dlPanel.addRow(skippedDeps[si2].name, 0, null);
-                  dlPanel.setResult(skippedDeps[si2].name, 'skipped', skippedDeps[si2].reason);
                 }
-
-                // Afficher toutes les lignes de téléchargement immediatement (meme en attente)
                 for (var di = 0; di < dlQueue.length; di++) {
                   dlPanel.addRow(dlQueue[di].newName, 0, dlQueue[di].upload_id);
+                }
+                // Puis l'état (raison explicite) des non téléchargées — chaque
+                // ligne porte sa raison, jamais un skip muet.
+                for (var si3 = 0; si3 < skippedDeps.length; si3++) {
+                  dlPanel.setResult(skippedDeps[si3].name, 'skipped', skippedDeps[si3].reason,
+                                    skippedDeps[si3].kind || 'already');
                 }
 
                 function startNext() {
@@ -2129,16 +2460,34 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   }
                 }
                 startNext();
-                // Attendre que tous les downloads soient termines
-                await new Promise(function(resolve) {
-                  var checkDone = setInterval(function() {
-                    if (dlActive === 0 && dlQueue.length === 0) {
-                      clearInterval(checkDone);
-                      resolve();
-                    }
-                  }, 500);
-                });
-                dlPanel.done();
+                // Attendre que tous les downloads soient termines. try/finally :
+                // une exception entre l'ouverture du panneau et la fin ne doit
+                // JAMAIS laisser la fenêtre figée en « en cours » (l'état final
+                // « Terminé » + récap doit toujours être posé).
+                try {
+                  await new Promise(function(resolve) {
+                    var checkDone = setInterval(function() {
+                      if (dlActive === 0 && dlQueue.length === 0) {
+                        clearInterval(checkDone);
+                        resolve();
+                      }
+                    }, 500);
+                  });
+                } finally {
+                  dlPanel.done();
+                }
+                var dlStats = dlPanel.stats();
+                // Récapitulatif final AUSSI en toast si des échecs réels sont
+                // survenus : jamais d'échec visible uniquement dans un panneau
+                // qu'on peut fermer.
+                if (dlStats.failed > 0) {
+                  aihToast(t('wf.dlRecapToast', {
+                    downloaded: dlStats.downloaded,
+                    already: dlStats.already,
+                    noref: dlStats.noref,
+                    failed: dlStats.failed,
+                  }), 'error');
+                }
               }
 
               // Résumé explicite des déps non téléchargées (toast) : même quand

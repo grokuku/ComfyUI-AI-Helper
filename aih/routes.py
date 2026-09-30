@@ -99,6 +99,48 @@ from aih import credentials
 _PACK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def extension_assets_no_cache_headers(headers, path, extension_name):
+    """Force la REVALIDATION HTTP des assets de l'extension servis par ComfyUI.
+
+    ComfyUI sert ``WEB_DIRECTORY`` (ici ``js/``) sous
+    ``/extensions/<dossier custom_nodes>/...`` via ``aiohttp.web.static`` :
+    la réponse ne portait AUCUN ``Cache-Control``, donc les navigateurs (et
+    les proxies) appliquaient une fraîcheur heuristique et pouvaient continuer
+    à exécuter un ``.js`` PÉRIMÉ après la mise à jour du pack — c'est la cause
+    prouvée des correctifs « livrés » qui semblaient inactifs (ancien
+    ``aih_workflow_share.js`` encore exécuté par le navigateur).
+
+    ``no-cache, must-revalidate`` ne supprime pas le cache : il OBLIGE la
+    revalidation ETag/Last-Modified à chaque chargement (304 sans corps si le
+    fichier n'a pas changé) → jamais de contenu ancien, coût bande passante nul.
+
+    Args:
+        headers: en-têtes de la réponse (objet mutable type CIMultiDict).
+        path: chemin de la requête (``request.path``).
+        extension_name: nom du dossier de l'extension (segment d'URL).
+
+    Returns:
+        bool: True si les en-têtes anti-cache ont été posés.
+    """
+    if headers is None or not path or not extension_name:
+        return False
+    try:
+        raw = str(path)
+        # Ceinture de sécurité : un chemin contenant un segment « .. » ne peut
+        # jamais viser légitimement un asset de l'extension (aiohttp sert déjà
+        # normalisé, mais la fonction pure doit être sûre par elle-même).
+        if ".." in [seg for seg in raw.split("/") if seg not in ("", ".")]:
+            return False
+        prefix = "/extensions/" + str(extension_name).strip("/") + "/"
+        if not raw.startswith(prefix):
+            return False
+        headers["Cache-Control"] = "no-cache, must-revalidate"
+        headers["Pragma"] = "no-cache"
+        return True
+    except Exception:
+        return False
+
+
 # ── Helpers communs ───────────────────────────────────────────────────
 
 def _get_aih_user_dir():
@@ -792,6 +834,28 @@ def _register_models_group(r):
         except Exception as e:
             import logging as _log
             _log.exception(f"[AIH] download-model error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    @r.post("/api/aih/models/download/cancel")
+    async def aih_cancel_download(request):
+        """Annule le download en cours pour ``upload_id`` (cooperatif).
+
+        Le transfert est en cours dans l'executor : cette route ne fait que
+        poser un drapeau consulte par la boucle de streaming (HTTP ou callback
+        SFTP). Le handler du download abandonne alors, supprime le ``.part`` et
+        repond ``{success: false, cancelled: true, error: 'Téléchargement
+        annulé'}``. Idempotente : un id inconnu repond ok sans effet.
+        """
+        try:
+            body = await request.json()
+            upload_id = body.get("upload_id", "")
+            if not upload_id:
+                return web.json_response({"error": "upload_id required"}, status=400)
+            _model_mgr.request_download_cancel(upload_id)
+            return web.json_response({"ok": True})
+        except Exception as e:
+            import logging as _log
+            _log.exception(f"[AIH] download-cancel error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
 
