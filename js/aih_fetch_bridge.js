@@ -149,12 +149,15 @@ function resolveConfig() {
  * Lecture seule de la config serveur courante (serverUrl + apiKey), SANS
  * requête réseau. Utilisé par le garde-fou du switch de source galerie
  * (image_viewer_source_switch.js) pour savoir si le serveur est configuré.
- * @returns {{serverUrl: string, apiKey: string}} valeurs résolues (serverUrl
- *   normalisée, sans slash final ni suffixe "/api").
+ * `apiKeyMasked` est un DRAPEAU (jamais la valeur masquée) : une clé enregistrée
+ * qui est en réalité un texte de masquage est blanchie par resolveConfig et
+ * seul ce drapeau la signale, pour que l'appelant affiche un message précis.
+ * @returns {{serverUrl: string, apiKey: string, apiKeyMasked: boolean}} valeurs
+ *   résolues (serverUrl normalisée, sans slash final ni suffixe "/api").
  */
 export function getRemoteConfig() {
     const cfg = resolveConfig();
-    return { serverUrl: cfg.serverUrl, apiKey: cfg.apiKey };
+    return { serverUrl: cfg.serverUrl, apiKey: cfg.apiKey, apiKeyMasked: cfg.apiKeyMasked === true };
 }
 
 /**

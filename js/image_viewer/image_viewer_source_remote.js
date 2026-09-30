@@ -91,12 +91,15 @@
  * ENREGISTREMENT (garde-fou cohérent avec l'étape 1)
  * ─────────────────────────────────────────────────────────────────────────────
  * Le provider n'est enregistré QUE si le serveur est configuré (serverUrl +
- * token). Au chargement de ce module, `ensureRemoteSourceRegistered()` tente
- * l'enregistrement ; c'est aussi la fonction appelée par les tests. Sans config,
- * le provider reste absent du registre : le garde-fou de l'étape 1 (image_viewer
- * _source_switch.js → evaluateSourceSwitch) refuse alors la bascule avec
- * `reason: 'not-implemented'` (ou 'not-configured' si le token manque).
- * Conséquence : l'option « Serveur » ne s'active qu'avec une config complète.
+ * une clé UTILISABLE : un texte de masquage est blanchi par le bridge et n'est
+ * jamais considéré comme une clé). Au chargement de ce module,
+ * `ensureRemoteSourceRegistered()` tente l'enregistrement ; le module de switch
+ * (image_viewer_source_switch.js → getRemoteStatus) le rappelle paresseusement
+ * pour rattraper une config enregistrée APRÈS le démarrage de ComfyUI, sans
+ * redémarrer. Sans config, le provider reste absent du registre : le garde-fou
+ * de l'étape 1 refuse alors la bascule avec `reason: 'not-configured'` (clé
+ * absente) ou 'masked-key' (clé = texte de masquage). Conséquence : l'option
+ * « Serveur » ne s'active qu'avec une config complète et valide.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * PLEIN ÉCRAN (étape 4)

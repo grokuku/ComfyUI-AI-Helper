@@ -885,8 +885,9 @@ class ImageViewerUI {
 
     /**
      * Rend l'état du switch de source : sélection, garde-fou « serveur non
-     * configuré » (option grisée + guidage AIH ▸ Paramètres serveur) et, si la
-     * source active est 'remote', l'indice de l'hôte configuré.
+     * configuré » (option grisée + guidage AIH ▸ Paramètres serveur / message
+     * précis si la clé enregistrée est un texte de masquage) et, si la source
+     * active est 'remote', l'indice de l'hôte configuré.
      * @param {object} state — instantané d'imageViewerState.
      */
     _renderSourceGroup(state) {
@@ -895,24 +896,35 @@ class ImageViewerUI {
 
         const currentId = normalizeSourceId(state && state.ui ? state.ui.gallery_source : SOURCE_LOCAL);
         const remote = getRemoteStatus();
+        // Une clé enregistrée qui est un TEXTE DE MASQUAGE a été blanchie : on
+        // affiche un message précis (ressaisir la clé) au lieu du guidage
+        // générique « non configuré » ou du message trompeur « non disponible ».
+        const maskedKey = remote.apiKeyMasked === true;
 
         buttons.local.classList.toggle('active', currentId === SOURCE_LOCAL);
         buttons.remote.classList.toggle('active', currentId === SOURCE_REMOTE);
         buttons.local.setAttribute('aria-checked', String(currentId === SOURCE_LOCAL));
         buttons.remote.setAttribute('aria-checked', String(currentId === SOURCE_REMOTE));
 
-        // Garde-fou : pas de serveur/token → option Serveur désactivée (grisée)
-        // avec guidage vers le menu AIH (titre + note visible).
+        // Garde-fou : pas de serveur/clé utilisable → option Serveur désactivée
+        // (grisée) avec guidage vers le menu AIH (titre + note visible).
         buttons.remote.disabled = !remote.configured;
-        buttons.remote.title = remote.configured ? t('iv.sourceRemoteTitle') : t('iv.sourceRemoteDisabled');
+        buttons.remote.title = maskedKey
+            ? t('iv.sourceRemoteMaskedKey')
+            : remote.configured
+                ? t('iv.sourceRemoteTitle')
+                : t('iv.sourceRemoteDisabled');
 
         let note = '';
-        if (!remote.configured) {
+        if (maskedKey) {
+            note = t('iv.sourceRemoteMaskedKey');
+        } else if (!remote.configured) {
             note = t('iv.sourceRemoteDisabled');
         } else if (currentId === SOURCE_REMOTE) {
             note = t('iv.sourceRemoteHost', { host: describeRemoteHost(remote.serverUrl) });
         } else if (!remote.hasProvider) {
-            // Étape 2 non livrée : provider 'remote' non enregistré.
+            // Cas résiduel : provider 'remote' non enregistrable alors que la
+            // config est valide (l'enregistrement paresseux a échoué).
             note = t('iv.sourceRemoteUnavailable');
         }
         if (this.elements.sourceNote) this.elements.sourceNote.textContent = note;
@@ -920,7 +932,8 @@ class ImageViewerUI {
 
     /**
      * Bascule demandée par l'utilisateur. Le refus est PROPRE : aucun état
-     * modifié, message explicite (garde-fou non configuré ou étape 2 non livrée).
+     * modifié, message explicite (serveur non configuré, clé masquée à
+     * ressaisir, ou provider distant non enregistrable).
      * @param {string} targetId — SOURCE_LOCAL | SOURCE_REMOTE.
      */
     async _handleSourceSelect(targetId) {
@@ -928,11 +941,13 @@ class ImageViewerUI {
             const viewer = this.callbacks.getViewer();
             const result = await applySourceSwitch(viewer, targetId);
             if (!result.ok) {
-                const key = result.reason === 'not-configured'
-                    ? 'iv.sourceRemoteDisabled'
-                    : result.reason === 'not-implemented'
-                        ? 'iv.sourceRemoteUnavailable'
-                        : 'iv.sourceSwitchError';
+                const key = result.reason === 'masked-key'
+                    ? 'iv.sourceRemoteMaskedKey'
+                    : result.reason === 'not-configured'
+                        ? 'iv.sourceRemoteDisabled'
+                        : result.reason === 'not-implemented'
+                            ? 'iv.sourceRemoteUnavailable'
+                            : 'iv.sourceSwitchError';
                 const message = key === 'iv.sourceSwitchError'
                     ? t(key, { message: (result.error && result.error.message) || '' })
                     : t(key);

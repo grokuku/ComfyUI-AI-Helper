@@ -19,7 +19,10 @@
 //   6. clé déjà enregistrée = masque (GET /aih/credentials avec
 //      api_key_masked) → ignorée, avertissement affiché ;
 //   7. bridge : une clé masquée en localStorage n'est jamais envoyée en
-//      Authorization: Bearer (aucune requête distante émise).
+//      Authorization: Bearer (aucune requête distante émise) ;
+//   8. sauvegarde RÉUSSIE → événement « aih-credentials-changed » (la galerie
+//      ré-enregistre sa source « Serveur » sans redémarrer ComfyUI) ; une
+//      sauvegarde refusée n'émet AUCUN événement.
 //
 // Usage : node js/test_aih_account_api_key_mask.mjs
 //   jsdom est résolu par js/test_helpers/jsdom_loader.mjs ; introuvable =
@@ -170,6 +173,13 @@ assert.deepStrictEqual(copied, [REAL_KEY], "toujours AUCUN masque copié");
 const saveBtn = Array.from(container.querySelectorAll("button"))
     .find((b) => /Sauvegarder|Save/.test(b.textContent));
 assert.ok(saveBtn, "bouton Enregistrer présent");
+
+// Notification post-sauvegarde consommée par la galerie (holaf_image_viewer.js)
+// pour ré-enregistrer la source « Serveur » sans redémarrer ComfyUI.
+const credEvents = [];
+const onCredEvent = (e) => credEvents.push(e.detail);
+doc.addEventListener("aih-credentials-changed", onCredEvent);
+
 saveBtn.click();
 await flush();
 assert.strictEqual(posts.length, 0,
@@ -177,6 +187,7 @@ assert.strictEqual(posts.length, 0,
 assert.ok(statusEl.textContent.includes("Refusé"),
     "message clair de refus de sauvegarde du masque");
 assert.strictEqual(inputKey.value, "", "champ nettoyé après refus (aucun masque résiduel)");
+assert.strictEqual(credEvents.length, 0, "sauvegarde refusée → AUCUN événement de config");
 
 // ── 5. La vraie clé reste acceptée (le garde-fou ne bloque pas les vraies) ─
 inputKey.value = REAL_KEY;
@@ -187,6 +198,11 @@ assert.strictEqual(posts.length, 1, "POST /aih/credentials émis pour la vraie c
 assert.strictEqual(posts[0].api_key, REAL_KEY, "la vraie clé est bien enregistrée");
 const cached = JSON.parse(localStorage.getItem("AIH_config"));
 assert.strictEqual(cached.apiKey, REAL_KEY, "cache localStorage mis à jour avec la vraie clé");
+doc.removeEventListener("aih-credentials-changed", onCredEvent);
+assert.strictEqual(credEvents.length, 1,
+    "sauvegarde réussie → événement aih-credentials-changed (galerie rafraîchie)");
+assert.strictEqual(credEvents[0].serverUrl, "https://aih.holaf.fr", "URL normalisée transmise");
+assert.strictEqual(credEvents[0].hasUsableKey, true, "clé utilisable signalée");
 
 // ── 6. Bridge : clé masquée en localStorage ≠ Bearer ─────────────────────
 assert.strictEqual(window.AIHFetchBridge.isMaskedApiKey(MASK), true,

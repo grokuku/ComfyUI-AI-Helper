@@ -6,14 +6,16 @@
 //   2. persistance : défaut 'local', clé absente → 'local', clé invalide →
 //      'local', 'remote' chargé tel quel ; save-settings POSTe gallery_source ;
 //   3. module de bascule (image_viewer_source_switch.js) : normalisation,
-//      garde-fou « serveur non configuré » ('not-configured'), refus temporaire
-//      « provider remote absent » ('not-implemented'), exécution réelle avec un
-//      provider factice (arrêt du poll, reset état/sélection, setActive +
-//      ré-ancrage collection, persistance, rechargement), no-op sans effet ;
+//      garde-fou « serveur non configuré » ('not-configured'), enregistrement
+//      PARESSEUX du provider quand la config devient valide ('remote' accepté
+//      sans redémarrer ComfyUI), refus 'masked-key' si la clé enregistrée est
+//      un texte de masquage, exécution réelle avec un provider factice (arrêt
+//      du poll, reset état/sélection, setActive + ré-ancrage collection,
+//      persistance, rechargement), no-op sans effet ;
 //   4. UI (jsdom) : groupe « Source » EN TÊTE du pane gauche, sélection par
 //      défaut = Local, option Serveur GRISÉE sans serveur configuré (+ guidage
-//      AIH), clic refusé proprement avec message quand le serveur est configuré
-//      mais l'étape 2 absente, indice de l'hôte serveur si source = remote ;
+//      AIH), clic après configuration → bascule effective (rattrapage),
+//      message PRÉCIS si clé masquée, indice de l'hôte serveur si remote ;
 //   5. contrôles négatifs : apply('remote') sans provider → aucun état modifié
 //      (activeId, gallery_source) ; reconcilier une valeur persistée 'remote'
 //      indisponible → repli 'local' persisté.
@@ -73,7 +75,7 @@ await import("./aih_strings.js");
 
 const SOURCE_KEYS = [
     "iv.source", "iv.sourceLocal", "iv.sourceRemote", "iv.sourceRemoteTitle",
-    "iv.sourceRemoteDisabled", "iv.sourceRemoteUnavailable", "iv.sourceRemoteHost",
+    "iv.sourceRemoteDisabled", "iv.sourceRemoteMaskedKey", "iv.sourceRemoteUnavailable", "iv.sourceRemoteHost",
     "iv.sourceSwitchError",
 ];
 for (const key of SOURCE_KEYS) {
@@ -83,6 +85,8 @@ for (const key of SOURCE_KEYS) {
 assert.strictEqual(captured.fr["iv.sourceLocal"], "Local");
 assert.strictEqual(captured.fr["iv.sourceRemote"], "Serveur");
 assert.strictEqual(captured.en["iv.sourceRemote"], "Server");
+assert.ok(captured.fr["iv.sourceRemoteMaskedKey"].includes("ressaisissez"), "FR masque → invite à ressaisir");
+assert.ok(captured.en["iv.sourceRemoteMaskedKey"].includes("re-enter"), "EN masque → invite à ressaisir");
 assert.ok(captured.fr["iv.sourceRemoteHost"].includes("{host}"), "placeholder {host} FR");
 assert.ok(captured.en["iv.sourceRemoteHost"].includes("{host}"), "placeholder {host} EN");
 assert.ok(captured.fr["iv.sourceSwitchError"].includes("{message}"), "placeholder {message} FR");
@@ -153,23 +157,49 @@ assert.strictEqual(switchMod.normalizeSourceId("local"), "local");
 window.localStorage.removeItem("AIH_config");
 let remote = switchMod.getRemoteStatus();
 assert.strictEqual(remote.configured, false, "sans config → non configuré");
-assert.strictEqual(remote.hasProvider, false, "provider remote non enregistré (étape 1)");
+assert.strictEqual(remote.hasProvider, false, "provider remote non enregistré sans config");
+assert.strictEqual(remote.apiKeyMasked, false, "sans clé → pas de drapeau masque");
 let decision = switchMod.evaluateSourceSwitch("remote");
 assert.strictEqual(decision.ok, false);
 assert.strictEqual(decision.reason, "not-configured", "refus : serveur non configuré");
 assert.strictEqual(switchMod.evaluateSourceSwitch("local").ok, true, "local toujours autorisé");
 
-// serverUrl sans token → considéré non configuré (token requis).
+// serverUrl sans clé → considéré non configuré (clé requise).
 window.localStorage.setItem("AIH_config", JSON.stringify({ serverUrl: "https://aih.example.com:8443", apiKey: "" }));
-assert.strictEqual(switchMod.getRemoteStatus().configured, false, "serverUrl sans token → non configuré");
+assert.strictEqual(switchMod.getRemoteStatus().configured, false, "serverUrl sans clé → non configuré");
+assert.strictEqual(GallerySource.has("remote"), false, "aucun provider enregistré sans clé utilisable");
 
-// serverUrl + token → configuré, mais provider absent (étape 2 non livrée).
+// RÉGRESSION CORRIGÉE : serverUrl + clé utilisable APRÈS le chargement du
+// module → le provider s'enregistre à la demande, sans recharger ComfyUI.
+// (Avant correctif : hasProvider=false → 'not-implemented' → toast
+// « Source serveur non disponible dans cette version. »)
 window.localStorage.setItem("AIH_config", JSON.stringify({ serverUrl: "https://aih.example.com:8443", apiKey: "tok" }));
-assert.strictEqual(switchMod.getRemoteStatus().configured, true, "serverUrl + token → configuré");
+const configured = switchMod.getRemoteStatus();
+assert.strictEqual(configured.configured, true, "serverUrl + clé → configuré");
+assert.strictEqual(configured.hasProvider, true, "provider 'remote' enregistré paresseusement (config après démarrage)");
 decision = switchMod.evaluateSourceSwitch("remote");
-assert.strictEqual(decision.ok, false);
-assert.strictEqual(decision.reason, "not-implemented", "refus temporaire : provider remote absent");
-ok("normalisation + 'not-configured' (sans token) + 'not-implemented' (étape 2 absente)");
+assert.strictEqual(decision.ok, true, "bascule acceptée immédiatement après configuration");
+ok("normalisation + 'not-configured' (sans clé) + enregistrement paresseux (config après démarrage)");
+
+// Contrôle NÉGATIF : la clé MASQUÉE n'est jamais utilisable → 'masked-key'
+// (et l'enregistrement paresseux ne doit PAS créer le provider).
+GallerySource.unregister("remote");
+window.localStorage.setItem("AIH_config", JSON.stringify({
+    serverUrl: "https://aih.example.com:8443",
+    apiKey: "Clé masquée — clique sur « Régénérer » pour en afficher une nouvelle.",
+}));
+let masked = switchMod.getRemoteStatus();
+assert.strictEqual(masked.apiKeyMasked, true, "clé masquée signalée par le bridge");
+assert.strictEqual(masked.hasApiKey, false, "clé masquée blanchie");
+assert.strictEqual(masked.configured, false, "clé masquée → non configuré");
+assert.strictEqual(masked.hasProvider, false, "aucun provider enregistré avec une clé masquée");
+assert.deepStrictEqual(switchMod.evaluateSourceSwitch("remote"),
+    { ok: false, id: "remote", reason: "masked-key" }, "refus PRÉCIS : clé masquée à ressaisir");
+ok("'masked-key' (clé = texte de masquage) + jamais d'enregistrement avec un masque");
+
+// Retour à une config valide pour la suite : le provider réel peut être
+// enregistré paresseusement, le provider FACTICE de la section 4 le remplacera.
+window.localStorage.setItem("AIH_config", JSON.stringify({ serverUrl: "https://aih.example.com:8443", apiKey: "tok" }));
 
 // Indice d'hôte (affichage).
 assert.strictEqual(switchMod.describeRemoteHost("https://aih.example.com:8443/"), "aih.example.com:8443");
@@ -252,12 +282,13 @@ assert.strictEqual(GallerySource.activeId(), "local");
 assert.strictEqual(imageViewerState.getState().ui.gallery_source, "local");
 ok("bascule complète (poll/état/sélection/collection/persistance/reload) + no-op + retour local");
 
-// Contrôle négatif : refus 'not-implemented' → AUCUNE modification d'état.
+// Contrôle négatif : refus sans provider NI config → AUCUNE modification d'état.
 GallerySource.unregister("remote");
+window.localStorage.removeItem("AIH_config");
 imageViewerState.setState({ ui: { gallery_source: "local" }, images: [{}], selectedImages: new Set([{ path_canon: "x" }]) });
 const refused = await switchMod.applySourceSwitch(fakeViewer, "remote");
 assert.strictEqual(refused.ok, false);
-assert.strictEqual(refused.reason, "not-implemented");
+assert.strictEqual(refused.reason, "not-configured");
 assert.strictEqual(GallerySource.activeId(), "local", "registre inchangé après refus");
 assert.strictEqual(imageViewerState.getState().ui.gallery_source, "local", "état inchangé après refus");
 assert.strictEqual(imageViewerState.getState().selectedImages.length, 1, "sélection préservée après refus");
@@ -332,21 +363,43 @@ I18n.setLocale("fr");
 el = buildUI();
 ok("libellés/guidage i18n : panneau reconstruit FR → EN → FR");
 
-// Serveur configuré mais étape 2 absente : option activée, clic → refus + message.
+// Serveur configuré APRÈS le chargement (cas du signalement) : le provider
+// s'enregistre paresseusement → option activée, note vide, clic → bascule RÉELLE
+// (plus de toast « Source serveur non disponible dans cette version. »).
 window.localStorage.setItem("AIH_config", JSON.stringify({ serverUrl: "https://aih.example.com:8443", apiKey: "tok" }));
 UI._render(imageViewerState.getState());
 assert.strictEqual(el.remote.disabled, false, "serveur configuré → option activée");
-assert.strictEqual(el.note.textContent, I18n.t("iv.sourceRemoteUnavailable"), "note étape 2 absente");
+assert.strictEqual(el.note.textContent, "", "aucune note d'indisponibilité quand le provider est enregistré");
+assert.strictEqual(GallerySource.has("remote"), true, "provider enregistré à la demande");
 toasts.length = 0;
 el.remote.click();
 await sleep(20);
+assert.strictEqual(toasts.length, 0, "aucun toast de refus");
+assert.strictEqual(imageViewerState.getState().ui.gallery_source, "remote", "bascule effective");
+assert.strictEqual(GallerySource.activeId(), "remote", "registre basculé sur remote");
+ok("clic Serveur (config après démarrage) → provider enregistré à la demande + bascule effective");
+
+// Clé enregistrée = TEXTE DE MASQUAGE : option grisée (aucune clé utilisable) +
+// message PRÉCIS invitant à ressaisir la clé ; refus programmé 'masked-key'.
+await switchMod.applySourceSwitch(fakeViewer, "local");
+GallerySource.unregister("remote");
+window.localStorage.setItem("AIH_config", JSON.stringify({
+    serverUrl: "https://aih.example.com:8443",
+    apiKey: "Clé masquée — clique sur « Régénérer » pour en afficher une nouvelle.",
+}));
+UI._render(imageViewerState.getState());
+assert.strictEqual(el.remote.disabled, true, "clé masquée → option grisée");
+assert.strictEqual(el.remote.title, I18n.t("iv.sourceRemoteMaskedKey"), "tooltip précis anti-masque");
+assert.strictEqual(el.note.textContent, I18n.t("iv.sourceRemoteMaskedKey"), "note précise anti-masque");
+assert.strictEqual(GallerySource.has("remote"), false, "aucun provider enregistré avec une clé masquée");
+toasts.length = 0;
+await UI._handleSourceSelect("remote");
 assert.strictEqual(toasts.length, 1, "un message de refus affiché");
-assert.strictEqual(toasts[0].message, I18n.t("iv.sourceRemoteUnavailable"), "message de refus explicite");
+assert.strictEqual(toasts[0].message, I18n.t("iv.sourceRemoteMaskedKey"), "message précis (ressaisir la clé)");
 assert.strictEqual(toasts[0].type, "warning");
 assert.strictEqual(imageViewerState.getState().ui.gallery_source, "local", "état reste local après refus");
-assert.strictEqual(GallerySource.activeId(), "local", "registre reste local après refus");
 assert.ok(el.local.classList.contains("active"), "contrôle resynchronisé sur Local");
-ok("clic Serveur (configuré, étape 2 absente) → toast de refus + état inchangé");
+ok("clé masquée → message précis + provider jamais enregistré + état inchangé");
 
 // Cas limite : tentative programmée sans config (UI périmée) → refus 'not-configured'.
 window.localStorage.removeItem("AIH_config");

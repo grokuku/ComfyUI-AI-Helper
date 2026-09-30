@@ -584,6 +584,19 @@ import {
                         serverUrl: serverUrl,
                         apiKey: apiKey,
                     });
+                    // La source « Serveur » de la galerie enregistre son provider
+                    // à la demande (image_viewer_source_switch.js), mais on
+                    // notifie l'app pour rafraîchir immédiatement l'état du
+                    // switch (note/tooltip) sans redémarrer ComfyUI. Événement
+                    // local, sans réseau ; sans listener il ne fait rien.
+                    const CE = (typeof window !== 'undefined' && typeof window.CustomEvent === 'function')
+                        ? window.CustomEvent
+                        : (typeof CustomEvent === 'function' ? CustomEvent : null);
+                    if (typeof document !== 'undefined' && CE) {
+                        document.dispatchEvent(new CE('aih-credentials-changed', {
+                            detail: { serverUrl, hasUsableKey: isUsableApiKey(apiKey) },
+                        }));
+                    }
                     // Nettoyage de l'affichage après succès : URL normalisée
                     // (déjà réécrite ci-dessus) et jamais de masque en valeur.
                     inputKey.value = apiKey;

@@ -25,10 +25,12 @@ import { holafExtUrl } from './holaf_ext_base.js';
 import * as Settings from './image_viewer/image_viewer_settings.js';
 import { GallerySource } from './image_viewer/image_viewer_source.js';
 // Effet de bord : enregistre la source 'remote' SI le serveur AIH est configuré
-// (serverUrl + token). Sinon le garde-fou de l'étape 1 garde l'option grisée.
+// (serverUrl + clé utilisable). Sinon le garde-fou de l'étape 1 garde l'option
+// grisée. Le switch réessaie l'enregistrement à la demande (config validée
+// après le démarrage) et sur l'événement « aih-credentials-changed ».
 // REMOTE_POLL_LIMIT : taille de la tête lue à chaque tick du poll serveur.
 import { REMOTE_POLL_LIMIT } from './image_viewer/image_viewer_source_remote.js';
-import { reconcileStoredSource } from './image_viewer/image_viewer_source_switch.js';
+import { reconcileStoredSource, refreshRemoteSourceRegistration } from './image_viewer/image_viewer_source_switch.js';
 import { UI, createThemeMenu } from './image_viewer/image_viewer_ui.js';
 import { initGallery, syncGallery, refreshThumbnailInGallery, forceRelayout, refreshAfterIncremental } from './image_viewer/image_viewer_gallery.js';
 import { PAGE_SIZE, setWindowLoaded, resetWindowCache, forEachLoadedImage, insertImagesAtTop, removeImagesByPaths } from './image_viewer/image_viewer_data.js';
@@ -1595,6 +1597,19 @@ const holafImageViewer = {
             .catch(() => {});
     },
 };
+
+// ── Rattrapage de config serveur SANS redémarrage ─────────────────────────
+// L'onglet Compte (aih_menu.js) émet « aih-credentials-changed » après une
+// sauvegarde réussie. On ré-enregistre le provider distant (idempotent, sans
+// réseau) et on re-rend le groupe Source : l'option « Serveur » se réactive
+// immédiatement, sans recharger ComfyUI ni ressaisir la clé. Si l'UI n'est pas
+// encore construite, le rendu est un no-op sûr (_render sort tôt).
+if (typeof document !== 'undefined') {
+    document.addEventListener('aih-credentials-changed', () => {
+        refreshRemoteSourceRegistration();
+        if (holafImageViewer.isInitialized) UI._render(imageViewerState.getState());
+    });
+}
 
 (async () => {
     const isStandalone = window.location.pathname.startsWith('/holaf/view');

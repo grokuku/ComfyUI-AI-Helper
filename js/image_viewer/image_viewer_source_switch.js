@@ -21,24 +21,40 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * ÉTAT ÉTAPE 2 (livré)
  * ─────────────────────────────────────────────────────────────────────────────
- * Le provider 'remote' (image_viewer_source_remote.js) est désormais IMPLÉMENTÉ
- * et ENREGISTRÉ au chargement SI le serveur est configuré (serverUrl + token).
+ * Le provider 'remote' (image_viewer_source_remote.js) est IMPLÉMENTÉ et
+ * enregistré dès que le serveur est configuré (serverUrl + clé UTILISABLE).
  * Le garde-fou `hasProvider` de ce module ouvre donc la bascule pour de vrai :
  *   - serveur configuré → 'remote' enregistré → `evaluateSourceSwitch('remote')`
  *     accepte et `applySourceSwitch` bascule réellement ;
  *   - serveur NON configuré → provider absent → refus 'not-configured' (grisé).
- * Aucune modification du garde-fou n'a été nécessaire (il lisait déjà le
- * registre). PAGE_SIZE (image_viewer_data.js) est réaligné sur le pageSize de
- * la source active (local 500 ↔ serveur 200) par rebindSourceCollection().
+ * PAGE_SIZE (image_viewer_data.js) est réaligné sur le pageSize de la source
+ * active (local 500 ↔ serveur 200) par rebindSourceCollection().
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * RATTRAPAGE DE CONFIGURATION (correctif « source serveur non disponible »)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Bug réel : le provider n'était enregistré QU'UNE FOIS, à l'évaluation du
+ * module distant (au démarrage de ComfyUI). Une config enregistrée APRÈS ce
+ * démarrage — ou une clé masquée blanchie à la lecture — laissait alors
+ * `configured:true` (la config courante est valide) mais `hasProvider:false`,
+ * d'où le refus « not-implemented » et le toast trompeur « Source serveur non
+ * disponible dans cette version. » alors que la source était livrée.
+ * Correctif : `getRemoteStatus()` tente un enregistrement paresseux IDEMPOTENT
+ * à chaque lecture d'état (clic, rendu de l'UI, réconciliation). Le provider
+ * s'enregistre donc sans redémarrer ComfyUI dès que la config devient valide.
+ * La clé masquée n'est JAMAIS considérée comme utilisable (garde-fou intact).
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * REASONS DE REFUS (contrat stable pour l'UI)
  * ─────────────────────────────────────────────────────────────────────────────
  *   'not-configured' : serveur/token absents → option « Serveur » grisée,
  *                      guidage « AIH ▸ Paramètres serveur ».
- *   'not-implemented': serveur configuré mais provider 'remote' non enregistré
- *                      (ne survient plus qu'au chargement si la config est
- *                      incomplète — sinon le provider est enregistré à l'étape 2).
+ *   'masked-key'     : une clé est enregistrée mais c'est un TEXTE DE MASQUAGE
+ *                      (blanchi, jamais émis en Bearer) → message précis
+ *                      invitant à ressaisir la vraie clé (iv.sourceRemoteMaskedKey).
+ *   'not-implemented': serveur configuré mais provider 'remote' impossible à
+ *                      enregistrer (cas résiduel : échec d'enregistrement) ;
+ *                      ne signifie plus « étape 2 absente ».
  *   'error'          : échec technique pendant la bascule (rollback effectué).
  */
 
@@ -46,6 +62,9 @@ import { GallerySource } from './image_viewer_source.js';
 import { imageViewerState } from './image_viewer_state.js';
 import { resetWindowCache, rebindSourceCollection } from './image_viewer_data.js';
 import { getRemoteConfig } from '../aih_fetch_bridge.js';
+// Le provider distant est enregistré à la demande (idempotent) : une config
+// validée après le démarrage doit s'appliquer sans redémarrer ComfyUI.
+import { ensureRemoteSourceRegistered } from './image_viewer_source_remote.js';
 
 export const SOURCE_LOCAL = 'local';
 export const SOURCE_REMOTE = 'remote';
@@ -56,13 +75,35 @@ export function normalizeSourceId(value) {
 }
 
 /**
+ * Enregistrement PARESSEUX du provider 'remote' (idempotent, sans réseau).
+ * Exporté pour être appelé par l'UI/les tests et pour que le garde-fou puisse
+ * rattraper une configuration arrivée après le démarrage de ComfyUI. Ne lève
+ * jamais : un échec d'enregistrement laisse simplement `hasProvider:false`
+ * (l'UI affiche alors le refus 'not-implemented').
+ * @returns {boolean} true si le provider est (désormais) enregistré.
+ */
+export function refreshRemoteSourceRegistration() {
+    try {
+        return ensureRemoteSourceRegistered();
+    } catch (e) {
+        console.error('[GallerySourceSwitch] enregistrement du provider remote échoué :', e);
+        return false;
+    }
+}
+
+/**
  * État du serveur distant pour le garde-fou du switch.
- * `configured` exige serverUrl ET token : un serveur sans token ne peut rien
- * servir, l'option est donc grisée dans ce cas.
- * @returns {{configured: boolean, hasProvider: boolean, serverUrl: string, hasApiKey: boolean}}
+ * `configured` exige serverUrl ET une clé utilisable (non masquée) : un serveur
+ * sans clé valide ne peut rien servir, l'option est donc grisée dans ce cas.
+ * `apiKeyMasked` distingue « clé absente » de « clé enregistrée = texte de
+ * masquage » (message précis dans l'UI).
+ * EFFET DE BORD BÉNIN : tente l'enregistrement paresseux du provider quand la
+ * config est valide — c'est ce qui rattrape une config sauvegardée APRÈS le
+ * chargement sans exiger un redémarrage de ComfyUI (idempotent, jamais levé).
+ * @returns {{configured: boolean, hasProvider: boolean, serverUrl: string, hasApiKey: boolean, apiKeyMasked: boolean}}
  */
 export function getRemoteStatus() {
-    let cfg = { serverUrl: '', apiKey: '' };
+    let cfg = { serverUrl: '', apiKey: '', apiKeyMasked: false };
     try {
         cfg = getRemoteConfig();
     } catch (e) {
@@ -70,16 +111,22 @@ export function getRemoteStatus() {
     }
     const serverUrl = cfg.serverUrl || '';
     const hasApiKey = !!cfg.apiKey;
+    const apiKeyMasked = cfg.apiKeyMasked === true;
+    if (serverUrl && hasApiKey) {
+        refreshRemoteSourceRegistration();
+    }
     return {
         configured: !!serverUrl && hasApiKey,
         hasProvider: GallerySource.has(SOURCE_REMOTE),
         serverUrl,
         hasApiKey,
+        apiKeyMasked,
     };
 }
 
 /**
- * Décision PURE de bascule (aucun effet de bord).
+ * Décision PURE de bascule (aucun effet de bord propre ; `getRemoteStatus`
+ * rattrape au passage l'enregistrement du provider quand la config est valide).
  * @param {string} targetId — 'local' | 'remote' (toute autre valeur → 'local').
  * @returns {{ok: boolean, id: string, reason: string|null}}
  */
@@ -89,6 +136,11 @@ export function evaluateSourceSwitch(targetId) {
         return { ok: true, id, reason: null };
     }
     const remote = getRemoteStatus();
+    // Clé enregistrée = texte de masquage : message PRÉCIS (ressaisir la clé),
+    // jamais le message trompeur « non disponible dans cette version ».
+    if (remote.apiKeyMasked) {
+        return { ok: false, id, reason: 'masked-key' };
+    }
     if (!remote.configured) {
         return { ok: false, id, reason: 'not-configured' };
     }
@@ -262,6 +314,7 @@ export default {
     SOURCE_REMOTE,
     normalizeSourceId,
     getRemoteStatus,
+    refreshRemoteSourceRegistration,
     evaluateSourceSwitch,
     describeRemoteHost,
     applySourceSwitch,
