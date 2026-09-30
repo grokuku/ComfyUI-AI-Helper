@@ -690,28 +690,29 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch } from "./aih_fetch_bri
       }
       container.querySelector("#wf-deps").innerHTML = depsHtml;
 
-      // Vérifier si un workflow du même nom existe déjà
+      // Vérifier si un workflow du même nom existe déjà.
+      // La propriété est calculée CÔTÉ SERVEUR (`is_mine`) : le front ne
+      // compare plus d'identités (user_id n'est PAS exposé — pas d'énumération).
       function checkExisting(name) {
+        if (!name) { existingId = null; return; }
         remoteGet(getApiUrl() + "/workflows?q=" + encodeURIComponent(name) + "&limit=5")
           .then(function (data) {
             var items = data?.items || [];
-            return remoteGet(getApiUrl() + "/auth/me")
-              .then(function (me) {
-                if (!me || typeof me.id !== 'string') return;
-                for (var i = 0; i < items.length; i++) {
-                  if (items[i].name.toLowerCase() === name.toLowerCase() && items[i].user_id === me.id) {
-                    existingId = items[i].id;
-                    var btn = container.querySelector("#wf-publish-btn");
-                    btn.textContent = t("wf.update", { version: (items[i].version + 1) });
-                    btn.style.background = "#f59e0b";
-                    return;
-                  }
-                }
-                existingId = null;
-                var btn = container.querySelector("#wf-publish-btn");
-                btn.textContent = t("wf.publish");
-                btn.style.background = "var(--aih-accent, #D8700D)";
-              });
+            var btn = container.querySelector("#wf-publish-btn");
+            if (!btn) return;
+            for (var i = 0; i < items.length; i++) {
+              // « Mettre à jour » UNIQUEMENT si le workflow est le nôtre :
+              // sinon on publie un NOUVEAU workflow (jamais écraser autrui).
+              if (items[i].name.toLowerCase() === name.toLowerCase() && items[i].is_mine === true) {
+                existingId = items[i].id;
+                btn.textContent = t("wf.update", { version: (items[i].version + 1) });
+                btn.style.background = "#f59e0b";
+                return;
+              }
+            }
+            existingId = null;
+            btn.textContent = t("wf.publish");
+            btn.style.background = "var(--aih-accent, #D8700D)";
           })
           .catch(function(){});
       }
@@ -907,10 +908,14 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch } from "./aih_fetch_bri
           var html = "";
           for (var i = 0; i < items.length; i++) {
             var w = items[i];
-            var author = w.author || w.user_id || "?";
+            var author = w.author || "?";
             var depsCount = (w.required_nodes?.length || 0) + (w.required_models?.length || 0) + (w.required_loras?.length || 0);
-            var delHtml =
-              '<button class="wf-del-btn" data-wf-id="' + w.id + '" data-wf-name="' + esc(w.name) + '" onclick="event.stopPropagation();window._wfDeleteWorkflow(this)" style="position:absolute;top:4px;right:4px;width:22px;height:22px;border:1px solid #555;border-radius:4px;background:rgba(60,60,64,0.9);color:#f87171;font-size:11px;cursor:pointer;padding:0;line-height:20px;text-align:center;z-index:2;display:none;">🗑</button>';
+            // Le bouton de suppression n'est proposé QUE sur nos propres
+            // workflows (is_mine calculé côté serveur) — le serveur reste la
+            // garde finale (403 sur DELETE d'autrui).
+            var delHtml = (w.is_mine === true)
+              ? '<button class="wf-del-btn" data-wf-id="' + w.id + '" data-wf-name="' + esc(w.name) + '" onclick="event.stopPropagation();window._wfDeleteWorkflow(this)" style="position:absolute;top:4px;right:4px;width:22px;height:22px;border:1px solid #555;border-radius:4px;background:rgba(60,60,64,0.9);color:#f87171;font-size:11px;cursor:pointer;padding:0;line-height:20px;text-align:center;z-index:2;display:none;">🗑</button>'
+              : '';
             html +=
               '<div class="wf-card" style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid #444;border-radius:6px;margin-bottom:4px;cursor:pointer;background:#3a3a3e;position:relative;"' +
 
@@ -988,7 +993,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch } from "./aih_fetch_bri
           var html =
             '<div style="margin-bottom:12px;">' +
             '<h2 style="font-size:16px;font-weight:700;color:#e2e8f0;margin:0 0 4px 0;">' + esc(w.name) + '</h2>' +
-            '<p style="font-size:12px;color:#888;margin:0;">' + t('wf.by') + esc(w.author || w.user_id) + ' · v' + (w.version || 1) +
+            '<p style="font-size:12px;color:#888;margin:0;">' + t('wf.by') + esc(w.author || "?") + ' · v' + (w.version || 1) +
             ' · ❤️ ' + (w.likes || 0) + ' · 📥 ' + (w.downloads || 0) + '</p>' +
             (w.description ? '<p style="font-size:12px;color:#aaa;margin:8px 0 0 0;">' + esc(w.description) + '</p>' : '') +
             '</div>' +
@@ -1392,7 +1397,10 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch } from "./aih_fetch_bri
                   });
                   if (installData.success) newNodesInstalled++;
                 } catch(e) {
+                  // L'erreur réelle (4xx/5xx serveur…) est remontée à
+                  // l'utilisateur : jamais un échec muet.
                   console.warn("[AIH] Node install failed: " + nname, e);
+                  aihToast(t("wf.nodeInstallFailed", { name: nname, error: e.message }), "error");
                 }
               }
 

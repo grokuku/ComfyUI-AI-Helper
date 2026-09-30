@@ -13,7 +13,9 @@ IS_WINDOWS = platform.system() == "Windows" # Needed for default shell
 # Strict allow-list for bulk settings updates (used by
 # POST /holaf/utilities/save-all-settings). Only UI preferences may be written
 # through this route. [Security] and [Terminal] are explicitly excluded so an
-# attacker cannot inject a password hash or a Terminal.shell_command (RCE).
+# attacker cannot inject a sensitive credential (SFTP password / API token) or a
+# Terminal.shell_command (RCE). This is a defense-in-depth guard, NOT application
+# authentication: the pack itself ships no password mechanism.
 ALLOWED_BULK_SECTIONS = {
     'TerminalUI': {
         'theme', 'font_size', 'panel_x', 'panel_y', 'panel_width',
@@ -82,9 +84,6 @@ def load_all_configs():
     
     default_shell = 'cmd.exe' if IS_WINDOWS else ('bash' if os.path.exists('/bin/bash') else 'sh')
     shell_cmd = config_parser_obj.get('Terminal', 'shell_command', fallback=default_shell)
-    password_hash = config_parser_obj.get('Security', 'password_hash', fallback=None)
-    if not password_hash:
-        password_hash = None
 
     ui_terminal_defaults = {'panel_width': 600, 'panel_height': 400}
     ui_settings_terminal = _parse_panel_settings(config_parser_obj, 'TerminalUI', ui_terminal_defaults)
@@ -146,7 +145,6 @@ def load_all_configs():
 
     return {
         'shell_command': shell_cmd,
-        'password_hash': password_hash,
         'ui_terminal': ui_settings_terminal,
         'ui_model_manager': ui_settings_model_manager,
         'ui_image_viewer': ui_settings_image_viewer,
@@ -176,8 +174,8 @@ async def save_bulk_settings_to_config(settings_data):
     SECURITY: This uses a strict allow-list of sections and keys. Unknown
     sections/keys are ignored (with a log entry) rather than written, and the
     [Security] and [Terminal] sections are always rejected. This prevents an
-    attacker from injecting Terminal.shell_command or a password hash through
-    the API.
+    attacker from injecting Terminal.shell_command or a sensitive credential
+    (SFTP password / API token) through the API.
     """
     if not isinstance(settings_data, dict):
         print("🟡 [Holaf-Config] Bulk settings ignored: payload is not a JSON object.")

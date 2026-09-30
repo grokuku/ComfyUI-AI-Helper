@@ -36,7 +36,6 @@ import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { HOLAF_THEMES } from "./holaf_themes.js";
 import { escapeHtml, sanitizeMarkdownHtml, sanitizeUrl } from "./holaf_dom_utils.js";
 import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
-import { ensureAuthenticated, expireSession } from "./holaf_auth.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -715,14 +714,10 @@ const holafNodesManager = {
         }
     },
 
-    // Authentification UNIFIÉE : délègue entièrement à HolafAuth
-    // (js/holaf_auth.js) — une seule invite partagée par session, plus AUCUNE
-    // modale de mot de passe locale ici (le terminal et blobby l'utilisent aussi).
-    async _ensureAuthenticated(message = t("auth.message")) {
-        return ensureAuthenticated(message);
-    },
-
-    async _executeNodeAction(actionPath, nodePayloads, actionName, confirmMessage, requiresAuth = false) {
+    // Le pack n'a AUCUNE authentification applicative : ce module n'ouvre donc
+    // jamais d'invite de mot de passe. L'accès est filtré par le reverse-proxy
+    // (Caddy basic_auth / Authentik) devant ComfyUI.
+    async _executeNodeAction(actionPath, nodePayloads, actionName, confirmMessage) {
         if (this.isActionInProgress) {
             AIH.ask({ title: t("nm.actionInProgress"), message: t("nm.actionInProgressMsg") });
             return;
@@ -730,11 +725,6 @@ const holafNodesManager = {
         if (!nodePayloads || nodePayloads.length === 0) {
             AIH.ask({ title: actionName, message: t("nm.noNodesSelected") });
             return;
-        }
-
-        if (requiresAuth) {
-            const authenticated = await this._ensureAuthenticated();
-            if (!authenticated) return;
         }
 
         const nodeNamesForDisplay = nodePayloads.map(p => p.name).join(', ');
@@ -817,30 +807,11 @@ const holafNodesManager = {
             try {
                 result = await postAction();
             } catch (err) {
-                if (err instanceof HolafFetchError && err.status === 401) {
-                    // Session serveur expirée : invalider l'état LOCAL puis ouvrir
-                    // l'invite PARTAGÉE (HolafAuth), et rejouer UNE fois.
-                    removeInProgressDialog();
-                    expireSession();
-                    const reconnected = await this._ensureAuthenticated(t("nm.sessionExpired"));
-                    if (!reconnected) {
-                        AIH.ask({ title: t("nm.actionCancelled", { action: actionName }), message: t("nm.authRequiredForAction") });
-                        return;
-                    }
-                    showInProgressDialog();
-                    try {
-                        result = await postAction();
-                    } catch (retryErr) {
-                        if (retryErr instanceof HolafFetchError && retryErr.status === 401) {
-                            removeInProgressDialog();
-                            AIH.ask({ title: t("nm.actionError", { action: actionName }), message: t("nm.authFailedNotExecuted") });
-                            return;
-                        }
-                        result = asResultOrThrow(retryErr);
-                    }
-                } else {
-                    result = asResultOrThrow(err);
-                }
+                // Réponse non-2xx exploitable (400 « tout a échoué » ; le 207
+                // succès partiel est un 2xx rendu directement par la brique) :
+                // le corps JSON reste LE résultat affiché. Hors JSON exploitable
+                // (réseau/timeout), asResultOrThrow re-throw vers le catch générique.
+                result = asResultOrThrow(err);
             }
 
             removeInProgressDialog();
@@ -940,8 +911,7 @@ const holafNodesManager = {
             '/holaf/nodes/update',
             nodesToUpdatePayloads,
             "Update",
-            message,
-            true
+            message
         );
     },
 
@@ -967,8 +937,7 @@ const holafNodesManager = {
             '/holaf/nodes/install-requirements',
             nodesForReqPayloads,
             t("nm.installRequirements"),
-            t("nm.installRequirementsMsg"),
-            true
+            t("nm.installRequirementsMsg")
         );
     },
 
@@ -1108,9 +1077,6 @@ const holafNodesManager = {
     async _performInstall(url) {
         if (this.isActionInProgress) return;
 
-        const authenticated = await this._ensureAuthenticated();
-        if (!authenticated) return;
-
         this.isActionInProgress = true;
         this.updateActionButtonsState();
 
@@ -1150,32 +1116,9 @@ const holafNodesManager = {
         const postInstall = () => HolafFetch.post('/holaf/nodes/install', { body: { url: url }, timeout: 0 });
 
         try {
-            let result;
-            try {
-                result = await postInstall();
-            } catch (err) {
-                if (!(err instanceof HolafFetchError && err.status === 401)) throw err;
-                // Session serveur expirée : invalider l'état LOCAL puis ouvrir
-                // l'invite PARTAGÉE (HolafAuth), et rejouer UNE fois.
-                removeInstallOverlay();
-                expireSession();
-                const reconnected = await this._ensureAuthenticated(t("nm.sessionExpired"));
-                if (!reconnected) {
-                    AIH.ask({ title: t("nm.installCancelled"), message: t("nm.authRequiredInstall") });
-                    return;
-                }
-                showInstallOverlay();
-                try {
-                    result = await postInstall();
-                } catch (retryErr) {
-                    if (retryErr instanceof HolafFetchError && retryErr.status === 401) {
-                        removeInstallOverlay();
-                        AIH.ask({ title: t("nm.installFailed"), message: t("nm.authFailedNotInstalled") });
-                        return;
-                    }
-                    throw retryErr;
-                }
-            }
+            // Non-2xx : HolafFetch a levé → le catch générique ci-dessous
+            // affiche le champ `message` du corps JSON serveur.
+            const result = await postInstall();
 
             removeInstallOverlay();
 

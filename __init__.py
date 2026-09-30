@@ -72,7 +72,6 @@ import re # Added for finalize_upload_model_route for subfolder splitting
 # --- Holaf Utilities Submodules ---
 from . import holaf_database
 from . import holaf_config
-from . import holaf_auth
 from . import holaf_utils # Also initializes its dirs and cleans up temp uploads
 from . import holaf_terminal
 from . import holaf_image_viewer_backend
@@ -652,9 +651,7 @@ async def comparer_view_route(request: web.Request):
 @routes.get("/holaf/utilities/settings")
 async def holaf_get_all_settings_route(request: web.Request):
     current_live_config = CONFIG # Use the live global CONFIG
-    password_is_set = current_live_config.get('password_hash') is not None
     response_data = {
-        "password_is_set": password_is_set,
         "TerminalUI": current_live_config.get('ui_terminal'),
         "ModelManagerUI": current_live_config.get('ui_model_manager'),
         "ImageViewerUI": current_live_config.get('ui_image_viewer'),
@@ -674,31 +671,11 @@ async def holaf_save_all_settings_route(request: web.Request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 @routes.post("/holaf/utilities/restart")
-@holaf_auth.require_auth
 async def holaf_restart_server_route(request: web.Request):
     return await holaf_server_management.restart_server_route(request)
 
-# Shared Auth Routes — UNIFIED prompt for the whole pack (js/holaf_auth.js).
-# Session cookie is a BROWSER SESSION cookie (no Max-Age) set by holaf_auth.
-@routes.post("/holaf/auth/login")
-async def holaf_auth_login_route(request: web.Request):
-    return await holaf_auth.login_route(request, CONFIG)
-
-@routes.post("/holaf/auth/setup")
-async def holaf_auth_setup_route(request: web.Request):
-    return await holaf_auth.setup_route(request, CONFIG)
-
-@routes.post("/holaf/auth/logout")
-async def holaf_auth_logout_route(request: web.Request):
-    return await holaf_auth.logout_route(request)
-
-@routes.get("/holaf/auth/status")
-async def holaf_auth_status_route(request: web.Request):
-    return await holaf_auth.status_route(request, CONFIG)
-
 # Terminal Routes
 @routes.get("/holaf/terminal") # WebSocket
-@holaf_auth.require_auth
 async def holaf_terminal_websocket_route(request: web.Request):
     return await holaf_terminal.websocket_handler(request, CONFIG)
 
@@ -747,7 +724,6 @@ async def get_model_types_config_route(request: web.Request):
         return web.json_response(json.load(f))
 
 @routes.post("/holaf/models/upload-chunk")
-@holaf_auth.require_auth
 async def upload_model_chunk_route(request: web.Request):
     try:
         data = await request.post()
@@ -772,7 +748,6 @@ async def upload_model_chunk_route(request: web.Request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 @routes.post("/holaf/models/finalize-upload")
-@holaf_auth.require_auth
 async def finalize_upload_model_route(request: web.Request):
     try:
         data = await request.json()
@@ -847,7 +822,6 @@ if model_manager_helper:
             return web.json_response({"error": str(e)}, status=500)
 
     @routes.post("/holaf/models/deep-scan-local")
-    @holaf_auth.require_auth
     async def model_deep_scan_route(request: web.Request):
         try:
             data = await request.json()
@@ -862,7 +836,6 @@ if model_manager_helper:
             return web.json_response({"error": str(e)}, status=500)
 
     @routes.post("/holaf/models/delete") # This is for Model Manager, distinct from Image Viewer delete
-    @holaf_auth.require_auth
     async def delete_model_route(request: web.Request):
         try:
             data = await request.json()
@@ -1159,14 +1132,14 @@ if nodes_manager_helper:
 
         except Exception as e: print(f"🔴 [NM] Batch action error: {e}"); return web.json_response({"error":str(e)},500)
 
+    # Node management routes carry no application-level guard: the pack ships no
+    # application authentication at all (access control is delegated to the
+    # reverse proxy in front of ComfyUI — Caddy basic_auth or Authentik).
     @routes.post("/holaf/nodes/update")
-    @holaf_auth.require_auth
     async def nm_update_route(r): return await _handle_node_action_batch(r, "update_node_from_git")
     @routes.post("/holaf/nodes/delete")
-    @holaf_auth.require_auth
     async def nm_delete_route(r): return await _handle_node_action_batch(r, "delete_node_folder")
     @routes.post("/holaf/nodes/install-requirements")
-    @holaf_auth.require_auth
     async def nm_install_req_route(r): return await _handle_node_action_batch(r, "install_node_requirements")
 
     @routes.get("/holaf/nodes/readme/local/{node_name}")
@@ -1196,7 +1169,6 @@ if nodes_manager_helper:
 
     # --- Node Manager Install & Search Routes ---
     @routes.post("/holaf/nodes/install")
-    @holaf_auth.require_auth
     async def nm_install_route(request: web.Request):
         if nodes_manager_helper is None:
             return web.json_response({"status": "error", "message": "Node manager module not available."}, status=503)
@@ -1230,15 +1202,13 @@ if nodes_manager_helper:
 # --- AIH HTTP Routes (/aih/* and /api/aih/*) ---
 # Phase 2 chantier C (PLAN_FUSION.md §3.5) : toutes les routes AIH vivent
 # dans le sous-package 'aih' (aih/routes.py) et sont enregistrées d'un bloc
-# ici, après le bootstrap sys.path du package. Le décorateur d'authentification
-# partagé Holaf est passé explicitement : il sécurise les routes sensibles du
-# pack (credentials, clés OpenAI, update, install de custom nodes, blobby
-# save/load/exec) avec LA MÊME invite de mot de passe que le terminal
-# (js/holaf_auth.js). L'enregistrement est défensif : un échec n'empêche pas
-# le chargement du reste du pack.
+# ici, après le bootstrap sys.path du package. Le pack n'applique AUCUNE
+# authentification applicative : l'accès est filtré en amont par le
+# reverse-proxy (Caddy basic_auth / Authentik). L'enregistrement est
+# défensif : un échec n'empêche pas le chargement du reste du pack.
 try:
     from aih import routes as aih_routes
-    _AIH_ROUTE_COUNT = aih_routes.register(routes, require_auth=holaf_auth.require_auth)
+    _AIH_ROUTE_COUNT = aih_routes.register(routes)
     if not _AIH_ROUTE_COUNT:
         print("🟡 [Holaf-Init] No AIH routes were registered.")
 except Exception as _aih_routes_err:
@@ -1393,10 +1363,7 @@ print("\n" + "="*50)
 print("✅ [Holaf-Utilities] Extension initialized with modular structure.")
 final_config = CONFIG # Use the reloaded global CONFIG
 print(f"  > Terminal Shell: {final_config.get('shell_command', 'N/A')}")
-if final_config.get('password_hash'):
-    print("  > Auth Status: 🔑 Password is set (session prompt shared by all tools).")
-else:
-    print("  > Auth Status: 🔵 No password set. The first protected tool will ask for setup.")
+print("  > Auth: 🔵 No application authentication (secure via Caddy/Authentik; never expose port 8188).")
 if not NODE_CLASS_MAPPINGS:
     print("  > Additional Nodes: None found or loaded from 'nodes/' directory.")
 print("="*50 + "\n")

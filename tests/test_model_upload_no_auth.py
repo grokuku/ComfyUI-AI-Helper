@@ -1,30 +1,26 @@
-"""Upload de modèles du pack : la garde d'authentification BOUT EN BOUT.
+"""Upload de modèles du pack : AUCUNE authentification applicative (décision produit).
 
 Contrat verrouillé (routes RÉELLES extraites de __init__.py par AST, serveur
-aiohttp réel, garde réelle holaf_auth.require_auth) :
-  1. POST /holaf/models/upload-chunk sans cookie de session → 401
-     {"success": false, "error": "Authentication required."} et AUCUN chunk
-     écrit sur disque ;
-  2. POST /holaf/models/finalize-upload sans cookie → 401 et AUCUN fichier ;
-  3. avec le cookie holaf_session (posé par le login réel) : la séquence
-     nominale chunks → finalize assemble le fichier sur disque (contenu
-     identique) et répond 200 — c'est le flux que le front doit rejoindre ;
-  4. contrôle négatif : un cookie signé mais ALTÉRÉ → 401 (pas de laisser-passer).
+aiohttp réel, AUCUNE garde) :
+  1. POST /holaf/models/upload-chunk SANS aucun cookie → 200 et le chunk est
+     écrit sur disque (comportement « zéro mot de passe ») ;
+  2. POST /holaf/models/finalize-upload SANS aucun cookie → 200 et le fichier
+     est assemblé octet à octet ;
+  3. contrôle négatif : aucune requête n'exige de session (pas de 401), et le
+     module holaf_auth n'existe plus dans le pack.
+
+C'est la preuve INVERSE de l'ancien tests/test_model_upload_auth_flow.py
+(supprimé) : le pack ne garde plus ses routes ; l'accès est filtré en amont
+par le reverse-proxy (Caddy basic_auth / Authentik).
 
 Pourquoi extraire les handlers par AST : __init__.py importe `server` (ComfyUI)
 et n'est pas importable tel quel. L'extraction fait tourner le CODE RÉEL des
-routes (pas une copie), avec des dépendances minimales pointées vers tmp_path
+routes, avec des dépendances minimales pointées vers tmp_path
 (folder_paths.base_path, TEMP_UPLOAD_DIR) pour ne rien écrire dans le dépôt.
-
-Le bug client corrigé (js/model_manager/model_manager_actions.js) était de ne
-JAMAIS déclencher l'invite partagée ni rejouer la requête sur ce 401 : la
-preuve front est js/test_model_manager_auth_upload.mjs ; ce fichier verrouille
-le contrat HTTP que ce test simule.
 """
 
 import ast
 import asyncio
-import importlib.util
 import os
 import re
 import sys
@@ -37,42 +33,12 @@ import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
-# Le minimum de mot de passe doit être déterministe dans les tests.
-os.environ.pop("AIH_MIN_PASSWORD_LENGTH", None)
-
 PACKAGE_DIR = Path(__file__).resolve().parent.parent
 _PKG = "holaf_utils_pkg"
 
-PASSWORD = "password-8"
 UPLOAD_ID = "holaf-upload-test-123"
 CHUNKS = [b"hello ", b"world!"]
 TOTAL = sum(len(c) for c in CHUNKS)
-
-_holaf_auth = None
-
-
-def _ensure_pkg():
-    if _PKG not in sys.modules:
-        pkg = types.ModuleType(_PKG)
-        pkg.__path__ = [str(PACKAGE_DIR)]
-        sys.modules[_PKG] = pkg
-
-
-def _load_module(name):
-    _ensure_pkg()
-    spec = importlib.util.spec_from_file_location(f"{_PKG}.{name}", PACKAGE_DIR / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[f"{_PKG}.{name}"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _auth():
-    global _holaf_auth
-    if _holaf_auth is None:
-        _load_module("holaf_config")
-        _holaf_auth = _load_module("holaf_auth")
-    return _holaf_auth
 
 
 def _extract_functions(file_path, names, namespace):
@@ -95,10 +61,7 @@ def _extract_functions(file_path, names, namespace):
 
 
 def _build_app(tmp_path):
-    """App aiohttp réelle : login holaf_auth + les 2 routes d'upload gardées."""
-    a = _auth()
-    config = {"password_hash": a.hash_password(PASSWORD)}
-
+    """App aiohttp réelle : les 2 routes d'upload, SANS aucune garde."""
     temp_uploads = tmp_path / "temp_uploads"
     temp_uploads.mkdir()
     models_dir = tmp_path / "models" / "checkpoints"
@@ -139,17 +102,9 @@ def _build_app(tmp_path):
         ns,
     )
 
-    async def login(request):
-        return await a.login_route(request, config)
-
     app = web.Application()
-    app.router.add_post("/holaf/auth/login", login)
-    app.router.add_post(
-        "/holaf/models/upload-chunk", a.require_auth(ns["upload_model_chunk_route"])
-    )
-    app.router.add_post(
-        "/holaf/models/finalize-upload", a.require_auth(ns["finalize_upload_model_route"])
-    )
+    app.router.add_post("/holaf/models/upload-chunk", ns["upload_model_chunk_route"])
+    app.router.add_post("/holaf/models/finalize-upload", ns["finalize_upload_model_route"])
     return app, temp_uploads, models_dir
 
 
@@ -173,9 +128,9 @@ async def _post_finalize(client, upload_id):
     })
 
 
-def test_model_upload_without_session_is_rejected_and_writes_nothing(tmp_path):
-    """Sans cookie : 401 exact (message du front) et AUCUN octet sur disque."""
-    app, temp_uploads, models_dir = _build_app(tmp_path)
+def test_upload_chunk_without_any_cookie_is_accepted(tmp_path):
+    """Sans le moindre cookie : 200 et le chunk est bien écrit sur disque."""
+    app, temp_uploads, _models_dir = _build_app(tmp_path)
 
     async def scenario():
         client = TestClient(TestServer(app))
@@ -184,38 +139,24 @@ def test_model_upload_without_session_is_rejected_and_writes_nothing(tmp_path):
             resp = await client.post(
                 "/holaf/models/upload-chunk", data=_chunk_form(UPLOAD_ID, 0, CHUNKS[0])
             )
-            assert resp.status == 401, f"attendu 401, reçu {resp.status}"
-            assert await resp.json() == {
-                "success": False,
-                "error": "Authentication required.",
-            }, "corps 401 exact attendu (celui géré par le front)"
-            assert list(temp_uploads.iterdir()) == [], "aucun chunk ne doit être écrit"
-
-            resp = await _post_finalize(client, UPLOAD_ID)
-            assert resp.status == 401, f"attendu 401, reçu {resp.status}"
-            assert await resp.json() == {
-                "success": False,
-                "error": "Authentication required.",
-            }
-            assert not (models_dir / "model.safetensors").exists(), "aucun fichier assemblé"
+            assert resp.status == 200, f"attendu 200 (aucune garde), reçu {resp.status}"
+            assert (await resp.json())["status"] == "ok"
+            assert [p.name for p in temp_uploads.iterdir()] == [f"{UPLOAD_ID}-0.chunk"], \
+                "le chunk doit être écrit sans authentification"
         finally:
             await client.close()
 
     asyncio.run(scenario())
 
 
-def test_model_upload_with_session_assembles_file_over_the_wire(tmp_path):
-    """Avec le cookie posé par le login : chunks + finalize 200 → fichier sur disque."""
+def test_full_upload_without_cookie_assembles_file(tmp_path):
+    """chunks + finalize sans aucun cookie → fichier final octet à octet."""
     app, temp_uploads, models_dir = _build_app(tmp_path)
 
     async def scenario():
         client = TestClient(TestServer(app))
         await client.start_server()
         try:
-            resp = await client.post("/holaf/auth/login", json={"password": PASSWORD})
-            assert resp.status == 200, "login réel du pack"
-            assert "holaf_session" in {c.key for c in client.session.cookie_jar}, "cookie posé"
-
             for index, chunk in enumerate(CHUNKS):
                 resp = await client.post(
                     "/holaf/models/upload-chunk", data=_chunk_form(UPLOAD_ID, index, chunk)
@@ -231,7 +172,7 @@ def test_model_upload_with_session_assembles_file_over_the_wire(tmp_path):
             assert (await resp.json())["status"] == "ok"
 
             final_path = models_dir / "model.safetensors"
-            assert final_path.is_file(), "fichier final assemblé"
+            assert final_path.is_file(), "fichier final assemblé sans authentification"
             assert final_path.read_bytes() == b"".join(CHUNKS), "contenu identique (octet à octet)"
             assert list(temp_uploads.iterdir()) == [], "chunks nettoyés après assemblage"
         finally:
@@ -240,26 +181,10 @@ def test_model_upload_with_session_assembles_file_over_the_wire(tmp_path):
     asyncio.run(scenario())
 
 
-def test_tampered_session_cookie_is_rejected(tmp_path):
-    """Contrôle négatif : un cookie signé puis ALTÉRÉ ne passe pas la garde."""
-    app, _temp_uploads, _models_dir = _build_app(tmp_path)
-    a = _auth()
-
-    async def scenario():
-        client = TestClient(TestServer(app))
-        await client.start_server()
-        try:
-            token = a.create_session_token()
-            tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
-            client.session.cookie_jar.update_cookies({"holaf_session": tampered})
-            resp = await client.post(
-                "/holaf/models/upload-chunk", data=_chunk_form(UPLOAD_ID, 0, CHUNKS[0])
-            )
-            assert resp.status == 401, f"cookie altéré : attendu 401, reçu {resp.status}"
-        finally:
-            await client.close()
-
-    asyncio.run(scenario())
+def test_no_auth_module_in_pack():
+    """Le module d'authentification applicative n'existe plus dans le pack."""
+    assert not (PACKAGE_DIR / "holaf_auth.py").exists(), "holaf_auth.py doit avoir été supprimé"
+    assert not (PACKAGE_DIR / "__main__.py").exists(), "le CLI de hash doit avoir été supprimé"
 
 
 if __name__ == "__main__":

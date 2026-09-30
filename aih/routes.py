@@ -14,7 +14,7 @@ imports standardisés, préfixes ``/aih/*`` et ``/api/aih/*`` conservés).
 
 Architecture
 ------------
-Un unique point d'entrée : ``register(server_routes, require_auth=None)``,
+Un unique point d'entrée : ``register(server_routes)``,
 appelé UNE seule fois par le ``__init__.py`` racine de l'extension, juste
 après le bootstrap du sous-package ``aih/`` (qui a ajouté la racine du pack
 au ``sys.path``, rendant les imports absolus ``from aih import X`` valides).
@@ -22,12 +22,12 @@ au ``sys.path``, rendant les imports absolus ``from aih import X`` valides).
 - ``server_routes`` : l'objet ``server.PromptServer.instance.routes`` (table
   de décorateurs aiohttp) — le même que celui utilisé par toutes les routes
   ``/holaf/*`` d'Utils.
-- ``require_auth``  : le décorateur d'authentification partagé Holaf
-  (``holaf_auth.require_auth``), passé par le ``__init__.py`` racine. Il
-  sécurise les routes sensibles du pack (credentials, clés OpenAI, update,
-  install de custom nodes, blobby save/load/exec). S'il n'est pas fourni,
-  la garde fail-closed ``_fail_closed_auth_guard`` remplace la route de
-  shell par un refus permanent (503) : jamais de shell ouvert par défaut.
+
+AUCUNE authentification applicative : le pack n'expose ni mot de passe, ni
+cookie de session, ni garde de route. L'accès aux routes sensibles (shell,
+update, credentials…) est filtré EN AMONT par le reverse-proxy (Caddy
+``basic_auth`` ou forward-auth Authentik) placé devant ComfyUI. ⚠️ Ne JAMAIS
+exposer le port 8188 directement, sinon cette protection est contournée.
 
 Les groupes sont enregistrés indépendamment : l'échec d'un groupe est
 journalisé mais ne prive pas les autres (robustesse héritée de la source).
@@ -46,10 +46,9 @@ Groupes (ordre historique des commits du chantier C) :
      frontend appelle directement /holaf/utilities/restart.
   3. ``blobby``      : POST /aih/blobby/save + GET /aih/blobby/load
      (paramètres du companion, fichier user/default/aih/blobby.json) et
-     POST /aih/blobby/exec (shell local) — cette dernière SÉCURISÉE derrière
-     la session partagée du pack (cookie de session ``holaf_session``, obtenu
-     via POST /holaf/auth/login ; même invite unique js/holaf_auth.js que le
-     terminal) ; 401 sinon.
+     POST /aih/blobby/exec (shell local) — aucun mot de passe applicatif :
+     la protection vient du reverse-proxy devant ComfyUI, avec un plafond de
+     15 s sur l'exécution shell.
   4. ``models``      : /api/aih/models/* (liste locale/distante, upload et
      download SFTP chunked via paramiko, fingerprint head/tail, progression)
      portés fidèlement depuis l'ancien monorepo AI-Helper →
@@ -65,7 +64,8 @@ Groupes (ordre historique des commits du chantier C) :
 Non portés volontairement :
   - GET /aih/terminal (WebSocket PTY **sans mot de passe**) : ABANDONNÉ —
     décision « terminal unique Utils » (PLAN_FUSION.md §2.2). Le seul shell
-    interactif du pack fusionné reste GET /holaf/terminal (authentifié).
+    interactif du pack fusionné reste GET /holaf/terminal (protégé par le
+    reverse-proxy, aucun mot de passe applicatif).
   - POST /aih/restart : REMPLACÉ par la réutilisation directe de
     POST /holaf/utilities/restart (rien à créer côté backend).
   - Tout ``pip install`` automatique (INTERDIT, PLAN_FUSION.md §3.3).
@@ -154,26 +154,11 @@ class _RecordingRoutes:
         return self._target.post(path)
 
 
-def _fail_closed_auth_guard(handler):
-    """Garde-fou fail-closed si aucune fonction d'auth n'est fournie.
-
-    Utilisé pour /aih/blobby/exec quand ``register()`` est appelé sans
-    ``require_auth`` (contexte où holaf_auth serait indisponible) : on
-    préfère une route morte (503 permanent) à une route de shell ouverte.
-    """
-    async def wrapper(request):
-        return web.json_response(
-            {"ok": False, "error": "Authentication unavailable: endpoint disabled."},
-            status=503,
-        )
-    return wrapper
-
-
 # ══════════════════════════════════════════════════════════════════════
 # GROUPE 1 — Credentials & clés & presets (chemins de données inchangés)
 # ══════════════════════════════════════════════════════════════════════
 
-def _register_credentials_group(r, require_auth):
+def _register_credentials_group(r):
     """GET/POST /aih/credentials, /aih/elements/presets*, /aih/openai/keys."""
 
     # ── Credentials (lecture / ecriture du fichier local) ──────────────
@@ -182,7 +167,6 @@ def _register_credentials_group(r, require_auth):
     # Les nodes Python lisent ce fichier via aih.credentials.
 
     @r.get("/aih/credentials")
-    @require_auth
     async def aih_get_credentials_route(request):
         try:
             creds = credentials._load_aih_credentials(use_cache=False)
@@ -201,7 +185,6 @@ def _register_credentials_group(r, require_auth):
             }, status=500)
 
     @r.post("/aih/credentials")
-    @require_auth
     async def aih_save_credentials_route(request):
         try:
             data = await request.json()
@@ -343,7 +326,6 @@ def _register_credentials_group(r, require_auth):
     # ── OpenAI API Keys (stockage local par base_url) ──────────────────
 
     @r.get("/aih/openai/keys")
-    @require_auth
     async def aih_get_openai_keys(request):
         """Retourne les clés API stockées, optionnellement filtrées par base_url."""
         try:
@@ -395,7 +377,7 @@ def _register_credentials_group(r, require_auth):
 # ══════════════════════════════════════════════════════════════════════
 # GROUPE 2 — Update (POST /aih/update, SANS auto-restart)
 
-def _register_update_group(r, require_auth):
+def _register_update_group(r):
     """POST /aih/update — git fetch + reset --hard FETCH_HEAD.
 
     Contrat pour le chantier D (widgets JS) :
@@ -414,7 +396,6 @@ def _register_update_group(r, require_auth):
     from aih import update_manager as _update_manager
 
     @r.post("/aih/update")
-    @require_auth
     async def aih_update_route(request):
         try:
             result = _update_manager.update_repo()
@@ -460,28 +441,17 @@ def _get_blobby_file():
     return blobby_file
 
 
-def _register_blobby_group(r, require_auth):
+def _register_blobby_group(r):
     """Routes du Blobby Companion.
 
     - POST /aih/blobby/save + GET /aih/blobby/load : stockage JSON clé→valeur
-      des paramètres du companion (fichier local). SÉCURISÉES derrière
-      ``require_auth`` (même cookie de session signé que /aih/blobby/exec) :
-      lecture/écriture des paramètres du companion exigent une session valide.
-    - POST /aih/blobby/exec : exécution shell locale. 🔴 À la source, cette
-      route était OUVERTE (aucune auth). Elle est ici PORTÉE UNIQUEMENT
-      SÉCURISÉE derrière la session partagée du pack : le décorateur
-      ``require_auth`` (holaf_auth.require_auth, passé par le __init__.py
-      racine) vérifie le cookie de session ``holaf_session`` — exactement la
-      même garde que GET /holaf/terminal. Le client s'authentifie via l'invite
-      UNIQUE (js/holaf_auth.js → POST /holaf/auth/login, ou setup la première
-      fois), puis le cookie part automatiquement sur chaque requête même
-      origine. Sans session valide → 401. Si aucun décorateur n'a été fourni
-      à register(), une garde fail-closed renvoie 503 en permanence : jamais
-      de shell ouvert.
+      des paramètres du companion (fichier local).
+    - POST /aih/blobby/exec : exécution shell locale (plafond dur de 15 s).
+      AUCUN mot de passe applicatif : la protection est assurée par le
+      reverse-proxy (Caddy basic_auth / Authentik) devant ComfyUI.
     """
 
     @r.post("/aih/blobby/save")
-    @require_auth
     async def aih_blobby_save_route(request):
         try:
             body = await request.json()
@@ -504,7 +474,6 @@ def _register_blobby_group(r, require_auth):
             return web.json_response({"error": str(e)}, status=500)
 
     @r.get("/aih/blobby/load")
-    @require_auth
     async def aih_blobby_load_route(request):
         try:
             key = request.query.get("key")
@@ -520,12 +489,9 @@ def _register_blobby_group(r, require_auth):
             logging.error(f"[Blobby] load error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
-    # ── Blobby Exec (commandes shell locales) — AUTH OBLIGATOIRE ────────
-
-    guard = require_auth if require_auth is not None else _fail_closed_auth_guard
+    # ── Blobby Exec (commandes shell locales) — plafond 15 s ────────────
 
     @r.post("/aih/blobby/exec")
-    @guard
     async def aih_blobby_exec_route(request):
         """Exécute une commande shell locale sur la machine ComfyUI."""
         import subprocess as _sp
@@ -571,7 +537,7 @@ def _register_blobby_group(r, require_auth):
 
 # GROUPE 4 — Models SFTP chunked + fingerprint & Custom Nodes
 
-def _register_models_group(r, require_auth):
+def _register_models_group(r):
     """Routes /api/aih/models/* (via aih.model_manager) et /api/aih/custom-nodes*
     (via aih.custom_nodes_manager). Contrats identiques à la source AI-Helper ;
     les transferts SFTP (paramiko) et HTTP sont lancés dans un executor pour ne
@@ -593,7 +559,6 @@ def _register_models_group(r, require_auth):
             return web.json_response({"error": str(e)}, status=500)
 
     @r.post("/api/aih/custom-nodes/install")
-    @require_auth
     async def aih_install_node(request):
         try:
             body = await request.json()
@@ -1739,18 +1704,14 @@ def start_sync_engine_if_available():
 # POINT D'ENTRÉE — appelé une fois par le __init__.py racine
 # ══════════════════════════════════════════════════════════════════════
 
-def register(server_routes, require_auth=None):
+def register(server_routes):
     """Enregistre toutes les routes AIH sur l'objet routes du PromptServer.
 
     Args:
         server_routes: ``server.PromptServer.instance.routes``.
-        require_auth: décorateur d'authentification partagé Holaf
-            (``holaf_auth.require_auth``). Il sécurise les routes sensibles
-            (credentials, clés OpenAI, update, install de custom nodes,
-            blobby save/load/exec). S'il n'est pas fourni, la garde
-            fail-closed ``_fail_closed_auth_guard`` remplace la route de
-            shell par un refus permanent (503) : jamais de shell ouvert
-            par défaut.
+
+    Le pack n'applique AUCUNE authentification applicative : l'accès aux
+    routes sensibles est filtré en amont par le reverse-proxy.
 
     Returns:
         int: nombre de routes effectivement enregistrées.
@@ -1767,10 +1728,10 @@ def register(server_routes, require_auth=None):
             return False
 
     print("--- Registering AIH HTTP routes (aih/routes.py) ---")
-    _safe("credentials", _register_credentials_group, r, require_auth)
-    _safe("update", _register_update_group, r, require_auth)
-    _safe("blobby", _register_blobby_group, r, require_auth)
-    _safe("models", _register_models_group, r, require_auth)
+    _safe("credentials", _register_credentials_group, r)
+    _safe("update", _register_update_group, r)
+    _safe("blobby", _register_blobby_group, r)
+    _safe("models", _register_models_group, r)
     if _safe("local", _register_local_group, r):
         # Comportement d'origine de la source : le moteur de synchronisation
         # daemon du mode miroir démarre avec le chargement des routes local.

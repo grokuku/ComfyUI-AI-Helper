@@ -169,8 +169,8 @@ assert.ok(window.document.getElementById("wf-publish-btn"),
     "l'onglet Partager est rendu (formulaire de publication présent)");
 assert.ok(calledUrls.some((c) => c.url.startsWith(SERVER_URL + "/api/workflows?q=")),
     "le contrôle de workflow existant interroge bien le serveur configuré");
-assert.ok(calledUrls.some((c) => c.url === SERVER_URL + "/api/auth/me"),
-    "l'identité serveur est récupérée (comparaison propriétaire pour la mise à jour)");
+assert.ok(!calledUrls.some((c) => c.url === SERVER_URL + "/api/auth/me"),
+    "AUCUN /api/auth/me : la propriété vient du serveur (is_mine), plus d'identité côté front");
 
 console.log(
     "✅ RÉGRESSION « Workflow Sharing ne se lance pas » : module ES importable, " +

@@ -9,7 +9,6 @@
 import "../aih_strings.js";
 import { HolafPanelManager } from "../holaf_panel_manager.js";
 import { HolafFetch, HolafFetchError } from "../vendor/holaf/holaf-fetch.js";
-import { ensureAuthenticated, expireSession, isUnauthorized } from "../holaf_auth.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -17,35 +16,14 @@ const t = (key, params) => {
     return I && typeof I.t === "function" ? I.t(key, params) : key;
 };
 
-// --- AUTH DES ROUTES PROTÉGÉES (/holaf/models/*) ---
+// --- ERREURS DES ROUTES /holaf/models/* ---
 
 /**
- * POST sur une route protégée par le mot de passe partagé. Sur 401 (session
- * absente ou invalidée), ouvre l'invite PARTAGÉE (HolafAuth.ensureAuthenticated)
- * puis rejoue la requête UNE fois — même pattern que le Nodes Manager. Les
- * autres erreurs remontent inchangées. Si l'utilisateur annule l'invite, une
- * erreur explicite (message localisé) est levée pour ne pas afficher un faux
- * « échec de segment ».
+ * Message d'erreur d'une requête : le message serveur prime (400/403/409/500),
+ * sinon le fallback localisé puis le message réseau. Aucune authentification
+ * applicative (l'accès est assuré par le reverse-proxy devant ComfyUI).
  */
-async function postAuthenticated(url, opts, promptMessage) {
-    try {
-        return await HolafFetch.post(url, opts);
-    } catch (err) {
-        if (!isUnauthorized(err)) throw err;
-        expireSession();
-        const authenticated = await ensureAuthenticated(promptMessage);
-        if (!authenticated) throw new Error(t("mma.authCancelled"));
-        return await HolafFetch.post(url, opts);
-    }
-}
-
-/**
- * Message d'erreur d'une requête protégée : le message serveur prime (400/403/
- * 409/500), un 401 est traduit en message d'authentification (jamais "401" brut),
- * sinon le fallback localisé puis le message réseau.
- */
-function authenticatedErrorMessage(err, fallbackMessage) {
-    if (isUnauthorized(err)) return t("mma.authRefused");
+function serverErrorMessage(err, fallbackMessage) {
     if (err instanceof HolafFetchError && err.data && err.data.message) return err.data.message;
     if (err instanceof HolafFetchError && err.status >= 400) return fallbackMessage;
     return err.message;
@@ -118,33 +96,10 @@ export async function processUploadQueue(manager) {
 
     // Réserve IMMÉDIATEMENT le job (avant tout await) : un appel concurrent
     // (fin d'un autre transfert) ne peut pas prendre le même fichier.
-    nextJob.status = 'authenticating';
+    nextJob.status = 'uploading';
     manager.isUploading = true;
     manager.updateActionButtonsState();
     manager.activeUploads++;
-
-    // Les routes /holaf/models/* sont protégées par le mot de passe partagé :
-    // l'invite UNIQUE (HolafAuth) s'ouvre AVANT les envois, sinon chaque chunk
-    // partirait en 401. Après authentification, elle ne redemande plus rien.
-    // (ensureAuthenticated résout false si l'utilisateur annule ; le try/catch
-    // évite qu'une erreur inattendue laisse la file bloquée en 'authenticating'.)
-    let authenticated = false;
-    try {
-        authenticated = await ensureAuthenticated(t("mma.sessionRequired"));
-    } catch (err) {
-        console.error("[Holaf MM] Auth check failed:", err);
-    }
-    if (!authenticated) {
-        nextJob.status = 'error';
-        nextJob.errorMessage = t("mma.authCancelled");
-        manager.activeUploads--;
-        manager.isUploading = false;
-        manager.updateActionButtonsState();
-        reportUploadErrors(manager);
-        return;
-    }
-
-    nextJob.status = 'uploading';
 
     if (!manager.statusUpdateRaf) {
         manager.updateStatusBarText();
@@ -198,12 +153,9 @@ async function uploadFile(manager, job) {
 
                         // FormData passé tel quel (corps brut auto, pas de raw
                         // nécessaire). Chunks d'un gros modèle sur un lien lent
-                        // → timeout désactivé (l'ancien fetch natif n'en avait
-                        // pas). Sur 401 (session invalidée en cours d'upload),
-                        // postAuthenticated ouvre l'invite partagée puis rejoue
-                        // la requête UNE fois.
-                        await postAuthenticated('/holaf/models/upload-chunk',
-                            { body: formData, timeout: 0 }, t("mma.sessionRequired"));
+                        // → timeout désactivé (l'ancien fetch natif n'en avait pas).
+                        await HolafFetch.post('/holaf/models/upload-chunk',
+                            { body: formData, timeout: 0 });
                         job.chunksSent++;
                         job.sentBytes += chunk.size;
                         job.progress = (job.chunksSent / job.totalChunks) * 100;
@@ -211,9 +163,8 @@ async function uploadFile(manager, job) {
                         calculateSpeed(manager.uploadStats);
                     } catch (err) {
                         job.status = 'error';
-                        // Message serveur (400/403/409/500) sinon fallback i18n ;
-                        // un 401 est traduit en message d'authentification.
-                        job.errorMessage = authenticatedErrorMessage(
+                        // Message serveur (400/403/409/500) sinon fallback i18n.
+                        job.errorMessage = serverErrorMessage(
                             err, t("mma.chunkFailed", { chunk: chunkIndex }));
                         reject(err);
                         return; // Stop this worker
@@ -231,7 +182,7 @@ async function uploadFile(manager, job) {
         job.status = 'error';
         // Le worker a déjà posé un message ciblé : ne pas l'écraser par le
         // message brut (l'ancien code perdait la traduction i18n ici).
-        if (!job.errorMessage) job.errorMessage = authenticatedErrorMessage(
+        if (!job.errorMessage) job.errorMessage = serverErrorMessage(
             error, t("mma.chunkFailed", { chunk: 0 }));
     }
 }
@@ -239,9 +190,8 @@ async function uploadFile(manager, job) {
 async function finalizeUpload(manager, job) {
     try {
         // L'assemblage disque d'un gros modèle peut dépasser 30 s → timeout
-        // désactivé (l'ancien fetch natif n'en avait pas). Sur 401, l'invite
-        // partagée s'ouvre puis la requête est rejouée UNE fois.
-        await postAuthenticated('/holaf/models/finalize-upload', {
+        // désactivé (l'ancien fetch natif n'en avait pas).
+        await HolafFetch.post('/holaf/models/finalize-upload', {
             body: {
                 upload_id: job.id,
                 filename: job.file.name,
@@ -252,14 +202,13 @@ async function finalizeUpload(manager, job) {
                 // expected_sha256 removed from payload
             },
             timeout: 0,
-        }, t("mma.sessionRequired"));
+        });
         job.status = 'done';
         manager.refreshAfterUpload = true;
     } catch (error) {
         job.status = 'error';
-        // Message serveur (409 « existe déjà », 403, 500…) sinon fallback i18n ;
-        // un 401 est traduit en message d'authentification.
-        job.errorMessage = authenticatedErrorMessage(
+        // Message serveur (409 « existe déjà », 403, 500…) sinon fallback i18n.
+        job.errorMessage = serverErrorMessage(
             error, t("mma.finalizationFailed"));
     }
 }
@@ -422,15 +371,14 @@ export async function processScanQueue(manager) {
     const pathsToScanInBatch = manager.scanQueue.splice(0, manager.scanQueue.length);
     try {
         // Scan approfondi (lecture/hash des fichiers) : potentiellement long →
-        // timeout désactivé. Route protégée : l'invite partagée s'ouvre sur 401
-        // puis la requête est rejouée UNE fois.
-        const result = await postAuthenticated('/holaf/models/deep-scan-local', {
+        // timeout désactivé (l'ancien fetch natif n'en avait pas).
+        const result = await HolafFetch.post('/holaf/models/deep-scan-local', {
             body: { paths: pathsToScanInBatch },
             timeout: 0,
-        }, t("mma.sessionRequired"));
+        });
         if (result.details?.errors?.length > 0) console.error("[Holaf MM] Deep Scan Errors:", result.details.errors);
     } catch (error) {
-        AIH.ask({ title: t("mma.scanError"), message: t("mma.scanErrorMsg", { message: authenticatedErrorMessage(error, error.message) }) });
+        AIH.ask({ title: t("mma.scanError"), message: t("mma.scanErrorMsg", { message: serverErrorMessage(error, error.message) }) });
     } finally {
         processScanQueue(manager); // Process next batch or finish
     }
@@ -454,9 +402,8 @@ export async function performDelete(manager) {
     try {
         // La brique parse et renvoie tout 2xx (y compris le 207 Multi-Status
         // de succès partiel, accepté par l'ancien code) ; les non-2xx lèvent.
-        // Route protégée : invite partagée sur 401 puis rejeu UNE fois.
-        const result = await postAuthenticated('/holaf/models/delete',
-            { body: { paths: pathsToDelete } }, t("mma.sessionRequired"));
+        const result = await HolafFetch.post('/holaf/models/delete',
+            { body: { paths: pathsToDelete } });
         let message = t("mma.deletedCount", { count: result.details?.deleted_count || 0 });
         if (result.details?.errors?.length > 0) {
             message += t("mma.errorsOccurred", { count: result.details.errors.length });
@@ -464,7 +411,7 @@ export async function performDelete(manager) {
         }
         await AIH.ask({ title: t("mma.deleteComplete"), message });
     } catch (error) {
-        await AIH.ask({ title: t("mma.deleteError"), message: t("mma.deleteErrorMsg", { message: authenticatedErrorMessage(error, error.message) }) });
+        await AIH.ask({ title: t("mma.deleteError"), message: t("mma.deleteErrorMsg", { message: serverErrorMessage(error, error.message) }) });
     } finally {
         manager.isLoading = false;
         manager.selectedModelPaths.clear();

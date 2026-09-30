@@ -23,7 +23,6 @@
     box-sizing: border-box;
 }
 
-#holaf-terminal-panel .holaf-terminal-non-terminal-view input[type="password"],
 #holaf-terminal-panel .holaf-terminal-non-terminal-view input[type="text"] {
     background-color: var(--holaf-input-background) !important;
     color: var(--holaf-text-primary) !important;
@@ -37,7 +36,6 @@
     outline: none;
 }
 
-#holaf-terminal-panel .holaf-terminal-non-terminal-view input[type="password"]:focus,
 #holaf-terminal-panel .holaf-terminal-non-terminal-view input[type="text"]:focus {
     border-color: var(--holaf-accent-color) !important;
 }

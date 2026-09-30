@@ -21,14 +21,11 @@
  *     JSON control messages (resize / session-ended), so keystrokes that look
  *     like JSON can no longer be swallowed by the control parser.
  *
- * SECURITY NOTE: The terminal executes shell commands on the ComfyUI host and
- *   is protected by the SHARED password session (cookie holaf_session). The
- *   password prompt itself is NEVER rendered here: the terminal calls the
- *   unified invite HolafAuth.ensureAuthenticated() (js/holaf_auth.js), which
- *   is also used by the Nodes Manager and Blobby — one prompt per browser
- *   session, then every tool reuses the session. Passwords are sent as
- *   plaintext over the WebSocket handshake / HTTP: use HTTPS/WSS in remote
- *   deployments, and never expose the ComfyUI port directly.
+ * SECURITY NOTE: The terminal executes shell commands on the ComfyUI host.
+ *   The pack ships NO application authentication; access to this shell is
+ *   restricted by the reverse-proxy in front of ComfyUI (Caddy basic_auth or
+ *   Authentik forward-auth). NEVER expose the ComfyUI port (8188) directly,
+ *   and use HTTPS/WSS in remote deployments.
  * === End Documentation ===
  */
 import "./aih_dialog.js";
@@ -39,7 +36,6 @@ import { holafExtUrl } from "./holaf_ext_base.js";
 // CORRECTED IMPORT: No longer depends on panel_manager for themes.
 import { HOLAF_THEMES } from "./holaf_themes.js";
 import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
-import { ensureAuthenticated, expireSession } from "./holaf_auth.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -382,17 +378,9 @@ const holafTerminal = {
         view.append(this.reconnectStatusMessage, connectButton);
         return view;
     },
-    // Shared auth gate: the ONE password prompt lives in js/holaf_auth.js.
-    // The terminal never renders its own login/setup views anymore.
+    // No application auth: the terminal opens directly (access is enforced by
+    // the reverse-proxy in front of ComfyUI).
     async connect() {
-        const authenticated = await ensureAuthenticated();
-        if (!authenticated) {
-            if (this.reconnectStatusMessage) {
-                this.reconnectStatusMessage.textContent = t("term.authRequired");
-            }
-            this.showView('reconnect');
-            return;
-        }
         this.connectWebSocket();
     },
     showView(viewName) {
@@ -462,18 +450,10 @@ const holafTerminal = {
     },
     // The server told us the shell exited (Ctrl+D / 'exit' / crash) or the
     // socket dropped. Reset all session state and show the reconnect screen;
-    // the next connect re-validates the shared session via HolafAuth
-    // (status check — prompt only if the cookie is really gone) and opens a
-    // brand-new WebSocket + fresh PTY.
+    // the next connect opens a brand-new WebSocket + fresh PTY.
     handleSessionEnded() {
         this.closeSocket();
         this.disposeTerminal();
-        // La session mémoire peut être périmée (restart serveur, logout ailleurs)
-        // : on force une re-vérification au prochain connect → jamais de boucle
-        // de reconnexion « à l'aveugle » sur un cookie invalide. Nota : la session
-        // n'expire JAMAIS côté serveur (aucun TTL) ; ceci ne couvre que le cas
-        // où le cookie a réellement disparu/invalidé.
-        expireSession();
         if (this.panelElements && this.panelElements.panelEl.style.display === 'flex') {
             if (this.reconnectStatusMessage) this.reconnectStatusMessage.textContent = t("term.sessionEnded");
             this.showView('reconnect');

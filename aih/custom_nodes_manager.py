@@ -23,7 +23,8 @@ Différence vs source (documentée) : la fonction _install_custom_node() ne lanc
 PAS de ``pip install -r requirements.txt`` après le clone — l'auto pip install
 est INTERDIT dans le pack fusionné (PLAN_FUSION.md §3.3). L'utilisateur installe
 les requirements via le Nodes Manager d'Utils (POST /holaf/nodes/install-requirements,
-protégé par authentification) ou manuellement ; un message explicite est renvoyé.
+sans authentification applicative — protégé par le reverse-proxy) ou manuellement ;
+un message explicite est renvoyé.
 """
 
 import os

@@ -475,7 +475,7 @@ import {
             saveBtn.disabled = true;
             saveBtn.textContent = "...";
             try {
-                // Route locale /aih/* → HolafFetch SANS auth (same-origin transparente).
+                // Route locale /aih/credentials → HolafFetch SANS auth (same-origin transparente).
                 const data = await HolafFetch.post("/aih/credentials", {
                     body: {
                         api_key: inputKey.value.trim(),
@@ -992,7 +992,7 @@ import {
         const spinnerEl = modal.body.querySelector("#aih-update-spinner");
 
         try {
-            // Route locale /aih/* → HolafFetch SANS auth (same-origin transparente).
+            // Route locale /aih/update → HolafFetch SANS auth (same-origin transparente).
             const data = await HolafFetch.post("/aih/update");
             spinnerEl.style.display = "none";
             logEl.style.display = "block";

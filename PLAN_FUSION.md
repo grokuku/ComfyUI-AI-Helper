@@ -1,5 +1,11 @@
 # PLAN DE FUSION — CUI-Holaf-Utils
 
+> ⚠️ **DOCUMENT HISTORIQUE.** Les mentions d'« authentification par mot de passe » /
+> `holaf_auth` / `require_auth` / `holaf_session` ci-dessous décrivent un état
+> ANTÉRIEUR du pack, **supprimé depuis** : décision produit définitive « zéro mot
+> de passe — sécurité uniquement par le reverse-proxy (Caddy + Authentik) ». Le
+> pack actuel ne contient AUCUNE authentification applicative (cf. `README.md`).
+
 > Fusion des trois extensions ComfyUI de l'auteur grokuku en un pack unique : **CUI-Holaf-Utils**, renommé ensuite **ComfyUI-AI-Helper** (marque AIH unifiée).
 >
 > | Repo | Rôle dans la fusion |

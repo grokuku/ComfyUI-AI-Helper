@@ -11,9 +11,9 @@
 # - Control messages travel as TEXT frames only ({resize, session-ended}); all
 #   raw keyboard input travels as BINARY frames. This keeps user keystrokes
 #   that happen to look like JSON from being swallowed by the control channel.
-# - AUTH: the WebSocket route is decorated with holaf_auth.require_auth in the
-#   pack __init__.py (shared password session, cookie holaf_session). The
-#   handler re-checks the cookie as defense in depth: never an open shell.
+# - AUTH: NO application authentication. The pack ships no password mechanism;
+#   access to this shell WebSocket is restricted by the reverse-proxy in front
+#   of ComfyUI (Caddy basic_auth / Authentik). Never expose port 8188 directly.
 import asyncio
 import os
 import platform
@@ -42,8 +42,6 @@ else:
         print("   Please run 'pip install pywinpty' in your ComfyUI Python environment.")
         PtyProcess = None
 
-from . import holaf_auth # Shared password session (defense-in-depth check below)
-
 # --- Terminal Environment ---
 def is_running_in_conda():
     conda_prefix = os.environ.get('CONDA_PREFIX')
@@ -55,10 +53,10 @@ def is_running_in_venv():
 
 # --- API Route Handlers ---
 async def websocket_handler(request: web.Request, global_app_config):
-    # Defense in depth: the route is already guarded by require_auth, but a
-    # mis-registered route must never open an unauthenticated shell.
-    if not holaf_auth.is_authenticated(request):
-        return web.Response(status=401, text="Authentication required.")
+    # NO application authentication: the pack ships no password mechanism.
+    # Access to this shell WebSocket is restricted by the reverse-proxy in
+    # front of ComfyUI (Caddy basic_auth / Authentik). The previous defense-in-
+    # depth cookie check was removed together with the auth module.
 
     # NO timeout on the session: a terminal stays open indefinitely, including
     # through several minutes of a SILENT command (e.g. a HuggingFace model
@@ -388,9 +386,8 @@ async def websocket_handler(request: web.Request, global_app_config):
         # task had completed within 5 minutes — which is exactly what a silent
         # multi-minute download looks like (reader blocked in os.read, receiver
         # idle, nothing to send). That ceiling closed the terminal mid-download
-        # and bounced the user back to the password prompt. Removing it makes
-        # the session live as long as the user keeps it open (logout or shell
-        # exit still end it cleanly).
+        # and forced the user to reconnect. Removing it makes the session live
+        # as long as the user keeps it open (shell exit still ends it cleanly).
         _, pending = await asyncio.wait(
             [sender_task, receiver_task, thread_done],
             return_when=asyncio.FIRST_COMPLETED
