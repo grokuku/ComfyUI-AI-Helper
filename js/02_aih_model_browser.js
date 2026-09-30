@@ -49,16 +49,82 @@ var WF_REMOTE_MAX_PAGES = 20;
         return I && typeof I.t === "function" ? I.t(key, params) : key;
     };
 
+    // ─── Build marker + sonde d'obsolescence (motif Workflow Share) ────────────
+    // Cause PROUVÉE d'un correctif « livré mais invisible » : le navigateur
+    // exécute un 02_aih_model_browser.js PÉRIMÉ (cache heuristique du serveur
+    // statique ComfyUI, antérieur au middleware no-cache du pack). La sonde
+    // relit le fichier RÉELLEMENT servi (fetch cache:no-store) et compare son
+    // marqueur à celui-ci : si le code en cours est plus ancien que le fichier
+    // servi, on le DIT (console + bandeau). Les symptômes exacts d'un build
+    // périmé — barre d'outils « Transferts » absente et fenêtre de progression
+    // jamais ouverte — cessent alors d'être confondus avec un bug de code.
+    var AIH_MB_BUILD = "mb-transfers-2026-09-30-r7";
+    var AIH_MB_BUILD_RX = /AIH_MB_BUILD\s*=\s*["']([^"']+)["']/;
+    var _mbStaleWarned = false;
+
+    function _mbExtractBuild(text) {
+        var m = AIH_MB_BUILD_RX.exec(String(text == null ? "" : text));
+        return m ? m[1] : null;
+    }
+
+    // Compare le marqueur EN COURS à celui du fichier réellement servi.
+    // @returns {Promise<boolean|null>} true=obsolète, false=à jour, null=indéterminé.
+    function checkServedBuildFreshness() {
+        if (typeof fetch !== "function" || typeof window === "undefined") {
+            return Promise.resolve(null);
+        }
+        var url;
+        try {
+            url = new URL(import.meta.url, window.location.href);
+            url.searchParams.set("aih_build_probe", String(Date.now()));
+        } catch (e) {
+            return Promise.resolve(null);
+        }
+        return fetch(url.toString(), { cache: "no-store" })
+            .then(function (res) { return res && res.ok ? res.text() : null; })
+            .then(function (text) {
+                var served = _mbExtractBuild(text);
+                var stale = served !== null && served !== AIH_MB_BUILD;
+                if (window.AIH_MB) window.AIH_MB.stale = stale;
+                if (stale && !_mbStaleWarned) {
+                    _mbStaleWarned = true;
+                    console.error("[AIH] Model Browser OBSOLÈTE — exécuté " + AIH_MB_BUILD
+                        + " / servi " + served
+                        + " : le navigateur exécute un JS périmé. Recharge FORCÉE"
+                        + " (Ctrl+Shift+R / Cmd+Shift+R).");
+                }
+                return stale;
+            })
+            .catch(function () { return null; });
+    }
+
+    // Exposé pour les tests et le diagnostic utilisateur.
+    window.AIH_MB = {
+        build: AIH_MB_BUILD,
+        stale: null,
+        checkServedBuildFreshness: checkServedBuildFreshness,
+    };
+
     // ─── Fenêtre de progression dédiée (js/aih_download_window.js) ─────────────
     // Ouverte AU LANCEMENT d'un téléchargement (unitaire ET lot) : c'est la vue
     // demandée (nom du fichier, PHASE explicite, %, octets/total, MB/s, ETA,
     // ✕ par ligne, progression globale N/M, récap final). La progression « en
-    // ligne » de la liste reste en place (aucune régression). Si AIH.Dialog est
-    // indisponible, les helpers renvoient null : le download continue sans
-    // fenêtre, exactement comme avant.
+    // ligne » de la liste reste en place (aucune régression). Si AIH.DownloadWindow
+    // est absent (build périmé ou module non chargé), on le SIGNALE bruyamment
+    // une seule fois au lieu de continuer en silence sans fenêtre.
     var _dlWindow = null;
+    var _dlWinUnavailableWarned = false;
     function _dlWinOpen() {
-        if (!(window.AIH && window.AIH.DownloadWindow)) return null;
+        if (!(window.AIH && window.AIH.DownloadWindow)) {
+            if (!_dlWinUnavailableWarned) {
+                _dlWinUnavailableWarned = true;
+                console.error("[AIH] Fenêtre de transferts INDISPONIBLE : "
+                    + "window.AIH.DownloadWindow absent (build " + AIH_MB_BUILD
+                    + " / module aih_download_window.js non chargé). Recharge FORCÉE"
+                    + " (Ctrl+Shift+R / Cmd+Shift+R).");
+            }
+            return null;
+        }
         _dlWindow = window.AIH.DownloadWindow.open();
         return _dlWindow;
     }
@@ -246,6 +312,8 @@ var WF_REMOTE_MAX_PAGES = 20;
             ".mb-transfers-btn:hover { border-color: var(--aih-accent, #D8700D); background: #2a2a2e; }",
             ".mb-transfers-badge { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--aih-accent, #D8700D); color: #fff; font-size: 10px; font-weight: 700; line-height: 18px; text-align: center; }",
             ".mb-transfers-badge.is-empty { background: #444; color: #999; }",
+            ".mb-build-label { margin-left: auto; font-size: 10px; color: #555; user-select: text; }",
+            ".mb-stale-banner { font-size: 11px; color: #f87171; background: rgba(220,38,38,0.12); border: 1px solid #7f1d1d; border-radius: 6px; padding: 6px 8px; margin: 2px 0 6px; flex-shrink: 0; }",
             /* Sélection : barre de compteur + effacement */
             ".mb-selection-bar { display: flex; align-items: center; gap: 8px; padding: 6px 0 0; flex-shrink: 0; }",
             ".mb-selection-count { font-size: 10px; color: #9ca3af; white-space: nowrap; }",
@@ -955,11 +1023,15 @@ var WF_REMOTE_MAX_PAGES = 20;
 
         m.body.innerHTML = "" +
             '<div class="mb-filters" id="mb-filters"></div>' +
+            // Bandeau « build obsolète » : rempli par la sonde de fraîcheur
+            // (voir checkServedBuildFreshness). Masqué par défaut.
+            '<div id="mb-stale-banner" class="mb-stale-banner" style="display:none;"></div>' +
             '<div class="mb-toolbar" id="mb-toolbar">' +
             '  <button type="button" class="mb-transfers-btn" title="' + t('mb.transfersTitle') + '">' +
             '    <span class="mb-transfers-label">' + t('mb.transfers') + '</span>' +
             '    <span class="mb-transfers-badge is-empty">0</span>' +
             '  </button>' +
+            '  <span class="mb-build-label">' + _esc(AIH_MB_BUILD) + '</span>' +
             '</div>' +
             '<div class="mb-panels" id="mb-panels">' +
             '  <div class="mb-panel mb-panel-local">' +
@@ -1114,6 +1186,18 @@ var WF_REMOTE_MAX_PAGES = 20;
         }
         if (m._remoteList) {
             m._remoteList.addEventListener('dblclick', function (e) { _onListDblClick(e, m, true); });
+        }
+
+        // Sonde de fraîcheur : si le fichier SERVI contient un marqueur de build
+        // différent de celui en cours, ce code est PÉRIMÉ. On l'affiche au lieu
+        // de laisser croire à une fonctionnalité cassée.
+        var staleBanner = m.modal.querySelector('#mb-stale-banner');
+        if (staleBanner) {
+            checkServedBuildFreshness().then(function (stale) {
+                if (!stale || !staleBanner.isConnected) return;
+                staleBanner.textContent = t('mb.staleBuild', { running: AIH_MB_BUILD });
+                staleBanner.style.display = 'block';
+            });
         }
 
     }

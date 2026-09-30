@@ -49,6 +49,11 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
     var WINDOW_ID = "aih-download-window";
     var POLL_MS = 800; // même cadence que la progression en ligne du Model Browser
 
+    // Marqueur de build (diagnostic d'obsolescence, même motif que Workflow Share
+    // et 02_aih_model_browser.js).
+    var AIH_DLW_BUILD = "download-window-2026-09-30-r7";
+    var _dlgUnavailableWarned = false;
+
     // Abonnés au NOMBRE de transferts en cours + en file d'attente (badge du
     // Model Browser). Module-level : survit à la (re)création de la fenêtre.
     var _changeListeners = [];
@@ -186,7 +191,18 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
     function _createWindow() {
         var D = AIH.Dialog;
-        if (!D || typeof D.open !== "function") return null;
+        if (!D || typeof D.open !== "function") {
+            // Ne JAMAIS échouer en silence : sans AIH.Dialog (module périmé qui
+            // appelle une API absente, ou aih_dialog.js non chargé), la fenêtre
+            // ne peut pas s'ouvrir. On le DIT une fois, clairement.
+            if (!_dlgUnavailableWarned) {
+                _dlgUnavailableWarned = true;
+                console.error("[AIH] Fenêtre de transferts : AIH.Dialog.open indisponible"
+                    + " (build " + AIH_DLW_BUILD + ") — recharge FORCÉE"
+                    + " (Ctrl+Shift+R / Cmd+Shift+R).");
+            }
+            return null;
+        }
 
         _injectCSS();
 
@@ -605,6 +621,7 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         activeCount: activeCount,
         isVisible: isVisible,
         isOpen: isOpen,
+        build: AIH_DLW_BUILD,
         // Abonnement au compteur (badge). Renvoie une fonction de désabonnement.
         onChange: function (cb) {
             if (typeof cb !== "function") return function () {};

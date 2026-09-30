@@ -1,10 +1,22 @@
 // Tests du point d'entrée PERMANENT « Transferts » du Model Browser :
 // bouton + badge, fermeture = MASQUAGE tant qu'un transfert est actif (le suivi
 // n'est jamais perdu), réouverture par le bouton, ✕ par ligne toujours réel.
-// jsdom + fetch stubé, AUCUN appel réseau réel.
+//
+// CHARGEMENT RÉEL : on importe TOUS les .js du WEB_DIRECTORY en parallèle
+// (chemin exact de ComfyUI, cf. js/test_helpers/ext_load.mjs) — AUCUN stub de
+// AIH.Dialog. La VRAIE implémentation (js/aih_dialog.js) est utilisée.
+//
+// VISIBILITÉ RÉELLE : les assertions ne se contentent PAS de l'existence de
+// l'élément. Elles vérifient la cascade CSS computée (display/visibility/
+// opacity, y compris sur les ANCÊTRES), la présence effective dans le document
+// et l'ordre d'empilement (fenêtre de transferts au-dessus du Model Browser).
+// C'est ce défaut des anciens tests (existence seule) qui a laissé passer le
+// bug « livré mais invisible ».
 // Usage : node js/test_aih_model_browser_transfers.mjs
 import assert from "node:assert";
 import { loadJsdomOrSkip } from "./test_helpers/jsdom_loader.mjs";
+import { loadAllExtensions } from "./test_helpers/ext_load.mjs";
+import { assertVisible, assertStackedAbove, visibilityProblem } from "./test_helpers/visibility.mjs";
 
 const JSDOM = await loadJsdomOrSkip("test_aih_model_browser_transfers");
 
@@ -65,40 +77,60 @@ globalThis.fetch = async (url, opts) => {
         if (opts && opts.body) calls.download.push(JSON.parse(opts.body));
         return new Promise((resolve) => { pending.push(resolve); });
     }
+    // Sonde de fraîcheur de build : le fichier servi est identique → à jour.
+    if (u.includes("aih_build_probe")) {
+        return new Response("var AIH_MB_BUILD = \"mb-transfers-2026-09-30-r7\";",
+            { status: 200, headers: { "content-type": "text/javascript" } });
+    }
     return json({});
 };
 window.fetch = globalThis.fetch;
 window.localStorage.setItem("AIH_config", JSON.stringify({ serverUrl: "https://aih.example.com", apiKey: "tok" }));
 
-await import("./02_aih_model_browser.js");
+/* ─── 0. Chargement RÉEL façon ComfyUI (import parallèle, AUCUN stub) ────── */
+console.log("0. Chargement réel (tous les .js du WEB_DIRECTORY, aucun stub)");
+const results = await loadAllExtensions();
+const byFile = Object.fromEntries(results.map((r) => [r.file, r]));
+for (const f of ["aih_dialog.js", "aih_download_window.js", "02_aih_model_browser.js"]) {
+    assert.ok(byFile[f] && byFile[f].ok,
+        `${f} importé sans exception (${byFile[f] && byFile[f].error ? byFile[f].error.message : ""})`);
+}
 for (const k of ["aihOpenModalV2", "aihShowAlert", "aihShowConfirm", "aihToast", "showConflictModal", "HolafModal"]) {
     if (typeof window[k] !== "undefined") globalThis[k] = window[k];
 }
+assert.strictEqual(typeof window.AIH.Dialog.open, "function", "VRAIE AIH.Dialog.open utilisée (pas de stub)");
+ok("modules réels chargés en parallèle ; AIH.Dialog réel disponible");
 
 const winEl = () => document.querySelector("#aih-download-window");
 const badge = () => document.querySelector(".mb-transfers-badge");
 const transfersBtn = () => document.querySelector(".mb-transfers-btn");
 const remoteItems = () => document.querySelectorAll("#mb-remote-list .mb-item");
 
-/* ─── 1. Bouton + badge initiaux ─────────────────────────────────────────── */
-console.log("1. Bouton « Transferts » + badge à l'ouverture");
+/* ─── 1. Bouton + badge initiaux, RÉELLEMENT VISIBLES ────────────────────── */
+console.log("1. Bouton « Transferts » + badge VISIBLES à l'ouverture");
 window.openModelBrowser();
 await sleep(200);
+assert.ok(document.getElementById("aih-modal-model-browser"),
+    "le dialogue porte son id (contrat aihOpenModalV2 → AIH.Dialog.open : id transmis)");
 assert.ok(transfersBtn(), "bouton « Transferts » présent");
-assert.ok(badge(), "badge présent");
+assertVisible(assert, transfersBtn(), "bouton « Transferts »", { window });
+assertVisible(assert, badge(), "badge de transferts", { window });
 assert.strictEqual(badge().textContent, "0", "badge à 0 sans transfert");
 assert.ok(badge().classList.contains("is-empty"), "badge 0 marqué vide");
-ok("bouton « Transferts » + badge 0 (aucun transfert)");
+ok("bouton « Transferts » + badge 0 RÉELLEMENT visibles (cascade CSS vérifiée)");
 
-/* ─── 2. Lancement → fenêtre visible + badge 1 ───────────────────────────── */
-console.log("2. Lancement → fenêtre + badge 1");
+/* ─── 2. Lancement → fenêtre VISIBLE au-dessus du Model Browser + badge 1 ── */
+console.log("2. Lancement → fenêtre VISIBLE + badge 1");
 remoteItems()[0].dispatchEvent(new window.MouseEvent("dblclick", { bubbles: true }));
 await sleep(120);
 assert.ok(winEl(), "fenêtre ouverte");
+assertVisible(assert, winEl(), "fenêtre de progression", { window });
 assert.strictEqual(window.AIH.DownloadWindow.isVisible(), true, "fenêtre VISIBLE");
+assertStackedAbove(assert, winEl(), document.getElementById("aih-modal-model-browser"),
+    "fenêtre de progression vs Model Browser", window);
 assert.strictEqual(badge().textContent, "1", "badge = 1");
 assert.ok(!badge().classList.contains("is-empty"), "badge non vide");
-ok("lancement → fenêtre visible + badge 1");
+ok("lancement → fenêtre RÉELLEMENT visible, au-dessus du Model Browser ; badge 1");
 
 /* ─── 3. Fermer pendant le transfert = MASQUER (jamais perdre le suivi) ──── */
 console.log("3. ✕ pendant transfert = masquer");
@@ -108,21 +140,23 @@ headerClose.click();
 await sleep(60);
 assert.ok(winEl(), "la fenêtre reste dans le DOM (masquée, PAS détruite)");
 assert.strictEqual(winEl().style.display, "none", "fenêtre masquée (display:none)");
+assert.ok(visibilityProblem(winEl(), { window }) !== null, "visibilité réelle = masquée (contrôle négatif)");
 assert.strictEqual(window.AIH.DownloadWindow.isVisible(), false, "isVisible() false après masquage");
 assert.strictEqual(window.AIH.DownloadWindow.isOpen(), true, "isOpen() true : le suivi continue");
 assert.strictEqual(badge().textContent, "1", "badge MAINTENU à 1 pendant le masquage");
 assert.strictEqual(window.AIH.DownloadWindow.activeCount(), 1, "activeCount() = 1");
-ok("✕ pendant transfert → masquage, suivi + badge maintenus");
+ok("✕ pendant transfert → masquage réel, suivi + badge maintenus");
 
-/* ─── 4. Réouverture par le bouton « Transferts » ────────────────────────── */
+/* ─── 4. Réouverture par le bouton « Transferts » (RE-VISIBLE) ───────────── */
 console.log("4. Réouverture par le bouton");
 transfersBtn().click();
 await sleep(60);
 assert.ok(winEl(), "fenêtre toujours présente");
 assert.notStrictEqual(winEl().style.display, "none", "fenêtre ré-affichée");
+assertVisible(assert, winEl(), "fenêtre ré-ouverte", { window });
 assert.strictEqual(window.AIH.DownloadWindow.isVisible(), true, "isVisible() true après réouverture");
 assert.strictEqual(badge().textContent, "1", "badge toujours 1");
-ok("bouton « Transferts » → réouverture de la même fenêtre (suivi intact)");
+ok("bouton « Transferts » → réouverture VISIBLE de la même fenêtre (suivi intact)");
 
 /* ─── 5. ✕ par ligne toujours RÉEL (annulation) ──────────────────────────── */
 console.log("5. ✕ par ligne = annulation réelle");
@@ -158,6 +192,7 @@ assert.strictEqual(document.querySelector("#aih-download-window").style.display,
 window.AIH.DownloadWindow.open();
 await sleep(40);
 assert.strictEqual(document.querySelector("#aih-download-window"), before, "la réouverture réutilise le MÊME nœud");
+assertVisible(assert, winEl(), "fenêtre rouverte par l'API", { window });
 ok("contrôle négatif : ✕ actif → masquage (jamais destruction ni recréation)");
 
 console.log(`\n✅ test_aih_model_browser_transfers : ${n} groupes PASSENT`);

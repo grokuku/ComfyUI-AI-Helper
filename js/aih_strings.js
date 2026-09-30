@@ -203,6 +203,7 @@ import "./aih_i18n.js";
         "mb.selectionCount": "{count} sélectionné(s)",
         "mb.clearSelection": "Effacer la sélection",
         "mb.selectAllRows": "Tout sélectionner",
+        "mb.staleBuild": "⚠️ Cette page exécute une version PÉRIMÉE du Model Browser ({running}). Une version plus récente est servie par le serveur : recharge FORCÉE (Ctrl+Shift+R / Cmd+Shift+R) pour voir le bouton « ⬇️ Transferts » et la fenêtre de progression des téléchargements.",
 
         /* Workflow Share (aih_workflow_share.js) */
         "wf.title": "📤  Workflows",
@@ -1457,6 +1458,7 @@ import "./aih_i18n.js";
         "mb.selectionCount": "{count} selected",
         "mb.clearSelection": "Clear selection",
         "mb.selectAllRows": "Select all",
+        "mb.staleBuild": "⚠️ This page is running an OUTDATED Model Browser build ({running}). A newer build is served by the server: hard reload (Ctrl+Shift+R / Cmd+Shift+R) to see the “⬇️ Transfers” button and the download progress window.",
 
         /* Workflow Share (aih_workflow_share.js) */
         "wf.title": "📤  Workflows",

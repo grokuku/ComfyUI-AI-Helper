@@ -1063,6 +1063,11 @@ import {
     window.aihOpenModalV2 = function (options) {
         options = options || {};
         const ctrl = open({
+            // `id` et `theme` DOIVENT être transmis : sans `id`, le dialogue n'a
+            // aucun identifiant DOM → `#aih-modal-*` introuvable et le garde
+            // anti-doublon de open() est inopérant (deux fenêtres empilées).
+            id: options.id,
+            theme: options.theme,
             title: options.title,
             content: options.content,
             width: options.width,

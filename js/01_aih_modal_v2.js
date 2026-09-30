@@ -63,6 +63,10 @@ import "./aih_dialog.js";
         }
 
         const ctrl = D.open({
+            // `id` / `theme` transmis (sinon perte de l'identifiant DOM et du
+            // garde anti-doublon — voir aih_dialog.js).
+            id: options.id,
+            theme: options.theme,
             title: options.title,
             content: options.content,
             width: options.width,
@@ -84,7 +88,6 @@ import "./aih_dialog.js";
             onOpen: options.onOpen,
             onResize: options.onResize,
             zIndex: options.zIndex,
-            theme: options.theme,
         });
 
         // Adapte le controller AIH.Dialog → API v2 (modal/body/setBody).

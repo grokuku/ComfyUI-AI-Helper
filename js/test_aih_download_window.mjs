@@ -23,6 +23,7 @@
 // jsdom est résolu par le loader partagé ; introuvable = SKIP bruyant (exit 2).
 import assert from "node:assert";
 import { loadJsdomOrSkip } from "./test_helpers/jsdom_loader.mjs";
+import { assertVisible } from "./test_helpers/visibility.mjs";
 
 const JSDOM = await loadJsdomOrSkip("test_aih_download_window");
 
@@ -144,6 +145,7 @@ await import("./02_aih_model_browser.js");
 for (const k of ["aihOpenModalV2", "aihShowAlert", "aihShowConfirm", "aihToast", "showConflictModal", "HolafModal"]) {
     if (typeof window[k] !== "undefined") globalThis[k] = window[k];
 }
+assert.strictEqual(typeof window.AIH.Dialog.open, "function", "VRAIE AIH.Dialog.open utilisée (aucun stub)");
 assert.strictEqual(typeof window.AIH.DownloadWindow, "object", "AIH.DownloadWindow exposé");
 assert.strictEqual(typeof window.AIH.DownloadWindow.open, "function", "AIH.DownloadWindow.open exposé");
 
@@ -160,6 +162,8 @@ const windowTitle = () => winEl().querySelector(".aih-dialog-title").textContent
 console.log("2. Fenêtre ouverte au lancement (unitaire)");
 window.openModelBrowser();
 await sleep(150);
+assert.ok(document.getElementById("aih-modal-model-browser"),
+    "le dialogue Model Browser porte son id (aihOpenModalV2 transmet options.id)");
 const remoteItems = () => document.querySelectorAll("#mb-remote-list .mb-item");
 assert.strictEqual(remoteItems().length, 2, "deux modèles distants listés");
 
@@ -167,6 +171,7 @@ remoteItems()[0].dispatchEvent(new window.MouseEvent("dblclick", { bubbles: true
 await sleep(120);
 
 assert.ok(winEl(), "la fenêtre de progression est ouverte au lancement du download");
+assertVisible(assert, winEl(), "fenêtre de progression des téléchargements", { window });
 assert.ok(/Téléchargement/.test(windowTitle()), `titre fenêtre = téléchargement, obtenu « ${windowTitle()} »`);
 assert.strictEqual(dlRows().length, 1, "une ligne pour le fichier lancé");
 assert.ok(/Krea2-Turbo/.test(rowEl(0).querySelector(".aih-dlw-name").textContent), "nom du fichier affiché");
@@ -210,6 +215,7 @@ await sleep(200);
 assert.ok(rowEl(0).classList.contains("is-ok"), "ligne marquée réussie");
 assert.strictEqual(windowTitle(), "Téléchargement terminé", "titre final explicite");
 assert.ok(finalEl().classList.contains("is-visible"), "bandeau final VISIBLE (état explicite, pas seulement en DOM)");
+assertVisible(assert, finalEl(), "bandeau final visible", { window });
 assert.strictEqual(globalCount(), "Progression : 1/1", "progression globale 1/1");
 assert.ok(/1 réussi\(s\)/.test(finalText()) && /0 annulé\(s\)/.test(finalText()) && /0 échec\(s\)/.test(finalText()),
     `récap chiffré attendu, obtenu « ${finalText()} »`);

@@ -18,6 +18,7 @@
 import assert from "node:assert";
 import { loadJsdomOrSkip } from "./test_helpers/jsdom_loader.mjs";
 import { loadAllExtensions } from "./test_helpers/ext_load.mjs";
+import { assertVisible, assertStackedAbove } from "./test_helpers/visibility.mjs";
 
 const JSDOM = await loadJsdomOrSkip("test_aih_model_browser_real_load");
 
@@ -108,6 +109,8 @@ ok("openModelBrowser + AIH.DownloadWindow.open disponibles après le chargement 
 console.log("3. Double-clic distant → fenêtre + téléchargement");
 window.openModelBrowser();
 await sleep(200);
+assert.ok(document.getElementById("aih-modal-model-browser"),
+    "le dialogue Model Browser porte son id (aihOpenModalV2 transmet options.id)");
 const remoteItems = () => document.querySelectorAll("#mb-remote-list .mb-item");
 assert.strictEqual(remoteItems().length, 2, "deux modèles distants listés");
 
@@ -116,19 +119,25 @@ await sleep(120);
 
 const dlw = document.querySelector("#aih-download-window");
 assert.ok(dlw, "la fenêtre de progression est OUVERTE au double-clic");
+assertVisible(assert, dlw, "fenêtre de progression", { window });
+assert.notStrictEqual(dlw.style.display, "none", "fenêtre non masquée");
+assertStackedAbove(assert, dlw, document.getElementById("aih-modal-model-browser"),
+    "fenêtre de progression vs Model Browser", window);
 assert.strictEqual(document.querySelectorAll("#aih-download-window .aih-dlw-row").length, 1, "une ligne de progression");
 assert.strictEqual(calls.download.length, 1, "le téléchargement est bien parti");
 assert.strictEqual(calls.download[0].upload_id, "uid-1", "upload_id du modèle double-cliqué");
-ok("double-clic distant → fenêtre ouverte (1 ligne) + POST /models/download");
+ok("double-clic distant → fenêtre VISIBLE (1 ligne) + POST /models/download, au-dessus du browser");
 
 /* ─── 4. Point d'entrée permanent « Transferts » + badge ─────────────────── */
 console.log("4. Bouton « Transferts » + badge");
 const transfersBtn = document.querySelector(".mb-transfers-btn");
 assert.ok(transfersBtn, "bouton « Transferts » présent dans la barre d'outils");
+assertVisible(assert, transfersBtn, "bouton « Transferts »", { window });
 const badge = document.querySelector(".mb-transfers-badge");
 assert.ok(badge, "badge de compteur présent");
+assertVisible(assert, badge, "badge de transferts", { window });
 assert.strictEqual(badge.textContent, "1", "badge = 1 transfert en cours");
-ok("bouton « Transferts » + badge (1) présents après un lancement");
+ok("bouton « Transferts » + badge (1) RÉELLEMENT visibles après un lancement");
 
 console.log(`\n✅ test_aih_model_browser_real_load : ${n} groupes PASSENT`);
 try { dom.window.close(); } catch (e) { /* silencieux */ }
