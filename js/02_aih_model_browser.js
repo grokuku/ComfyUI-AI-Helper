@@ -10,7 +10,7 @@
 
 import "./aih_dialog.js";
 import "./aih_strings.js";
-import { remoteRequest } from "./aih_fetch_bridge.js";
+import { remoteRequest, normalizeServerUrl } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 import {
     collectWorkflowModelNames,
@@ -345,7 +345,7 @@ var WF_REMOTE_MAX_PAGES = 20;
         // Lire la config depuis localStorage (même clé que aih_menu.js)
         var cfg = {};
         try { cfg = JSON.parse(localStorage.getItem('AIH_config') || '{}'); } catch(e) {}
-        var baseUrl = (cfg.serverUrl || '').replace(/\/+$/, '');
+        var baseUrl = normalizeServerUrl(cfg.serverUrl);
         if (!baseUrl) {
             return Promise.reject(new Error(t('aih.notConfiguredError')));
         }

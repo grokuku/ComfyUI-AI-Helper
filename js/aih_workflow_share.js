@@ -2,7 +2,7 @@ import "./aih_dialog.js";
 import "./aih_strings.js";
 import { makeDraggable } from "./holaf_window_utils.js";
 import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToast as bridgeHideToast } from "./aih_toast_bridge.js";
-import { remoteGet, remotePost, remoteDelete, HolafFetch } from "./aih_fetch_bridge.js";
+import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } from "./aih_fetch_bridge.js";
 
 /**
  * AIH Workflow Manager — Modale unique avec 2 onglets.
@@ -33,7 +33,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch } from "./aih_fetch_bri
     // pas configuré (les points d'entrée vérifient via ensureServerConfigured).
     try {
       var cfg = JSON.parse(localStorage.getItem("AIH_config") || "{}");
-      var base = (cfg.serverUrl || "").replace(/\/+$/, "");
+      var base = normalizeServerUrl(cfg.serverUrl);
       return base ? base + "/api" : "";
     } catch { return ""; }
   }

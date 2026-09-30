@@ -1,5 +1,5 @@
 import "./aih_strings.js";
-import { remoteGet, remotePost } from "./aih_fetch_bridge.js";
+import { remoteGet, remotePost, normalizeServerUrl } from "./aih_fetch_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -119,7 +119,7 @@ const t = (key, params) => {
                     // configuré (comportements dégradés ci-dessous).
                     try {
                         const cfg = JSON.parse(localStorage.getItem("AIH_config") || "{}");
-                        const base = (cfg.serverUrl || "").replace(/\/+$/, "");
+                        const base = normalizeServerUrl(cfg.serverUrl);
                         return base ? base + "/api" : "";
                     } catch {
                         return "";

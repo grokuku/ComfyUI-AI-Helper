@@ -1,7 +1,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { showToast as bridgeShowToast } from "./aih_toast_bridge.js";
-import { remoteRequest, HolafFetch } from "./aih_fetch_bridge.js";
+import { remoteRequest, HolafFetch, normalizeServerUrl } from "./aih_fetch_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -39,7 +39,7 @@ function getApiUrl() {
     // (apiCall renvoie alors une erreur explicite).
     try {
         const cfg = JSON.parse(localStorage.getItem("AIH_config") || "{}");
-        const base = (cfg.serverUrl || "").replace(/\/+$/, "");
+        const base = normalizeServerUrl(cfg.serverUrl);
         return base ? base + "/api" : "";
     } catch {
         return "";

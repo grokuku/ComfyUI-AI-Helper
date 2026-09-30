@@ -15,7 +15,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { saveWindowRect, loadWindowRect } from "./holaf_window_utils.js";
-import { remoteGet, remotePost, HolafFetch } from "./aih_fetch_bridge.js";
+import { remoteGet, remotePost, HolafFetch, normalizeServerUrl } from "./aih_fetch_bridge.js";
 import { formatContextBar, applyContextBar } from "./aih_context_utils.js";
 import { escapeHtml } from "./holaf_dom_utils.js";
 // Registre d'outils + dispatcher + enforcement de mode + undo (étape 2).
@@ -217,7 +217,7 @@ var _blobbyBackendAvailable = true;
 function _blobbyGetBackendUrl() {
     // Aucune URL par défaut codée en dur : renvoie "" si le serveur n'est
     // pas configuré — les appelants doivent vérifier et dégrader proprement.
-    try { return JSON.parse(localStorage.getItem('AIH_config'))?.serverUrl?.replace(/\/+$/, '') || ''; }
+    try { return normalizeServerUrl(JSON.parse(localStorage.getItem('AIH_config'))?.serverUrl) || ''; }
     catch { return ''; }
 }
 

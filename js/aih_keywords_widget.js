@@ -1,7 +1,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { showToast as bridgeShowToast } from "./aih_toast_bridge.js";
-import { remoteRequest } from "./aih_fetch_bridge.js";
+import { remoteRequest, normalizeServerUrl } from "./aih_fetch_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -34,9 +34,10 @@ function getApiUrl() {
     // Délègue au helper partagé (aucune URL par défaut codée en dur :
     // chaîne vide si le serveur n'est pas configuré).
     try {
-        const base = (window.AIH && window.AIH.getServerUrl
+        const raw = (window.AIH && window.AIH.getServerUrl
             ? window.AIH.getServerUrl()
-            : "").replace(/\/+$/, "");
+            : "");
+        const base = normalizeServerUrl(raw);
         return base ? base + "/api" : "";
     } catch {
         return "";

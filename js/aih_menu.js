@@ -43,7 +43,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { showToast } from "./aih_toast_bridge.js";
-import { remoteGet, remoteRequest } from "./aih_fetch_bridge.js";
+import { remoteGet, remoteRequest, normalizeServerUrl } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 import { escapeHtml } from "./holaf_dom_utils.js";
 import {
@@ -73,8 +73,13 @@ import {
     const httpStatusLabel = (e) => (e && e.status) ? `HTTP ${e.status}` : t("menu.httpNetworkError");
 
     function getConfig() {
-        try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; }
-        catch { return {}; }
+        try {
+            const cfg = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+            // L'URL peut avoir été saisie sans schéma / avec "/api" / un slash :
+            // on la normalise dès la lecture (même règle que le bridge).
+            if (cfg.serverUrl) cfg.serverUrl = normalizeServerUrl(cfg.serverUrl);
+            return cfg;
+        } catch { return {}; }
     }
 
     function setConfig(cfg) {
@@ -474,19 +479,25 @@ import {
         const saveBtn = mkBtn(t("menu.save"), _aihStyle.btn(), async () => {
             saveBtn.disabled = true;
             saveBtn.textContent = "...";
+            // Corrige la saisie (schéma implicite, "/api", slash final) AVANT
+            // l'envoi et le cache : sinon le bridge fabrique une URL cassée et
+            // la connexion échoue ("/api/api/..." ou requête relative).
+            const serverUrl = normalizeServerUrl(inputUrl.value);
+            const apiKey = inputKey.value.trim();
+            inputUrl.value = serverUrl;
             try {
                 // Route locale /aih/credentials → HolafFetch SANS auth (same-origin transparente).
                 const data = await HolafFetch.post("/aih/credentials", {
                     body: {
-                        api_key: inputKey.value.trim(),
-                        server_url: inputUrl.value.trim(),
+                        api_key: apiKey,
+                        server_url: serverUrl,
                     },
                 });
                 if (data.status === "ok") {
                     // Mettre a jour aussi localStorage pour le cache UI
                     setConfig({
-                        serverUrl: inputUrl.value.trim(),
-                        apiKey: inputKey.value.trim(),
+                        serverUrl: serverUrl,
+                        apiKey: apiKey,
                     });
                     status.textContent = t("menu.savedIn", { path: data.path });
                     status.style.color = "#4ade80";
@@ -512,7 +523,7 @@ import {
         HolafFetch.get("/aih/credentials")
             .then(data => {
                 if (data.status === "ok") {
-                    if (data.server_url) inputUrl.value = data.server_url;
+                    if (data.server_url) inputUrl.value = normalizeServerUrl(data.server_url);
                     if (data.api_key) inputKey.value = data.api_key;
                     if (data.path) {
                         status.textContent = t("menu.file", { path: data.path });
