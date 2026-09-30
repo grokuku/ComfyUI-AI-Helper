@@ -12,50 +12,65 @@
 
 1.  **Remote Code Execution:** The Terminal utility is designed to execute shell commands on your server from a web browser. If your ComfyUI is accessible on a network (even a local one), anyone who can access the ComfyUI web page could potentially take control of your server.
 2.  **Network Security:** **DO NOT EXPOSE** your ComfyUI instance to the public internet (e.g., using `--listen 0.0.0.0`) with this extension installed, unless you have secured it behind a robust authentication layer (like a reverse proxy with a login/password) and are using **HTTPS**.
-3.  **Password Authentication:** The Terminal is secured by a password that you set. The password is saved as a hash in the `config.ini` file.
+3.  **Password session (one prompt per browser session):** The Terminal,
+    Nodes Manager, Model Manager and Blobby shell endpoints are protected by a
+    password. The FIRST protected tool you use shows the password prompt
+    (setup on first run, minimum **8 characters**); every other tool then
+    reuses the same session without asking again. The session cookie is a
+    BROWSER SESSION cookie (`holaf_session`, no `Max-Age`/`Expires`): it dies
+    when the browser is closed. There is deliberately **no login
+    rate-limiting** — keep ComfyUI behind an authenticated reverse proxy.
+    There is also **no session timeout**: a session never expires server-side,
+    so a long (silent) operation such as a HuggingFace download can never log
+    you out or close your terminal mid-run.
 4.  **Intended Use:** This tool is intended for advanced users who need to perform system maintenance (manage files, update repositories, monitor processes with `nvidia-smi`) on a remote or headless ComfyUI server without needing a separate SSH session.
 
 **If you do not understand these risks, DO NOT INSTALL THIS EXTENSION.**
 
 ---
 
-### 🔐 Sensitive routes require a password
+### 🔐 Sensitive routes require the shared password session
 
-Beyond the Terminal, the following sensitive endpoints are **always** protected
-by the same password-based session authentication (`holaf_session` cookie):
+A single password (hash stored in `config.ini` under `[Security] /
+password_hash`) protects the following endpoints. They always return `401`
+without a valid `holaf_session` cookie — there is **no local-only exemption**:
 
-* `POST /holaf/utilities/restart`
-* `POST /holaf/models/upload-chunk`, `POST /holaf/models/finalize-upload`, `POST /holaf/models/delete`
-* `GET/POST /aih/credentials`, `GET /aih/openai/keys`
-* `POST /aih/update`
-* `POST /api/aih/custom-nodes/install`
-* `POST/GET /aih/blobby/save`, `/aih/blobby/load`, `POST /aih/blobby/exec`
+* `GET /holaf/terminal` (WebSocket) — interactive shell (RCE).
+* `POST /holaf/utilities/restart` — restarts the ComfyUI server.
+* `POST /holaf/models/upload-chunk`, `POST /holaf/models/finalize-upload`,
+  `POST /holaf/models/delete`, `POST /holaf/models/deep-scan-local`.
+* `POST /holaf/nodes/update`, `/holaf/nodes/delete`, `/holaf/nodes/install`,
+  `/holaf/nodes/install-requirements` — `git`/`pip` operations on custom nodes.
+* `GET/POST /aih/credentials`, `GET /aih/openai/keys` — read/write local
+  credentials.
+* `POST /aih/update` — `git fetch` + `git reset --hard` on the pack.
+* `POST /api/aih/custom-nodes/install`.
+* `POST/GET /aih/blobby/save`, `/aih/blobby/load`, `POST /aih/blobby/exec`.
 
-There is **no local-only exemption**: these routes require a valid session even
-when ComfyUI is bound to `127.0.0.1`. This is intentional — a reverse proxy on
-the same host (e.g. Caddy) can still forward requests to a loopback-bound
-ComfyUI, so a bind-address check cannot reliably distinguish local access from
-proxied access. **You MUST set a password** (via the Terminal setup panel or by
-writing a `password_hash` into `config.ini`) for these features to work. Without
-a configured password, the login endpoint refuses all sessions and these routes
-return `401`.
+Auth endpoints (shared by every frontend, see `js/holaf_auth.js`):
+`POST /holaf/auth/login`, `POST /holaf/auth/setup` (first-time setup / change),
+`POST /holaf/auth/logout`, `GET /holaf/auth/status`.
 
-### 🔒 Brute-force protection (login rate limiting)
+* **Session duration:** browser session only (cookie without `Max-Age`). The
+  signed token has **no server-side expiry**: a session ends ONLY with an
+  explicit logout (`POST /holaf/auth/logout`) or when the browser is closed.
+  ⚠️ Accepted trade-off: a stolen token stays valid until logout — the only
+  other bound is the browser-session cookie. Deploy behind an authenticated
+  reverse proxy.
+* **Minimum password length:** 8 characters (`AIH_MIN_PASSWORD_LENGTH` can
+  raise it; existing hashes are unaffected).
+* **One prompt per session:** the first protected tool opens the shared
+  `AIH.Dialog` prompt; the other tools never re-ask once the session exists.
+* **No rate-limiting** on the login endpoints. If ComfyUI is exposed directly
+  — e.g. `--listen 0.0.0.0`, a published Docker port, or any host on the LAN
+  reaching the ComfyUI port — **an attacker can brute-force the password**.
+  Bind ComfyUI to `127.0.0.1` (or firewall the port) and keep an authenticated
+  reverse proxy / SSO in front.
 
-Login endpoints (`/holaf/auth/login`, `/holaf/terminal/auth`, and the
-`current_password` check of `/holaf/terminal/set-password`) are rate-limited to
-thwart online brute-force attacks on the terminal password:
-
-* **Per IP**: `AIH_RATE_LIMIT_MAX_FAILURES` (default `5`) failures within
-  `AIH_RATE_LIMIT_WINDOW_SECONDS` (default `900` = 15 min) lock the IP out.
-* **Global backstop**: `AIH_RATE_LIMIT_GLOBAL_MAX` (default `50`) failures
-  within `AIH_RATE_LIMIT_GLOBAL_WINDOW_SECONDS` (default `60`) lock everyone
-  briefly — this prevents bypassing the per-IP limit by rotating spoofed
-  `X-Forwarded-For` headers.
-* A successful login resets the per-IP counter.
-
-New terminal passwords must be at least `AIH_MIN_PASSWORD_LENGTH` (default
-`12`) characters (existing hashes are unaffected).
+**Conserved protections** (not password-related): path confinement/allow-lists
+for files and model paths, SFTP URL validation, the bulk-settings allow-list
+(`[Terminal]`/`[Security]` rejected → no `shell_command` injection through
+`POST /holaf/utilities/save-all-settings`), and command timeouts.
 
 ---
 
@@ -96,17 +111,26 @@ New terminal passwords must be at least `AIH_MIN_PASSWORD_LENGTH` (default
 ### First-Time Use (Terminal)
 
 1.  After installation and restarting ComfyUI, click the **"Utilities"** button in the top menu bar, then select **"Terminal"**.
-2.  A floating panel will appear, displaying a "Setup" screen.
-3.  Enter and confirm a strong password directly in the panel and click "Set Password".
-4.  The backend will attempt to save a hashed version of your password to a `config.ini` file.
-    *   **On success,** the panel will switch to a login screen.
-    *   **On failure (due to file permissions),** the panel will display the generated password hash and instructions. You will then need to manually copy this hash into your `config.ini` file and restart ComfyUI.
-    *   The `config.ini` file is located in `ComfyUI/custom_nodes/ComfyUI-Holaf-Utilities/`.
+2.  On first run, the shared authentication prompt appears: enter and confirm a
+    password (minimum **8 characters**). The backend saves its PBKDF2 hash to
+    `config.ini` under `[Security] / password_hash` and logs you in directly.
+    *   **On success,** the terminal connects immediately.
+    *   **On failure (file permissions),** the prompt displays the generated
+        hash and instructions: copy it into `config.ini` under `[Security]` and
+        restart ComfyUI.
+    *   The `config.ini` file is located in
+        `ComfyUI/custom_nodes/ComfyUI-Holaf-Utilities/`.
+    *   You can also generate the hash manually: run
+        `python -m custom_nodes.ComfyUI-Holaf-Utilities` (see `__main__.py`)
+        and paste the printed `password_hash` line into `config.ini` under
+        `[Security]`.
 
 ### Normal Usage
 
 1.  Click the **"Utilities"** menu to open a utility panel.
-2.  For the Terminal, enter the password you configured and click "Connect".
+2.  The first protected tool asks for the password (once per browser session);
+    afterwards every tool (Terminal, Nodes Manager, Blobby…) reuses the same
+    session without asking again.
 3.  You can show/hide the panel by clicking the menu item again.
 
 ---
@@ -118,8 +142,10 @@ New terminal passwords must be at least `AIH_MIN_PASSWORD_LENGTH` (default
 PYTHON=/path/to/venv/bin/python ./run_tests.sh
 ```
 
-Les tests couvrent le rate-limiting d'authentification (`tests/test_rate_limit.py`).
-Le script lance pytest depuis un répertoire temporaire : le `__init__.py` racine
+Les tests couvrent l'authentification partagée (`tests/test_auth_session.py` :
+minimum 8, cookie de session sans `Max-Age`, gardes des routes) et la
+non-régression des protections qui ne sont pas des mots de passe. Le script
+lance pytest depuis un répertoire temporaire : le `__init__.py` racine
 est le point d'entrée de l'extension (il importe `server` de ComfyUI) et ne doit
 pas être importé par pytest.
 

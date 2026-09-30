@@ -24,6 +24,11 @@ import {
 } from "./holaf_themes.js";
 import { HolafWipManager, WIP_FEATURES } from "./holaf_wip_settings.js";
 import { saveWindowRect, loadWindowRect } from "./holaf_window_utils.js";
+import {
+    validatePasswordChange,
+    changePassword,
+    getMinPasswordLength,
+} from "./holaf_auth.js";
 
 const SETTINGS_RECT_KEY = "aih:settings-panel";
 
@@ -46,6 +51,7 @@ const HolafSettingsManager = {
         { id: "general", label: "settings.general" },
         { id: "aih-account", label: "settings.aihAccount" },
         { id: "aih-providers", label: "settings.aihProviders" },
+        { id: "security", label: "settings.security" },
     ],
 
     init() {
@@ -163,6 +169,8 @@ const HolafSettingsManager = {
             this.renderAihTab(container, "renderAccountTab", t("settings.accountTab"));
         } else if (this.activeTab === "aih-providers") {
             this.renderAihTab(container, "renderProviderTab", t("settings.providerTab"));
+        } else if (this.activeTab === "security") {
+            this.renderSecurityTab(container);
         }
     },
 
@@ -401,6 +409,114 @@ const HolafSettingsManager = {
                 window.holaf.rebuildMenu();
             }
         });
+    },
+
+    // ── Onglet Sécurité (changement du mot de passe partagé) ──
+    // Branchement direct sur la route EXISTANTE POST /holaf/auth/setup, qui
+    // exige déjà le mot de passe courant (pas de takeover non authentifié).
+    // La validation client (min 8, confirmation) vit dans HolafAuth
+    // (js/holaf_auth.js) : validatePasswordChange + changePassword.
+    renderSecurityTab(container) {
+        container.innerHTML = "";
+
+        const group = document.createElement("div");
+        group.className = "holaf-settings-group";
+        group.style.cssText = "padding:15px;";
+
+        const title = document.createElement("h3");
+        title.style.cssText = "margin:0 0 6px;font-size:14px;";
+        title.textContent = t("settings.changePassword");
+
+        const desc = document.createElement("p");
+        desc.className = "holaf-settings-field-description";
+        desc.style.cssText = "font-size:11px;margin:0 0 14px;line-height:1.5;";
+        desc.textContent = t("settings.changePasswordDesc");
+
+        // Fabrique un champ « label + input password » (accessibilité : le label
+        // porte `for` sur l'id unique de l'input).
+        const mkField = (id, labelKey, autocomplete) => {
+            const field = document.createElement("div");
+            field.className = "holaf-settings-field";
+            field.style.cssText = "display:flex;flex-direction:column;gap:4px;margin-bottom:10px;";
+            const label = document.createElement("label");
+            label.htmlFor = id;
+            label.style.fontSize = "12px";
+            label.textContent = t(labelKey);
+            const input = document.createElement("input");
+            input.type = "password";
+            input.id = id;
+            input.autocomplete = autocomplete;
+            input.style.cssText = "width:100%;padding:6px 10px;box-sizing:border-box;border-radius:4px;border:1px solid var(--holaf-border-color,#555);background-color:var(--holaf-input-background,#1a1a1e);color:var(--holaf-text-primary,#fff);font-size:12px;";
+            field.append(label, input);
+            return { field, input };
+        };
+
+        const current = mkField("holaf-settings-pwd-current", "settings.changeCurrent", "current-password");
+        const next = mkField("holaf-settings-pwd-new", "settings.changeNew", "new-password");
+        const confirm = mkField("holaf-settings-pwd-confirm", "settings.changeConfirm", "new-password");
+
+        const submit = document.createElement("button");
+        submit.type = "button";
+        submit.textContent = t("settings.changeSubmit");
+        submit.style.cssText = "padding:6px 12px;border-radius:4px;border:none;background:var(--holaf-accent-color,#ff8c00);color:white;cursor:pointer;font-size:12px;font-weight:600;";
+
+        const status = document.createElement("p");
+        status.className = "holaf-settings-field-description";
+        status.style.cssText = "margin:10px 0 0;font-size:12px;min-height:1.2em;";
+
+        const setStatus = (key, params, isSuccess) => {
+            status.textContent = key ? t(key, params) : "";
+            status.style.color = isSuccess
+                ? "#4ade80"
+                : "var(--holaf-error-color,#ef4444)";
+        };
+
+        const REASON_KEYS = {
+            "current-missing": "settings.changeCurrentRequired",
+            "new-missing": "settings.changeNewRequired",
+            "too-short": "settings.changeNewMin",
+            "mismatch": "settings.changeMismatch",
+        };
+
+        submit.addEventListener("click", async () => {
+            // Minimum réel (lu depuis /holaf/auth/status) : jamais un 8 en dur.
+            const min = await getMinPasswordLength();
+            const check = validatePasswordChange(
+                current.input.value, next.input.value, confirm.input.value, min
+            );
+            if (!check.ok) {
+                setStatus(REASON_KEYS[check.reason] || "settings.changeError", { min: check.min, error: "" });
+                return;
+            }
+
+            submit.disabled = true;
+            const originalLabel = submit.textContent;
+            submit.textContent = t("settings.changeSubmitting");
+            setStatus("");
+            try {
+                await changePassword(current.input.value, next.input.value);
+                current.input.value = "";
+                next.input.value = "";
+                confirm.input.value = "";
+                setStatus("settings.changeSuccess", null, true);
+            } catch (err) {
+                if (err && err.status === 403) {
+                    setStatus("settings.changeCurrentWrong");
+                } else if (err && err.status === 400) {
+                    setStatus("settings.changeNewMin", { min });
+                } else if (err && err.status === 0) {
+                    setStatus("settings.changeReach");
+                } else {
+                    setStatus("settings.changeError", { error: (err && err.message) || err });
+                }
+            } finally {
+                submit.disabled = false;
+                submit.textContent = originalLabel;
+            }
+        });
+
+        group.append(title, desc, current.field, next.field, confirm.field, submit, status);
+        container.appendChild(group);
     },
 
     /**

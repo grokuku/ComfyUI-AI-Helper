@@ -8,14 +8,17 @@
  * AI-Helper n'existe plus depuis la fusion).
  *
  * Note pack fusionné : POST /aih/blobby/exec est sécurisé derrière l'auth
- * terminal Holaf (cookie holaf_session). Un 401 est affiché à l'utilisateur
- * avec une invitation au login via le Terminal AIH (jamais d'erreur muette).
+ * partagée du pack (cookie de session holaf_session). L'invite de mot de passe
+ * est UNIQUE : Blobby passe par HolafAuth.ensureAuthenticated()
+ * (js/holaf_auth.js), comme le Terminal et le Nodes Manager — jamais de
+ * modale propre à Blobby, jamais de 401 muet.
  */
 
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { saveWindowRect, loadWindowRect } from "./holaf_window_utils.js";
 import { remoteGet, remotePost, HolafFetch } from "./aih_fetch_bridge.js";
+import { ensureAuthenticated } from "./holaf_auth.js";
 import { formatContextBar, applyContextBar } from "./aih_context_utils.js";
 import { escapeHtml } from "./holaf_dom_utils.js";
 // Registre d'outils + dispatcher + enforcement de mode + undo (étape 2).
@@ -2696,16 +2699,22 @@ const Blobby = {
         // Executer chaque commande sequentiellement
         for (var i = 0; i < commands.length; i++) {
             try {
-                var r = await HolafFetch.request(localUrl + '/aih/blobby/exec', {
+                var execOpts = {
                     method: 'POST',
                     raw: true,
                     body: { action: 'shell', command: commands[i] }
-                });
-                // L'exec est protégé par l'auth terminal Holaf (cookie holaf_session).
-                // Un 401 doit se voir : on invite au login au lieu d'une erreur muette.
+                };
+                var r = await HolafFetch.request(localUrl + '/aih/blobby/exec', execOpts);
                 if (r.status === 401) {
-                    results.push({ command: commands[i], output: t("bl.sessionRequired") });
-                    continue;
+                    // Route shell protégée : invite PARTAGÉE (HolafAuth), UN retry.
+                    var authenticated = await ensureAuthenticated(t("bl.sessionRequired"));
+                    if (authenticated) {
+                        r = await HolafFetch.request(localUrl + '/aih/blobby/exec', execOpts);
+                    }
+                    if (!authenticated || r.status === 401) {
+                        results.push({ command: commands[i], output: t("bl.sessionRequired") });
+                        continue;
+                    }
                 }
                 var data = await r.json().catch(() => ({}));
                 var output = data.output || (data.ok ? t("bl.done") : t("bl.error"));
@@ -2800,24 +2809,30 @@ const Blobby = {
                 return;
             }
             var cmd = commands[idx];
-            HolafFetch.request(localUrl + '/aih/blobby/exec', {
+            var execOpts = {
                 method: 'POST',
                 raw: true,
                 body: { action: 'shell', command: cmd.command }
-            })
+            };
+            HolafFetch.request(localUrl + '/aih/blobby/exec', execOpts)
             .then(function(r) {
-                // L'exec est protégé par l'auth terminal Holaf (cookie holaf_session).
-                // Un 401 doit se voir : on invite au login au lieu d'une erreur muette.
-                if (r.status === 401) {
+                // Route shell protégée : invite PARTAGÉE (HolafAuth), UN retry.
+                if (r.status !== 401) return r.json();
+                return ensureAuthenticated(t("bl.sessionRequired")).then(function(authenticated) {
+                    if (!authenticated) return null;
+                    return HolafFetch.request(localUrl + '/aih/blobby/exec', execOpts).then(function(retryR) {
+                        if (retryR.status === 401) return null;
+                        return retryR.json();
+                    });
+                });
+            })
+            .then(function(data) {
+                if (data === null) {
                     output = output.replace('⏳', '\n\n' + t("bl.sessionRequired"));
                     idx++;
                     runNext();
-                    return null;
+                    return;
                 }
-                return r.json();
-            })
-            .then(function(data) {
-                if (data === null) return;
                 var result = '';
                 if (data.ok) {
                     result = '\n\n' + (data.output || t("bl.doneExclam"));

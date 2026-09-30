@@ -10,9 +10,9 @@
  * FIX(lifecycle): Full session lifecycle rework:
  *   - The server sends {"type":"session-ended"} (TEXT control frame) when the
  *     shell exits (Ctrl+D / exit / crash). On receipt we tear down the socket
- *     AND the xterm instance, then show a clean login screen. The next
- *     successful login creates a brand-new WebSocket + fresh PTY-bound
- *     terminal instead of resurrecting a dead session.
+ *     AND the xterm instance, then show the reconnect screen. The next
+ *     connect creates a brand-new WebSocket + fresh PTY-bound terminal
+ *     instead of resurrecting a dead session.
  *   - Every connection disposes the previous xterm and opens a pristine one.
  *   - All handlers are guarded against stale events from a replaced socket
  *     (late onclose/onerror of the old socket used to null out the NEW socket,
@@ -21,9 +21,14 @@
  *     JSON control messages (resize / session-ended), so keystrokes that look
  *     like JSON can no longer be swallowed by the control parser.
  *
- * SECURITY NOTE: Terminal passwords are sent as plaintext over WebSocket.
- *   This is acceptable for local/loopback connections. For remote deployments,
- *   ensure ComfyUI is served over HTTPS/WSS to protect credentials in transit.
+ * SECURITY NOTE: The terminal executes shell commands on the ComfyUI host and
+ *   is protected by the SHARED password session (cookie holaf_session). The
+ *   password prompt itself is NEVER rendered here: the terminal calls the
+ *   unified invite HolafAuth.ensureAuthenticated() (js/holaf_auth.js), which
+ *   is also used by the Nodes Manager and Blobby — one prompt per browser
+ *   session, then every tool reuses the session. Passwords are sent as
+ *   plaintext over the WebSocket handshake / HTTP: use HTTPS/WSS in remote
+ *   deployments, and never expose the ComfyUI port directly.
  * === End Documentation ===
  */
 import "./aih_dialog.js";
@@ -34,6 +39,7 @@ import { holafExtUrl } from "./holaf_ext_base.js";
 // CORRECTED IMPORT: No longer depends on panel_manager for themes.
 import { HOLAF_THEMES } from "./holaf_themes.js";
 import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
+import { ensureAuthenticated, expireSession } from "./holaf_auth.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -238,13 +244,10 @@ const holafTerminal = {
         this.contentContainer = this.panelElements.contentEl;
         this.terminalContainer = this.createTerminalView();
         this.loadingView = this.createLoadingView();
-        this.loginView = this.createLoginView();
-        this.setupView = this.createSetupView();
-        this.manualSetupView = this.createManualSetupView();
+        this.reconnectView = this.createReconnectView();
 
         this.contentContainer.append(
-            this.loadingView, this.loginView, this.setupView,
-            this.manualSetupView, this.terminalContainer
+            this.loadingView, this.reconnectView, this.terminalContainer
         );
     },
     createThemeMenu() {
@@ -366,53 +369,37 @@ const holafTerminal = {
         v.textContent = t("term.checkingStatus");
         return v;
     },
-    createLoginView() {
+    createReconnectView() {
         const view = document.createElement("div");
         view.className = "holaf-terminal-non-terminal-view";
-        const ptitle = document.createElement("h4"); ptitle.textContent = t("term.loginTitle"); ptitle.style.marginTop = "0";
-        const label = document.createElement("label"); label.textContent = t("term.password"); label.style.cssText = "display: block; margin-bottom: 5px;";
-        this.passwordInput = document.createElement("input"); this.passwordInput.type = "password"; this.passwordInput.style.cssText = "width: 200px; max-width: 80%; margin-bottom: 10px;";
-        this.passwordInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.authenticateAndConnect(); });
-        const connectButton = document.createElement("button"); connectButton.textContent = t("term.connect"); connectButton.className = "comfy-button";
-        connectButton.addEventListener("click", this.authenticateAndConnect.bind(this));
-        this.loginStatusMessage = document.createElement("p"); this.loginStatusMessage.className = "holaf-terminal-status-message";
-        view.append(ptitle, label, this.passwordInput, connectButton, this.loginStatusMessage);
+        this.reconnectStatusMessage = document.createElement("p");
+        this.reconnectStatusMessage.className = "holaf-terminal-status-message";
+        this.reconnectStatusMessage.style.marginBottom = "10px";
+        const connectButton = document.createElement("button");
+        connectButton.textContent = t("term.connect");
+        connectButton.className = "comfy-button";
+        connectButton.addEventListener("click", () => this.connect());
+        view.append(this.reconnectStatusMessage, connectButton);
         return view;
     },
-    createSetupView() {
-        const view = document.createElement("div");
-        view.className = "holaf-terminal-non-terminal-view";
-        const title = document.createElement("h3"); title.textContent = t("term.setupTitle"); title.className = "holaf-terminal-title-success";
-        const p1 = document.createElement("p"); p1.textContent = t("term.setupIntro"); p1.style.marginBottom = "15px";
-        const passLabel = document.createElement("label"); passLabel.textContent = t("term.newPassword"); passLabel.style.display = "block"; passLabel.style.marginBottom = "2px";
-        this.newPasswordInput = document.createElement("input"); this.newPasswordInput.type = "password"; this.newPasswordInput.style.cssText = "width: 200px; max-width: 80%; margin-bottom: 5px;";
-        const confirmLabel = document.createElement("label"); confirmLabel.textContent = t("term.confirmPassword"); confirmLabel.style.display = "block"; confirmLabel.style.marginBottom = "2px";
-        this.confirmPasswordInput = document.createElement("input"); this.confirmPasswordInput.type = "password"; this.confirmPasswordInput.style.cssText = "width: 200px; max-width: 80%; margin-bottom: 10px;";
-        this.confirmPasswordInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.setPassword(); });
-        const setButton = document.createElement("button"); setButton.textContent = t("term.setPassword"); setButton.className = "comfy-button";
-        setButton.addEventListener("click", this.setPassword.bind(this));
-        this.setupStatusMessage = document.createElement("p"); this.setupStatusMessage.className = "holaf-terminal-status-message";
-        view.append(title, p1, passLabel, this.newPasswordInput, confirmLabel, this.confirmPasswordInput, setButton, this.setupStatusMessage);
-        return view;
-    },
-    createManualSetupView() {
-        const view = document.createElement("div");
-        view.className = "holaf-terminal-non-terminal-view"; view.style.fontSize = "12px";
-        const title = document.createElement("h3"); title.textContent = t("term.manualSetupTitle"); title.className = "holaf-terminal-title-warning";
-        const p1 = document.createElement("p"); p1.innerHTML = t("term.manualSetupIntro");
-        const p2 = document.createElement("p"); p2.innerHTML = t("term.manualSetupSteps"); p2.style.margin = "10px 0"; p2.style.textAlign = "left";
-        this.hashDisplay = document.createElement("input"); this.hashDisplay.type = "text"; this.hashDisplay.readOnly = true; this.hashDisplay.style.cssText = "width: 100%; font-family: monospace; margin: 5px 0; padding: 5px;";
-        const copyButton = document.createElement("button"); copyButton.textContent = t("term.copyHash"); copyButton.className = "comfy-button"; copyButton.style.marginTop = "5px";
-        copyButton.addEventListener("click", () => { if (this.hashDisplay) { this.hashDisplay.select(); navigator.clipboard.writeText(this.hashDisplay.value).catch(() => document.execCommand("copy")); } });
-        const p3 = document.createElement("p"); p3.innerHTML = t("term.manualSetupRestart"); p3.style.textAlign = "left";
-        view.append(title, p1, p2, this.hashDisplay, copyButton, p3);
-        return view;
+    // Shared auth gate: the ONE password prompt lives in js/holaf_auth.js.
+    // The terminal never renders its own login/setup views anymore.
+    async connect() {
+        const authenticated = await ensureAuthenticated();
+        if (!authenticated) {
+            if (this.reconnectStatusMessage) {
+                this.reconnectStatusMessage.textContent = t("term.authRequired");
+            }
+            this.showView('reconnect');
+            return;
+        }
+        this.connectWebSocket();
     },
     showView(viewName) {
         if (!this.contentContainer) { console.error("[Holaf Terminal] showView: contentContainer is null!"); return; }
         const views = {
-            loading: this.loadingView, login: this.loginView, setup: this.setupView,
-            manual_setup: this.manualSetupView, terminal: this.terminalContainer
+            loading: this.loadingView, reconnect: this.reconnectView,
+            terminal: this.terminalContainer
         };
         for (const vName in views) {
             if (views[vName]) {
@@ -421,10 +408,6 @@ const holafTerminal = {
         }
         if (viewName === 'terminal') {
             requestAnimationFrame(() => this.fitTerminal());
-        } else if (viewName === 'login' && this.passwordInput) {
-            this.passwordInput.focus();
-        } else if (viewName === 'setup' && this.newPasswordInput) {
-            this.newPasswordInput.focus();
         }
     },
     async checkServerStatus() {
@@ -445,65 +428,10 @@ const holafTerminal = {
 
                 this.applySettings();
             }
-            d.password_is_set ? this.showView('login') : this.showView('setup');
+            this.connect();
         } catch (e) {
             console.error("[Holaf Terminal] Error checking server status:", e);
             if (this.loadingView) this.loadingView.textContent = t("term.cantContactServer");
-        }
-    },
-    async setPassword() {
-        if (!this.newPasswordInput || !this.confirmPasswordInput || !this.setupStatusMessage) return;
-        const newPass = this.newPasswordInput.value; const confirmPass = this.confirmPasswordInput.value;
-        if (!newPass || newPass.length < 4) { this.setupStatusMessage.textContent = t("term.passTooShort"); return; }
-        if (newPass !== confirmPass) { this.setupStatusMessage.textContent = t("term.passMismatch"); return; }
-        this.setupStatusMessage.textContent = t("term.settingPassword");
-        try {
-            // HolafFetch lève sur non-2xx (→ catch : message serveur ou « cantContactServer »).
-            const d = await HolafFetch.post('/holaf/terminal/set-password', { body: { password: newPass } });
-            if (d.status === "ok" && d.action === "reload") {
-                this.setupStatusMessage.textContent = ""; this.showView('login');
-                if (this.loginStatusMessage) this.loginStatusMessage.textContent = t("term.passwordSet");
-            } else if (d.status === "manual_required") {
-                if (this.hashDisplay) this.hashDisplay.value = `password_hash = ${d.hash}`; this.showView('manual_setup');
-            } else {
-                this.setupStatusMessage.textContent = `Error: ${d.message || t("term.unknownError")}`;
-            }
-        } catch (e) {
-            // Non-2xx : le corps JSON serveur porte le message d'erreur (champ `message`).
-            if (e instanceof HolafFetchError && e.data) {
-                this.setupStatusMessage.textContent = `Error: ${e.data.message || t("term.unknownError")}`;
-            } else {
-                this.setupStatusMessage.textContent = t("term.cantContactServer");
-            }
-            console.error("[Holaf Terminal] Error setting password:", e);
-        }
-    },
-    async authenticateAndConnect() {
-        if (!this.passwordInput || !this.loginStatusMessage) return;
-        const password = this.passwordInput.value;
-        if (!password) { this.loginStatusMessage.textContent = t("term.passEmpty"); return; }
-        this.loginStatusMessage.textContent = t("term.authenticating");
-        try {
-            // HolafFetch lève sur non-2xx (→ catch : 503 = écran setup, sinon message serveur).
-            const d = await HolafFetch.post('/holaf/terminal/auth', { body: { password: password } });
-            if (d.session_token) {
-                this.connectWebSocket(d.session_token);
-            } else {
-                this.loginStatusMessage.textContent = `Error: ${d.message || t("term.authFailed")}`;
-            }
-        } catch (e) {
-            if (e instanceof HolafFetchError && e.status === 503) {
-                // No password set on the server yet: offer the setup screen.
-                this.loginStatusMessage.textContent = "";
-                this.showView('setup');
-            } else if (e instanceof HolafFetchError && e.data) {
-                this.loginStatusMessage.textContent = `Error: ${e.data.message || t("term.authFailed")}`;
-            } else {
-                this.loginStatusMessage.textContent = t("term.cantReachServer");
-            }
-            console.error("[Holaf Terminal] Error authenticating:", e);
-        } finally {
-            if (this.passwordInput) this.passwordInput.value = "";
         }
     },
 
@@ -532,22 +460,28 @@ const holafTerminal = {
             try { s.close(); } catch (e) { }
         }
     },
-    // The server told us the shell exited (Ctrl+D / 'exit' / crash). Reset all
-    // session state and return to a clean login screen; the next successful
-    // login opens a brand-new WebSocket + fresh PTY.
+    // The server told us the shell exited (Ctrl+D / 'exit' / crash) or the
+    // socket dropped. Reset all session state and show the reconnect screen;
+    // the next connect re-validates the shared session via HolafAuth
+    // (status check — prompt only if the cookie is really gone) and opens a
+    // brand-new WebSocket + fresh PTY.
     handleSessionEnded() {
         this.closeSocket();
         this.disposeTerminal();
+        // La session mémoire peut être périmée (restart serveur, logout ailleurs)
+        // : on force une re-vérification au prochain connect → jamais de boucle
+        // de reconnexion « à l'aveugle » sur un cookie invalide. Nota : la session
+        // n'expire JAMAIS côté serveur (aucun TTL) ; ceci ne couvre que le cas
+        // où le cookie a réellement disparu/invalidé.
+        expireSession();
         if (this.panelElements && this.panelElements.panelEl.style.display === 'flex') {
-            if (this.loginStatusMessage) this.loginStatusMessage.textContent = t("term.sessionEnded");
-            this.showView('login');
+            if (this.reconnectStatusMessage) this.reconnectStatusMessage.textContent = t("term.sessionEnded");
+            this.showView('reconnect');
         }
     },
     // ------------------------------------------------------------------------
 
-    async connectWebSocket(sessionToken) {
-        if (!sessionToken) { if (this.loginStatusMessage) this.loginStatusMessage.textContent = t("term.noSessionToken"); this.showView('login'); return; }
-
+    async connectWebSocket() {
         const scriptsReady = await this.ensureScriptsLoaded();
         if (!scriptsReady) {
             this.showView('loading');
@@ -566,7 +500,7 @@ const holafTerminal = {
 
             // Always start from a pristine xterm: the previous instance was
             // attached to a PTY that may be gone, and its buffer holds the old
-            // session. Reusing it after re-login is what produced "dead"
+            // session. Reusing it after a reconnect is what produced "dead"
             // terminals full of leftover output.
             this.disposeTerminal();
             this.terminal = new window.Terminal({
@@ -603,7 +537,7 @@ const holafTerminal = {
 
         await new Promise(resolve => requestAnimationFrame(resolve));
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const url = `${protocol}//${window.location.host}/holaf/terminal?token=${encodeURIComponent(sessionToken)}`;
+        const url = `${protocol}//${window.location.host}/holaf/terminal`;
 
         this.closeSocket(); // Detach + drop any previous socket first.
         // Per-connection flag: set when the server explicitly announced the end
@@ -655,14 +589,13 @@ const holafTerminal = {
             this.socket = null;
             if (!sessionEndedReceived) {
                 // FIX: no 'session-ended' control frame arrived (network drop,
-                // server restart, proxy timeout...). Reset to a pristine login
-                // view instead of leaving a dead terminal bound to a gone PTY:
-                // the leftover writeln used to produce "dead" terminals that a
-                // re-login could not revive.
+                // server restart, proxy timeout...). Reset to a pristine
+                // reconnect view instead of leaving a dead terminal bound to a
+                // gone PTY: the leftover writeln used to produce "dead"
+                // terminals that a reconnect could not revive.
                 console.warn("[Holaf Terminal] WebSocket closed without 'session-ended'; resetting session.");
                 this.handleSessionEnded();
             }
-            if (this.panelElements && this.panelElements.panelEl.style.display === 'flex') { this.checkServerStatus(); }
         };
         socket.onerror = (event) => {
             if (this.socket !== socket) return;

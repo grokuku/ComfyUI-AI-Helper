@@ -36,6 +36,7 @@ import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { HOLAF_THEMES } from "./holaf_themes.js";
 import { escapeHtml, sanitizeMarkdownHtml, sanitizeUrl } from "./holaf_dom_utils.js";
 import { HolafFetch, HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
+import { ensureAuthenticated, expireSession } from "./holaf_auth.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -714,240 +715,11 @@ const holafNodesManager = {
         }
     },
 
-    async _checkAuthStatus() {
-        try {
-            // HolafFetch lève sur non-2xx (→ catch : {false, false}, comme avant) ;
-            // `cache` est une option native, forwardée telle quelle.
-            const data = await HolafFetch.get('/holaf/auth/status', { cache: 'no-store' });
-            return {
-                authenticated: data.authenticated === true,
-                passwordConfigured: data.password_configured === true
-            };
-        } catch (e) {
-            console.warn("[Holaf NodesManager] Auth status check failed:", e);
-            return { authenticated: false, passwordConfigured: false };
-        }
-    },
-
-    _showLoginModal(message = t("nm.authRequiredMsg"), passwordNotConfigured = false) {
-        return new Promise((resolve) => {
-            const overlay = document.createElement("div");
-            overlay.className = "holaf-dialog-overlay";
-            overlay.style.zIndex = "210000";
-
-            const dialog = document.createElement("div");
-            dialog.className = "holaf-utility-panel holaf-dialog-inline";
-            const themeClass = (this.panelElements && this.panelElements.panelEl
-                ? this.panelElements.panelEl.className.match(/holaf-theme-\S+/)?.[0]
-                : null) || HOLAF_THEMES[0].className;
-            dialog.classList.add(themeClass);
-
-            const header = document.createElement("div");
-            header.className = "holaf-utility-header";
-            header.style.cursor = "default";
-            const title = document.createElement("span");
-            title.textContent = passwordNotConfigured ? t("nm.passwordSetupRequired") : t("nm.authRequired");
-            header.appendChild(title);
-
-            const content = document.createElement("div");
-            content.className = "holaf-dialog-content";
-            content.style.whiteSpace = "normal";
-
-            const info = document.createElement("p");
-            info.textContent = passwordNotConfigured
-                ? t("nm.noPasswordYet")
-                : message;
-            info.style.cssText = "margin:0 0 12px 0;color:var(--holaf-text-secondary);line-height:1.4;";
-
-            const label = document.createElement("label");
-            label.textContent = passwordNotConfigured ? t("nm.newPassword") : t("nm.password");
-            label.style.cssText = "display:block;margin-bottom:5px;color:var(--holaf-text-primary);";
-
-            const passwordInput = document.createElement("input");
-            passwordInput.type = "password";
-            passwordInput.autocomplete = passwordNotConfigured ? "new-password" : "current-password";
-            passwordInput.style.cssText = "width:100%;padding:8px;box-sizing:border-box;background-color:var(--holaf-input-background);color:var(--holaf-text-primary);border:1px solid var(--holaf-border-color);border-radius:3px;outline:none;margin-bottom:10px;";
-
-            const confirmLabel = document.createElement("label");
-            const confirmInput = document.createElement("input");
-            const manualContainer = document.createElement("div");
-
-            if (passwordNotConfigured) {
-                confirmLabel.textContent = t("nm.confirmPassword");
-                confirmLabel.style.cssText = "display:block;margin-bottom:5px;color:var(--holaf-text-primary);";
-                confirmInput.type = "password";
-                confirmInput.autocomplete = "new-password";
-                confirmInput.style.cssText = "width:100%;padding:8px;box-sizing:border-box;background-color:var(--holaf-input-background);color:var(--holaf-text-primary);border:1px solid var(--holaf-border-color);border-radius:3px;outline:none;margin-bottom:10px;";
-
-                manualContainer.style.cssText = "display:none;margin-top:10px;padding:8px;border:1px dashed var(--holaf-border-color);border-radius:3px;";
-                const manualTitle = document.createElement("p");
-                manualTitle.textContent = t("nm.manualSetupRequired");
-                manualTitle.style.cssText = "margin:0 0 6px 0;color:var(--holaf-text-secondary);";
-                const manualSteps = document.createElement("p");
-                manualSteps.textContent = t("nm.manualSteps");
-                manualSteps.style.cssText = "margin:0 0 6px 0;color:var(--holaf-text-secondary);";
-                const hashInput = document.createElement("input");
-                hashInput.type = "text";
-                hashInput.readOnly = true;
-                hashInput.style.cssText = "width:100%;font-family:monospace;padding:6px;box-sizing:border-box;background-color:var(--holaf-input-background);color:var(--holaf-text-primary);border:1px solid var(--holaf-border-color);border-radius:3px;margin-bottom:6px;";
-                const copyButton = document.createElement("button");
-                copyButton.textContent = t("nm.copyHash");
-                copyButton.className = "comfy-button";
-                copyButton.addEventListener("click", () => {
-                    if (hashInput.value) {
-                        hashInput.select();
-                        navigator.clipboard.writeText(hashInput.value).catch(() => document.execCommand("copy"));
-                    }
-                });
-                manualContainer.append(manualTitle, manualSteps, hashInput, copyButton);
-            }
-
-            const statusMessage = document.createElement("p");
-            statusMessage.style.cssText = "margin:0;color:var(--holaf-accent-color);font-size:0.9em;min-height:1.2em;";
-
-            content.append(info, label, passwordInput);
-            if (passwordNotConfigured) content.append(confirmLabel, confirmInput, manualContainer);
-            content.append(statusMessage);
-
-            const footer = document.createElement("div");
-            footer.className = "holaf-dialog-footer";
-
-            const cancelButton = document.createElement("button");
-            cancelButton.textContent = t("nm.cancel");
-            cancelButton.className = "comfy-button";
-            cancelButton.style.backgroundColor = "var(--holaf-tag-background)";
-
-            const actionButton = document.createElement("button");
-            actionButton.textContent = passwordNotConfigured ? t("nm.createPassword") : t("nm.connect");
-            actionButton.className = "comfy-button";
-            actionButton.style.backgroundColor = "var(--holaf-accent-color)";
-            actionButton.style.color = "white";
-
-            footer.append(cancelButton, actionButton);
-            dialog.append(header, content, footer);
-            overlay.appendChild(dialog);
-            document.body.appendChild(overlay);
-
-            let resolved = false;
-
-            const closeModal = (value) => {
-                if (resolved) return;
-                resolved = true;
-                if (document.body.contains(overlay)) document.body.removeChild(overlay);
-                resolve(value);
-            };
-
-            const submitLogin = async () => {
-                const password = passwordInput.value;
-                if (!password) {
-                    statusMessage.textContent = t("nm.passEmpty");
-                    passwordInput.focus();
-                    return;
-                }
-                if (passwordNotConfigured) {
-                    if (password.length < 4) {
-                        statusMessage.textContent = t("nm.passTooShort");
-                        passwordInput.focus();
-                        return;
-                    }
-                    if (password !== confirmInput.value) {
-                        statusMessage.textContent = t("nm.passMismatch");
-                        confirmInput.focus();
-                        return;
-                    }
-                }
-
-                actionButton.disabled = true;
-                cancelButton.disabled = true;
-                passwordInput.disabled = true;
-                if (confirmInput) confirmInput.disabled = true;
-                statusMessage.textContent = passwordNotConfigured ? t("nm.creatingPassword") : t("nm.authenticating");
-
-                try {
-                    if (passwordNotConfigured) {
-                        // HolafFetch lève sur non-2xx (→ catch partagé ci-dessous).
-                        const setupData = await HolafFetch.post('/holaf/terminal/set-password', { body: { password } });
-
-                        if (setupData.status === "manual_required" && setupData.hash) {
-                            const hashInput = manualContainer.querySelector('input[readonly]');
-                            if (hashInput) hashInput.value = `password_hash = ${setupData.hash}`;
-                            manualContainer.style.display = "block";
-                            statusMessage.textContent = "";
-                            // Keep the modal open so the user can copy the hash;
-                            // the action cannot proceed until a restart.
-                            return;
-                        }
-
-                        if (!(setupData.status === "ok" && setupData.action === "reload")) {
-                            statusMessage.textContent = `Error: ${setupData.message || t("nm.couldNotSetPassword")}`;
-                            return;
-                        }
-                    }
-
-                    // HolafFetch lève sur non-2xx (401 identifiée dans le catch).
-                    const data = await HolafFetch.post('/holaf/auth/login', { body: { password } });
-
-                    if (data.success === true) {
-                        closeModal(true);
-                        return;
-                    }
-
-                    // 2xx mais pas authentifié : même message que l'ancien else.
-                    statusMessage.textContent = t("nm.passNotConfiguredOrWrong");
-                } catch (e) {
-                    console.error("[Holaf NodesManager] Login request failed:", e);
-                    if (e instanceof HolafFetchError && e.status === 0) {
-                        // Erreur réseau / timeout : le serveur n'a pas pu être joint.
-                        statusMessage.textContent = t("nm.cantReachServer");
-                    } else if (e instanceof HolafFetchError && e.status === 401) {
-                        statusMessage.textContent = t("nm.passNotConfiguredOrWrong");
-                    } else if (e instanceof HolafFetchError) {
-                        const serverMessage = (e.data && (e.data.message || e.data.error)) || "";
-                        statusMessage.textContent = serverMessage
-                            ? `Error: ${serverMessage}`
-                            : t("nm.passNotConfiguredOrWrong");
-                    } else {
-                        statusMessage.textContent = t("nm.cantReachServer");
-                    }
-                } finally {
-                    passwordInput.value = "";
-                    if (confirmInput) confirmInput.value = "";
-                    actionButton.disabled = false;
-                    cancelButton.disabled = false;
-                    passwordInput.disabled = false;
-                    if (confirmInput) confirmInput.disabled = false;
-                    passwordInput.focus();
-                }
-            };
-
-            actionButton.onclick = submitLogin;
-            cancelButton.onclick = () => closeModal(false);
-            passwordInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
-                    e.preventDefault();
-                    submitLogin();
-                }
-            });
-            if (confirmInput) {
-                confirmInput.addEventListener('keydown', (e) => {
-                    if (e.key === 'Enter') {
-                        e.preventDefault();
-                        submitLogin();
-                    }
-                });
-            }
-            overlay.addEventListener('click', (e) => {
-                if (e.target === overlay) closeModal(false);
-            });
-
-            passwordInput.focus();
-        });
-    },
-
-    async _ensureAuthenticated(message = t("nm.authRequiredMsg")) {
-        const status = await this._checkAuthStatus();
-        if (status.authenticated) return true;
-        return this._showLoginModal(message, !status.passwordConfigured);
+    // Authentification UNIFIÉE : délègue entièrement à HolafAuth
+    // (js/holaf_auth.js) — une seule invite partagée par session, plus AUCUNE
+    // modale de mot de passe locale ici (le terminal et blobby l'utilisent aussi).
+    async _ensureAuthenticated(message = t("auth.message")) {
+        return ensureAuthenticated(message);
     },
 
     async _executeNodeAction(actionPath, nodePayloads, actionName, confirmMessage, requiresAuth = false) {
@@ -1046,9 +818,11 @@ const holafNodesManager = {
                 result = await postAction();
             } catch (err) {
                 if (err instanceof HolafFetchError && err.status === 401) {
-                    // Session expirée : ouverture du modal de login, puis UN retry.
+                    // Session serveur expirée : invalider l'état LOCAL puis ouvrir
+                    // l'invite PARTAGÉE (HolafAuth), et rejouer UNE fois.
                     removeInProgressDialog();
-                    const reconnected = await this._showLoginModal(t("nm.sessionExpired"));
+                    expireSession();
+                    const reconnected = await this._ensureAuthenticated(t("nm.sessionExpired"));
                     if (!reconnected) {
                         AIH.ask({ title: t("nm.actionCancelled", { action: actionName }), message: t("nm.authRequiredForAction") });
                         return;
@@ -1381,9 +1155,11 @@ const holafNodesManager = {
                 result = await postInstall();
             } catch (err) {
                 if (!(err instanceof HolafFetchError && err.status === 401)) throw err;
-                // Session expirée : ouverture du modal de login, puis UN retry.
+                // Session serveur expirée : invalider l'état LOCAL puis ouvrir
+                // l'invite PARTAGÉE (HolafAuth), et rejouer UNE fois.
                 removeInstallOverlay();
-                const reconnected = await this._showLoginModal(t("nm.sessionExpired"));
+                expireSession();
+                const reconnected = await this._ensureAuthenticated(t("nm.sessionExpired"));
                 if (!reconnected) {
                     AIH.ask({ title: t("nm.installCancelled"), message: t("nm.authRequiredInstall") });
                     return;

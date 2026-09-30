@@ -1,9 +1,9 @@
 # === Holaf Utilities - Terminal Manager ===
 #
 # Session lifecycle contract:
-# - Every authenticated WebSocket connection spawns its OWN fresh PTY/shell.
+# - Every WebSocket connection spawns its OWN fresh PTY/shell.
 #   There is deliberately no shared/singleton PTY: when a shell exits (Ctrl+D,
-#   'exit', crash) the session is fully torn down and the next successful login
+#   'exit', crash) the session is fully torn down and the next connection
 #   always gets a brand-new, functional shell.
 # - When the shell exits, the client first receives an explicit TEXT control
 #   frame {"type": "session-ended"} before the WebSocket is closed, so the UI
@@ -11,6 +11,9 @@
 # - Control messages travel as TEXT frames only ({resize, session-ended}); all
 #   raw keyboard input travels as BINARY frames. This keeps user keystrokes
 #   that happen to look like JSON from being swallowed by the control channel.
+# - AUTH: the WebSocket route is decorated with holaf_auth.require_auth in the
+#   pack __init__.py (shared password session, cookie holaf_session). The
+#   handler re-checks the cookie as defense in depth: never an open shell.
 import asyncio
 import os
 import platform
@@ -18,7 +21,6 @@ import shlex
 import signal
 import sys
 import time
-import uuid
 import json
 import traceback
 import threading
@@ -40,18 +42,7 @@ else:
         print("   Please run 'pip install pywinpty' in your ComfyUI Python environment.")
         PtyProcess = None
 
-from . import holaf_auth
-from . import holaf_config # For config access if needed, or pass config values
-
-SESSION_TOKENS = set() # Manages active terminal session tokens
-SESSION_TOKENS_LOCK = threading.Lock() # Thread-safe access to SESSION_TOKENS
-
-# --- Password Hashing and Verification ---
-# Factorized into holaf_auth.py so the terminal and the shared auth module use
-# the exact same PBKDF2-HMAC-SHA256 implementation. These aliases keep any
-# existing callers working without changes.
-_hash_password = holaf_auth.hash_password
-_verify_password = holaf_auth.verify_password
+from . import holaf_auth # Shared password session (defense-in-depth check below)
 
 # --- Terminal Environment ---
 def is_running_in_conda():
@@ -62,119 +53,25 @@ def is_running_in_venv():
     venv_path = os.environ.get('VIRTUAL_ENV')
     return venv_path and sys.executable.startswith(os.path.normpath(venv_path))
 
-# Longueur minimale du mot de passe du terminal (brute-force en ligne).
-# Ne s'applique qu'aux nouveaux mots de passe — les hashes existants restent valides.
-MIN_PASSWORD_LENGTH = int(os.environ.get("AIH_MIN_PASSWORD_LENGTH", "12"))
-
 # --- API Route Handlers ---
-async def set_password_route(request: web.Request, global_app_config):
-    # The lock is handled inside save_setting_to_config; removing it here prevents a deadlock.
-    if holaf_auth.is_rate_limited(request):
-        return web.json_response({"status": "error", "message": "Too many attempts. Try again later."}, status=429)
-    try:
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "message": "Invalid request."}, status=400)
-
-        if not isinstance(data, dict):
-            return web.json_response({"status": "error", "message": "Invalid request."}, status=400)
-
-        current_hash = global_app_config.get('password_hash')
-
-        if current_hash:
-            # A password already exists: changing it requires proving knowledge of the
-            # current password. This prevents an unauthenticated attacker from
-            # hijacking the terminal by overwriting the password.
-            current_password = data.get('current_password')
-            if not current_password or not _verify_password(current_hash, current_password):
-                holaf_auth.record_failed_login(request)
-                return web.json_response({"status": "error", "message": "Current password is incorrect."}, status=403)
-
-        # No password is configured yet: first-time setup is allowed. This is
-        # protected by the CSRF middleware (Origin/Referer check) and, in remote
-        # deployments, by the authenticated reverse proxy in front of ComfyUI.
-        # On instances exposed WITHOUT an authenticated proxy, pre-configure
-        # 'password_hash' in config.ini to avoid a first-come-first-served takeover.
-        password = data.get('password')
-        if not password or len(password) < MIN_PASSWORD_LENGTH:
-            return web.json_response({"status": "error", "message": f"New password is too short (min {MIN_PASSWORD_LENGTH} characters)."}, status=400)
-
-        new_hash = _hash_password(password)
-
-        try:
-            await holaf_config.save_setting_to_config('Security', 'password_hash', new_hash)
-            global_app_config['password_hash'] = new_hash # Update live global config
-            holaf_auth.clear_failed_logins(request)
-            if current_hash:
-                print("🔑 [Holaf-Terminal] The terminal password has been changed via the UI.")
-            else:
-                print("🔑 [Holaf-Terminal] The terminal password has been set via the UI.")
-            return web.json_response({"status": "ok", "action": "reload"})
-        except PermissionError:
-            print("🔵 [Holaf-Terminal] A user tried to set/change the password, but file permissions prevented saving.")
-            if not current_hash:
-                # First-time setup: offer the manual fallback (README-documented UX):
-                # the user copies the hash into config.ini under [Security] password_hash.
-                return web.json_response({"status": "manual_required", "hash": new_hash})
-            return web.json_response({"status": "error", "message": "Could not save config.ini due to file permissions."}, status=500)
-    except Exception as e:
-        print(f"🔴 [Holaf-Terminal] Error setting password: {e}")
-        traceback.print_exc()
-        return web.json_response({"status": "error", "message": "An unexpected error occurred while updating the password."}, status=500)
-
-async def auth_route(request: web.Request, global_app_config):
-    # Compatibility endpoint for the current terminal frontend.
-    #
-    # It performs the same password verification as POST /holaf/auth/login and
-    # sets the shared holaf_session cookie, but it also returns the legacy
-    # one-time 'session_token' that the terminal WebSocket currently appends as
-    # ?token=... for its handshake. New clients should prefer
-    # POST /holaf/auth/login + cookie-only auth.
-    if not global_app_config.get('password_hash'):
-        return web.json_response({"status": "error", "message": "Terminal is not configured. No password is set."}, status=503)
-    if holaf_auth.is_rate_limited(request):
-        return web.json_response({"status": "error", "message": "Too many attempts. Try again later."}, status=429)
-    try:
-        data = await request.json()
-        password = data.get('password')
-    except Exception:
-        return web.json_response({"status": "error", "message": "Invalid request."}, status=400)
-
-    if not _verify_password(global_app_config['password_hash'], password):
-        holaf_auth.record_failed_login(request)
-        return web.json_response({"status": "error", "message": "Invalid password."}, status=403)
-
-    holaf_auth.clear_failed_logins(request)
-    session_token = str(uuid.uuid4())
-    with SESSION_TOKENS_LOCK:
-        SESSION_TOKENS.add(session_token)
-    def cleanup_token(): # Runs in the event loop's thread
-        with SESSION_TOKENS_LOCK:
-            SESSION_TOKENS.discard(session_token)
-    asyncio.get_running_loop().call_later(60, cleanup_token) # Token valid for 60s
-
-    response = web.json_response({"status": "ok", "session_token": session_token})
-    holaf_auth.set_session_cookie(response, request)
-    return response
-
 async def websocket_handler(request: web.Request, global_app_config):
-    # The route wrapper applies require_auth (cookie check). We keep the legacy
-    # one-time query token path for the current frontend: if a ?token= is
-    # supplied it is consumed as before, otherwise the caller must have already
-    # passed the shared cookie check performed by require_auth.
-    session_token = request.query.get('token')
-    if session_token:
-        with SESSION_TOKENS_LOCK:
-            if session_token not in SESSION_TOKENS:
-                return web.Response(status=403, text="Invalid or expired session token")
-            SESSION_TOKENS.discard(session_token) # One-time use token
-    elif not holaf_auth.is_authenticated(request):
-        return web.Response(status=403, text="Invalid or expired session")
-    
-    ws = web.WebSocketResponse()
+    # Defense in depth: the route is already guarded by require_auth, but a
+    # mis-registered route must never open an unauthenticated shell.
+    if not holaf_auth.is_authenticated(request):
+        return web.Response(status=401, text="Authentication required.")
+
+    # NO timeout on the session: a terminal stays open indefinitely, including
+    # through several minutes of a SILENT command (e.g. a HuggingFace model
+    # download that prints nothing). The handler only returns when one of the
+    # three concurrent tasks actually completes (client disconnect, shell exit,
+    # or a send failure) — never because a fixed wall-clock ceiling elapsed.
+    #
+    # `heartbeat` sends periodic WebSocket PING frames (browsers auto-reply
+    # PONG): this keeps the TCP connection alive through proxies/idle so a long
+    # silent command cannot be killed by an intermediary idle timeout.
+    ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
-    print("🟢 [Holaf-Terminal] WebSocket connection opened and authenticated.")
+    print("🟢 [Holaf-Terminal] WebSocket connection opened.")
     
     loop = asyncio.get_running_loop()
     pty_queue = asyncio.Queue() # For data from PTY to WebSocket
@@ -185,8 +82,8 @@ async def websocket_handler(request: web.Request, global_app_config):
     # Order matters: kill the shell first (force=True => SIGKILL on POSIX,
     # since interactive shells ignore SIGTERM), then collect the child so no
     # zombie/orphan remains, then release the master fd / ConPTY handles. The
-    # boolean guard makes repeated calls (stall timeout, normal completion,
-    # finally safety net) harmless.
+    # boolean guard makes repeated calls (normal completion, exception, finally
+    # safety net) harmless.
     pty_torn_down = False
     def _teardown():
         nonlocal pty_torn_down
@@ -485,27 +382,23 @@ async def websocket_handler(request: web.Request, global_app_config):
         reader_thread.start()
 
         # FIX: Wait for ANY task to finish (client disconnect, PTY exit, or error),
-        # then terminate the PTY and close the WebSocket to unblock remaining tasks.
-        # A hard 300s ceiling guarantees this handler can never hang forever here
-        # (e.g. reader wedged, silent client): on expiry the PTY is torn down so
-        # every remaining task unblocks.
-        done, pending = await asyncio.wait(
+        # then terminate the PTY and close the WebSocket to unblock remaining
+        # tasks. There is deliberately NO `timeout=` here: this handler used to
+        # carry a 300s "stall ceiling" that force-killed the PTY whenever no
+        # task had completed within 5 minutes — which is exactly what a silent
+        # multi-minute download looks like (reader blocked in os.read, receiver
+        # idle, nothing to send). That ceiling closed the terminal mid-download
+        # and bounced the user back to the password prompt. Removing it makes
+        # the session live as long as the user keeps it open (logout or shell
+        # exit still end it cleanly).
+        _, pending = await asyncio.wait(
             [sender_task, receiver_task, thread_done],
-            timeout=300,
             return_when=asyncio.FIRST_COMPLETED
         )
 
-        if not done:
-            # Stall timeout reached with nothing completed: kill the PTY now.
-            # The standard cleanup below (plus the idempotent finally) drains or
-            # cancels whatever is left.
-            print("🔴 [Holaf-Terminal] Terminal session stalled (300s without completion); forcing PTY teardown.")
-            _teardown()
-
-        # Terminate/reap/close the PTY to unblock the reader thread. Idempotent:
-        # a no-op if the stall timeout already triggered it. force=True must be
-        # lethal: interactive shells ignore SIGTERM, which used to leave them
-        # alive and the reader thread blocked forever.
+        # Terminate/reap/close the PTY to unblock the reader thread. force=True
+        # must be lethal: interactive shells ignore SIGTERM, which used to leave
+        # them alive and the reader thread blocked forever.
         _teardown()
 
         # Close WebSocket to unblock the receiver task if it's still running
@@ -529,9 +422,9 @@ async def websocket_handler(request: web.Request, global_app_config):
     finally:
         print("⚫ [Holaf-Terminal] Cleaning up PTY session.")
         # Safety net: whatever happened above (exception, client disconnect,
-        # shell exit, stall timeout), ensure the PTY process dies, the child is
-        # reaped and the master fd released so the next login always gets a
-        # fresh session. Idempotent: no-op if teardown already ran post-wait.
+        # shell exit), ensure the PTY process dies, the child is reaped and the
+        # master fd released so the next login always gets a fresh session.
+        # Idempotent: no-op if teardown already ran post-wait.
         # (proc_adapter/_teardown/ws are pre-initialized before the try block,
         # so no NameError is possible here.)
         _teardown()

@@ -3,7 +3,7 @@ __pycache__/
 *.pyo
 .env
 
-# ── Config sensitive (mot de passe terminal hashé + session_secret) ──
+# ── Config sensitive (mot de passe partagé hashé + session_secret) ──
 config.ini
 config.ini.tmp
 

@@ -47,9 +47,9 @@ Groupes (ordre historique des commits du chantier C) :
   3. ``blobby``      : POST /aih/blobby/save + GET /aih/blobby/load
      (paramètres du companion, fichier user/default/aih/blobby.json) et
      POST /aih/blobby/exec (shell local) — cette dernière SÉCURISÉE derrière
-     l'authentification par mot de passe du terminal Holaf (même mécanisme
-     que GET /holaf/terminal : cookie de session signé ``holaf_session``,
-     obtenu via POST /holaf/auth/login ou POST /holaf/terminal/auth) ; 401 sinon.
+     la session partagée du pack (cookie de session ``holaf_session``, obtenu
+     via POST /holaf/auth/login ; même invite unique js/holaf_auth.js que le
+     terminal) ; 401 sinon.
   4. ``models``      : /api/aih/models/* (liste locale/distante, upload et
      download SFTP chunked via paramiko, fingerprint head/tail, progression)
      portés fidèlement depuis l'ancien monorepo AI-Helper →
@@ -469,15 +469,15 @@ def _register_blobby_group(r, require_auth):
       lecture/écriture des paramètres du companion exigent une session valide.
     - POST /aih/blobby/exec : exécution shell locale. 🔴 À la source, cette
       route était OUVERTE (aucune auth). Elle est ici PORTÉE UNIQUEMENT
-      SÉCURISÉE derrière l'authentification par mot de passe du terminal
-      Holaf : le décorateur ``require_auth`` (holaf_auth.require_auth, passé
-      par le __init__.py racine) vérifie le cookie de session signé
-      ``holaf_session`` — exactement la même garde que GET /holaf/terminal.
-      Le client doit donc s'authentifier au préalable via
-      POST /holaf/auth/login ou POST /holaf/terminal/auth (le cookie part
-      ensuite automatiquement sur chaque requête même origine). Sans session
-      valide → 401. Si aucun décorateur n'a été fourni à register(), une
-      garde fail-closed renvoie 503 en permanence : jamais de shell ouvert.
+      SÉCURISÉE derrière la session partagée du pack : le décorateur
+      ``require_auth`` (holaf_auth.require_auth, passé par le __init__.py
+      racine) vérifie le cookie de session ``holaf_session`` — exactement la
+      même garde que GET /holaf/terminal. Le client s'authentifie via l'invite
+      UNIQUE (js/holaf_auth.js → POST /holaf/auth/login, ou setup la première
+      fois), puis le cookie part automatiquement sur chaque requête même
+      origine. Sans session valide → 401. Si aucun décorateur n'a été fourni
+      à register(), une garde fail-closed renvoie 503 en permanence : jamais
+      de shell ouvert.
     """
 
     @r.post("/aih/blobby/save")

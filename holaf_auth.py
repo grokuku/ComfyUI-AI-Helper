@@ -6,22 +6,38 @@
 # Purpose:
 # Shared, stateless authentication for the Holaf utilities. It reuses the
 # password hash stored in config.ini ([Security] / password_hash) and issues a
-# signed, expiring cookie (holaf_session) instead of keeping server-side state.
+# signed SESSION cookie (holaf_session) instead of keeping server-side state.
 # The signing key is persisted as [Security] / session_secret and generated on
 # first use so sessions survive ComfyUI restarts.
 #
+# Session semantics (NO timeout — explicit product requirement):
+# - The cookie is a BROWSER SESSION cookie: no Max-Age / Expires attribute, so
+#   it dies when the browser is closed. There is no persistent cookie either.
+# - The signed token has NO server-side expiry. A session ends for exactly two
+#   reasons: an explicit logout (POST /holaf/auth/logout) or the browser being
+#   closed. This deliberately rules out the "long command silently kills the
+#   terminal and asks for the password again" regression.
+# - ALL password-consuming frontends share ONE prompt (js/holaf_auth.js); this
+#   module is the single backend implementation of login/setup/status/logout.
+#
 # Security notes:
+#   ⚠️ ASSUMED TRADE-OFF: because the token never expires server-side, a stolen
+#   token (or cookie) stays valid until an explicit logout. The only other
+#   bound is the browser-session cookie (dies on browser close). This is an
+#   accepted trade-off by the product owner (a defensive TTL used to log the
+#   user out mid-download). Deploy behind an authenticated reverse proxy.
 # - Password hashing is PBKDF2-HMAC-SHA256 (the same algorithm already used by
-#   holaf_terminal.py / __main__.py).
+#   __main__.py / holaf_terminal.py).
 # - Session tokens are HMAC-SHA256 signed payloads. No server-side session store
-#   is required; validation recomputes the MAC and checks the expiry.
+#   is required; validation only recomputes the MAC (no expiry check).
 # - Client-facing errors are intentionally generic to avoid leaking whether a
 #   password is configured or which part of a token is invalid.
+# - NO rate-limiting is implemented on purpose (explicit user requirement): the
+#   deployment is expected to sit behind an authenticated reverse proxy.
 # === End Documentation ===
 
 import base64
 import binascii
-import collections
 import functools
 import hashlib
 import hmac
@@ -30,29 +46,21 @@ import os
 import secrets
 import threading
 import time
+import traceback
 
 from aiohttp import web
 
 from . import holaf_config
 
 SESSION_COOKIE_NAME = "holaf_session"
-SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60  # 30 days
+# NO server-side token lifetime on purpose: a session only ends with an
+# explicit logout or when the browser is closed (the cookie has no Max-Age).
 PBKDF2_ITERATIONS = 260000
 
-# --- Brute-force rate limiting (login attempts) ---
-# Bloque les attaques en ligne sur le mot de passe du terminal :
-#   - par IP : RATE_LIMIT_MAX_FAILURES échecs dans la fenêtre → lockout ;
-#   - global  : backstop contre le spoofing X-Forwarded-For (rotation d'IP).
-# Surchargeable via l'environnement (défauts raisonnables : 5 / 15 min).
-RATE_LIMIT_MAX_FAILURES = int(os.environ.get("AIH_RATE_LIMIT_MAX_FAILURES", "5"))
-RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AIH_RATE_LIMIT_WINDOW_SECONDS", "900"))  # 15 min
-RATE_LIMIT_GLOBAL_MAX = int(os.environ.get("AIH_RATE_LIMIT_GLOBAL_MAX", "50"))
-RATE_LIMIT_GLOBAL_WINDOW_SECONDS = int(os.environ.get("AIH_RATE_LIMIT_GLOBAL_WINDOW_SECONDS", "60"))
-RATE_LIMIT_MAX_TRACKED_IPS = 1024
-
-_rate_limit_lock = threading.Lock()
-_failed_logins = collections.defaultdict(collections.deque)  # ip -> timestamps (monotonic)
-_global_failures = collections.deque()  # timestamps (monotonic), toutes IP confondues
+# Longueur minimale d'un NOUVEAU mot de passe (setup / changement).
+# Ne s'applique qu'aux nouveaux mots de passe — les hashes existants restent
+# valides. Surchargeable via l'environnement (défaut : 8).
+MIN_PASSWORD_LENGTH = int(os.environ.get("AIH_MIN_PASSWORD_LENGTH", "8"))
 
 _session_secret_lock = threading.Lock()
 _session_secret_cache = None
@@ -151,12 +159,16 @@ def _sign(payload_b64: str) -> str:
 
 
 def create_session_token(now: int | None = None) -> str:
-    """Create a signed, expiring session token."""
+    """Create a signed session token that NEVER expires server-side.
+
+    The payload keeps an ``iat`` timestamp for traceability only; no ``exp``
+    field is written and none is checked on validation, so a long-running
+    (silent) command can never invalidate the session.
+    """
     if now is None:
         now = int(time.time())
     payload = {
         "iat": now,
-        "exp": now + SESSION_MAX_AGE_SECONDS,
     }
     payload_b64 = _b64url_encode(
         json.dumps(payload, separators=(',', ':')).encode('utf-8')
@@ -165,11 +177,13 @@ def create_session_token(now: int | None = None) -> str:
 
 
 def validate_session_token(token, now: int | None = None) -> bool:
-    """Return True if *token* has a valid signature and has not expired."""
+    """Return True if *token* has a valid signature (no expiry check).
+
+    *now* is accepted for backward compatibility with callers/tests but is
+    intentionally ignored: a signed session token is valid until logout.
+    """
     if not token or not isinstance(token, str):
         return False
-    if now is None:
-        now = int(time.time())
 
     try:
         payload_b64, signature = token.split('.', 1)
@@ -183,13 +197,16 @@ def validate_session_token(token, now: int | None = None) -> bool:
     if not hmac.compare_digest(expected_signature, signature):
         return False
 
+    # The payload must at least be well-formed JSON (defense against a validly
+    # signed token whose body was never a JSON object).
     try:
         payload = json.loads(_b64url_decode(payload_b64).decode('utf-8'))
-        expires_at = int(payload.get('exp', 0))
     except (binascii.Error, ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
         return False
+    if not isinstance(payload, dict):
+        return False
 
-    return expires_at > now
+    return True
 
 
 # --- Cookie helpers ---
@@ -204,14 +221,17 @@ def _is_secure_request(request: web.Request) -> bool:
 
 
 def set_session_cookie(response: web.Response, request: web.Request, token: str | None = None) -> str:
-    """Attach the shared session cookie to *response* and return the token."""
+    """Attach the shared SESSION cookie to *response* and return the token.
+
+    SESSION cookie on purpose: no max_age / expires → the browser discards it
+    when closed (the old code issued a persistent 30-day cookie).
+    """
     if token is None:
         token = create_session_token()
 
     response.set_cookie(
         SESSION_COOKIE_NAME,
         token,
-        max_age=SESSION_MAX_AGE_SECONDS,
         httponly=True,
         samesite='Strict',
         secure=_is_secure_request(request),
@@ -245,14 +265,13 @@ def require_auth(handler):
     return wrapper
 
 
-# --- Unified auth endpoints ---
+# --- Unified auth endpoints (single implementation for ALL frontends) ---
 async def login_route(request: web.Request, global_config) -> web.Response:
-    """POST /holaf/auth/login"""
-    if is_rate_limited(request):
-        return web.json_response(
-            {"success": False, "error": "Too many attempts. Try again later."},
-            status=429,
-        )
+    """POST /holaf/auth/login — verify the password, set the session cookie.
+
+    Deliberately NOT rate-limited (explicit product decision; the pack is meant
+    to live behind an authenticated reverse proxy).
+    """
     password_hash = global_config.get('password_hash')
     password = None
     try:
@@ -264,68 +283,78 @@ async def login_route(request: web.Request, global_config) -> web.Response:
 
     # Generic message on purpose: do not reveal whether a password is set.
     if not password_hash or not verify_password(password_hash, password):
-        record_failed_login(request)
         return web.json_response(
             {"success": False, "error": "Invalid credentials."},
             status=401,
         )
 
-    clear_failed_logins(request)
     response = web.json_response({"success": True})
     set_session_cookie(response, request)
     return response
 
 
-# --- Rate limiting helpers (exposés pour les autres routes d'auth) ---
+async def setup_route(request: web.Request, global_config) -> web.Response:
+    """POST /holaf/auth/setup — define the password (first time) or change it.
 
-def _client_ip(request: web.Request) -> str:
-    """IP du client, best-effort : 1er X-Forwarded-For (proxy Caddy) sinon peer."""
-    xff = request.headers.get('X-Forwarded-For', '')
-    first = xff.split(',')[0].strip() if xff else ''
-    if first and len(first) <= 64:
-        return first
-    return request.remote or 'unknown'
+    - First-time setup (no hash configured yet) is open: it is protected by the
+      CSRF middleware (Origin/Referer) and, in remote deployments, by the
+      authenticated reverse proxy. Pre-configure 'password_hash' in config.ini
+      to avoid a first-come-first-served takeover on an exposed instance.
+    - Changing an existing password requires the CURRENT password.
+    - On success the shared session cookie is set (auto-login): the setup
+      prompt is the only prompt the user sees.
+    """
+    try:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid request."}, status=400)
 
+        if not isinstance(data, dict):
+            return web.json_response({"status": "error", "message": "Invalid request."}, status=400)
 
-def _prune_older_than(dq, now, window):
-    while dq and now - dq[0] > window:
-        dq.popleft()
+        current_hash = global_config.get('password_hash')
 
+        if current_hash:
+            # A password already exists: changing it requires proving knowledge
+            # of the current password (no unauthenticated takeover).
+            current_password = data.get('current_password')
+            if not current_password or not verify_password(current_hash, current_password):
+                return web.json_response(
+                    {"status": "error", "message": "Current password is incorrect."},
+                    status=403,
+                )
 
-def is_rate_limited(request: web.Request) -> bool:
-    """True si la requête est en lockout (trop d'échecs récents, par IP ou global)."""
-    now = time.monotonic()
-    with _rate_limit_lock:
-        _prune_older_than(_global_failures, now, RATE_LIMIT_GLOBAL_WINDOW_SECONDS)
-        if len(_global_failures) >= RATE_LIMIT_GLOBAL_MAX:
-            return True
-        ip = _client_ip(request)
-        dq = _failed_logins[ip]
-        _prune_older_than(dq, now, RATE_LIMIT_WINDOW_SECONDS)
-        return len(dq) >= RATE_LIMIT_MAX_FAILURES
+        password = data.get('password')
+        if not password or len(password) < MIN_PASSWORD_LENGTH:
+            return web.json_response(
+                {"status": "error", "message": f"New password is too short (min {MIN_PASSWORD_LENGTH} characters)."},
+                status=400,
+            )
 
+        new_hash = hash_password(password)
 
-def record_failed_login(request: web.Request) -> None:
-    """Enregistre un échec d'authentification (bucket par IP + compteur global)."""
-    now = time.monotonic()
-    ip = _client_ip(request)
-    with _rate_limit_lock:
-        _global_failures.append(now)
-        _failed_logins[ip].append(now)
-        # Borne la mémoire : purge les entrées IP inactives au-delà du seuil.
-        if len(_failed_logins) > RATE_LIMIT_MAX_TRACKED_IPS:
-            for key in list(_failed_logins):
-                dq = _failed_logins[key]
-                _prune_older_than(dq, now, RATE_LIMIT_WINDOW_SECONDS)
-                if not dq:
-                    del _failed_logins[key]
-
-
-def clear_failed_logins(request: web.Request) -> None:
-    """Réinitialise le compteur d'échecs de l'IP (login réussi)."""
-    ip = _client_ip(request)
-    with _rate_limit_lock:
-        _failed_logins.pop(ip, None)
+        try:
+            await holaf_config.save_setting_to_config('Security', 'password_hash', new_hash)
+            global_config['password_hash'] = new_hash  # Update live global config
+            if current_hash:
+                print("🔑 [Holaf-Auth] The shared password has been changed via the UI.")
+            else:
+                print("🔑 [Holaf-Auth] The shared password has been set via the UI.")
+            response = web.json_response({"status": "ok", "action": "reload"})
+            set_session_cookie(response, request)  # Auto-login after setup.
+            return response
+        except PermissionError:
+            print("🔵 [Holaf-Auth] A user tried to set/change the password, but file permissions prevented saving.")
+            if not current_hash:
+                # First-time setup: offer the manual fallback (README-documented UX):
+                # the user copies the hash into config.ini under [Security] password_hash.
+                return web.json_response({"status": "manual_required", "hash": new_hash})
+            return web.json_response({"status": "error", "message": "Could not save config.ini due to file permissions."}, status=500)
+    except Exception as e:
+        print(f"🔴 [Holaf-Auth] Error setting password: {e}")
+        traceback.print_exc()
+        return web.json_response({"status": "error", "message": "An unexpected error occurred while updating the password."}, status=500)
 
 
 async def logout_route(request: web.Request) -> web.Response:
@@ -336,8 +365,9 @@ async def logout_route(request: web.Request) -> web.Response:
 
 
 async def status_route(request: web.Request, global_config=None) -> web.Response:
-    """GET /holaf/auth/status"""
+    """GET /holaf/auth/status — drives the SINGLE shared frontend prompt."""
     return web.json_response({
         "authenticated": is_authenticated(request),
         "password_configured": bool(global_config.get('password_hash')) if global_config else None,
+        "min_password_length": MIN_PASSWORD_LENGTH,
     })

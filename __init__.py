@@ -678,10 +678,15 @@ async def holaf_save_all_settings_route(request: web.Request):
 async def holaf_restart_server_route(request: web.Request):
     return await holaf_server_management.restart_server_route(request)
 
-# Shared Auth Routes
+# Shared Auth Routes — UNIFIED prompt for the whole pack (js/holaf_auth.js).
+# Session cookie is a BROWSER SESSION cookie (no Max-Age) set by holaf_auth.
 @routes.post("/holaf/auth/login")
 async def holaf_auth_login_route(request: web.Request):
     return await holaf_auth.login_route(request, CONFIG)
+
+@routes.post("/holaf/auth/setup")
+async def holaf_auth_setup_route(request: web.Request):
+    return await holaf_auth.setup_route(request, CONFIG)
 
 @routes.post("/holaf/auth/logout")
 async def holaf_auth_logout_route(request: web.Request):
@@ -692,14 +697,6 @@ async def holaf_auth_status_route(request: web.Request):
     return await holaf_auth.status_route(request, CONFIG)
 
 # Terminal Routes
-@routes.post("/holaf/terminal/set-password")
-async def holaf_terminal_set_password_route(request: web.Request):
-    return await holaf_terminal.set_password_route(request, CONFIG)
-
-@routes.post("/holaf/terminal/auth")
-async def holaf_terminal_auth_route(request: web.Request):
-    return await holaf_terminal.auth_route(request, CONFIG)
-
 @routes.get("/holaf/terminal") # WebSocket
 @holaf_auth.require_auth
 async def holaf_terminal_websocket_route(request: web.Request):
@@ -1234,9 +1231,11 @@ if nodes_manager_helper:
 # Phase 2 chantier C (PLAN_FUSION.md §3.5) : toutes les routes AIH vivent
 # dans le sous-package 'aih' (aih/routes.py) et sont enregistrées d'un bloc
 # ici, après le bootstrap sys.path du package. Le décorateur d'authentification
-# partagé Holaf est passé explicitement : il sécurise POST /aih/blobby/exec
-# (même vérification par mot de passe que GET /holaf/terminal). L'enregistrement
-# est défensif : un échec n'empêche pas le chargement du reste du pack.
+# partagé Holaf est passé explicitement : il sécurise les routes sensibles du
+# pack (credentials, clés OpenAI, update, install de custom nodes, blobby
+# save/load/exec) avec LA MÊME invite de mot de passe que le terminal
+# (js/holaf_auth.js). L'enregistrement est défensif : un échec n'empêche pas
+# le chargement du reste du pack.
 try:
     from aih import routes as aih_routes
     _AIH_ROUTE_COUNT = aih_routes.register(routes, require_auth=holaf_auth.require_auth)
@@ -1395,9 +1394,9 @@ print("✅ [Holaf-Utilities] Extension initialized with modular structure.")
 final_config = CONFIG # Use the reloaded global CONFIG
 print(f"  > Terminal Shell: {final_config.get('shell_command', 'N/A')}")
 if final_config.get('password_hash'):
-    print("  > Terminal Status: 🔑 Password is set.")
+    print("  > Auth Status: 🔑 Password is set (session prompt shared by all tools).")
 else:
-    print("  > Terminal Status: 🔵 No password set. Setup required.")
+    print("  > Auth Status: 🔵 No password set. The first protected tool will ask for setup.")
 if not NODE_CLASS_MAPPINGS:
     print("  > Additional Nodes: None found or loaded from 'nodes/' directory.")
 print("="*50 + "\n")
