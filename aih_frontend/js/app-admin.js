@@ -303,7 +303,11 @@
       }
     }
 
-    // === Settings (API Key) ===
+    // === Clés API (multi-clés nommées) ===
+    //
+    // Modèle actuel : PLUSIEURS clés nommées par utilisateur (une par machine
+    // ComfyUI), AUCUNE expiration, révocation INDIVIDUELLE. La clé en clair
+    // n'est affichée qu'UNE SEULE FOIS, juste après sa création.
 
     function toggleSettings() {
       toggleMergedSettings();
@@ -313,15 +317,105 @@
       closeMergedSettings();
     }
 
-    // ── Garde-fou anti-masque ───────────────────────────────────────────────
-    // Bug réel corrigé : le masquage mettait un TEXTE (« Clé masquée — clique
-    // sur « Regénérer »… ») dans la VALEUR du champ ; le bouton « Copier »
-    // recopiait ce texte et l'utilisateur l'a collé comme clé API sur une autre
-    // instance ComfyUI → 401 incompréhensible. Désormais : le masque vit dans
-    // l'attribut placeholder (non copiable comme valeur), le champ reste vide,
-    // et aucune valeur masquée/vide ne peut être copiée.
+    // ── i18n FR/EN (parité stricte) ─────────────────────────────────────────
+    // La page est en FR par défaut (<html lang="fr">). On résout la langue via
+    // `localStorage.aih_locale` (convention du pack), sinon navigator.language.
+    var API_TOKENS_I18N = {
+      fr: {
+        title: 'Clés API',
+        desc: 'Utilisez ces clés pour connecter ComfyUI & autres outils à votre compte. Nomme chaque clé pour retrouver la machine associée.',
+        namePlaceholder: 'Nom de la clé (ex. ComfyUI salon)',
+        create: 'Nouvelle clé',
+        copy: 'Copier',
+        rename: 'Renommer',
+        revoke: 'Révoquer',
+        active: 'Active',
+        revoked: 'Révoquée',
+        empty: 'Aucune clé API.',
+        loading: 'Chargement...',
+        createdAt: 'Créée le {date}',
+        lastUsed: 'Dernière utilisation : {date}',
+        neverUsed: 'Jamais utilisée',
+        revealWarning: '⚠️ Copie-la maintenant : elle ne sera plus affichée.',
+        copied: 'Copié !',
+        copyImpossible: 'Copie impossible.',
+        copyMasked: 'Aucune clé copiable : crée une nouvelle clé pour en afficher une.',
+        copyTitleMasked: 'Aucune clé à copier — crée une nouvelle clé',
+        copyTitleReady: 'Copier la clé API',
+        nameRequired: 'Le nom de la clé est obligatoire.',
+        createOk: 'Clé créée ! Copie-la maintenant.',
+        renamePrompt: 'Nouveau nom de la clé :',
+        renameOk: 'Clé renommée.',
+        revokeConfirm: 'Révoquer « {name} » ? Cette clé cessera immédiatement de fonctionner. Les autres clés restent valides.',
+        revokeOk: 'Clé révoquée.',
+        actionError: 'Erreur : {msg}',
+        unavailableLocal: 'Indisponible en mode local',
+        apiError: 'Erreur {status}'
+      },
+      en: {
+        title: 'API keys',
+        desc: 'Use these keys to connect ComfyUI & other tools to your account. Name each key to remember which machine it belongs to.',
+        namePlaceholder: 'Key name (e.g. ComfyUI studio)',
+        create: 'New key',
+        copy: 'Copy',
+        rename: 'Rename',
+        revoke: 'Revoke',
+        active: 'Active',
+        revoked: 'Revoked',
+        empty: 'No API key.',
+        loading: 'Loading...',
+        createdAt: 'Created on {date}',
+        lastUsed: 'Last used: {date}',
+        neverUsed: 'Never used',
+        revealWarning: '⚠️ Copy it now: it will never be shown again.',
+        copied: 'Copied!',
+        copyImpossible: 'Copy failed.',
+        copyMasked: 'No copyable key: create a new key to reveal one.',
+        copyTitleMasked: 'No key to copy — create a new key',
+        copyTitleReady: 'Copy the API key',
+        nameRequired: 'The key name is required.',
+        createOk: 'Key created! Copy it now.',
+        renamePrompt: 'New key name:',
+        renameOk: 'Key renamed.',
+        revokeConfirm: 'Revoke "{name}"? This key will stop working immediately. The other keys remain valid.',
+        revokeOk: 'Key revoked.',
+        actionError: 'Error: {msg}',
+        unavailableLocal: 'Unavailable in local mode',
+        apiError: 'Error {status}'
+      }
+    };
+
+    function apiTokensLang() {
+      var stored = null;
+      try { stored = localStorage.getItem('aih_locale'); } catch (e) {}
+      if (stored === 'en' || stored === 'fr') return stored;
+      var nav = '';
+      try { nav = String(navigator.language || '').toLowerCase(); } catch (e) {}
+      return nav.indexOf('en') === 0 ? 'en' : 'fr';
+    }
+
+    function tApi(key, params) {
+      var dict = API_TOKENS_I18N[apiTokensLang()] || API_TOKENS_I18N.fr;
+      var s = Object.prototype.hasOwnProperty.call(dict, key) ? dict[key] : (API_TOKENS_I18N.fr[key] || key);
+      if (params) {
+        Object.keys(params).forEach(function(k) {
+          s = s.split('{' + k + '}').join(String(params[k]));
+        });
+      }
+      return s;
+    }
+
+    async function apiTokensJson(res) {
+      try { return await res.json(); } catch (e) { return {}; }
+    }
+
+    // ── Garde-fou anti-masque (logique DÉJÀ CORRIGÉE, conservée) ─────────────
+    // Bug réel : le masquage mettait un TEXTE (« Clé masquée — clique sur
+    // « Régénérer »… ») dans la VALEUR du champ ; « Copier » recopiait ce texte,
+    // collé ensuite comme clé API → 401 incompréhensible. Règle : le masque vit
+    // dans `placeholder` (jamais copiable comme valeur), le champ reste vide
+    // hors révélation, et aucune valeur masquée/vide ne peut être copiée.
     var API_KEY_MASK_RE = /(masqu|r[ée]g[ée]n[ée]r|\bhidden\b|\bplaceholder\b|\b(chargement|loading)\b|\b(indisponible|unavailable)\b|\b(pas de token|no token)\b|\b(erreur|error)\b)/i;
-    var API_KEY_MASK_PLACEHOLDER = 'Clé masquée — clique sur « Regénérer » pour en afficher une nouvelle.';
 
     function apiKeyLooksMasked(value) {
       var s = String(value == null ? '' : value).trim();
@@ -333,24 +427,26 @@
       return s.length > 0 && !apiKeyLooksMasked(s);
     }
 
-    // Seul un token RÉEL (renvoyé par /auth/token) est copiable : évite que
-    // l'état interne mente si la valeur du champ a été modifiée autrement.
+    // Seul un token RÉEL (renvoyé par POST /auth/tokens) est copiable : évite
+    // que l'état interne mente si la valeur du champ a été modifiée autrement.
     var apiKeyCopyable = false;
 
     function updateApiKeyCopyButton() {
       var btn = document.getElementById('settings-copy-key');
       if (!btn) return;
       btn.disabled = !apiKeyCopyable;
-      btn.title = apiKeyCopyable
-        ? 'Copier la clé API'
-        : 'Clé masquée : clique sur « Regenerer » pour en afficher une nouvelle';
+      btn.title = apiKeyCopyable ? tApi('copyTitleReady') : tApi('copyTitleMasked');
       btn.setAttribute('aria-disabled', btn.disabled ? 'true' : 'false');
+    }
+
+    function _applyTokensStatusClass(el, kind) {
+      el.className = 'text-xs mt-2 ' + (kind === 'success' ? 'text-emerald-500' : kind === 'error' ? 'text-rose-500' : 'text-amber-500');
     }
 
     function showApiKeyStatus(kind, message, autoHideMs) {
       var el = document.getElementById('settings-key-status');
       if (!el) return;
-      el.className = 'text-xs mt-2 ' + (kind === 'success' ? 'text-emerald-500' : kind === 'error' ? 'text-rose-500' : 'text-amber-500');
+      _applyTokensStatusClass(el, kind);
       el.textContent = message;
       el.classList.remove('hidden');
       if (autoHideMs) {
@@ -358,62 +454,217 @@
       }
     }
 
-    async function loadApiKey() {
-      if (LOCAL_MODE) return;
-      var nameEl = document.getElementById('settings-username');
-      if (currentUser) nameEl.textContent = currentUser.display_name || currentUser.username;
-      var input = document.getElementById('settings-api-key');
-      // IMPORTANT : plus JAMAIS de texte d'état dans la VALEUR du champ (il
-      // était copié par le bouton « Copier » puis collé comme clé API).
-      input.value = '';
-      input.placeholder = 'Chargement...';
-      apiKeyCopyable = false;
-      updateApiKeyCopyButton();
-      var statusEl = document.getElementById('settings-key-status');
-      if (statusEl) { statusEl.classList.add('hidden'); statusEl.textContent = ''; }
-      try {
-        var res = await fetch(API + '/auth/token');
-        if (!res.ok) throw new Error('Erreur ' + res.status);
-        var data = await res.json();
-        if (data.token && apiKeyIsCopyable(data.token)) {
-          input.value = data.token;
-          input.placeholder = '';
-          apiKeyCopyable = true;
-        } else if (data && data.exists) {
-          // Clé stockée hashée côté serveur : on ne l'affiche PAS. Le masque
-          // est un placeholder (grisé) et le bouton Copier est désactivé.
-          input.placeholder = API_KEY_MASK_PLACEHOLDER;
-          showApiKeyStatus('warn', 'Clé masquée — clique sur « Regenerer » pour en afficher une nouvelle.');
-        } else {
-          input.placeholder = 'Aucune clé disponible';
-          showApiKeyStatus('warn', 'Aucune clé API disponible.');
-        }
-      } catch (err) {
-        // Le texte d'erreur reste HORS du champ (message de statut), jamais
-        // en valeur : sinon il serait copiable comme clé.
-        input.placeholder = 'Indisponible';
-        showApiKeyStatus('error', 'Erreur : ' + err.message);
+    function showApiTokensStatus(kind, message, autoHideMs) {
+      var el = document.getElementById('api-tokens-status');
+      if (!el) return;
+      _applyTokensStatusClass(el, kind);
+      el.textContent = message;
+      el.classList.remove('hidden');
+      if (autoHideMs) {
+        setTimeout(function() { el.classList.add('hidden'); }, autoHideMs);
       }
+    }
+
+    function applyApiTokensI18n() {
+      var t = document.getElementById('api-tokens-title'); if (t) t.textContent = tApi('title');
+      var d = document.getElementById('api-tokens-desc'); if (d) d.textContent = tApi('desc');
+      var n = document.getElementById('api-token-new-name'); if (n) n.placeholder = tApi('namePlaceholder');
+      var c = document.getElementById('api-token-create-btn'); if (c) c.textContent = tApi('create');
+      var w = document.getElementById('api-token-reveal-warning'); if (w) w.textContent = tApi('revealWarning');
+      var cp = document.getElementById('settings-copy-key'); if (cp) cp.textContent = tApi('copy');
+      var empty = document.getElementById('api-tokens-empty'); if (empty) empty.textContent = tApi('empty');
+    }
+
+    function hideApiKeyReveal() {
+      var box = document.getElementById('api-token-reveal');
+      if (box) box.classList.add('hidden');
+      var input = document.getElementById('settings-api-key');
+      if (input) { input.value = ''; input.placeholder = ''; }
+      apiKeyCopyable = false;
       updateApiKeyCopyButton();
     }
 
-    async function regenerateApiKey() {
-      if (LOCAL_MODE) { showModal('API Key', 'Indisponible en mode local', 'error'); return; }
-      if (!confirm('Regénérer la clé API ? L\'ancienne clé ne fonctionnera plus.')) return;
-      showApiKeyStatus('warn', 'Regénération...');
+    // Affiche UNE SEULE FOIS la clé en clair renvoyée par la création.
+    function showApiKeyReveal(token) {
+      var box = document.getElementById('api-token-reveal');
+      var input = document.getElementById('settings-api-key');
+      if (!box || !input) return;
+      input.value = String(token || '');
+      input.placeholder = '';
+      apiKeyCopyable = apiKeyIsCopyable(token);
+      var warn = document.getElementById('api-token-reveal-warning');
+      if (warn) warn.textContent = tApi('revealWarning');
+      box.classList.remove('hidden');
+      updateApiKeyCopyButton();
+    }
+
+    function _formatTokenDate(value) {
+      if (!value) return '';
+      var s = String(value);
+      var d = new Date(s.indexOf('T') >= 0 ? s : s.replace(' ', 'T') + 'Z');
+      if (isNaN(d.getTime())) d = new Date(s);
+      if (isNaN(d.getTime())) return s;
+      return d.toLocaleString(apiTokensLang() === 'en' ? 'en-US' : 'fr-FR');
+    }
+
+    function renderApiTokens(tokens) {
+      var list = document.getElementById('api-tokens-list');
+      if (!list) return;
+      list.innerHTML = '';
+      var items = Array.isArray(tokens) ? tokens : [];
+      var empty = document.getElementById('api-tokens-empty');
+      if (empty) {
+        empty.textContent = tApi('empty');
+        empty.classList.toggle('hidden', items.length > 0);
+      }
+      items.forEach(function(tok) { list.appendChild(_renderApiTokenRow(tok)); });
+    }
+
+    function _renderApiTokenRow(tok) {
+      var row = document.createElement('div');
+      row.className = 'flex items-start justify-between gap-2 rounded-md border border-slate-200 dark:border-slate-700 px-3 py-2';
+      row.setAttribute('data-token-id', String(tok.id));
+
+      var info = document.createElement('div');
+      info.className = 'min-w-0 text-xs';
+
+      var nameLine = document.createElement('div');
+      nameLine.className = 'flex items-center gap-2';
+      var nameEl = document.createElement('span');
+      nameEl.className = 'api-token-name font-medium text-slate-800 dark:text-slate-200';
+      nameEl.textContent = String(tok.name == null ? '' : tok.name);
+      nameLine.appendChild(nameEl);
+      if (tok.revoked) {
+        var badge = document.createElement('span');
+        badge.className = 'api-token-state text-[10px] px-1.5 py-0.5 rounded bg-rose-100 text-rose-600 dark:bg-rose-900/40 dark:text-rose-300';
+        badge.textContent = tApi('revoked');
+        nameLine.appendChild(badge);
+      }
+      info.appendChild(nameLine);
+
+      var meta = document.createElement('div');
+      meta.className = 'mt-0.5 text-slate-400 dark:text-slate-500';
+      var prefix = document.createElement('span');
+      prefix.className = 'api-token-prefix font-mono';
+      prefix.textContent = tok.prefix ? (tok.prefix + '…') : '—';
+      meta.appendChild(prefix);
+      var created = document.createElement('span');
+      created.className = 'api-token-created ml-2';
+      created.textContent = tApi('createdAt', { date: _formatTokenDate(tok.created_at) });
+      meta.appendChild(created);
+      info.appendChild(meta);
+
+      var usage = document.createElement('div');
+      usage.className = 'api-token-usage mt-0.5 text-slate-400 dark:text-slate-500';
+      if (tok.last_used_at) {
+        var line = tApi('lastUsed', { date: _formatTokenDate(tok.last_used_at) });
+        if (tok.last_used_ip) line += ' · ' + String(tok.last_used_ip);
+        if (tok.last_used_user_agent) line += ' · ' + String(tok.last_used_user_agent).slice(0, 60);
+        usage.textContent = line;
+      } else {
+        usage.textContent = tApi('neverUsed');
+      }
+      info.appendChild(usage);
+
+      row.appendChild(info);
+
+      var actions = document.createElement('div');
+      actions.className = 'flex shrink-0 gap-1';
+      if (!tok.revoked) {
+        var renameBtn = document.createElement('button');
+        renameBtn.type = 'button';
+        renameBtn.className = 'api-token-rename px-2 py-1 text-[11px] border border-slate-300 dark:border-slate-600 rounded text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700';
+        renameBtn.textContent = tApi('rename');
+        renameBtn.onclick = function() { renameApiToken(tok.id); };
+        actions.appendChild(renameBtn);
+
+        var revokeBtn = document.createElement('button');
+        revokeBtn.type = 'button';
+        revokeBtn.className = 'api-token-revoke px-2 py-1 text-[11px] border border-rose-300 dark:border-rose-700 rounded text-rose-600 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-900/30';
+        revokeBtn.textContent = tApi('revoke');
+        revokeBtn.onclick = function() { revokeApiToken(tok.id, tok.name); };
+        actions.appendChild(revokeBtn);
+      }
+      row.appendChild(actions);
+      return row;
+    }
+
+    // Charge la LISTE des clés nommées (jamais les clés elles-mêmes).
+    async function loadApiKey() {
+      if (LOCAL_MODE) return;
+      var nameEl = document.getElementById('settings-username');
+      if (nameEl && currentUser) nameEl.textContent = currentUser.display_name || currentUser.username;
+      applyApiTokensI18n();
+      hideApiKeyReveal();
+      showApiTokensStatus('warn', tApi('loading'));
       try {
-        var res = await fetch(API + '/auth/token', { method: 'POST' });
-        if (!res.ok) throw new Error('Erreur ' + res.status);
-        var data = await res.json();
-        var token = (data && data.token) || '';
-        var input = document.getElementById('settings-api-key');
-        input.value = token;
-        input.placeholder = '';
-        apiKeyCopyable = apiKeyIsCopyable(token);
-        updateApiKeyCopyButton();
-        showApiKeyStatus('success', token ? 'Nouvelle clé générée !' : 'Réponse sans clé — réessaie.');
+        var res = await fetch(API + '/auth/tokens');
+        if (!res.ok) throw new Error(tApi('apiError', { status: res.status }));
+        var data = await apiTokensJson(res);
+        renderApiTokens((data && data.tokens) || []);
+        var st = document.getElementById('api-tokens-status');
+        if (st) { st.classList.add('hidden'); st.textContent = ''; }
       } catch (err) {
-        showApiKeyStatus('error', 'Erreur : ' + err.message);
+        renderApiTokens([]);
+        showApiTokensStatus('error', tApi('actionError', { msg: err.message }));
+      }
+    }
+
+    // Crée une nouvelle clé nommée → la clé est affichée UNE SEULE FOIS.
+    async function createApiToken() {
+      if (LOCAL_MODE) { showModal('API Key', tApi('unavailableLocal'), 'error'); return; }
+      var nameInput = document.getElementById('api-token-new-name');
+      var name = nameInput ? String(nameInput.value || '').trim() : '';
+      if (!name) { showApiTokensStatus('error', tApi('nameRequired')); return; }
+      try {
+        var res = await fetch(API + '/auth/tokens', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name })
+        });
+        var data = await apiTokensJson(res);
+        if (!res.ok) throw new Error((data && data.error) || tApi('apiError', { status: res.status }));
+        if (nameInput) nameInput.value = '';
+        await loadApiKey();
+        showApiKeyReveal((data && data.token) || '');
+        showApiTokensStatus('success', tApi('createOk'));
+      } catch (err) {
+        showApiTokensStatus('error', tApi('actionError', { msg: err.message }));
+      }
+    }
+
+    async function renameApiToken(id) {
+      if (LOCAL_MODE) { showModal('API Key', tApi('unavailableLocal'), 'error'); return; }
+      var newName = prompt(tApi('renamePrompt'));
+      if (newName == null) return;
+      newName = String(newName).trim();
+      if (!newName) { showApiTokensStatus('error', tApi('nameRequired')); return; }
+      try {
+        var res = await fetch(API + '/auth/tokens/' + id, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: newName })
+        });
+        var data = await apiTokensJson(res);
+        if (!res.ok) throw new Error((data && data.error) || tApi('apiError', { status: res.status }));
+        showApiTokensStatus('success', tApi('renameOk'), 2000);
+        loadApiKey();
+      } catch (err) {
+        showApiTokensStatus('error', tApi('actionError', { msg: err.message }));
+      }
+    }
+
+    async function revokeApiToken(id, name) {
+      if (LOCAL_MODE) { showModal('API Key', tApi('unavailableLocal'), 'error'); return; }
+      if (!confirm(tApi('revokeConfirm', { name: name || '' }))) return;
+      try {
+        var res = await fetch(API + '/auth/tokens/' + id, { method: 'DELETE' });
+        var data = await apiTokensJson(res);
+        if (!res.ok) throw new Error((data && data.error) || tApi('apiError', { status: res.status }));
+        showApiTokensStatus('success', tApi('revokeOk'), 2000);
+        loadApiKey();
+      } catch (err) {
+        showApiTokensStatus('error', tApi('actionError', { msg: err.message }));
       }
     }
 
@@ -422,7 +673,7 @@
       var value = String(input.value || '');
       // Garde-fou : ne copie JAMAIS un masque / placeholder / champ vide.
       if (!apiKeyCopyable || !apiKeyIsCopyable(value)) {
-        showApiKeyStatus('warn', 'Clé masquée : clique sur « Regenerer » pour en afficher une nouvelle, puis copie-la.');
+        showApiKeyStatus('warn', tApi('copyMasked'));
         return;
       }
       input.select();
@@ -431,14 +682,14 @@
         ? navigator.clipboard.writeText(value)
         : Promise.reject(new Error('clipboard indisponible'));
       write.then(function() {
-        showApiKeyStatus('success', 'Copié !', 2000);
+        showApiKeyStatus('success', tApi('copied'), 2000);
       }).catch(function() {
         // Repli : copie de la sélection — la sélection porte la VALEUR RÉELLE
         // (le garde-fou ci-dessus a déjà refusé masque/vide).
         if (document.execCommand('copy')) {
-          showApiKeyStatus('success', 'Copié !', 2000);
+          showApiKeyStatus('success', tApi('copied'), 2000);
         } else {
-          showApiKeyStatus('error', 'Copie impossible.');
+          showApiKeyStatus('error', tApi('copyImpossible'));
         }
       });
     }
