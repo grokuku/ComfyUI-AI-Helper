@@ -61,6 +61,42 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     return (b / 1048576).toFixed(1) + " MB";
   }
 
+  // ── Normalisation d'identité d'un dépôt git (custom nodes) ──
+  // Bug réel (capture) : un pack DÉJÀ INSTALLÉ était quand même réinstallé et
+  // l'installation échouait (« Node '…' already installed »), parce que la
+  // détection comparait l'URL git par ÉGALITÉ DE CHAÎNE EXACTE. Or le même
+  // dépôt s'écrit différemment selon la source : dossier installé par
+  // ComfyUI-Manager (.git/config), aux_id du workflow (owner/repo), alias de
+  // nom (ComfyUI-AI-Helper vs AI-Helper)…
+  //   https://github.com/Owner/Repo.git ≡ git@github.com:owner/repo ≡
+  //   http://www.github.com/Owner/Repo/ ≡ ssh://git@github.com/owner/repo.git
+  // → normaliseRepoUrl() réduit à « host/path » (minuscules, sans « www. »,
+  //   sans « .git », sans slash final, sans port). normalizeRepoName() réduit
+  //   à un identifiant de pack (dernier segment, préfixe « comfyui[-_] »
+  //   retiré, alphanumérique).
+  function normalizeRepoUrl(raw) {
+    var s = String(raw == null ? "" : raw).trim().toLowerCase();
+    if (!s) return "";
+    s = s.replace(/\.git$/, "").replace(/\/+$/, "");
+    // Forme scp-like : git@host:owner/repo
+    var scp = s.match(/^[^@/]+@([^:/]+):(.+)$/);
+    if (scp) return scp[1].replace(/^www\./, "") + "/" + scp[2].replace(/^\/+|\/+$/g, "");
+    // Forme avec schéma : proto://[user@]host[:port]/owner/repo
+    var m = s.match(/^[a-z][a-z0-9+.\-]*:\/\/(?:[^@/]+@)?([^/]+?)(?::\d+)?\/(.+)$/);
+    if (m) return m[1].replace(/^www\./, "") + "/" + m[2].replace(/^\/+|\/+$/g, "");
+    // Forme nue : owner/repo
+    return s.replace(/^\/+|\/+$/g, "");
+  }
+
+  function normalizeRepoName(raw) {
+    var s = String(raw == null ? "" : raw).trim().toLowerCase();
+    if (!s) return "";
+    s = s.replace(/\.git$/, "").replace(/\/+$/, "");
+    s = s.split("/").pop() || s;
+    s = s.replace(/^comfyui[-_]/, "");
+    return s.replace(/[^a-z0-9]/g, "");
+  }
+
   // ── Check d'existence serveur AVANT upload ──
   // Appel UNIQUE et par lot de la route locale /api/aih/models/check (le pack
   // Python calcule les empreintes des fichiers — le navigateur n'a pas accès au
@@ -497,6 +533,118 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
       console.warn('[AIH] /aih/custom-nodes HTTP ' + (e.status||'') + (e.body ? ' ' + (typeof e.body === 'string' ? e.body : '') : '') + ' — route non enregistree ou erreur serveur');
       return [];
     }
+  }
+
+  // Index des packs déjà installés, comparable malgré les alias/renommages.
+  // Multi-signaux indexés :
+  //   - urls  : URL git normalisée (« host/owner/repo ») ;
+  //   - names : nom de dossier local normalisé + slug de l'URL normalisé ;
+  //   - types : noms de classes de nodes fournis par le pack installé.
+  // La valeur stockée est le libellé lisible du pack (nom de dossier) pour
+  // pouvoir AFFICHER la raison du match dans l'UI.
+  //
+  // ⚠️ Le nom de dossier est un signal de PREMIÈRE CLASSE : un pack installé
+  // SANS remote git (copie manuelle, gestionnaire sans `.git`) n'a AUCUNE URL
+  // dans l'index ; il n'est reconnu que par son nom de dossier (et ses
+  // classes). Sans ce signal, l'outil retente une installation déjà présente.
+  function buildInstalledNodeIndex(list) {
+    var urls = {};
+    var names = {};
+    var types = {};
+    for (var i = 0; i < (list || []).length; i++) {
+      var p = list[i] || {};
+      var folder = String(p.name || "").trim();
+      var label = folder || normalizeRepoUrl(p.git_url) || "";
+      var u = normalizeRepoUrl(p.git_url);
+      if (u) urls[u] = label || u;
+      var n = normalizeRepoName(p.name);
+      if (n) names[n] = label || n;
+      var un = normalizeRepoName(p.git_url);
+      if (un) names[un] = label || un;
+      var nt = p.node_types || [];
+      for (var ti = 0; ti < nt.length; ti++) {
+        var tname = nt[ti];
+        if (typeof tname === "string" && tname && !types[tname]) types[tname] = label || folder;
+      }
+    }
+    return { urls: urls, names: names, types: types };
+  }
+
+  // Retourne null si non installé, sinon la RAISON du match
+  // { reason: 'url' | 'folder' | 'types', detail, type? }. Du plus fort au plus
+  // faible : URL normalisée identique (alias .git/casse/git@/https/www/port),
+  // nom de dossier local normalisé (préfixe comfyui[-_], séparateurs), puis nom
+  // de classe de node fourni par le workflow et présent dans le pack installé
+  // (les classes ComfyUI sont globalement uniques : si la classe existe, le
+  // workflow fonctionnera). Aucun faux positif souhaité sur un dépôt différent.
+  function matchInstalledNode(idx, name, url, nodeTypes) {
+    if (!idx) return null;
+    var u = normalizeRepoUrl(url);
+    if (u && idx.urls && idx.urls[u]) return { reason: "url", detail: idx.urls[u] };
+    var n = normalizeRepoName(name);
+    if (n && idx.names && idx.names[n]) return { reason: "folder", detail: idx.names[n] };
+    var un = normalizeRepoName(url);
+    if (un && idx.names && idx.names[un]) return { reason: "folder", detail: idx.names[un] };
+    if (idx.types && nodeTypes && nodeTypes.length) {
+      for (var i = 0; i < nodeTypes.length; i++) {
+        var tname = nodeTypes[i];
+        if (typeof tname === "string" && tname && idx.types[tname]) {
+          return { reason: "types", detail: idx.types[tname], type: tname };
+        }
+      }
+    }
+    return null;
+  }
+
+  function nodeMatchesInstalledIndex(idx, name, url, nodeTypes) {
+    return !!matchInstalledNode(idx, name, url, nodeTypes);
+  }
+
+  // Libellé lisible de la raison d'un match « déjà installé ».
+  function installedMatchReason(match) {
+    if (!match) return "";
+    if (match.reason === "url") return t("wf.matchReasonUrl", { url: match.detail });
+    if (match.reason === "types") return t("wf.matchReasonNode", { name: match.type });
+    return t("wf.matchReasonFolder", { name: match.detail });
+  }
+
+  // Marque la ligne d'un node comme « déjà installé » dans l'UI (case décochée
+  // + badge avec la raison + astuce de forçage). Idempotent : jamais deux
+  // badges. Utilisé par le filet de sécurité « already installed ».
+  function markNodeInstalled(cb, reasonText) {
+    if (!cb) return;
+    cb.checked = false;
+    cb.dataset.installed = "1";
+    cb.title = t("wf.forceInstallHint");
+    var label = cb.closest ? cb.closest("label") : null;
+    if (!label) return;
+    var span = label.querySelector("span");
+    if (!span || /déjà installé|already installed/i.test(span.textContent)) return;
+    var reason = reasonText || t("wf.matchReasonServer");
+    span.innerHTML += ' <span style="color:#34d399;">' + t("wf.alreadyInstalledMatch", { reason: reason }) + '</span>';
+  }
+
+  // Message d'erreur d'installation LISIBLE : le serveur pack renvoie
+  // {success:false, message:"Node 'X' already installed"} en 400 ; HolafFetch
+  // attache ce corps à err.data. On préfère data.message/data.error au
+  // « erreur serveur (statut 400) » générique, pour un message clair.
+  function installErrorMessage(e) {
+    if (!e) return t("aih.failed");
+    var d = e.data || e.body;
+    if (d && typeof d === "object") {
+      if (typeof d.message === "string" && d.message) return d.message;
+      if (typeof d.error === "string" && d.error) return d.error;
+    }
+    return e.message || t("aih.failed");
+  }
+
+  // Filet de sécurité « already installed » : le serveur pack répond
+  // {success:false, message:"Node 'X' already installed"} en 400 quand le
+  // dossier existe DÉJÀ côté ComfyUI. Ce n'est PAS un échec : on classe ce cas
+  // en skip bénin (ligne « déjà installé », aucune erreur affichée), quel que
+  // soit l'état de la détection côté front.
+  function isAlreadyInstalledMessage(msg) {
+    return /already installed/i.test(String(msg == null ? "" : msg));
   }
 
   async function detectDependencies(workflowJSON) {
@@ -1016,6 +1164,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
           // Sélection RÉELLE (fichiers trouvés localement) ; clé composite
           // type|nom pour distinguer un model d'un lora homonyme.
           var selection = [];
+          var notFoundLocal = [];
           for (var ui = 0; ui < uploadCbs.length; ui++) {
             var ucb = uploadCbs[ui];
             var uType = ucb.dataset.type;
@@ -1026,13 +1175,20 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
               uFile = allFilesMap[uBase];
             }
             if (!uFile) {
+              // Fichier coché mais INTROUVABLE localement : sans upload_id le
+              // workflow publié listerait une dépendance NON téléchargeable.
+              // On le DIT (jamais de skip silencieux à la publication non plus).
               console.warn('[AIH] Non trouve localement: ' + uName);
+              notFoundLocal.push(uName);
               continue;
             }
             selection.push({
               key: uType + '|' + uName, name: uName, type: uType,
               path: uFile.path, size: uFile.size, status: null, remote: null,
             });
+          }
+          if (notFoundLocal.length > 0) {
+            aihToast(t('wf.uploadLocalMissing', { count: notFoundLocal.length, names: notFoundLocal.join(', ') }), 'error');
           }
 
           // Check PAR LOT AVANT l'envoi : on détermine ce qui existe déjà côté
@@ -1301,6 +1457,21 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
           var totalDeps = allDeps.nodes.length + allDeps.models.length + allDeps.loras.length;
           var depsEl = detailBody.querySelector("#wf-install-deps");
 
+          // Index des packs déjà installés, résolu UNE fois puis partagé par le
+          // rendu de la liste ET le bouton « Charger le workflow » (sinon la
+          // détection d'installation serait faite deux fois, avec risque de
+          // divergence). Les alias (comfyui-ai-helper vs AI-Helper, .git,
+          // ssh/https, casse…) matchent le même index.
+          var _installedIndexPromise = null;
+          function getInstalledIndex() {
+            if (!_installedIndexPromise) {
+              _installedIndexPromise = getInstalledCustomNodes()
+                .then(function (list) { return buildInstalledNodeIndex(list); })
+                .catch(function () { return buildInstalledNodeIndex([]); });
+            }
+            return _installedIndexPromise;
+          }
+
           if (totalDeps === 0) {
             depsEl.innerHTML = '<p style="font-size:12px;color:#34d399;">' + t('wf.noDeps') + '</p>';
           } else {
@@ -1315,24 +1486,26 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
               depHtml += '<div style="border:1px solid #444;border-radius:6px;overflow:hidden;">';
 
               if (allDeps.nodes.length) {
-                // Check which custom node packs are already installed (by git_url)
-                var installedNodes = await getInstalledCustomNodes();
-                var installedUrls = {};
-                for (var k = 0; k < installedNodes.length; k++) {
-                  if (installedNodes[k].git_url) {
-                    installedUrls[installedNodes[k].git_url] = true;
-                  }
-                }
+                // Packs déjà installés : comparaison NORMALISÉE (URL git + nom de
+                // dossier + slug) pour reconnaître les alias du même dépôt.
+                var installedIndex = await getInstalledIndex();
                 depHtml += '<div style="background:#3a3a3e;padding:6px 10px;border-bottom:1px solid #444;"><span style="font-size:11px;color:#f59e0b;font-weight:600;">' + t('wf.customNodesHeader') + '</span></div>';
                 for (var i = 0; i < allDeps.nodes.length; i++) {
                   var n = allDeps.nodes[i];
                   var nodeCount = n.node_types ? n.node_types.length : 1;
-                  var installed = n.url && installedUrls[n.url];
+                  var match = matchInstalledNode(installedIndex, n.name, n.url, n.node_types);
+                  var installed = !!match;
+                  var reason = installed ? installedMatchReason(match) : "";
+                  // Déjà installé → case DÉCOCHÉE (aucune tentative d'installation,
+                  // aucun échec) + RAISON affichée. La case reste COCHABLE : la
+                  // recocher FORCE l'installation (filet « already installed » en
+                  // secours). Sinon cochée par défaut.
                   depHtml += '<label style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid #3a3a3e;cursor:pointer;font-size:12px;color:' + (installed ? '#34d399' : '#ccc') + ';">' +
-                    '<input type="checkbox" class="wf-dep-cb" checked data-type="node" data-name="' + esc(n.name) + '" data-url="' + esc(n.url || '') + '" style="accent-color:var(--aih-accent, #D8700D);">' +
+                    '<input type="checkbox" class="wf-dep-cb"' + (installed ? '' : ' checked') + ' data-type="node" data-name="' + esc(n.name) + '" data-url="' + esc(n.url || '') + '"' + (installed ? ' data-installed="1" data-installed-reason="' + esc(reason) + '" title="' + esc(t('wf.forceInstallHint')) + '"' : '') + ' style="accent-color:var(--aih-accent, #D8700D);">' +
                     '<span style="flex:1;">' + esc(n.name) +
                     (nodeCount > 1 ? ' (' + t('wf.nodeCount', { count: nodeCount }) + ') ' : '') +
-                    (installed ? t('wf.alreadyInstalled') : '') + '</span>' +
+                    (installed ? ' <span style="color:#34d399;">' + t('wf.alreadyInstalledMatch', { reason: reason }) + '</span>' : '') +
+                    (!installed && !n.url ? ' <span style="color:#f87171;">' + t('wf.noGitUrl') + '</span>' : '') + '</span>' +
                     (n.url && !installed ? '<button onclick="window._wfInstallNode(\'' + esc(n.url) + '\', \'' + esc(n.name) + '\', this)" style="padding:2px 8px;border:1px solid #555;border-radius:3px;background:#4a4a4e;color:#ccc;font-size:10px;cursor:pointer;">' + t('wf.install') + '</button>' : '') +
                     (n.url ? '<a href="' + esc(n.url) + '" target="_blank" style="color:var(--aih-accent, #D8700D);text-decoration:none;font-size:11px;" onclick="event.stopPropagation();">🔗</a>' : '') +
                     '</label>';
@@ -1348,7 +1521,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   depHtml += '<div style="padding:6px 10px;border-bottom:1px solid #3a3a3e;font-size:12px;color:' + (installed ? '#34d399' : '#ccc') + ';">' +
                     '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;">' +
                     '<input type="checkbox" class="wf-dep-cb"' + (installed ? '' : ' checked') + ' data-type="model" data-model-type="' + esc(m.type || 'model') + '" data-name="' + esc(m.name) + '" ' + (hasFile ? 'data-upload-id="' + esc(m.upload_id) + '"' : '') + ' style="accent-color:var(--aih-accent, #D8700D);">' +
-                    '<span style="flex:1;">' + esc(m.name) + (installed ? t('wf.alreadyInstalled') : '') + '</span>' +
+                    '<span style="flex:1;">' + esc(m.name) + (installed ? t('wf.alreadyInstalled') : '') + (!installed && !hasFile ? ' <span style="color:#f87171;">' + t('wf.depNoServerRef') + '</span>' : '') + '</span>' +
                     '<span style="font-size:10px;color:#666;">' + (m.type || t('wf.modelType')) + '</span></label>';
                   if (!installed && hasFile) {
                     var typeToFolder = {'checkpoint':'checkpoints','lora':'loras','vae':'vae','clip':'clip','clip_vision':'clip_vision','controlnet':'controlnet','unet':'unet','unet_gguf':'unet_gguf','upscale':'upscale_models','gligen':'gligen','hypernetwork':'hypernetworks','text_encoder':'text_encoders','style_model':'style_models','model':'checkpoints'};
@@ -1371,7 +1544,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   depHtml += '<div style="padding:6px 10px;border-bottom:1px solid #3a3a3e;font-size:12px;color:' + (installed ? '#34d399' : '#ccc') + ';">' +
                     '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;">' +
                     '<input type="checkbox" class="wf-dep-cb"' + (installed ? '' : ' checked') + ' data-type="lora" data-name="' + esc(l.name) + '" ' + (hasFile ? 'data-upload-id="' + esc(l.upload_id) + '"' : '') + ' style="accent-color:var(--aih-accent, #D8700D);">' +
-                    '<span style="flex:1;">' + esc(l.name) + (installed ? t('wf.alreadyInstalled') : '') + '</span></label>';
+                    '<span style="flex:1;">' + esc(l.name) + (installed ? t('wf.alreadyInstalled') : '') + (!installed && !hasFile ? ' <span style="color:#f87171;">' + t('wf.depNoServerRef') + '</span>' : '') + '</span></label>';
                   if (!installed && hasFile) {
                     depHtml += '<div style="display:flex;align-items:center;gap:4px;margin-top:4px;">' +
                       '<span class="wf-dep-basepath" style="font-size:10px;color:#666;font-family:monospace;white-space:nowrap;flex-shrink:0;">loras/</span>' +
@@ -1392,27 +1565,43 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
             btn.textContent = t("wf.cloning");
             btn.disabled = true;
             var toast = aihToast(t("wf.installing", { name: nodeName }), "progress");
+            var cb = btn.closest && btn.closest("label") ? btn.closest("label").querySelector("input.wf-dep-cb") : null;
+            // Succès (installation réelle OU déjà présent côté serveur) : la
+            // ligne passe en « installé », jamais un échec pour un node déjà là.
+            function _markInstalled(msgKey) {
+              btn.textContent = t("wf.installed");
+              btn.style.color = "#34d399";
+              btn.style.borderColor = "#34d399";
+              btn.disabled = true;
+              markNodeInstalled(cb);
+              aihToastDone(toast, "success", t(msgKey, { name: nodeName }));
+            }
             try {
               var data = await HolafFetch.request("/api/aih/custom-nodes/install", {
                 method: "POST",
                 body: {git_url: gitUrl, name: nodeName}
               });
               if (data.success) {
-                btn.textContent = t("wf.installed");
-                btn.style.color = "#34d399";
-                btn.style.borderColor = "#34d399";
-                aihToastDone(toast, "success", t("wf.installedMsg", { name: nodeName }));
+                _markInstalled("wf.installedMsg");
+              } else if (isAlreadyInstalledMessage(data.message)) {
+                // Filet de sécurité : dossier déjà présent côté ComfyUI.
+                _markInstalled("wf.alreadyInstalledMsg");
               } else {
                 btn.textContent = "❌";
                 btn.style.color = "#f87171";
                 aihToastDone(toast, "error", "❌ " + (data.message || t("aih.failed")));
-
               }
             } catch (e) {
-              btn.textContent = "❌";
-              btn.style.color = "#f87171";
-              aihToastDone(toast, "error", "❌ " + e.message);
-
+              var emsg = installErrorMessage(e);
+              if (isAlreadyInstalledMessage(emsg)) {
+                // Filet de sécurité : le serveur répond « Node 'X' already
+                // installed » (400) → skip bénin, AUCUNE erreur affichée.
+                _markInstalled("wf.alreadyInstalledMsg");
+              } else {
+                btn.textContent = "❌";
+                btn.style.color = "#f87171";
+                aihToastDone(toast, "error", t("wf.nodeInstallFailed", { name: nodeName, error: emsg }));
+              }
             }
           };
 
@@ -1494,7 +1683,22 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                 var r = rows[fileName];
                 if (!r) return;
                 if (r.pollInterval) { clearInterval(r.pollInterval); r.pollInterval = null; }
-                if (success) {
+                if (success === 'skipped') {
+                  // Non téléchargé (aucune référence serveur, déjà local, ou
+                  // conservé) : état NEUTRE + raison explicite — jamais un faux
+                  // succès ni un skip muet.
+                  r.status.textContent = "\u23ed";
+                  r.fill.style.background = "#6b7280";
+                  r.fill.style.animation = "none";
+                  r.fill.style.width = "100%";
+                  r.row.style.background = "rgba(107,114,128,0.15)";
+                  if (errorMsg) {
+                    var skipEl = document.createElement("div");
+                    skipEl.style.cssText = "font-size:10px;color:#cbd5e1;word-break:break-all;width:100%;margin-left:26px;";
+                    skipEl.textContent = errorMsg;
+                    r.row.appendChild(skipEl);
+                  }
+                } else if (success) {
                   r.status.textContent = "\u2705";
                   r.fill.style.background = "#16a34a";
                   r.fill.style.animation = "none";
@@ -1667,27 +1871,74 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                 parsed.extra.title = data.name;
               }
 
-              // 2. Install custom nodes (checked, not already installed)
+              // 2. Install custom nodes (checked, PAS déjà installés)
+              // Un pack DÉJÀ INSTALLÉ (même sous un alias : ComfyUI-AI-Helper
+              // vs AI-Helper, .git, ssh/https, casse, dossier sans remote git…)
+              // est SKIPPÉ — aucune tentative, aucune erreur. La détection est la
+              // même que celle du badge rendu dans la liste (index normalisé
+              // partagé). Récocher une case marquée `data-installed="1"`
+              // = FORÇAGE explicite (on tente l'installation).
               var nodeCbs = detailBody.querySelectorAll('.wf-dep-cb[data-type="node"]:checked');
+              var installedIndex = nodeCbs.length > 0 ? await getInstalledIndex() : null;
               var newNodesInstalled = 0;
+              var nodesSkippedInstalled = 0;
+              var nodesAlreadyOnServer = [];
+              var nodesWithoutUrl = [];
               for (var ni = 0; ni < nodeCbs.length; ni++) {
                 var ncb = nodeCbs[ni];
                 var nurl = ncb.dataset.url;
                 var nname = ncb.dataset.name;
-                if (!nurl) continue;
+                // `:checked` + data-installed="1" ⇒ l'utilisateur a RECOCHÉ un
+                // node détecté installé ⇒ forçage : on ne le saute pas.
+                var forced = ncb.dataset.installed === '1';
+                if (!forced && nodeMatchesInstalledIndex(installedIndex, nname, nurl)) {
+                  nodesSkippedInstalled++;
+                  console.log('[AIH] Node déjà installé, skip: ' + nname);
+                  continue;
+                }
+                // Ni détecté installé, ni installable (aucune URL git) : message
+                // clair, jamais une erreur brute ni un échec muet.
+                if (!nurl) { nodesWithoutUrl.push(nname); continue; }
                 statusEl.textContent = t("wf.installingNode", { i: (ni + 1), total: nodeCbs.length, name: esc(nname) });
                 try {
                   var installData = await HolafFetch.request("/api/aih/custom-nodes/install", {
                     method: "POST",
                     body: {git_url: nurl, name: nname}
                   });
-                  if (installData.success) newNodesInstalled++;
+                  if (installData && installData.success === false && isAlreadyInstalledMessage(installData.message)) {
+                    // Filet de sécurité : dossier déjà présent côté ComfyUI.
+                    markNodeInstalled(ncb);
+                    nodesAlreadyOnServer.push(nname);
+                  } else if (installData && installData.success) {
+                    newNodesInstalled++;
+                  }
                 } catch(e) {
-                  // L'erreur réelle (4xx/5xx serveur…) est remontée à
-                  // l'utilisateur : jamais un échec muet.
-                  console.warn("[AIH] Node install failed: " + nname, e);
-                  aihToast(t("wf.nodeInstallFailed", { name: nname, error: e.message }), "error");
+                  var emsg = installErrorMessage(e);
+                  if (isAlreadyInstalledMessage(emsg)) {
+                    // FILET DE SÉCURITÉ : le serveur répond « Node 'X' already
+                    // installed » (400) → skip bénin, la ligne passe en « déjà
+                    // installé », AUCUNE erreur affichée.
+                    markNodeInstalled(ncb);
+                    nodesAlreadyOnServer.push(nname);
+                    console.log('[AIH] Node ' + nname + ' déjà installé côté serveur — skip bénin');
+                  } else {
+                    // L'erreur RÉELLE (5xx, git clone impossible…) est remontée
+                    // avec le message serveur exact — jamais un échec muet ni un
+                    // « erreur serveur (statut 400) » générique.
+                    console.warn("[AIH] Node install failed: " + nname, e);
+                    aihToast(t("wf.nodeInstallFailed", { name: nname, error: emsg }), "error");
+                  }
                 }
+              }
+              if (nodesSkippedInstalled > 0) {
+                console.log('[AIH] ' + nodesSkippedInstalled + ' custom node(s) déjà installé(s), non réinstallé(s)');
+              }
+              if (nodesAlreadyOnServer.length > 0) {
+                // Message CLAIR et non bloquant : déjà présents, aucun échec.
+                aihToast(t("wf.alreadyInstalledSummary", { count: nodesAlreadyOnServer.length, names: nodesAlreadyOnServer.join(', ') }), "info");
+              }
+              if (nodesWithoutUrl.length > 0) {
+                aihToast(t("wf.nodesNoGitUrl", { count: nodesWithoutUrl.length, names: nodesWithoutUrl.join(', ') }), "error");
               }
 
               // 3. Collect models/loras to download (with local existence check)
@@ -1716,12 +1967,21 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   });
                 } catch(e) { return null; }
               }
+              var skippedDeps = [];  // deps cochées mais NON téléchargées : {name, reason}
               for (var i = 0; i < cbs.length; i++) {
                 var cb = cbs[i];
                 var dtype = cb.dataset.type;
                 var origName = cb.dataset.name;
                 var uploadId = cb.dataset.uploadId;
-                if (!uploadId || (dtype !== 'model' && dtype !== 'lora')) continue;
+                if (dtype !== 'model' && dtype !== 'lora') continue;
+                // Référence serveur absente (upload_id manquant) : l'entrée est
+                // listée dans le workflow mais n'est PAS téléchargeable. On le
+                // DIT explicitement — plus jamais de skip silencieux (c'était
+                // la cause « 8 annoncés / 6 téléchargés »).
+                if (!uploadId) {
+                  skippedDeps.push({ name: origName, reason: t('wf.depSkippedNoRef') });
+                  continue;
+                }
                 var depDiv = cb.closest('div');
                 var pathInput = depDiv ? depDiv.querySelector('.wf-dep-path') : null;
                 var newPath = pathInput ? pathInput.value.trim() : origName;
@@ -1737,6 +1997,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
 
                 // Check if a local file with the same size already exists, then verify by fingerprint
                 var alreadyLocal = false;
+                var alreadyLocalName = origName;
                 if (depSize > 0 && localBySize[depSize]) {
                   var candidates = localBySize[depSize];
                   for (var ci = 0; ci < candidates.length; ci++) {
@@ -1755,12 +2016,16 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                     }
                     if (match) {
                       alreadyLocal = true;
+                      alreadyLocalName = candidates[ci].name;
                       downloadResults[origName] = candidates[ci].name;
                       break;
                     }
                   }
                 }
-                if (alreadyLocal) continue;
+                if (alreadyLocal) {
+                  skippedDeps.push({ name: origName, reason: t('wf.depSkippedAlreadyLocal', { name: alreadyLocalName }) });
+                  continue;
+                }
 
                 // Check for name conflict: a local file with the same name exists but different content
                 if (localFilesFlat[newPath]) {
@@ -1784,6 +2049,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                     if (conflictResult.action === 'keep') {
                       // Skip download, use local file
                       downloadResults[origName] = newPath;
+                      skippedDeps.push({ name: origName, reason: t('wf.depSkippedKept') });
                       console.log('[AIH] Conflict resolved: keep local for ' + origName);
                       continue;
                     } else if (conflictResult.action === 'suffix') {
@@ -1802,15 +2068,30 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
               }
 
               // 4. Download models with progress panel (parallel)
-              if (toDownload.length > 0) {
-                statusEl.textContent = t("wf.downloadingModels", { count: toDownload.length });
+              // Le panneau liste TOUTES les deps cochées : celles réellement
+              // téléchargées ET celles NON téléchargées (raison visible). Le
+              // compteur reflète le nombre réel de téléchargements.
+              if (toDownload.length > 0 || skippedDeps.length > 0) {
+                if (toDownload.length > 0) {
+                  statusEl.textContent = t("wf.downloadingModels", { count: toDownload.length })
+                    + (skippedDeps.length ? t("wf.depsSkippedSuffix", { count: skippedDeps.length }) : "");
+                } else {
+                  statusEl.textContent = t("wf.depsNoneDownloadable", { count: skippedDeps.length });
+                }
                 var dlPanel = createDownloadPanel(t("wf.downloadingTitle"));
                 // Downloads sequentiels par batches de 2 pour ne pas saturer SFTP
                 var MAX_PARALLEL = 2;
                 var dlQueue = toDownload.slice();
                 var dlActive = 0;
 
-                // Afficher toutes les lignes immediatement (meme en attente)
+                // Lignes NON téléchargées D'ABORD (visibles même sans download) :
+                // chaque ligne porte sa raison — jamais un skip muet.
+                for (var si2 = 0; si2 < skippedDeps.length; si2++) {
+                  dlPanel.addRow(skippedDeps[si2].name, 0, null);
+                  dlPanel.setResult(skippedDeps[si2].name, 'skipped', skippedDeps[si2].reason);
+                }
+
+                // Afficher toutes les lignes de téléchargement immediatement (meme en attente)
                 for (var di = 0; di < dlQueue.length; di++) {
                   dlPanel.addRow(dlQueue[di].newName, 0, dlQueue[di].upload_id);
                 }
@@ -1858,6 +2139,15 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                   }, 500);
                 });
                 dlPanel.done();
+              }
+
+              // Résumé explicite des déps non téléchargées (toast) : même quand
+              // aucun download n'a été lancé, l'utilisateur est informé.
+              if (skippedDeps.length > 0) {
+                aihToast(t('wf.depsSkippedToast', {
+                  count: skippedDeps.length,
+                  names: skippedDeps.map(function (s) { return s.name; }).join(', '),
+                }), 'info');
               }
 
               // 5. Always verify and adapt model names in workflow

@@ -104,7 +104,13 @@ def _sanitize_node_name(node_name_from_client: str) -> str | None:
 
 
 def _read_git_url(node_dir):
-    """Lit l'URL du remote origin depuis .git/config."""
+    """Lit l'URL du remote depuis .git/config.
+
+    Priorité au remote ``origin`` ; à défaut, le premier remote déclarant une
+    URL (dépôt cloné avec un remote renommé, miroir, etc.). Retourne "" si le
+    dossier n'a pas de ``.git/config`` exploitable — un pack installé sans git
+    reste alors détectable par son seul nom de dossier.
+    """
     git_config = os.path.join(node_dir, ".git", "config")
     if not os.path.isfile(git_config):
         return ""
@@ -112,7 +118,15 @@ def _read_git_url(node_dir):
         config = configparser.ConfigParser()
         config.read(git_config)
         if 'remote "origin"' in config:
-            return config['remote "origin"'].get('url', '')
+            url = config['remote "origin"'].get('url', '')
+            if url:
+                return url
+        # Repli : n'importe quel remote déclarant une URL.
+        for section in config.sections():
+            if section.startswith('remote '):
+                url = config[section].get('url', '')
+                if url:
+                    return url
     except Exception:
         pass
     return ""
@@ -198,13 +212,17 @@ def _get_node_type_map():
     return _get_node_types_from_sys_modules()
 
 
-def _extract_node_types(node_dir):
+def _extract_node_types(node_dir, type_map=None):
     """Retourne les node types fournis par ce dossier custom_nodes.
     Priorite 1: NODE_CLASS_MAPPINGS global (sys.modules scan).
     Priorite 2: ast.parse() du __init__.py (fiable, gere les dicts imbriques).
+
+    ``type_map`` (optionnel) évite de rescanner sys.modules pour CHAQUE dossier
+    quand on itère tout custom_nodes/ : le scan est fait une seule fois.
     """
     folder_name = os.path.basename(node_dir)
-    type_map = _get_node_type_map()
+    if type_map is None:
+        type_map = _get_node_type_map()
 
     if folder_name in type_map:
         return type_map[folder_name]
@@ -247,25 +265,35 @@ def _extract_node_types(node_dir):
 
 
 def _get_installed_custom_nodes():
-    """Scanne custom_nodes/ et retourne [{name, git_url, has_git, node_types}]."""
+    """Scanne custom_nodes/ et retourne [{name, git_url, has_git, node_types}].
+
+    TOUS les dossiers de premier niveau sont retournés, y compris ceux SANS
+    remote git (installation manuelle, copie d'archive, gestionnaire n'ayant
+    pas laissé de ``.git``). L'index d'installation côté front (workflow share)
+    s'appuie AUSSI sur le nom de dossier : exclure ces packs les rendait
+    invisibles → un pack pourtant présent était réinstallé puis refusé
+    (« Node 'X' already installed »). ``git_url`` reste vide quand il n'existe
+    pas ; ``has_git`` indique la présence d'un dossier ``.git``.
+    """
     if not _CUSTOM_NODES_DIR or not os.path.isdir(_CUSTOM_NODES_DIR):
         return []
 
     results = []
+    # Scan sys.modules UNE fois pour tous les dossiers (sinon O(dossiers x modules)).
+    type_map = _get_node_type_map()
     for name in os.listdir(_CUSTOM_NODES_DIR):
         node_dir = os.path.join(_CUSTOM_NODES_DIR, name)
         if not os.path.isdir(node_dir) or name.startswith('.'):
             continue
         git_url = _read_git_url(node_dir)
         has_git = os.path.isdir(os.path.join(node_dir, ".git"))
-        if has_git or git_url:
-            node_types = _extract_node_types(node_dir)
-            results.append({
-                "name": name,
-                "git_url": git_url,
-                "has_git": has_git,
-                "node_types": node_types,
-            })
+        node_types = _extract_node_types(node_dir, type_map)
+        results.append({
+            "name": name,
+            "git_url": git_url,
+            "has_git": has_git,
+            "node_types": node_types,
+        })
     return results
 
 
