@@ -185,11 +185,19 @@ class ImageViewerState {
             // OPTIMISATION CRITIQUE 1 : Retourne la référence directe au tableau d'images (gros volume).
             images: state.images,
             
-            // FIX CRITIQUE 2 : Copie explicite des tableaux de filtres.
+            // FIX TRI-ÉTAT : folder_filters/format_filters distinguent « jamais
+            // choisi » (null → AUCUN filtre ; l'UI locale coche tout) de « tout
+            // décoché » ([] → zéro image locale). La copie ne doit donc PAS
+            // transformer null en [] : sinon le court-circuit « dossiers locaux
+            // décochés » de loadFilteredImages et le contrat du backend local
+            // (`folder_filters: null` = pas de filtre → toutes les images)
+            // deviennent inatteignables, et une galerie SERVEUR vide s'affiche
+            // sans même émettre la requête /api/media (les dossiers/compteurs,
+            // eux, viennent de /api/media/folders).
             filters: { 
                 ...state.filters,
-                folder_filters: [...(state.filters.folder_filters || [])],
-                format_filters: [...(state.filters.format_filters || [])],
+                folder_filters: state.filters.folder_filters == null ? null : [...state.filters.folder_filters],
+                format_filters: state.filters.format_filters == null ? null : [...state.filters.format_filters],
                 tags_filter: [...(state.filters.tags_filter || [])],
                 workflow_sources: [...(state.filters.workflow_sources || [])],
                 locked_folders: [...(state.filters.locked_folders || [])],

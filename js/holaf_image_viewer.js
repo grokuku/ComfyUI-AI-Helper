@@ -1199,9 +1199,17 @@ const holafImageViewer = {
         try {
             const { filters } = imageViewerState.getState();
             // An explicitly empty folder_filters array means the user deselected ALL
-            // folders → show zero images (placeholder). A null/undefined value means
-            // "no folder filter" → keep the normal (all folders) behaviour.
-            if (Array.isArray(filters.folder_filters) && filters.folder_filters.length === 0) {
+            // folders → show zero images (placeholder). A null value means
+            // "no folder filter" (never chosen) → keep the normal (all folders) behaviour.
+            // ATTENTION SOURCE : ce tri-état est propre au filtre LOCAL. En source
+            // 'remote', `folder_filters` n'a AUCUN effet (les dossiers serveur vivent
+            // dans state.ui.remote_subfolders, où [] = AUCUN filtre → GET /api/media
+            // sans `subfolders`) : le court-circuit doit donc être RÉSERVÉ à la source
+            // locale, sinon la galerie serveur se vidait SANS même émettre la requête
+            // de liste alors que les dossiers/compteurs (GET /api/media/folders)
+            // s'affichaient — symptôme « Aucune image ne correspond aux filtres ».
+            if (GallerySource.activeId() !== 'remote'
+                && Array.isArray(filters.folder_filters) && filters.folder_filters.length === 0) {
                 resetWindowCache();
                 imageViewerState.setState({
                     images: [],
