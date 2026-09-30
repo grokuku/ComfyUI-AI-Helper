@@ -85,6 +85,11 @@ function jsonResponse(data, status = 200) {
 // ── État du faux serveur (piloté par scénario) ───────────────────────────
 let checkMode = "mixed";          // "mixed" (big identique) | "none" | "fail" | "different"
 let dedupAll = false;             // /upload répond deduplicated:true (aucun octet)
+// Phase renvoyée par /upload/progress : 'uploading' (défaut) ou 'finalizing'
+// (tous les octets reçus, le serveur recopie le fichier complet vers son
+// stockage — étape longue et sans progression fine pour un 13 Go).
+let progressPhase = "uploading";
+let uploadDelayMs = 0;            // retarde la réponse /upload (laisse poller)
 const checkCalls = [];
 const uploadCalls = [];
 const workflowPosts = [];
@@ -130,10 +135,11 @@ window.fetch = globalThis.fetch = async (url, init) => {
         });
     }
     if (u.includes("/api/aih/models/upload/progress")) {
-        return jsonResponse({ percent: 100, speed_mbs: 12.5 });
+        return jsonResponse({ percent: 100, speed_mbs: 12.5, phase: progressPhase });
     }
     if (u.includes("/api/aih/models/upload")) {
         uploadCalls.push({ url: u, body: init && init.body, signal: init && init.signal });
+        if (uploadDelayMs) await sleep(uploadDelayMs);
         if (dedupAll) {
             return jsonResponse({ success: true, upload_id: "srv-old", file_path: "workflows/models/srv-old/x", deduplicated: true });
         }
@@ -203,6 +209,8 @@ async function openShare() {
     checkCalls.length = 0;
     uploadCalls.length = 0;
     workflowPosts.length = 0;
+    progressPhase = "uploading";
+    uploadDelayMs = 0;
     window.openWorkflowManager();
     await waitFor(() => window.document.getElementById("wf-publish-btn"), "bouton publier");
     await waitFor(() => window.document.querySelectorAll("#wf-deps .wf-upload-cb").length === 2, "dépendances listées");
@@ -365,8 +373,33 @@ console.log("6. Check indisponible + dédup serveur → « ignoré », pas de fa
     ok("déduplication visible et honnête (réplique exacte du bug « 0.2 s »)");
 }
 
-/* ══ 7. Verrous statiques (mutation) ═════════════════════════════════════ */
-console.log("7. Verrous statiques : drapeau transmis, modale via AIH.Dialog, i18n FR/EN");
+/* ══ 7. Progression : la finalisation serveur n'est plus muette ═════════ */
+console.log("7. Progression : phase 'finalizing' affichée puis retirée au résultat");
+{
+    checkMode = "mixed"; dedupAll = false;
+    await openShare();
+    progressPhase = "finalizing";
+    uploadDelayMs = 800;   // laisse le polling (500 ms) renvoyer la phase finalizing
+    await publishAndWaitModal();
+    window.document.getElementById("wf-pre-all").click();   // envoie aussi l'existant
+    window.document.getElementById("wf-pre-send").click();
+    await waitFor(() => rowFor("style.safetensors"), "ligne d'upload");
+    await sleep(700);      // ≥ 1 poll : la phase finalizing doit s'afficher
+
+    const row = rowFor("style.safetensors");
+    assert.ok(row && /finalisation/i.test(row.textContent),
+        "pendant la finalisation (recopie serveur d'un gros fichier), la ligne l'annonce — jamais un blocage muet");
+    assert.strictEqual(statusOf(row), "⏳", "toujours en cours : aucun faux résultat");
+
+    await waitDone();
+    assert.ok(!/finalisation/i.test(rowFor("style.safetensors").textContent),
+        "la note de finalisation est retirée quand le résultat arrive");
+    assert.strictEqual(statusOf(rowFor("style.safetensors")), "✅");
+    ok("phase finalizing affichée pendant l'attente puis nettoyée au résultat");
+}
+
+/* ══ 8. Verrous statiques (mutation) ════════════════════════════════════ */
+console.log("8. Verrous statiques : drapeau transmis, modale via AIH.Dialog, i18n FR/EN");
 {
     const src = readFileSync(new URL("./aih_workflow_share.js", import.meta.url), "utf8");
     assert.ok(/uploadModelToServer\(item\.path,\s*item\.type,\s*isOverwrite\)/.test(src),
@@ -376,6 +409,8 @@ console.log("7. Verrous statiques : drapeau transmis, modale via AIH.Dialog, i18
     assert.ok(/window\.AIH\s*&&\s*window\.AIH\.Dialog/.test(src) && /D\.open\(/.test(src),
         "mutation : la modale doit passer par le système de fenêtres unifié AIH.Dialog");
     assert.ok(!/\/files\/check/.test(src), "le front ne devine jamais l'existence : il interroge la route de check du pack");
+    assert.ok(/p\.phase === 'finalizing'/.test(src),
+        "mutation : si la phase finalizing n'était plus traitée, la finalisation d'un 13 Go resterait une barre figée muette");
 
     // Parité i18n stricte : chaque clé nouvelle existe en FR ET en EN.
     const strings = readFileSync(new URL("./aih_strings.js", import.meta.url), "utf8");
@@ -389,7 +424,7 @@ console.log("7. Verrous statiques : drapeau transmis, modale via AIH.Dialog, i18
         "wf.preUploadStateDifferentHash", "wf.preUploadLocal", "wf.preUploadRemote",
         "wf.preUploadRemoteDate", "wf.preUploadOverwrite", "wf.preUploadVolume",
         "wf.preUploadOverwriteAll", "wf.preUploadIgnoreExisting", "wf.preUploadSend",
-        "wf.preUploadSkippedNoBytes",
+        "wf.preUploadSkippedNoBytes", "wf.uploadFinalizing",
     ];
     for (const key of keys) {
         const token = '"' + key + '"';

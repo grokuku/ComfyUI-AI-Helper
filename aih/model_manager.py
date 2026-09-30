@@ -104,11 +104,61 @@ def _sftp_connect(sftp_config):
                     password=sftp_config['password'], timeout=15)
     return ssh
 
-# Progression des uploads en cours : filepath → {chunk, total, speed_mbs, start}
+# Progression des uploads en cours : filepath → {chunk, total, speed_mbs, start, phase}
 _upload_progress = {}
 
 # Progression des downloads : upload_id → {bytes_recv, bytes_total, speed_mbs, start}
 _download_progress = {}
+
+
+# ── Timeout des étapes SYNCHRONES côté serveur (/files/complete, download) ──
+# POST /files/complete n'est PAS une simple écriture DB : le backend recopie
+# le fichier TEMPORAIRE COMPLET (reçu chunk par chunk) vers le stockage réel
+# (SFTPStorage.upload → sftp.put ; LocalStorage.upload → copie cross-device
+# possible) AVANT de répondre. La requête ne reçoit donc AUCUN octet pendant
+# toute la durée de l'opération : le « read timeout » de requests s'applique à
+# la DURÉE TOTALE, pas à l'inactivité entre deux paquets.
+#
+# Même problème sur /files/<id>/download : le backend précharge d'abord TOUT le
+# fichier du stockage vers un temp local, puis le streame — le client ne voit
+# donc rien pendant le préchargement.
+#
+# L'ancien plafond FIXE de 60 s faisait échouer toute finalisation de plus de
+# 60 s — exactement le symptôme observé : « Complete failed:
+# HTTPSConnectionPool(...): Read timed out. (read timeout=60) » sur 4,6 Go et
+# 13,5 Go, alors que 1,5 Go (finalisé en <60 s) passait.
+#
+# On dimensionne donc le timeout SUR LA TAILLE, avec un débit plancher
+# volontairement pessimiste (débit mesuré : 9-13 Mo/s côté client→backend) :
+# 13,5 Go → ~56 min de budget, 4,6 Go → ~19 min, un petit fichier garde 5 min.
+_SERVER_SYNC_MIN_MBPS = 4.0        # débit plancher supposé de la recopie serveur (Mo/s)
+_SERVER_SYNC_MIN_TIMEOUT = 300     # plancher absolu du read timeout (s)
+_SERVER_SYNC_CONNECT_TIMEOUT = 30  # connexion + TLS (s)
+
+
+def _server_side_timeout(size_bytes):
+    """Timeout ``(connect, read)`` pour une étape SYNCHRONE côté backend, selon
+    la taille du fichier.
+
+    Le read timeout couvre la recopie SYNCHRONE du fichier complet côté serveur
+    (temp → stockage pour ``/complete`` ; stockage → temp pour le download). Il
+    est calculé sur un débit plancher de ``_SERVER_SYNC_MIN_MBPS`` : c'est un
+    PLAFOND de sécurité, pas une durée prévue (le transfert réel est bien plus
+    rapide) — il ne doit jamais couper un gros fichier en pleine finalisation,
+    mais doit finir par rendre la main si le serveur est réellement figé.
+    """
+    try:
+        size = int(size_bytes)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        read_timeout = _SERVER_SYNC_MIN_TIMEOUT
+    else:
+        read_timeout = max(
+            _SERVER_SYNC_MIN_TIMEOUT,
+            size / (_SERVER_SYNC_MIN_MBPS * 1024 * 1024),
+        )
+    return (_SERVER_SYNC_CONNECT_TIMEOUT, read_timeout)
 
 
 # Toutes les categories de models connues par ComfyUI
@@ -435,15 +485,29 @@ def upload_model_to_server(filepath, file_type="model", on_progress=None, overwr
             _upload_progress.pop(filepath, None)
             return {'success': False, 'error': f'Chunk upload failed: {e}'}
 
-    # 4. Complete
-    _upload_progress.pop(filepath, None)
+    # 4. Complete — étape SYNCHRONE côté serveur (recopie du fichier temporaire
+    # complet vers le stockage), donc potentiellement LONGUE pour un gros
+    # modèle : timeout dimensionné sur la taille (cf. _server_side_timeout).
+    # On CONSERVE une entrée de progression pendant l'attente (phase
+    # « finalizing ») pour que l'UI affiche une finalisation au lieu d'une
+    # barre figée muette.
+    prev = _upload_progress.get(filepath) or {}
+    _upload_progress[filepath] = {
+        'chunk': prev.get('chunk', 1),
+        'total': prev.get('total', 1),
+        'speed_mbs': prev.get('speed_mbs', 0.0),
+        'start': prev.get('start', time.time()),
+        'phase': 'finalizing',
+    }
+    timeout = _server_side_timeout(size)
     try:
         complete_data = {'upload_id': upload_id}
         if fp:
             complete_data['fingerprint_head'] = fp['head']
             complete_data['fingerprint_tail'] = fp['tail']
         resp = requests.post(f"{api_url}/files/complete", json=complete_data,
-                             headers={**auth_headers, 'Content-Type': 'application/json'}, timeout=60)
+                             headers={**auth_headers, 'Content-Type': 'application/json'},
+                             timeout=timeout)
         if not resp.ok:
             err = resp.json().get('error', resp.text)
             return {'success': False, 'error': f'Complete failed: {err}'}
@@ -452,7 +516,15 @@ def upload_model_to_server(filepath, file_type="model", on_progress=None, overwr
                 'file_path': result.get('file_path', ''),
                 'deduplicated': False, 'overwrite': bool(overwrite)}
     except Exception as e:
-        return {'success': False, 'error': f'Complete failed: {e}'}
+        # Erreur EXPLICITE : on nomme l'étape, la taille et le budget de timeout
+        # pour que « Erreur: timeout » ne soit plus ambigu (finalisation serveur
+        # ≠ transfert des octets, qui a, lui, réussi).
+        return {'success': False, 'error': (
+            f'Complete failed (finalisation serveur, {size} octets, '
+            f'timeout read {timeout[1]:.0f}s) : {e}'
+        )}
+    finally:
+        _upload_progress.pop(filepath, None)
 
 
 def check_models_on_server(items):
@@ -584,10 +656,26 @@ def _sftp_mkdir_p(sftp, remote_dir):
 
 
 def get_upload_progress(filepath):
-    """Retourne la progression d'un upload en cours."""
+    """Retourne la progression d'un upload en cours.
+
+    ``phase`` vaut ``'uploading'`` (envoi des chunks) ou ``'finalizing'``
+    (tous les chunks reçus, le serveur recopie le fichier complet vers le
+    stockage — étape longue et sans progression fine). L'UI s'en sert pour
+    afficher une finalisation explicite au lieu d'une barre figée muette.
+    """
     p = _upload_progress.get(filepath)
     if not p:
         return None
+    phase = p.get('phase', 'uploading')
+    if phase == 'finalizing':
+        # Les octets sont TOUS arrivés : 100 % pendant la finalisation serveur.
+        return {
+            'chunk': p.get('chunk', 1),
+            'total': p.get('total', 1),
+            'percent': 100.0,
+            'speed_mbs': p.get('speed_mbs', 0.0),
+            'phase': 'finalizing',
+        }
     if 'bytes_total' in p and p['bytes_total'] > 0:
         pct = round(p['bytes_sent'] / p['bytes_total'] * 100, 1)
     else:
@@ -597,6 +685,7 @@ def get_upload_progress(filepath):
         'total': p['total'],
         'percent': pct,
         'speed_mbs': p['speed_mbs'],
+        'phase': phase,
     }
 
 
@@ -720,8 +809,13 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
     else:
         # ── Mode HTTP fallback (storage local) ──
         try:
+            # Le backend précharge TOUT le fichier du stockage vers un temp
+            # local AVANT de streame : pendant ce préchargement le client ne
+            # reçoit aucun octet → le read timeout s'applique à cette durée, qui
+            # croît avec la taille. Même correctif que /files/complete.
             resp = requests.get(f"{api_url}/files/{upload_id}/download",
-                               headers=auth_headers, stream=True, timeout=600)
+                               headers=auth_headers, stream=True,
+                               timeout=_server_side_timeout(file_size if file_size else 0))
             if not resp.ok:
                 try: err_msg = resp.text[:200]
                 except Exception: err_msg = ''

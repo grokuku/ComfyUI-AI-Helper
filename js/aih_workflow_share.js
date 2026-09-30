@@ -280,21 +280,35 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
 
         // Polling de progression toutes les 500ms (débit RÉEL mesuré côté
         // serveur) — aucune estimation locale taille/durée en vol.
-        var pollInterval = null;
+        var state = { row: row, fill: fill, status: statusEl, startTime: Date.now(), speedEl: speedEl, sizeBytes: sizeBytes, pollInterval: null, finalizingNote: null };
+        rows[fileName] = state;
         if (filepath) {
-          pollInterval = setInterval(function() {
+          state.pollInterval = setInterval(function() {
             HolafFetch.request('/api/aih/models/upload/progress?path=' + encodeURIComponent(filepath))
               .then(function(p) {
                 if (!p || typeof p.percent !== 'number') return;
-                fill.style.width = p.percent + '%';
+                state.fill.style.width = p.percent + '%';
+                if (p.phase === 'finalizing') {
+                  // Tous les octets sont arrivés : le serveur recopie le fichier
+                  // complet vers son stockage (étape longue pour un 13 Go, sans
+                  // progression fine). On l'affiche au lieu de laisser une barre
+                  // figée muette — sinon l'utilisateur croit à un blocage.
+                  if (!state.finalizingNote) {
+                    var noteEl = document.createElement("div");
+                    noteEl.style.cssText = "font-size:10px;color:#9ca3af;width:100%;margin-left:26px;";
+                    noteEl.textContent = t("wf.uploadFinalizing");
+                    state.row.appendChild(noteEl);
+                    state.finalizingNote = noteEl;
+                  }
+                  return;
+                }
                 if (p.speed_mbs > 0) {
-                  speedEl.textContent = p.speed_mbs + ' MB/s';
+                  state.speedEl.textContent = p.speed_mbs + ' MB/s';
                 }
               })
               .catch(function(){});
           }, 500);
         }
-        rows[fileName] = { row: row, fill: fill, status: statusEl, startTime: Date.now(), speedEl: speedEl, sizeBytes: sizeBytes, pollInterval: pollInterval };
       },
       // status : 'sent' | 'overwritten' | 'skipped' | 'failed' (booléens
       // historiques acceptés : true = 'sent', false = 'failed').
@@ -304,6 +318,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
         if (status === true) status = "sent";
         if (status === false) status = "failed";
         if (r.pollInterval) { clearInterval(r.pollInterval); r.pollInterval = null; }
+        if (r.finalizingNote) { r.finalizingNote.remove(); r.finalizingNote = null; }
         doneCount++;
         if (status === "sent" || status === "overwritten") {
           // Débit moyen d'un transfert RÉELLEMENT effectué (le fichier a été
