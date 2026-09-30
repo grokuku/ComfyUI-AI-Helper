@@ -49,12 +49,13 @@ Groupes (ordre historique des commits du chantier C) :
      POST /aih/blobby/exec (shell local) — aucun mot de passe applicatif :
      la protection vient du reverse-proxy devant ComfyUI, avec un plafond de
      15 s sur l'exécution shell.
-  4. ``models``      : /api/aih/models/* (liste locale/distante, upload et
-     download SFTP chunked via paramiko, fingerprint head/tail, progression)
-     portés fidèlement depuis l'ancien monorepo AI-Helper →
-     ``aih/model_manager.py`` ; /api/aih/custom-nodes* depuis
-     l'ancien manager custom-nodes du monorepo → ``aih/custom_nodes_manager.py``
-     (SANS l'auto ``pip install`` post-clone, interdit — cf. §3.3).
+  4. ``models``      : /api/aih/models/* (liste locale/distante, check PAR LOT
+     d'existence avant upload, upload et download SFTP chunked via paramiko,
+     fingerprint head/tail, progression) portés fidèlement depuis l'ancien
+     monorepo AI-Helper → ``aih/model_manager.py`` ; /api/aih/custom-nodes*
+     depuis l'ancien manager custom-nodes du monorepo →
+     ``aih/custom_nodes_manager.py`` (SANS l'auto ``pip install`` post-clone,
+     interdit — cf. §3.3).
   5. ``local``       : GET /aih/local/status, /aih/local/api/* (miroirs du
      store SQLite, sync/outbox/conflicts/retry, recherche sémantique,
      embeddings, music3), service statique du frontend site (copié dans
@@ -655,7 +656,43 @@ def _register_models_group(r):
         )
         return web.json_response({'items': models, 'total': len(models)})
 
-    # ── Models : upload (chunked ou SFTP direct) + progression ─────────
+    # ── Models : check d'existence AVANT upload + upload (chunked/SFTP) ─
+
+    @r.post("/api/aih/models/check")
+    async def aih_check_models(request):
+        """Check PAR LOT d'existence serveur AVANT upload (modale pré-upload).
+
+        Corps : {"items": [{"path": chemin local, "type": type ComfyUI}, ...]}
+        Réponse 200 : {"ok": bool, "error": str|null, "items": [...]} — contrat
+        exact dans ``aih.model_manager.check_models_on_server``. Un ``ok=false``
+        (serveur non configuré / injoignable) n'est PAS une erreur bloquante :
+        le front retombe sur l'upload normal (dédup serveur), mais distingue
+        désormais les fichiers ignorés d'un vrai transfert.
+        """
+        try:
+            body = await request.json()
+            items = body.get("items", [])
+            if not isinstance(items, list) or not items:
+                return web.json_response(
+                    {"ok": False, "error": "items (liste non vide) requis", "items": []},
+                    status=400,
+                )
+            if len(items) > 200:
+                return web.json_response(
+                    {"ok": False, "error": "Maximum 200 items par requête", "items": []},
+                    status=400,
+                )
+            import asyncio as _aio
+            import functools as _ft
+            loop = _aio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, _ft.partial(_model_mgr.check_models_on_server, items)
+            )
+            return web.json_response(result)
+        except Exception as e:
+            import logging as _log
+            _log.exception(f"[AIH] check-models error: {e}")
+            return web.json_response({"ok": False, "error": str(e), "items": []}, status=500)
 
     @r.post("/api/aih/models/upload")
     async def aih_upload_model(request):
@@ -663,6 +700,10 @@ def _register_models_group(r):
             body = await request.json()
             filepath = body.get("path", "")
             file_type = body.get("type", "model")
+            # Écrasement EXPLICITE choisi dans la modale de pré-upload :
+            # le drapeau est transmis tel quel à model_manager, qui saute alors
+            # la déduplication (coché = les octets sont réellement renvoyés).
+            overwrite = bool(body.get("overwrite", False))
             if not filepath or not os.path.isfile(filepath):
                 return web.json_response({"error": "path required and must exist"}, status=400)
             # Lancer l'upload dans un thread pour ne pas bloquer l'event loop
@@ -670,7 +711,8 @@ def _register_models_group(r):
             import functools as _ft
             loop = _aio.get_event_loop()
             result = await loop.run_in_executor(
-                None, _ft.partial(_model_mgr.upload_model_to_server, filepath, file_type)
+                None, _ft.partial(_model_mgr.upload_model_to_server, filepath, file_type,
+                                  overwrite=overwrite)
             )
             status = 200 if result["success"] else 400
             return web.json_response(result, status=status)

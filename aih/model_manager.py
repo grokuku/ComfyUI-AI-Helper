@@ -28,7 +28,10 @@ Endpoints servis par aih/routes.py :
   GET  /api/aih/models/list              → liste locale complète + fingerprints
   GET  /api/aih/models/remote            → proxy liste distante (paginée)
   GET  /api/aih/models/local             → liste locale filtrée (type/search)
+  POST /api/aih/models/check             → check PAR LOT d'existence serveur
+                                           (pré-upload : présent/absent + taille)
   POST /api/aih/models/upload            → upload chunked/SFTP d'un fichier local
+                                           (overwrite=true = écrasement explicite)
   GET  /api/aih/models/upload/progress   → progression de l'upload courant
   POST /api/aih/models/fingerprint       → fingerprint head/tail d'un fichier
   GET  /api/aih/models/download/progress → progression du download courant
@@ -280,11 +283,18 @@ def _compute_fingerprint(filepath):
         return None
 
 
-def upload_model_to_server(filepath, file_type="model", on_progress=None):
+def upload_model_to_server(filepath, file_type="model", on_progress=None, overwrite=False):
     """
     Upload un fichier model vers le serveur AIH via chunked upload.
     Retourne {success, upload_id, file_path} ou {success: False, error}.
     Import paramiko paresseux (uniquement en mode SFTP direct).
+
+    ``overwrite=True`` : ÉCRASEMENT EXPLICITE choisi par l'utilisateur dans la
+    modale de pré-upload — la déduplication par fingerprint est alors SAUTÉE et
+    un nouvel upload est créé (les octets sont réellement renvoyés). Sans ce
+    drapeau, un fichier déjà présent est IGNORÉ (aucun octet transféré) et la
+    réponse porte ``deduplicated: True`` pour que l'UI distingue « ignoré »
+    d'un vrai transfert.
     """
     import requests
 
@@ -300,9 +310,10 @@ def upload_model_to_server(filepath, file_type="model", on_progress=None):
     if api_key:
         auth_headers["Authorization"] = f"Bearer {api_key}"
 
-    # 1. Fingerprint pour déduplication
+    # 1. Fingerprint pour déduplication — SAUF écrasement explicite
+    # (`fp` sert aussi au /complete : empreinte mémorisée pour les futurs checks)
     fp = _compute_fingerprint(filepath)
-    if fp:
+    if fp and not overwrite:
         try:
             resp = requests.post(f"{api_url}/files/check", json={
                 'size': fp['size'], 'head': fp['head'], 'tail': fp['tail']
@@ -438,9 +449,104 @@ def upload_model_to_server(filepath, file_type="model", on_progress=None):
             return {'success': False, 'error': f'Complete failed: {err}'}
         result = resp.json()
         return {'success': True, 'upload_id': upload_id,
-                'file_path': result.get('file_path', '')}
+                'file_path': result.get('file_path', ''),
+                'deduplicated': False, 'overwrite': bool(overwrite)}
     except Exception as e:
         return {'success': False, 'error': f'Complete failed: {e}'}
+
+
+def check_models_on_server(items):
+    """Vérifie en lot la présence des modèles sur le serveur AIH (AVANT upload).
+
+    Utilisé par l'onglet 📤 Partager : la modale de pré-upload liste les modèles
+    de la sélection avec leur état serveur (« absent » / « déjà présent
+    (identique) » / « déjà présent (version différente) ») pour que l'utilisateur
+    choisisse explicitement ce qu'il écrase — au lieu de sauter silencieusement
+    les doublons en affichant un faux succès (bug « 8 fichiers, 0.2 s »).
+
+    `items` : [{'path': chemin local, 'type': type ComfyUI}, ...].
+    Retour : {'ok': bool, 'error': str|None, 'items': [
+        {'path', 'name', 'type', 'size',
+         'status': 'identical'|'different'|'absent'|'unknown',
+         'remote': {'upload_id', 'filename', 'size', 'file_path', 'created_at'}|None,
+         'error': str|None} ]}.
+    `ok=False` (serveur non configuré / réseau / HTTP) → l'appelant NE DOIT PAS
+    bloquer l'upload : il retombe sur le comportement historique (dédup côté
+    serveur) — mais l'UI distingue désormais les fichiers ignorés.
+
+    Le critère d'« identique » est EXACTEMENT celui de la déduplication
+    d'upload : size + sha256(1er Mo) + sha256(dernier Mo), vérifié par le
+    backend sur un fichier réellement présent sur le stockage.
+    """
+    import requests
+
+    results = []
+    pending = []
+    for raw in (items or []):
+        path = str((raw or {}).get('path') or '')
+        item_type = str((raw or {}).get('type') or 'model')
+        entry = {'path': path, 'name': os.path.basename(path), 'type': item_type,
+                 'size': 0, 'status': 'unknown', 'remote': None, 'error': None}
+        if not path or not os.path.isfile(path):
+            entry['error'] = 'fichier local introuvable'
+            results.append(entry)
+            continue
+        entry['size'] = os.path.getsize(path)
+        fp = _compute_fingerprint(path)
+        if not fp:
+            entry['error'] = 'fingerprint impossible'
+            results.append(entry)
+            continue
+        entry['_fp'] = fp
+        pending.append(entry)
+        results.append(entry)
+
+    if not pending:
+        return {'ok': False, 'error': 'aucun fichier vérifiable', 'items': results}
+
+    api_url, api_key = _get_aih_credentials()
+    if not api_url:
+        err = "Serveur AIH non configuré (Settings ▸ onglet « AIH · Compte »)"
+    else:
+        headers = {'Content-Type': 'application/json'}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+        payload = {'items': [
+            {'filename': e['name'], 'size': e['_fp']['size'],
+             'head': e['_fp']['head'], 'tail': e['_fp']['tail']}
+            for e in pending
+        ]}
+        try:
+            resp = requests.post(f'{api_url}/files/check-batch', json=payload,
+                                 headers=headers, timeout=30)
+            if resp.ok:
+                data = resp.json()
+                by_name = {}
+                for r in (data.get('items') or []):
+                    if isinstance(r, dict) and r.get('filename'):
+                        by_name[str(r['filename'])] = r
+                for e in pending:
+                    r = by_name.get(e['name'])
+                    if r and r.get('status') in ('identical', 'different', 'absent'):
+                        e['status'] = r['status']
+                        e['remote'] = r.get('remote')
+                    else:
+                        e['error'] = 'réponse serveur incomplète'
+                for e in results:
+                    e.pop('_fp', None)
+                return {'ok': True, 'error': None, 'items': results}
+            try:
+                err = resp.json().get('error', resp.text[:200])
+            except Exception:
+                err = resp.text[:200] or f'HTTP {resp.status_code}'
+        except Exception as e:
+            err = str(e)
+
+    for e in results:
+        e.pop('_fp', None)
+        if e['status'] == 'unknown':
+            e['error'] = e['error'] or err
+    return {'ok': False, 'error': err, 'items': results}
 
 
 def get_download_progress(upload_id):

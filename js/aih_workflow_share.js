@@ -55,6 +55,169 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     return d.innerHTML;
   }
 
+  function formatSize(bytes) {
+    var b = Number(bytes) || 0;
+    if (b >= 1073741824) return (b / 1073741824).toFixed(2) + " GB";
+    return (b / 1048576).toFixed(1) + " MB";
+  }
+
+  // ── Check d'existence serveur AVANT upload ──
+  // Appel UNIQUE et par lot de la route locale /api/aih/models/check (le pack
+  // Python calcule les empreintes des fichiers — le navigateur n'a pas accès au
+  // filesystem ComfyUI — et interroge le backend AIH). Retourne la sélection
+  // enrichie de `status` ('identical'|'different'|'absent'|'unknown') et
+  // `remote` ; `null` si la vérification est impossible (serveur non configuré,
+  // route absente…) → on retombe sur le comportement historique.
+  async function checkServerPresence(selection) {
+    try {
+      var data = await HolafFetch.request('/api/aih/models/check', {
+        method: 'POST',
+        body: {
+          items: selection.map(function (s) { return { path: s.path, type: s.type }; }),
+        },
+      });
+      if (!data || data.ok !== true || !Array.isArray(data.items)) return null;
+      var byPath = {};
+      for (var i = 0; i < data.items.length; i++) {
+        var r = data.items[i];
+        if (r && r.path) byPath[r.path] = r;
+      }
+      for (var j = 0; j < selection.length; j++) {
+        var hit = byPath[selection[j].path];
+        if (hit && (hit.status === 'identical' || hit.status === 'different' || hit.status === 'absent')) {
+          selection[j].status = hit.status;
+          selection[j].remote = hit.remote || null;
+        }
+      }
+      return selection;
+    } catch (e) {
+      console.warn('[AIH] Server presence check failed: ' + (e && e.message ? e.message : e));
+      return null;
+    }
+  }
+
+  // ── Modale de pré-upload : modèles déjà présents à écraser ──
+  // Déclenchée AVANT l'envoi, uniquement quand au moins un modèle de la
+  // sélection existe déjà côté serveur. Défauts intelligents : « absent » =
+  // envoyé (case cochée, verrouillée) ; « identique » / « différent » = NON
+  // coché par défaut (on ne renvoie pas 13 Go pour rien) mais décochable/…
+  // cocher = écrasement explicite (drapeau `overwrite` de l'upload).
+  // Résolution : {action:'confirm', overwrite:[clés]} ou {action:'cancel'}.
+  function showPreUploadModal(items) {
+    var D = window.AIH && window.AIH.Dialog;
+    if (!D || typeof D.open !== "function") {
+      // Fenêtres unifiées absentes : pas de friction ajoutée, comportement
+      // historique conservé (l'absence d'écrasement reste visible au résultat).
+      return Promise.resolve({ action: "confirm", overwrite: [] });
+    }
+    return new Promise(function (resolve) {
+      var byKey = {};
+      var rowsHtml = "";
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        byKey[it.key] = it;
+        var existing = it.status === "identical" || it.status === "different";
+        var sameSize = !!(it.remote && Number(it.remote.size) === Number(it.size));
+        var stateKey = it.status === "identical" ? "wf.preUploadStateIdentical"
+          : it.status === "different"
+            ? (sameSize ? "wf.preUploadStateDifferentHash" : "wf.preUploadStateDifferentSize")
+            : "wf.preUploadStateAbsent";
+        var stateColor = it.status === "identical" ? "#34d399"
+          : it.status === "different" ? "#f59e0b" : "#888";
+        var remoteMeta = it.remote
+          ? " · " + t("wf.preUploadRemote", { size: formatSize(it.remote.size) })
+            + (it.remote.created_at ? " · " + t("wf.preUploadRemoteDate", { date: it.remote.created_at }) : "")
+          : "";
+        rowsHtml +=
+          '<label data-key="' + esc(it.key) + '" style="display:flex;flex-direction:column;gap:3px;padding:6px 8px;border:1px solid ' +
+            (it.status === "different" ? "rgba(245,158,11,0.55)" : "#444") +
+            ';border-radius:6px;margin-bottom:4px;background:#2a2a2e;cursor:pointer;">' +
+            '<span style="display:flex;align-items:center;gap:6px;">' +
+              '<input type="checkbox" class="wf-pre-cb" data-key="' + esc(it.key) + '" data-existing="' + (existing ? "1" : "0") + '"' +
+                (existing ? "" : " checked disabled") +
+                ' style="accent-color:var(--aih-accent, #D8700D);">' +
+              '<span style="flex:1;font-size:12px;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(it.name) + '">' + esc(it.name) + '</span>' +
+              (existing ? '<span style="font-size:10px;color:var(--aih-accent, #D8700D);">' + t("wf.preUploadOverwrite") + '</span>' : '') +
+              '<span style="font-size:10px;color:' + stateColor + ';white-space:nowrap;">' + t(stateKey) + '</span>' +
+            '</span>' +
+            '<span style="font-size:10px;color:#888;margin-left:22px;">' +
+              esc(t("wf.preUploadLocal", { size: formatSize(it.size) })) + esc(remoteMeta) +
+            '</span>' +
+          '</label>';
+      }
+
+      var content =
+        '<div style="display:flex;flex-direction:column;gap:8px;">' +
+          '<p style="font-size:12px;color:#aaa;margin:0;">' + t("wf.preUploadIntro") + '</p>' +
+          '<div id="wf-pre-list" style="max-height:46vh;overflow-y:auto;">' + rowsHtml + '</div>' +
+          '<div style="display:flex;gap:8px;">' +
+            '<button id="wf-pre-all" class="aih-dialog-btn" style="flex:1;">' + t("wf.preUploadOverwriteAll") + '</button>' +
+            '<button id="wf-pre-none" class="aih-dialog-btn" style="flex:1;">' + t("wf.preUploadIgnoreExisting") + '</button>' +
+          '</div>' +
+          '<div id="wf-pre-volume" style="font-size:11px;color:#fbbf24;"></div>' +
+          '<div style="display:flex;justify-content:flex-end;gap:8px;border-top:1px solid #444;padding-top:8px;">' +
+            '<button id="wf-pre-cancel" class="aih-dialog-btn aih-dialog-btn-cancel">' + t("dialog.cancel") + '</button>' +
+            '<button id="wf-pre-send" class="aih-dialog-btn aih-dialog-btn-primary"></button>' +
+          '</div>' +
+        '</div>';
+
+      var ctrl = D.open({
+        title: t("wf.preUploadTitle"),
+        width: "620px",
+        height: "auto",
+        maxHeight: "80vh",
+        minWidth: "420px",
+        modal: true,
+        resizable: false,
+        content: content,
+        _onResolve: function (value) {
+          resolve(value || { action: "cancel", overwrite: [] });
+        },
+      });
+      var root = ctrl.el || ctrl.modal;
+      var cbs = root.querySelectorAll(".wf-pre-cb");
+
+      function updateSummary() {
+        var count = 0, bytes = 0, overwrite = [];
+        for (var i = 0; i < cbs.length; i++) {
+          var cb = cbs[i];
+          if (!cb.checked) continue;
+          var it = byKey[cb.getAttribute("data-key")];
+          count++;
+          bytes += Number(it && it.size) || 0;
+          if (cb.getAttribute("data-existing") === "1") overwrite.push(it.key);
+        }
+        root.querySelector("#wf-pre-volume").textContent =
+          t("wf.preUploadVolume", { size: formatSize(bytes) });
+        root.querySelector("#wf-pre-send").textContent =
+          t("wf.preUploadSend", { count: count });
+        return { count: count, overwrite: overwrite };
+      }
+
+      for (var ci = 0; ci < cbs.length; ci++) {
+        cbs[ci].addEventListener("change", updateSummary);
+      }
+      root.querySelector("#wf-pre-all").onclick = function () {
+        for (var i = 0; i < cbs.length; i++) cbs[i].checked = true;
+        updateSummary();
+      };
+      root.querySelector("#wf-pre-none").onclick = function () {
+        for (var i = 0; i < cbs.length; i++) {
+          if (cbs[i].getAttribute("data-existing") === "1") cbs[i].checked = false;
+        }
+        updateSummary();
+      };
+      root.querySelector("#wf-pre-cancel").onclick = function () {
+        ctrl.close({ action: "cancel", overwrite: [] });
+      };
+      root.querySelector("#wf-pre-send").onclick = function () {
+        var summary = updateSummary();
+        ctrl.close({ action: "confirm", overwrite: summary.overwrite });
+      };
+      updateSummary();
+    });
+  }
+
   // ── Upload progress panel ──
 
   function createUploadPanel() {
@@ -74,21 +237,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     var rows = {};
     var doneCount = 0, totalCount = 0;
     var startTime = Date.now();
-
-    var timer = setInterval(function() {
-      // Mettre a jour le temps ecoule pour les uploads en cours
-      for (var fn in rows) {
-        var r = rows[fn];
-        // Les lignes pilotées par le polling (/upload/progress) affichent le
-        // débit RÉEL mesuré côté serveur : ne pas l'écraser par une moyenne
-        // locale taille/durée (absurde tant que tout le fichier n'est pas
-        // transmis, ex. « 449 MB/s » pour un 13 Go encore en vol).
-        if (r.status.textContent === "⏳" && !r.pollInterval) {
-          var elapsed = ((Date.now() - r.startTime) / 1000).toFixed(1);
-          var mbps = (r.sizeBytes / 1048576 / elapsed).toFixed(1); r.speedEl.textContent = mbps + " MB/s";
-        }
-      }
-    }, 500);
+    var counts = { sent: 0, overwritten: 0, skipped: 0, failed: 0 };
 
     return {
       addRow: function(fileName, sizeBytes, filepath) {
@@ -107,10 +256,13 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
         nameEl.style.cssText = "font-size:12px;color:#ccc;min-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0;";
         nameEl.textContent = fileName;
         nameEl.title = fileName;
-        // Speed (mis a jour via polling)
+        // Speed — JAMAIS de valeur inventée : la seule source autorisée est la
+        // mesure RÉELLE du serveur (/upload/progress) ou la moyenne d'un
+        // transfert réellement effectué ; sinon « — » (un fichier SAUTÉ ne
+        // consomme aucun octet : bug « 0.2 s / 140 391 MB/s »).
         var speedEl = document.createElement("span");
         speedEl.style.cssText = "font-size:10px;color:#888;min-width:55px;text-align:right;font-family:monospace;";
-        speedEl.textContent = "0 MB/s";
+        speedEl.textContent = "—";
         // Size
         var sizeEl = document.createElement("span");
         sizeEl.style.cssText = "font-size:11px;color:#888;min-width:55px;text-align:right;";
@@ -126,7 +278,8 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
         row.appendChild(sizeEl);
         body.appendChild(row);
 
-        // Polling de progression toutes les 500ms
+        // Polling de progression toutes les 500ms (débit RÉEL mesuré côté
+        // serveur) — aucune estimation locale taille/durée en vol.
         var pollInterval = null;
         if (filepath) {
           pollInterval = setInterval(function() {
@@ -143,20 +296,40 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
         }
         rows[fileName] = { row: row, fill: fill, status: statusEl, startTime: Date.now(), speedEl: speedEl, sizeBytes: sizeBytes, pollInterval: pollInterval };
       },
-      setResult: function(fileName, success, errorMsg) {
+      // status : 'sent' | 'overwritten' | 'skipped' | 'failed' (booléens
+      // historiques acceptés : true = 'sent', false = 'failed').
+      setResult: function(fileName, status, errorMsg) {
         var r = rows[fileName];
         if (!r) return;
+        if (status === true) status = "sent";
+        if (status === false) status = "failed";
         if (r.pollInterval) { clearInterval(r.pollInterval); r.pollInterval = null; }
         doneCount++;
-        if (success) {
-          // Débit moyen RÉEL du transfert réussi.
+        if (status === "sent" || status === "overwritten") {
+          // Débit moyen d'un transfert RÉELLEMENT effectué (le fichier a été
+          // envoyé) — seule moyenne légitime.
           var elapsed = (Date.now() - r.startTime) / 1000;
-          var speed = (r.sizeBytes / 1048576 / elapsed).toFixed(1);
-          r.speedEl.textContent = speed + " MB/s";
-          r.status.textContent = "✅";
-          r.fill.style.background = "#16a34a";
+          r.speedEl.textContent = elapsed > 0
+            ? (r.sizeBytes / 1048576 / elapsed).toFixed(1) + " MB/s"
+            : "—";
+          r.status.textContent = status === "overwritten" ? "♻️" : "✅";
+          r.fill.style.background = status === "overwritten" ? "#f59e0b" : "#16a34a";
           r.fill.style.width = "100%";
-          r.row.style.background = "rgba(22,163,74,0.15)";
+          r.row.style.background = status === "overwritten"
+            ? "rgba(245,158,11,0.15)" : "rgba(22,163,74,0.15)";
+          counts[status]++;
+        } else if (status === "skipped") {
+          // Fichier DÉJÀ présent : ni ✅ de transfert, ni débit.
+          r.speedEl.textContent = "—";
+          r.status.textContent = "⏭";
+          r.fill.style.background = "#6b7280";
+          r.fill.style.width = "100%";
+          r.row.style.background = "rgba(107,114,128,0.18)";
+          var noteEl = document.createElement("div");
+          noteEl.style.cssText = "font-size:10px;color:#9ca3af;width:100%;margin-left:26px;";
+          noteEl.textContent = t("wf.preUploadSkippedNoBytes");
+          r.row.appendChild(noteEl);
+          counts.skipped++;
         } else {
           // Transfert ÉCHOUÉ : « taille / durée » n'a AUCUN sens (un 13 Go qui
           // échoue au bout de 30 s afficherait 449 Mo/s). On n'invente pas de
@@ -170,13 +343,21 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
           errEl.style.cssText = "font-size:10px;color:#f87171;word-break:break-all;width:100%;margin-left:26px;";
           errEl.textContent = t("wf.errorPrefix") + (errorMsg || t("aih.unknown"));
           r.row.appendChild(errEl);
+          counts.failed++;
         }
         m.setTitle(t("wf.uploadProgress", { done: doneCount, total: totalCount }));
       },
       done: function() {
-        clearInterval(timer);
         var elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        m.setTitle(t("wf.uploadDone", { count: totalCount, seconds: elapsed }));
+        // Récapitulatif RÉEL : envoyés / écrasés / ignorés / échecs (fini le
+        // « N fichiers » indifférencié qui comptait des skips comme succès).
+        m.setTitle(t("wf.uploadDone", {
+          seconds: elapsed,
+          sent: t("wf.uploadCountSent", { count: counts.sent }),
+          overwritten: t("wf.uploadCountOverwritten", { count: counts.overwritten }),
+          skipped: t("wf.uploadCountSkipped", { count: counts.skipped }),
+          failed: t("wf.uploadCountFailed", { count: counts.failed }),
+        }));
         var closeBtn = document.createElement("button");
         closeBtn.textContent = t("dialog.close");
         closeBtn.style.cssText = "padding:6px 16px;border:1px solid #555;border-radius:6px;background:transparent;color:#999;font-size:12px;cursor:pointer;";
@@ -481,12 +662,17 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     }
   }
 
-  async function uploadModelToServer(filepath, fileType) {
+  async function uploadModelToServer(filepath, fileType, overwrite) {
     // Demande au Python d'uploader le fichier directement depuis le filesystem
     try {
+      var body = { path: filepath, type: fileType };
+      // Écrasement EXPLICITE décidé dans la modale de pré-upload : le pack
+      // Python saute alors la déduplication → les octets sont réellement
+      // renvoyés (coché = vraiment remplacé).
+      if (overwrite) body.overwrite = true;
       return await HolafFetch.request('/api/aih/models/upload', {
         method: 'POST',
-        body: { path: filepath, type: fileType },
+        body: body,
         // TRANSFERT LONG : un modèle de plusieurs Go prend plusieurs minutes.
         // Le timeout client par défaut (30 s, holaf-fetch.js) ABORDAIT le
         // transfert en plein vol → « Erreur: timeout » dès ~450 Mo (tout
@@ -783,6 +969,22 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
 
         statusEl.textContent = t("wf.publishing");
 
+        // Référencer un fichier serveur dans la charge utile du workflow
+        // (required_models/required_loras) — utilisé aussi pour les modèles
+        // IGNORÉS (déjà présents) afin que les autres instances puissent les
+        // télécharger via leur upload_id existant.
+        function setDepUpload(fileType, fileName, uploadId, filePath) {
+          if (!uploadId && !filePath) return;
+          var depArray = fileType === 'lora' ? deps.loras : deps.models;
+          for (var di = 0; di < depArray.length; di++) {
+            if (depArray[di].name === fileName) {
+              if (uploadId) depArray[di].upload_id = uploadId;
+              if (filePath) depArray[di].file_path = filePath;
+              break;
+            }
+          }
+        }
+
         // Uploader les models/loras cochés vers le serveur AIH
         var uploadCbs = container.querySelectorAll(".wf-upload-cb:checked");
         if (uploadCbs.length > 0) {
@@ -796,47 +998,96 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
             }
           }
 
-          var uploadedCount = 0, failedCount = 0;
-          var panel = createUploadPanel();
-
-          // Upload en parallele
-          var uploadPromises = [];
+          // Sélection RÉELLE (fichiers trouvés localement) ; clé composite
+          // type|nom pour distinguer un model d'un lora homonyme.
+          var selection = [];
           for (var ui = 0; ui < uploadCbs.length; ui++) {
-            (function(cb) {
-              var fileType = cb.dataset.type;
-              var fileName = cb.dataset.name;
-              var localFile = allFilesMap[fileName];
-              if (!localFile && fileName.indexOf('/') >= 0) {
-                var base = fileName.substring(fileName.lastIndexOf('/') + 1);
-                localFile = allFilesMap[base];
+            var ucb = uploadCbs[ui];
+            var uType = ucb.dataset.type;
+            var uName = ucb.dataset.name;
+            var uFile = allFilesMap[uName];
+            if (!uFile && uName.indexOf('/') >= 0) {
+              var uBase = uName.substring(uName.lastIndexOf('/') + 1);
+              uFile = allFilesMap[uBase];
+            }
+            if (!uFile) {
+              console.warn('[AIH] Non trouve localement: ' + uName);
+              continue;
+            }
+            selection.push({
+              key: uType + '|' + uName, name: uName, type: uType,
+              path: uFile.path, size: uFile.size, status: null, remote: null,
+            });
+          }
+
+          // Check PAR LOT AVANT l'envoi : on détermine ce qui existe déjà côté
+          // serveur (critère identique à la déduplication d'upload) au lieu de
+          // le découvrir après coup. Échec du check (route absente, serveur
+          // injoignable) → retour au comportement historique, sans blocage.
+          await checkServerPresence(selection);
+          var hasExisting = false;
+          for (var si = 0; si < selection.length; si++) {
+            if (selection[si].status === 'identical' || selection[si].status === 'different') {
+              hasExisting = true;
+              break;
+            }
+          }
+
+          var overwriteKeys = {};
+          if (hasExisting) {
+            var decision = await showPreUploadModal(selection);
+            if (!decision || decision.action !== 'confirm') {
+              // Annuler : ne rien envoyer (ni modèles, ni workflow).
+              statusEl.textContent = '';
+              statusEl.style.display = 'none';
+              return;
+            }
+            for (var oi = 0; oi < (decision.overwrite || []).length; oi++) {
+              overwriteKeys[decision.overwrite[oi]] = true;
+            }
+            // Existants IGNORÉS : rester référencés par leur upload_id serveur
+            // (le workflow publié pointera sur le fichier déjà en place, sinon
+            // les autres instances le verraient « manquant »).
+            for (var ri = 0; ri < selection.length; ri++) {
+              var selItem = selection[ri];
+              var selExisting = selItem.status === 'identical' || selItem.status === 'different';
+              if (selExisting && !overwriteKeys[selItem.key] && selItem.remote) {
+                setDepUpload(selItem.type, selItem.name, selItem.remote.upload_id, selItem.remote.file_path);
               }
-              if (!localFile) {
-                console.warn('[AIH] Non trouve localement: ' + fileName);
+            }
+          }
+
+          var panel = createUploadPanel();
+          var uploadPromises = [];
+          for (var ui2 = 0; ui2 < selection.length; ui2++) {
+            (function(item) {
+              var isOverwrite = !!overwriteKeys[item.key];
+              var isExisting = item.status === 'identical' || item.status === 'different';
+              // Existant NON coché = ignoré : aucun octet envoyé, mais la
+              // ligne de résultat le DIT (⏭ « ignoré », sans faux succès).
+              if (isExisting && !isOverwrite) {
+                panel.addRow(item.name, item.size, null);
+                panel.setResult(item.name, 'skipped');
                 return;
               }
-              panel.addRow(fileName, localFile.size, localFile.path);
+              panel.addRow(item.name, item.size, item.path);
               uploadPromises.push(
-                uploadModelToServer(localFile.path, fileType).then(function(upResult) {
+                uploadModelToServer(item.path, item.type, isOverwrite).then(function(upResult) {
                   if (upResult.success) {
-                    console.log('[AIH] Upload OK: ' + fileName);
-                    var depArray = fileType === 'lora' ? deps.loras : deps.models;
-                    for (var di = 0; di < depArray.length; di++) {
-                      if (depArray[di].name === fileName) {
-                        depArray[di].upload_id = upResult.upload_id;
-                        depArray[di].file_path = upResult.file_path;
-                        break;
-                      }
-                    }
-                    uploadedCount++;
-                    panel.setResult(fileName, true);
+                    console.log('[AIH] Upload OK: ' + item.name);
+                    setDepUpload(item.type, item.name, upResult.upload_id, upResult.file_path);
+                    // ``deduplicated`` = le serveur n'a transféré aucun octet :
+                    // « ignoré », jamais un succès de transfert.
+                    var outcome = upResult.deduplicated === true
+                      ? 'skipped' : (isOverwrite ? 'overwritten' : 'sent');
+                    panel.setResult(item.name, outcome);
                   } else {
-                    console.error('[AIH] Upload FAIL: ' + fileName + ' → ' + (upResult.error || 'echec'));
-                    failedCount++;
-                    panel.setResult(fileName, false, upResult.error);
+                    console.error('[AIH] Upload FAIL: ' + item.name + ' → ' + (upResult.error || 'echec'));
+                    panel.setResult(item.name, 'failed', upResult.error);
                   }
                 })
               );
-            })(uploadCbs[ui]);
+            })(selection[ui2]);
           }
           await Promise.all(uploadPromises);
           panel.done();
