@@ -79,12 +79,45 @@ export function normalizeServerUrl(raw) {
     return s.replace(/\/+$/, "");
 }
 
+// ─── Garde-fou anti-masque (texte d'état ≠ clé API) ─────────────────────────
+// Bug réel corrigé : le masquage d'affichage mettait un TEXTE (« Clé masquée —
+// clique sur « Régénérer » pour en afficher une nouvelle. ») dans la VALEUR du
+// champ ; le bouton « Copier » recopiait ce texte, l'utilisateur l'a collé comme
+// clé API sur une autre instance → 401 incompréhensible. Toute valeur qui
+// ressemble à un libellé de masquage / placeholder / message d'état est donc
+// traitée comme ABSENTE : jamais affichée en valeur, jamais copiée, jamais
+// enregistrée, jamais envoyée en Authorization: Bearer.
+const API_KEY_MASK_RE = /(masqu|r[ée]g[ée]n[ée]r|\bhidden\b|\bplaceholder\b|\b(chargement|loading)\b|\b(indisponible|unavailable)\b|\b(pas de token|no token)\b|\b(erreur|error)\b)/i;
+
+/**
+ * Vrai si la valeur ressemble à un libellé de masquage / message d'état
+ * (et non à une vraie clé API). Une valeur vide n'est PAS un masque : elle est
+ * simplement absente (voir isUsableApiKey).
+ * @param {*} value valeur à tester.
+ * @returns {boolean}
+ */
+export function isMaskedApiKey(value) {
+    const s = String(value == null ? "" : value).trim();
+    return s.length > 0 && API_KEY_MASK_RE.test(s);
+}
+
+/**
+ * Vrai si la valeur peut être utilisée comme clé API : non vide ET pas un
+ * texte de masquage / placeholder.
+ * @param {*} value valeur à tester.
+ * @returns {boolean}
+ */
+export function isUsableApiKey(value) {
+    const s = String(value == null ? "" : value).trim();
+    return s.length > 0 && !isMaskedApiKey(s);
+}
+
 // ─── Résolution LAZY de la config (serverUrl + apiKey) ──────────────────────
 // Lue depuis localStorage "AIH_config" (même clé que les wrappers historiques).
 // La source canonique window.AIH (03_aih_shared.js) est préférée quand elle
 // est disponible : elle lit la même clé et reste la référence la plus à jour.
 function resolveConfig() {
-    const cfg = { serverUrl: "", apiKey: "" };
+    const cfg = { serverUrl: "", apiKey: "", apiKeyMasked: false };
     try {
         const raw = JSON.parse(localStorage.getItem("AIH_config") || "{}");
         cfg.serverUrl = normalizeServerUrl(raw.serverUrl);
@@ -100,6 +133,14 @@ function resolveConfig() {
             const k = typeof window.AIH.getApiKey === "function" ? window.AIH.getApiKey() : "";
             if (k) cfg.apiKey = k;
         } catch { /* ignore */ }
+    }
+
+    // Rattrapage : une clé DÉJÀ ENREGISTRÉE qui est en réalité un texte de
+    // masquage est ignorée (aucun Bearer émis) et signalée par un drapeau pour
+    // que l'UI (onglet Compte) affiche un avertissement clair.
+    if (isMaskedApiKey(cfg.apiKey)) {
+        cfg.apiKeyMasked = true;
+        cfg.apiKey = "";
     }
     return cfg;
 }
@@ -126,6 +167,15 @@ export function getRemoteConfig() {
  */
 export async function remoteRequest(path, opts = {}) {
     const cfg = resolveConfig();
+    // Clé enregistrée = texte de masquage : ne JAMAIS partir en Bearer avec ce
+    // texte (401 incompréhensible). Erreur locale explicite : l'utilisateur
+    // ressaisit la vraie clé dans Settings ▸ AIH · Compte.
+    if (cfg.apiKeyMasked) {
+        throw new HolafFetchError(
+            "clé API enregistrée invalide (texte de masquage) — ressaisis la vraie clé dans Settings ▸ AIH · Compte",
+            { status: 0, data: { code: "API_KEY_MASKED" } }
+        );
+    }
     let url = path;
     const isAbsolute = /^https?:\/\//i.test(path || "");
     if (!isAbsolute) {
@@ -163,6 +213,8 @@ if (typeof window !== "undefined") {
         remoteRequest,
         getRemoteConfig,
         normalizeServerUrl,
+        isMaskedApiKey,
+        isUsableApiKey,
     };
 }
 

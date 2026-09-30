@@ -313,60 +313,133 @@
       closeMergedSettings();
     }
 
+    // ── Garde-fou anti-masque ───────────────────────────────────────────────
+    // Bug réel corrigé : le masquage mettait un TEXTE (« Clé masquée — clique
+    // sur « Regénérer »… ») dans la VALEUR du champ ; le bouton « Copier »
+    // recopiait ce texte et l'utilisateur l'a collé comme clé API sur une autre
+    // instance ComfyUI → 401 incompréhensible. Désormais : le masque vit dans
+    // l'attribut placeholder (non copiable comme valeur), le champ reste vide,
+    // et aucune valeur masquée/vide ne peut être copiée.
+    var API_KEY_MASK_RE = /(masqu|r[ée]g[ée]n[ée]r|\bhidden\b|\bplaceholder\b|\b(chargement|loading)\b|\b(indisponible|unavailable)\b|\b(pas de token|no token)\b|\b(erreur|error)\b)/i;
+    var API_KEY_MASK_PLACEHOLDER = 'Clé masquée — clique sur « Regénérer » pour en afficher une nouvelle.';
+
+    function apiKeyLooksMasked(value) {
+      var s = String(value == null ? '' : value).trim();
+      return s.length > 0 && API_KEY_MASK_RE.test(s);
+    }
+
+    function apiKeyIsCopyable(value) {
+      var s = String(value == null ? '' : value).trim();
+      return s.length > 0 && !apiKeyLooksMasked(s);
+    }
+
+    // Seul un token RÉEL (renvoyé par /auth/token) est copiable : évite que
+    // l'état interne mente si la valeur du champ a été modifiée autrement.
+    var apiKeyCopyable = false;
+
+    function updateApiKeyCopyButton() {
+      var btn = document.getElementById('settings-copy-key');
+      if (!btn) return;
+      btn.disabled = !apiKeyCopyable;
+      btn.title = apiKeyCopyable
+        ? 'Copier la clé API'
+        : 'Clé masquée : clique sur « Regenerer » pour en afficher une nouvelle';
+      btn.setAttribute('aria-disabled', btn.disabled ? 'true' : 'false');
+    }
+
+    function showApiKeyStatus(kind, message, autoHideMs) {
+      var el = document.getElementById('settings-key-status');
+      if (!el) return;
+      el.className = 'text-xs mt-2 ' + (kind === 'success' ? 'text-emerald-500' : kind === 'error' ? 'text-rose-500' : 'text-amber-500');
+      el.textContent = message;
+      el.classList.remove('hidden');
+      if (autoHideMs) {
+        setTimeout(function() { el.classList.add('hidden'); }, autoHideMs);
+      }
+    }
+
     async function loadApiKey() {
       if (LOCAL_MODE) return;
       var nameEl = document.getElementById('settings-username');
       if (currentUser) nameEl.textContent = currentUser.display_name || currentUser.username;
       var input = document.getElementById('settings-api-key');
-      input.value = 'Chargement...';
+      // IMPORTANT : plus JAMAIS de texte d'état dans la VALEUR du champ (il
+      // était copié par le bouton « Copier » puis collé comme clé API).
+      input.value = '';
+      input.placeholder = 'Chargement...';
+      apiKeyCopyable = false;
+      updateApiKeyCopyButton();
+      var statusEl = document.getElementById('settings-key-status');
+      if (statusEl) { statusEl.classList.add('hidden'); statusEl.textContent = ''; }
       try {
         var res = await fetch(API + '/auth/token');
         if (!res.ok) throw new Error('Erreur ' + res.status);
         var data = await res.json();
-        if (data.token) {
+        if (data.token && apiKeyIsCopyable(data.token)) {
           input.value = data.token;
+          input.placeholder = '';
+          apiKeyCopyable = true;
         } else if (data && data.exists) {
-          input.value = 'Clé masquée — clique sur « Regénérer » pour en afficher une nouvelle.';
+          // Clé stockée hashée côté serveur : on ne l'affiche PAS. Le masque
+          // est un placeholder (grisé) et le bouton Copier est désactivé.
+          input.placeholder = API_KEY_MASK_PLACEHOLDER;
+          showApiKeyStatus('warn', 'Clé masquée — clique sur « Regenerer » pour en afficher une nouvelle.');
         } else {
-          input.value = 'Erreur : pas de token';
+          input.placeholder = 'Aucune clé disponible';
+          showApiKeyStatus('warn', 'Aucune clé API disponible.');
         }
       } catch (err) {
-        input.value = 'Erreur : ' + err.message;
+        // Le texte d'erreur reste HORS du champ (message de statut), jamais
+        // en valeur : sinon il serait copiable comme clé.
+        input.placeholder = 'Indisponible';
+        showApiKeyStatus('error', 'Erreur : ' + err.message);
       }
+      updateApiKeyCopyButton();
     }
 
     async function regenerateApiKey() {
       if (LOCAL_MODE) { showModal('API Key', 'Indisponible en mode local', 'error'); return; }
       if (!confirm('Regénérer la clé API ? L\'ancienne clé ne fonctionnera plus.')) return;
-      var statusEl = document.getElementById('settings-key-status');
-      statusEl.className = 'text-xs mt-2 text-amber-500';
-      statusEl.textContent = 'Regénération...';
-      statusEl.classList.remove('hidden');
+      showApiKeyStatus('warn', 'Regénération...');
       try {
         var res = await fetch(API + '/auth/token', { method: 'POST' });
         if (!res.ok) throw new Error('Erreur ' + res.status);
         var data = await res.json();
-        document.getElementById('settings-api-key').value = data.token || '';
-        statusEl.className = 'text-xs mt-2 text-emerald-500';
-        statusEl.textContent = 'Nouvelle clé générée !';
+        var token = (data && data.token) || '';
+        var input = document.getElementById('settings-api-key');
+        input.value = token;
+        input.placeholder = '';
+        apiKeyCopyable = apiKeyIsCopyable(token);
+        updateApiKeyCopyButton();
+        showApiKeyStatus('success', token ? 'Nouvelle clé générée !' : 'Réponse sans clé — réessaie.');
       } catch (err) {
-        statusEl.className = 'text-xs mt-2 text-rose-500';
-        statusEl.textContent = 'Erreur : ' + err.message;
+        showApiKeyStatus('error', 'Erreur : ' + err.message);
       }
     }
 
     function copyApiKey() {
       var input = document.getElementById('settings-api-key');
+      var value = String(input.value || '');
+      // Garde-fou : ne copie JAMAIS un masque / placeholder / champ vide.
+      if (!apiKeyCopyable || !apiKeyIsCopyable(value)) {
+        showApiKeyStatus('warn', 'Clé masquée : clique sur « Regenerer » pour en afficher une nouvelle, puis copie-la.');
+        return;
+      }
       input.select();
       input.setSelectionRange(0, 99999);
-      navigator.clipboard.writeText(input.value).then(function() {
-        var statusEl = document.getElementById('settings-key-status');
-        statusEl.className = 'text-xs mt-2 text-emerald-500';
-        statusEl.textContent = 'Copié !';
-        statusEl.classList.remove('hidden');
-        setTimeout(function() { statusEl.classList.add('hidden'); }, 2000);
+      var write = (navigator.clipboard && typeof navigator.clipboard.writeText === 'function')
+        ? navigator.clipboard.writeText(value)
+        : Promise.reject(new Error('clipboard indisponible'));
+      write.then(function() {
+        showApiKeyStatus('success', 'Copié !', 2000);
       }).catch(function() {
-        document.execCommand('copy');
+        // Repli : copie de la sélection — la sélection porte la VALEUR RÉELLE
+        // (le garde-fou ci-dessus a déjà refusé masque/vide).
+        if (document.execCommand('copy')) {
+          showApiKeyStatus('success', 'Copié !', 2000);
+        } else {
+          showApiKeyStatus('error', 'Copie impossible.');
+        }
       });
     }
 

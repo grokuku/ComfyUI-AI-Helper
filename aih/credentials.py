@@ -39,9 +39,34 @@ Securite (ameliorations futures) :
 import json
 import os
 import logging
+import re
 
 _CREDENTIALS_CACHE = None
 _CREDENTIALS_PATH = None
+
+# Garde-fou anti-masque : un libellé d'affichage (« Clé masquée — clique sur
+# « Régénérer »… », placeholder, message d'état) a déjà été collé comme clé API
+# par un utilisateur (bug du bouton « Copier » côté front). Une telle valeur ne
+# doit JAMAIS être envoyée en Authorization: Bearer ni persistée.
+_MASKED_API_KEY_RE = re.compile(
+    r"(masqu"                                # FR : masquée/masqué/masques
+    r"|r[ée]g[ée]n[ée]r"                     # « Régénérer » (les libellés y invitent)
+    r"|\bhidden\b|\bplaceholder\b"
+    r"|\b(chargement|loading)\b"
+    r"|\b(indisponible|unavailable)\b"
+    r"|\b(pas de token|no token)\b"
+    r"|\b(erreur|error)\b)",
+    re.IGNORECASE,
+)
+
+
+def is_masked_api_key(value):
+    """Vrai si la valeur ressemble à un libellé de masquage / message d'état.
+
+    Une valeur vide n'est PAS un masque : elle est simplement absente.
+    """
+    s = (value or "").strip()
+    return bool(s) and bool(_MASKED_API_KEY_RE.search(s))
 
 
 def _migrate_to_aih_subfolder(old_path, new_path):
@@ -161,6 +186,18 @@ def get_api_url():
 
 
 def get_api_key():
-    """Retourne l'api_key."""
+    """Retourne l'api_key — ou "" si la valeur enregistrée est un masque.
+
+    Rattrapage : une clé DÉJÀ ENREGISTRÉE qui est en réalité un texte de
+    masquage (copiée par erreur depuis un champ masqué) est ignorée : elle ne
+    doit jamais partir en Authorization: Bearer (401 incompréhensible).
+    """
     creds = _load_aih_credentials()
-    return creds.get("api_key", "")
+    key = creds.get("api_key", "")
+    if is_masked_api_key(key):
+        logging.warning(
+            "[AIH credentials] api_key ignorée : texte de masquage enregistré "
+            "(ressaisir la vraie clé dans Settings ▸ AIH · Compte)"
+        )
+        return ""
+    return key

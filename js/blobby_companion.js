@@ -15,7 +15,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { saveWindowRect, loadWindowRect } from "./holaf_window_utils.js";
-import { remoteGet, remotePost, HolafFetch, normalizeServerUrl } from "./aih_fetch_bridge.js";
+import { remoteGet, remotePost, HolafFetch, normalizeServerUrl, isMaskedApiKey } from "./aih_fetch_bridge.js";
 import { formatContextBar, applyContextBar } from "./aih_context_utils.js";
 import { escapeHtml } from "./holaf_dom_utils.js";
 // Registre d'outils + dispatcher + enforcement de mode + undo (étape 2).
@@ -2196,7 +2196,9 @@ const Blobby = {
                 return;
             }
             var headers = { 'Content-Type': 'application/json' };
-            if (cfg.apiKey) headers['Authorization'] = 'Bearer ' + cfg.apiKey;
+            // Garde-fou : ne jamais envoyer un texte de masquage en Bearer
+            // (clé copiée par erreur depuis un champ masqué → 401).
+            if (cfg.apiKey && !isMaskedApiKey(cfg.apiKey)) headers['Authorization'] = 'Bearer ' + cfg.apiKey;
 
             // ── Étape 2 : chemin tool_calls (mode Actif + outils disponibles) ──
             // En mode Actif, Blobby reçoit les schémas d'outils (déjà filtrés

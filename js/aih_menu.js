@@ -43,7 +43,7 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { showToast } from "./aih_toast_bridge.js";
-import { remoteGet, remoteRequest, normalizeServerUrl } from "./aih_fetch_bridge.js";
+import { remoteGet, remoteRequest, normalizeServerUrl, isMaskedApiKey, isUsableApiKey } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 import { escapeHtml } from "./holaf_dom_utils.js";
 import {
@@ -78,6 +78,14 @@ import {
             // L'URL peut avoir été saisie sans schéma / avec "/api" / un slash :
             // on la normalise dès la lecture (même règle que le bridge).
             if (cfg.serverUrl) cfg.serverUrl = normalizeServerUrl(cfg.serverUrl);
+            // Rattrapage du bug « clé copiée = texte de masquage » : une valeur
+            // de masquage persistée dans localStorage est traitée comme
+            // ABSENTE (jamais affichée en valeur, jamais Bearer) ; le drapeau
+            // apiKeyMasked permet d'avertir l'utilisateur.
+            if (isMaskedApiKey(cfg.apiKey)) {
+                cfg.apiKeyMasked = true;
+                cfg.apiKey = "";
+            }
             return cfg;
         } catch { return {}; }
     }
@@ -293,7 +301,17 @@ import {
     async function checkServerStatus(el) {
         const cfg = getConfig();
         const baseUrl = (cfg.serverUrl || "").replace(/\/+$/, "");
-        const apiKey = cfg.apiKey || "";
+
+        // Clé enregistrée = texte de masquage : avertissement explicite plutôt
+        // qu'une sonde vouée au 401 (la clé n'est JAMAIS envoyée en Bearer).
+        if (cfg.apiKeyMasked) {
+            el.innerHTML = "";
+            el.style.display = "flex";
+            el.style.alignItems = "center";
+            el.textContent = t("menu.serverMaskedKeyStatus");
+            el.style.color = "#facc15";
+            return;
+        }
 
         // Serveur non configuré : état explicite au lieu d'une sonde vers
         // une destination arbitraire.
@@ -446,6 +464,11 @@ import {
         status.textContent = t("menu.loading");
         section.appendChild(status);
 
+        const setStatus = (key, color, params) => {
+            status.textContent = params ? t(key, params) : t(key);
+            status.style.color = color;
+        };
+
         const lbl1 = document.createElement("label");
         lbl1.textContent = t("menu.urlServer");
         lbl1.style.cssText = _aihStyle.label;
@@ -464,12 +487,63 @@ import {
         lbl2.style.cssText = _aihStyle.label;
         section.appendChild(lbl2);
 
+        // ── Clé API ──────────────────────────────────────────────────────
+        // La VALEUR du champ ne contient JAMAIS un texte de masquage (bug
+        // historique : il était recopié par le bouton « Copier » puis collé
+        // comme clé API sur une autre instance → 401 incompréhensible). Quand
+        // la clé n'est pas connue EN CLAIR, le champ reste VIDE et le masque
+        // vit dans l'attribut `placeholder` (grisé, non copiable comme valeur).
+        const keyRow = document.createElement("div");
+        keyRow.style.cssText = "display:flex; gap:6px; align-items:center; margin-bottom:4px;";
+
         const inputKey = document.createElement("input");
         inputKey.type = "password";
         inputKey.value = cfg.apiKey || "";
+        inputKey.placeholder = cfg.apiKeyMasked ? t("menu.apiKeyMaskedPlaceholder") : "";
         inputKey.style.cssText = _aihStyle.input;
-        inputKey.style.marginBottom = "4px";
-        section.appendChild(inputKey);
+        inputKey.style.width = "auto";
+        inputKey.style.flex = "1 1 auto";
+        inputKey.style.minWidth = "0";
+        keyRow.appendChild(inputKey);
+
+        const copyBtn = mkBtn(t("menu.copyKey"), _aihStyle.btnSecondary, async () => {
+            // Garde-fou en profondeur : refuse de copier vide / masque / message
+            // d'état. Seule une VRAIE clé connue en clair peut être copiée.
+            const raw = inputKey.value.trim();
+            if (!isUsableApiKey(raw)) {
+                setStatus("menu.copyKeyDisabledHint", "#facc15");
+                return;
+            }
+            try {
+                // clipboard.writeText peut être indisponible (contexte non
+                // sécurisé) : repli execCommand, qui copie la valeur réelle du
+                // champ (jamais un placeholder).
+                if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+                    await navigator.clipboard.writeText(raw);
+                } else {
+                    inputKey.select();
+                    inputKey.setSelectionRange(0, 99999);
+                    if (!document.execCommand("copy")) throw new Error("copy indisponible");
+                }
+                setStatus("menu.copyKeyCopied", "#4ade80");
+            } catch (err) {
+                setStatus("menu.copyKeyFailed", "#ef4444", { error: err.message });
+            }
+        });
+        keyRow.appendChild(copyBtn);
+        section.appendChild(keyRow);
+
+        // Le bouton « Copier » n'est ACTIF que si une vraie clé en clair est
+        // présente dans le champ (saisie utilisateur ou fichier credentials).
+        const refreshKeyActions = () => {
+            const usable = isUsableApiKey(inputKey.value);
+            copyBtn.disabled = !usable;
+            copyBtn.style.opacity = usable ? "1" : "0.45";
+            copyBtn.style.cursor = usable ? "pointer" : "not-allowed";
+            copyBtn.title = usable ? t("menu.copyKey") : t("menu.copyKeyDisabledHint");
+        };
+        inputKey.addEventListener("input", refreshKeyActions);
+        refreshKeyActions();
 
         const hint = document.createElement("p");
         hint.textContent = t("menu.apiKeyHint");
@@ -477,14 +551,25 @@ import {
         section.appendChild(hint);
 
         const saveBtn = mkBtn(t("menu.save"), _aihStyle.btn(), async () => {
-            saveBtn.disabled = true;
-            saveBtn.textContent = "...";
             // Corrige la saisie (schéma implicite, "/api", slash final) AVANT
             // l'envoi et le cache : sinon le bridge fabrique une URL cassée et
             // la connexion échoue ("/api/api/..." ou requête relative).
             const serverUrl = normalizeServerUrl(inputUrl.value);
             const apiKey = inputKey.value.trim();
             inputUrl.value = serverUrl;
+
+            // Garde-fou anti-masque : ne JAMAIS enregistrer un texte de
+            // masquage/placeholder comme clé (il serait ensuite envoyé en
+            // Bearer puis recollé ailleurs). Message clair, aucune requête.
+            if (isMaskedApiKey(apiKey)) {
+                setStatus("menu.apiKeyMaskRefused", "#ef4444");
+                inputKey.value = "";
+                refreshKeyActions();
+                return;
+            }
+
+            saveBtn.disabled = true;
+            saveBtn.textContent = "...";
             try {
                 // Route locale /aih/credentials → HolafFetch SANS auth (same-origin transparente).
                 const data = await HolafFetch.post("/aih/credentials", {
@@ -499,17 +584,19 @@ import {
                         serverUrl: serverUrl,
                         apiKey: apiKey,
                     });
-                    status.textContent = t("menu.savedIn", { path: data.path });
-                    status.style.color = "#4ade80";
+                    // Nettoyage de l'affichage après succès : URL normalisée
+                    // (déjà réécrite ci-dessus) et jamais de masque en valeur.
+                    inputKey.value = apiKey;
+                    inputKey.placeholder = "";
+                    refreshKeyActions();
+                    setStatus("menu.savedIn", "#4ade80", { path: data.path });
                     saveBtn.textContent = t("menu.saved");
                 } else {
-                    status.textContent = t("menu.saveErr", { error: data.message || t("aih.unknown") });
-                    status.style.color = "#ef4444";
+                    setStatus("menu.saveErr", "#ef4444", { error: data.message || t("aih.unknown") });
                     saveBtn.textContent = t("dialog.error");
                 }
             } catch (err) {
-                status.textContent = t("menu.networkError", { error: err.message });
-                status.style.color = "#ef4444";
+                setStatus("menu.networkError", "#ef4444", { error: err.message });
                 saveBtn.textContent = t("dialog.error");
             } finally {
                 saveBtn.disabled = false;
@@ -524,16 +611,31 @@ import {
             .then(data => {
                 if (data.status === "ok") {
                     if (data.server_url) inputUrl.value = normalizeServerUrl(data.server_url);
-                    if (data.api_key) inputKey.value = data.api_key;
-                    if (data.path) {
-                        status.textContent = t("menu.file", { path: data.path });
-                        status.style.color = "#888";
+
+                    // Une clé de fichier en texte de masquage (= clé collée par
+                    // erreur) n'est JAMAIS affichée en valeur : champ vide +
+                    // placeholder + avertissement invitant à ressaisir la clé.
+                    const fileKeyMasked = data.api_key_masked === true || isMaskedApiKey(data.api_key);
+                    if (fileKeyMasked) {
+                        inputKey.value = "";
+                        inputKey.placeholder = t("menu.apiKeyMaskedPlaceholder");
+                        setStatus("menu.apiKeyMaskedLoaded", "#facc15");
+                    } else if (data.api_key) {
+                        inputKey.value = data.api_key;
+                        inputKey.placeholder = "";
+                        if (data.path) setStatus("menu.file", "#888", { path: data.path });
+                    } else if (cfg.apiKeyMasked) {
+                        setStatus("menu.apiKeyMaskedLoaded", "#facc15");
+                    } else if (data.path) {
+                        setStatus("menu.file", "#888", { path: data.path });
                     }
+                    refreshKeyActions();
+
                     // Auto-migration : si le fichier n'existe pas mais que
-                    // localStorage a une cle, on migre silencieusement.
+                    // localStorage a une VRAIE cle, on migre silencieusement.
+                    // (cfg.apiKey est déjà nettoyé des masques par getConfig.)
                     if (!data.exists && cfg.apiKey) {
-                        status.textContent = t("menu.migrating");
-                        status.style.color = "#facc15";
+                        setStatus("menu.migrating", "#facc15");
                         return HolafFetch.post("/aih/credentials", {
                             body: {
                                 api_key: cfg.apiKey || "",
@@ -541,22 +643,18 @@ import {
                             },
                         }).then(saveData => {
                             if (saveData.status === "ok") {
-                                status.textContent = t("menu.migrated", { path: saveData.path });
-                                status.style.color = "#4ade80";
+                                setStatus("menu.migrated", "#4ade80", { path: saveData.path });
                             } else {
-                                status.textContent = t("menu.migrationFailed", { error: saveData.message || t("menu.unknown") });
-                                status.style.color = "#ef4444";
+                                setStatus("menu.migrationFailed", "#ef4444", { error: saveData.message || t("menu.unknown") });
                             }
                         });
                     }
                 } else {
-                    status.textContent = t("menu.readFileFailed", { error: data.message || t("menu.unknown") });
-                    status.style.color = "#ef4444";
+                    setStatus("menu.readFileFailed", "#ef4444", { error: data.message || t("menu.unknown") });
                 }
             })
             .catch(err => {
-                status.textContent = t("menu.loadError", { error: err.message });
-                status.style.color = "#ef4444";
+                setStatus("menu.loadError", "#ef4444", { error: err.message });
             });
     }
 

@@ -184,17 +184,10 @@
     }
 
     async function _loadApiKeySettings() {
-      if (LOCAL_MODE) return;   // /auth/* indisponible en local
-      var keyEl = document.getElementById('settings-api-key');
-      var userEl = document.getElementById('settings-username');
-      try {
-        var me = await fetch(API + '/auth/me').then(function(r){ return safeJson(r); });
-        if (me && me.username) userEl.textContent = me.username;
-        var res = await fetch(API + '/auth/token');
-        var data = await safeJson(res);
-        if (data && data.token) keyEl.value = data.token;
-        else if (data && data.exists) keyEl.placeholder = 'Clé masquée — régénère-la pour l\'afficher';
-      } catch {}
+      // Variante historique (non appelée dans le pack) : on délègue au
+      // chargeur canonique d'app-admin.js qui applique le garde-fou
+      // anti-masque — le masque va dans `placeholder`, jamais dans la valeur.
+      return loadApiKeySettings();
     }
 
     function switchSettingsTab(tab, btn) {

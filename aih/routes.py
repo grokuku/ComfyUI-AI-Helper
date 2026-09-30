@@ -171,9 +171,15 @@ def _register_credentials_group(r):
         try:
             creds = credentials._load_aih_credentials(use_cache=False)
             creds_path = credentials.get_credentials_path()
+            raw_key = creds.get("api_key", "")
+            # Jamais de texte de masquage renvoyé comme clé : la valeur est
+            # blanchie et signalée par api_key_masked (l'UI affiche alors un
+            # avertissement et invite à ressaisir la vraie clé).
+            key_masked = credentials.is_masked_api_key(raw_key)
             return web.json_response({
                 "status": "ok",
-                "api_key": creds.get("api_key", ""),
+                "api_key": "" if key_masked else raw_key,
+                "api_key_masked": key_masked,
                 "server_url": creds.get("server_url", ""),
                 "path": creds_path,
                 "exists": os.path.isfile(creds_path),
@@ -190,6 +196,17 @@ def _register_credentials_group(r):
             data = await request.json()
             api_key = (data.get("api_key") or "").strip()
             server_url = (data.get("server_url") or "").strip()
+
+            # Garde-fou : ne JAMAIS persister un libellé de masquage comme clé
+            # (il partirait ensuite en Bearer et serait recollé ailleurs).
+            if credentials.is_masked_api_key(api_key):
+                return web.json_response({
+                    "status": "error",
+                    "message": (
+                        "Valeur refusée : ce texte ressemble à un libellé de "
+                        "masquage, pas à une clé API. Saisis la vraie clé."
+                    ),
+                }, status=400)
 
             creds_path = credentials.get_credentials_path()
             os.makedirs(os.path.dirname(creds_path), exist_ok=True)
