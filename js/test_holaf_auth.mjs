@@ -10,8 +10,8 @@
 //   4. mot de passe incorrect : erreur affichée, dialogue maintenu ouvert ;
 //   5. withAuthRetry : session expirée (401) → invite partagée UNE fois → retry ;
 //   6. parité i18n FR/EN stricte (dictionnaires complets) + clés auth.* ;
-//   7. les outils (terminal, Nodes Manager, Blobby) délèguent au module partagé
-//      et ne recréent AUCUN champ/modal de mot de passe (pas de duplication).
+//   7. les outils (terminal, Nodes Manager, Blobby, upload de modèles) délèguent
+//      au module partagé et ne recréent AUCUN champ/modal de mot de passe.
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
 import { fakeDocument } from "./test_helpers/fake_dom.mjs";
@@ -219,7 +219,7 @@ ok(`parité FR/EN OK (${frKeys.length} clés, ${authKeys.length} clés auth.*)`)
 console.log("6. Outils branchés sur l'invite partagée");
 const sharedSrc = readFileSync(new URL("./holaf_auth.js", import.meta.url), "utf8");
 assert.ok(sharedSrc.includes("AIH.Dialog"), "l'invite partagée utilise AIH.Dialog");
-for (const file of ["holaf_terminal.js", "holaf_nodes_manager.js", "blobby_companion.js"]) {
+for (const file of ["holaf_terminal.js", "holaf_nodes_manager.js", "blobby_companion.js", "model_manager/model_manager_actions.js"]) {
     const src = readFileSync(new URL("./" + file, import.meta.url), "utf8");
     assert.ok(src.includes("holaf_auth.js"), `${file} importe holaf_auth.js`);
     assert.ok(!/type\s*=\s*"password"/.test(src), `${file} ne crée aucun champ mot de passe`);

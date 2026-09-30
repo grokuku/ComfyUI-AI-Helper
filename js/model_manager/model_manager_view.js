@@ -310,12 +310,13 @@ export function updateStatusBarText(manager) {
         let statusParts = [];
         // Upload status
         if (manager.isUploading) {
-            const currentJob = manager.uploadQueue.find(j => ['hashing', 'uploading', 'finalizing'].includes(j.status));
+            const currentJob = manager.uploadQueue.find(j => ['hashing', 'authenticating', 'uploading', 'finalizing'].includes(j.status));
             const queuedJobs = manager.uploadQueue.filter(j => j.status === 'queued').length;
             if (currentJob) {
                 const speed = manager.uploadStats.currentSpeed > 0 ? manager.uploadStats.currentSpeed.toFixed(2) : '...';
                 let progressText = `(${currentJob.progress.toFixed(1)}%)`;
                 if (currentJob.status === 'hashing') progressText = '(hashing...)';
+                else if (currentJob.status === 'authenticating') progressText = '(auth...)';
                 statusParts.push(`Uploading: ${currentJob.file.name.substring(0, 20)}... ${progressText} @ ${speed} MB/s`);
             }
             if (queuedJobs > 0) statusParts.push(`${queuedJobs} upload(s) queued`);

@@ -1142,6 +1142,12 @@ import "./aih_i18n.js";
         "mma.chunkFailed": "Échec du segment {chunk}.",
         "mma.finalizationFailed": "Échec de la finalisation.",
         "mma.assembleMismatch": "Taille assemblée incohérente. Attendu {expected}, obtenu {got}.",
+        "mma.sessionRequired": "Envoi de modèles protégé par mot de passe : saisissez-le dans la fenêtre d'authentification partagée pour continuer.",
+        "mma.authCancelled": "Authentification annulée : le mot de passe est requis pour envoyer des modèles. Relancez l'envoi et saisissez-le.",
+        "mma.authRefused": "Authentification refusée : la session n'a pas pu être établie pour cet envoi. Relancez l'envoi depuis l'invite partagée.",
+        "mma.uploadErrorTitle": "Erreur d'envoi de modèles",
+        "mma.uploadErrors": "{count} fichier(s) n'ont pas pu être envoyés. Exemple : {message}",
+        "mma.unknownUploadError": "Erreur d'envoi inconnue.",
 
         /* Profiler (holaf_profiler.js) */
         "pr.title": "AIH Workflow Profiler",
@@ -2367,6 +2373,12 @@ import "./aih_i18n.js";
         "mma.chunkFailed": "Chunk {chunk} failed.",
         "mma.finalizationFailed": "Finalization failed.",
         "mma.assembleMismatch": "Assembled size mismatch. Expected {expected}, got {got}.",
+        "mma.sessionRequired": "Model upload is password-protected: enter the password in the shared authentication dialog to continue.",
+        "mma.authCancelled": "Authentication cancelled: the password is required to upload models. Restart the upload and enter it.",
+        "mma.authRefused": "Authentication refused: the session could not be established for this upload. Restart the upload from the shared prompt.",
+        "mma.uploadErrorTitle": "Model upload error",
+        "mma.uploadErrors": "{count} file(s) could not be uploaded. Example: {message}",
+        "mma.unknownUploadError": "Unknown upload error.",
 
         /* Profiler (holaf_profiler.js) */
         "pr.title": "AIH Workflow Profiler",

@@ -1093,10 +1093,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch } from "./aih_fetch_bri
               depHtml += '</div>';
               depsEl.innerHTML = depHtml;
             });
-          })
-          .catch(function () {
-            detailBody.innerHTML = '<p style="color:#f87171;font-size:13px;text-align:center;padding:30px 0;">' + t('wf.loadError') + '</p>';
-          });
+          }
 
 // Install custom node (global for onclick)
           window._wfInstallNode = async function(gitUrl, nodeName, btn) {
