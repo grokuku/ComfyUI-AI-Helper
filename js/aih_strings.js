@@ -185,6 +185,16 @@ import "./aih_i18n.js";
         "mb.workflowSummary": "{total} modèle(s) du workflow · local {local} · distant {remote} · <span class=\"mb-wf-missing\">manquant en distant : {missing}</span>",
         "mb.workflowCapped": "⚠️ liste distante tronquée (plafond de chargement atteint)",
 
+        /* Fenêtre de progression des téléchargements (aih_download_window.js) */
+        "mb.dlwTitle": "⬇️ Téléchargement des modèles",
+        "mb.dlwGlobal": "Progression : {done}/{total}",
+        "mb.dlwQueued": "En attente",
+        "mb.dlwPhasePreparing": "Préparation côté serveur…",
+        "mb.dlwPhaseTransferring": "Transfert",
+        "mb.dlwEta": "reste ~{eta}",
+        "mb.dlwDoneTitle": "Téléchargement terminé",
+        "mb.dlwRecap": "{ok} réussi(s) · {cancelled} annulé(s) · {failed} échec(s)",
+
         /* Workflow Share (aih_workflow_share.js) */
         "wf.title": "📤  Workflows",
         "wf.uploadTitle": "Upload des dépendances",
@@ -1419,6 +1429,16 @@ import "./aih_i18n.js";
         "mb.workflowNoMatch": "No workflow model matches these filters",
         "mb.workflowSummary": "{total} workflow model(s) · local {local} · remote {remote} · <span class=\"mb-wf-missing\">missing remote: {missing}</span>",
         "mb.workflowCapped": "⚠️ remote list truncated (load cap reached)",
+
+        /* Download progress window (aih_download_window.js) */
+        "mb.dlwTitle": "⬇️ Model downloads",
+        "mb.dlwGlobal": "Progress: {done}/{total}",
+        "mb.dlwQueued": "Queued",
+        "mb.dlwPhasePreparing": "Preparing on server…",
+        "mb.dlwPhaseTransferring": "Transferring",
+        "mb.dlwEta": "~{eta} left",
+        "mb.dlwDoneTitle": "Download complete",
+        "mb.dlwRecap": "{ok} succeeded · {cancelled} cancelled · {failed} failed",
 
         /* Workflow Share (aih_workflow_share.js) */
         "wf.title": "📤  Workflows",

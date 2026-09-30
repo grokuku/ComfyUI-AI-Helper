@@ -699,16 +699,29 @@ def check_models_on_server(items):
 
 
 def get_download_progress(upload_id):
-    """Retourne la progression d'un download en cours."""
+    """Retourne la progression d'un download en cours.
+
+    ``phase`` distingue explicitement les deux états visibles côté client :
+      - ``'preparing'`` : le transfert est en cours d'établissement (aucun octet
+        reçu). Avec l'ancien backend (préchargement complet du stockage vers un
+        temp), cette phase durait des dizaines de minutes pour 13,5 Go ; elle
+        reste possible avec le repli temp ou un premier paquet lent.
+      - ``'transferring'`` : des octets sont déjà arrivés (débit/% affichables).
+    ``elapsed_s`` permet à l'UI de calculer un débit MOYEN stable (et une ETA)
+    au lieu de la vitesse instantanée sujet aux à-coups réseau.
+    """
     p = _download_progress.get(upload_id)
     if not p:
         return None
     pct = round(p['bytes_recv'] / p['bytes_total'] * 100, 1) if p['bytes_total'] > 0 else 0
+    elapsed = max(0.0, time.time() - p.get('start', time.time()))
     return {
         'bytes_recv': p['bytes_recv'],
         'bytes_total': p['bytes_total'],
         'percent': pct,
         'speed_mbs': p['speed_mbs'],
+        'phase': 'transferring' if p['bytes_recv'] > 0 else 'preparing',
+        'elapsed_s': round(elapsed, 1),
     }
 
 

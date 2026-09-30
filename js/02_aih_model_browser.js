@@ -9,6 +9,7 @@
  */
 
 import "./aih_dialog.js";
+import "./aih_download_window.js";
 import "./aih_strings.js";
 import { remoteRequest, normalizeServerUrl } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
@@ -37,6 +38,34 @@ var WF_REMOTE_MAX_PAGES = 20;
         var I = window.AIH && window.AIH.I18n;
         return I && typeof I.t === "function" ? I.t(key, params) : key;
     };
+
+    // ─── Fenêtre de progression dédiée (js/aih_download_window.js) ─────────────
+    // Ouverte AU LANCEMENT d'un téléchargement (unitaire ET lot) : c'est la vue
+    // demandée (nom du fichier, PHASE explicite, %, octets/total, MB/s, ETA,
+    // ✕ par ligne, progression globale N/M, récap final). La progression « en
+    // ligne » de la liste reste en place (aucune régression). Si AIH.Dialog est
+    // indisponible, les helpers renvoient null : le download continue sans
+    // fenêtre, exactement comme avant.
+    var _dlWindow = null;
+    function _dlWinOpen() {
+        if (!(window.AIH && window.AIH.DownloadWindow)) return null;
+        _dlWindow = window.AIH.DownloadWindow.open();
+        return _dlWindow;
+    }
+    function _dlWinAdd(uploadId, name, sizeBytes) {
+        var w = _dlWinOpen();
+        return w ? w.addFile(name, { uploadId: uploadId, sizeBytes: sizeBytes }) : null;
+    }
+    function _dlWinStart(uploadId) {
+        var w = _dlWinOpen();
+        if (w) w.startFile(uploadId);
+    }
+    function _dlWinSettle(uploadId, kind, message) {
+        if (_dlWindow && _dlWindow.isOpen()) _dlWindow.setResult(uploadId, kind, message);
+    }
+    function _dlWinDone() {
+        if (_dlWindow && _dlWindow.isOpen()) _dlWindow.done();
+    }
 
     // ─── Injection CSS (une seule fois) ──────────────────────────────────────────
     var _cssInjected = false;
@@ -574,6 +603,11 @@ var WF_REMOTE_MAX_PAGES = 20;
 
             var progressEl = showProgress(m, displayName, { cancelable: true });
 
+            // Fenêtre de progression dédiée : la ligne a été créée au lancement
+            // du lot (état « En attente ») ; startFile bascule vers
+            // « Préparation côté serveur… » puis « Transfert ».
+            _dlWinStart(uploadId);
+
             // Progression live + bouton d'annulation (voir _downloadRequest).
             _downloadRequest({
                 upload_id: uploadId,
@@ -584,23 +618,32 @@ var WF_REMOTE_MAX_PAGES = 20;
                 .then(function (data) {
                     if (data.status === 'ok' || data.success) {
                         if (data.conflict) {
+                            // Lot : conflit ignoré (résolution manuelle non
+                            // proposée ici) → la ligne de fenêtre n'est PAS un
+                            // succès : classée « annulé ».
                             updateProgress(progressEl, 50, t('mb.conflictIgnore'));
+                            _dlWinSettle(uploadId, 'cancelled');
                             resolve();
                             return;
                         }
                         updateProgress(progressEl, 100, t('mb.downloadDone'));
+                        _dlWinSettle(uploadId, 'ok');
                         resolve();
                     } else if (data.cancelled) {
                         // Annulation utilisateur : message dédié, pas « ❌ Erreur ».
                         updateProgress(progressEl, 0, t('mb.downloadCancelled'));
+                        _dlWinSettle(uploadId, 'cancelled');
                         reject(new Error(t('mb.downloadCancelled')));
                     } else {
-                        updateProgress(progressEl, 0, t('mb.errorPrefix') + (data.error || data.message || t('aih.unknown')));
+                        var errMsg = data.error || data.message || t('aih.unknown');
+                        updateProgress(progressEl, 0, t('mb.errorPrefix') + errMsg);
+                        _dlWinSettle(uploadId, 'failed', errMsg);
                         reject(new Error(data.error || t('aih.failed')));
                     }
                 })
                 .catch(function (err) {
                     updateProgress(progressEl, 0, t('mb.errorPrefix') + err.message);
+                    _dlWinSettle(uploadId, 'failed', err.message);
                     reject(err);
                 });
         });
@@ -653,6 +696,17 @@ var WF_REMOTE_MAX_PAGES = 20;
         btn.disabled = true;
         btn.textContent = t('mb.downloading');
 
+        // Fenêtre de progression : une ligne par fichier AVANT le premier
+        // transfert (« En attente ») → progression globale N/M exacte et
+        // visibilité immédiate du lot (demande utilisateur).
+        var win = _dlWinOpen();
+        if (win) {
+            selected.forEach(function (it) {
+                var uid = it.id || it.upload_id || it._id;
+                if (uid) win.addFile(it.name || it.filename || '?', { uploadId: uid, sizeBytes: it.size });
+            });
+        }
+
         var done = 0;
         function next() {
             if (done >= selected.length) {
@@ -667,6 +721,8 @@ var WF_REMOTE_MAX_PAGES = 20;
                 m._remoteHasMore = true;
                 loadRemoteModels(m);
                 loadLocalModels(m, true);
+                // État final de la fenêtre : « Téléchargement terminé » + récap.
+                _dlWinDone();
                 return;
             }
             var item = selected[done];
@@ -1496,7 +1552,7 @@ var WF_REMOTE_MAX_PAGES = 20;
             div.addEventListener('dblclick', function () {
                 var uploadId = item.id || item.upload_id || item._id;
                 var destSubdir = destInput.value.trim() || getDefaultDestDir(item) || '';
-                downloadRemoteModel(m, uploadId, displayName, getEffectiveType(item), destSubdir);
+                downloadRemoteModel(m, uploadId, displayName, getEffectiveType(item), destSubdir, item.size);
             });
 
             list.appendChild(div);
@@ -1582,11 +1638,15 @@ var WF_REMOTE_MAX_PAGES = 20;
     }
 
     // ─── downloadRemoteModel ───────────────────────────────────────────────────
-    function downloadRemoteModel(m, uploadId, filename, fileType, destSubdir) {
+    function downloadRemoteModel(m, uploadId, filename, fileType, destSubdir, sizeBytes) {
         if (!uploadId) {
             aihShowAlert(t('dialog.error'), t('mb.missingRemoteId'), "error");
             return;
         }
+
+        // Fenêtre de progression dédiée (téléchargement unitaire).
+        _dlWinAdd(uploadId, filename, sizeBytes);
+        _dlWinStart(uploadId);
 
         var progressEl = showProgress(m, filename, { cancelable: true });
 
@@ -1600,11 +1660,15 @@ var WF_REMOTE_MAX_PAGES = 20;
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
                     if (data.conflict) {
-                        // Conflit détecté par le serveur
+                        // Conflit détecté par le serveur : la ligne de fenêtre
+                        // reste ouverte, la résolution (écraser/renommer/
+                        // conserver) la réglera.
                         updateProgress(progressEl, 50, t('mb.conflictResolve'));
                         return handleDownloadConflict(m, uploadId, filename, fileType, destSubdir, data, progressEl);
                     }
                     updateProgress(progressEl, 100, t('mb.downloadDone'));
+                    _dlWinSettle(uploadId, 'ok');
+                    _dlWinDone();
                     m._remotePage = 1;
                     m._remoteHasMore = true;
                     loadLocalModels(m, true);
@@ -1612,12 +1676,19 @@ var WF_REMOTE_MAX_PAGES = 20;
                 } else if (data.cancelled) {
                     // Annulation utilisateur : message dédié, pas « ❌ Erreur ».
                     updateProgress(progressEl, 0, t('mb.downloadCancelled'));
+                    _dlWinSettle(uploadId, 'cancelled');
+                    _dlWinDone();
                 } else {
-                    updateProgress(progressEl, 0, t('mb.errorPrefix') + (data.error || data.message || t('aih.unknown')));
+                    var errMsg = data.error || data.message || t('aih.unknown');
+                    updateProgress(progressEl, 0, t('mb.errorPrefix') + errMsg);
+                    _dlWinSettle(uploadId, 'failed', errMsg);
+                    _dlWinDone();
                 }
             })
             .catch(function (err) {
                 updateProgress(progressEl, 0, t('mb.errorPrefix') + err.message);
+                _dlWinSettle(uploadId, 'failed', err.message);
+                _dlWinDone();
             });
     }
 
@@ -1633,6 +1704,10 @@ var WF_REMOTE_MAX_PAGES = 20;
                         return retryDownload(m, uploadId, result.newName, fileType, destSubdir, 'suffix', progressEl);
                     } else {
                         updateProgress(progressEl, 0, t('mb.downloadCancelledConflict'));
+                        // Conserver le fichier local = pas de téléchargement →
+                        // ligne de fenêtre réglée en « annulé » (récap final).
+                        _dlWinSettle(uploadId, 'cancelled');
+                        _dlWinDone();
                     }
                 });
         } else {
@@ -1645,6 +1720,8 @@ var WF_REMOTE_MAX_PAGES = 20;
                     retryDownload(m, uploadId, filename, fileType, destSubdir, 'overwrite', progressEl);
                 } else {
                     updateProgress(progressEl, 0, t('mb.downloadCancelledConflict'));
+                    _dlWinSettle(uploadId, 'cancelled');
+                    _dlWinDone();
                 }
             });
         }
@@ -1660,11 +1737,17 @@ var WF_REMOTE_MAX_PAGES = 20;
             conflict_resolution: resolution,
         };
 
+        // Le transfert REDÉMARRE après résolution du conflit : la ligne de la
+        // fenêtre repasse en « Préparation côté serveur… » avec un chrono neuf.
+        _dlWinStart(uploadId);
+
         // Progression live + bouton d'annulation (voir _downloadRequest).
         _downloadRequest(body, progressEl)
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
                     updateProgress(progressEl, 100, t('mb.downloadDone'));
+                    _dlWinSettle(uploadId, 'ok');
+                    _dlWinDone();
                     m._remotePage = 1;
                     m._remoteHasMore = true;
                     loadLocalModels(m, true);
@@ -1672,12 +1755,19 @@ var WF_REMOTE_MAX_PAGES = 20;
                 } else if (data.cancelled) {
                     // Annulation utilisateur : message dédié, pas « ❌ Erreur ».
                     updateProgress(progressEl, 0, t('mb.downloadCancelled'));
+                    _dlWinSettle(uploadId, 'cancelled');
+                    _dlWinDone();
                 } else {
-                    updateProgress(progressEl, 0, t('mb.errorPrefix') + (data.error || data.message || t('aih.unknown')));
+                    var errMsg = data.error || data.message || t('aih.unknown');
+                    updateProgress(progressEl, 0, t('mb.errorPrefix') + errMsg);
+                    _dlWinSettle(uploadId, 'failed', errMsg);
+                    _dlWinDone();
                 }
             })
             .catch(function (err) {
                 updateProgress(progressEl, 0, t('mb.errorPrefix') + err.message);
+                _dlWinSettle(uploadId, 'failed', err.message);
+                _dlWinDone();
             });
     }
 
