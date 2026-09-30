@@ -194,6 +194,15 @@ import "./aih_i18n.js";
         "mb.dlwEta": "reste ~{eta}",
         "mb.dlwDoneTitle": "Téléchargement terminé",
         "mb.dlwRecap": "{ok} réussi(s) · {cancelled} annulé(s) · {failed} échec(s)",
+        "mb.dlwEmpty": "Aucun transfert en cours. Les téléchargements lancés depuis la liste distante apparaîtront ici.",
+
+        /* Point d'entrée permanent « Transferts » + multi-sélection */
+        "mb.transfers": "⬇️ Transferts",
+        "mb.transfersTitle": "Ouvrir la fenêtre des transferts en cours",
+        "mb.transfersBadgeTitle": "{count} transfert(s) en cours ou en file d'attente",
+        "mb.selectionCount": "{count} sélectionné(s)",
+        "mb.clearSelection": "Effacer la sélection",
+        "mb.selectAllRows": "Tout sélectionner",
 
         /* Workflow Share (aih_workflow_share.js) */
         "wf.title": "📤  Workflows",
@@ -1439,6 +1448,15 @@ import "./aih_i18n.js";
         "mb.dlwEta": "~{eta} left",
         "mb.dlwDoneTitle": "Download complete",
         "mb.dlwRecap": "{ok} succeeded · {cancelled} cancelled · {failed} failed",
+        "mb.dlwEmpty": "No transfer in progress. Downloads started from the remote list will appear here.",
+
+        /* Permanent “Transfers” entry point + multi-selection */
+        "mb.transfers": "⬇️ Transfers",
+        "mb.transfersTitle": "Open the in-progress transfers window",
+        "mb.transfersBadgeTitle": "{count} transfer(s) running or queued",
+        "mb.selectionCount": "{count} selected",
+        "mb.clearSelection": "Clear selection",
+        "mb.selectAllRows": "Select all",
 
         /* Workflow Share (aih_workflow_share.js) */
         "wf.title": "📤  Workflows",

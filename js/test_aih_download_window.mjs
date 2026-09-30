@@ -226,10 +226,11 @@ console.log("6. Lot de 2 fichiers");
     const cbs = document.querySelectorAll("#mb-remote-list .mb-checkbox");
     assert.strictEqual(cbs.length, 2, "cases de sélection présentes");
     cbs.forEach((cb) => {
-        cb.checked = true;
-        // Ctrl enfoncé = sélection MULTIPLE (sinon le dernier change décoche
-        // les autres : « sélection unique » par défaut).
-        cb.dispatchEvent(new window.MouseEvent("change", { bubbles: true, ctrlKey: true }));
+        // jsdom exécute l'action par défaut du clic : la case bascule.
+        // Ctrl enfoncé = sélection MULTIPLE. Les modifieurs sont lus sur le
+        // CLIC (vrai MouseEvent) : un évènement 'change' ne porte jamais
+        // ctrlKey/shiftKey dans un vrai navigateur (piège historique).
+        cb.dispatchEvent(new window.MouseEvent("click", { bubbles: true, ctrlKey: true }));
     });
 }
 document.querySelector(".mb-batch-download").click();

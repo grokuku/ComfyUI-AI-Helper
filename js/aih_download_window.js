@@ -17,11 +17,20 @@
  *     chiffré (réussis · annulés · échecs) et bouton Fermer.
  *
  * La fermeture de la fenêtre N'ANNULE RIEN : les transferts continuent côté
- * serveur (les lignes en ligne du Model Browser restent la trace locale) ;
- * seule la fenêtre peut être rouverte au prochain téléchargement.
+ * serveur (les lignes en ligne du Model Browser restent la trace locale).
+ * TANT QU'UN TRANSFERT EST ACTIF, le ✕ d'en-tête (ou Échap) est détourné vers
+ * un MASQUAGE (display:none) : l'état, le polling et les compteurs survivent, et
+ * le bouton « Transferts » du Model Browser (ou AIH.DownloadWindow.open())
+ * rouvre la MÊME fenêtre. Sans transfert actif, le ✕ ferme réellement.
  *
  * Dépendances : js/aih_dialog.js (AIH.Dialog), vendor HolafFetch, clés i18n
- * « mb.dlw* » (aih_strings.js). API exposée : window.AIH.DownloadWindow.open().
+ * « mb.dlw* » (aih_strings.js). API exposée :
+ *   window.AIH.DownloadWindow.open()        ouvre ou rouvre (démasque)
+ *   window.AIH.DownloadWindow.dismiss()     masque si actif, sinon ferme
+ *   window.AIH.DownloadWindow.activeCount() transferts en cours + en attente
+ *   window.AIH.DownloadWindow.isVisible()   fenêtre présente et non masquée
+ *   window.AIH.DownloadWindow.isOpen()      fenêtre vivante (même masquée)
+ *   window.AIH.DownloadWindow.onChange(cb)  abonnement au compteur (badge)
  */
 
 import "./aih_dialog.js";
@@ -39,6 +48,16 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
     var WINDOW_ID = "aih-download-window";
     var POLL_MS = 800; // même cadence que la progression en ligne du Model Browser
+
+    // Abonnés au NOMBRE de transferts en cours + en file d'attente (badge du
+    // Model Browser). Module-level : survit à la (re)création de la fenêtre.
+    var _changeListeners = [];
+    function _notify(count) {
+        count = Math.max(0, count | 0);
+        for (var i = 0; i < _changeListeners.length; i++) {
+            try { _changeListeners[i](count); } catch (e) { /* silencieux */ }
+        }
+    }
 
     // ─── Formatage ──────────────────────────────────────────────────────────
     function fmtBytes(bytes) {
@@ -72,6 +91,7 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             ".aih-dlw-globalbar { height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden; }",
             ".aih-dlw-globalfill { height: 100%; width: 0%; background: var(--aih-accent, #D8700D); transition: width 0.3s ease; }",
             ".aih-dlw-rows { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; max-height: 52vh; overflow-y: auto; }",
+            ".aih-dlw-empty { margin-top: 12px; padding: 14px; text-align: center; color: #888; font-size: 12px; border: 1px dashed #444; border-radius: 6px; }",
             ".aih-dlw-row { padding: 7px 9px; border-radius: 6px; background: #2a2a2e; display: flex; flex-direction: column; gap: 4px; }",
             ".aih-dlw-row.is-ok { background: rgba(22,163,74,0.15); }",
             ".aih-dlw-row.is-cancelled { background: rgba(107,114,128,0.18); opacity: 0.85; }",
@@ -180,8 +200,10 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             failed: 0,
             done: false,
             closed: false,
+            masked: false,       // fenêtre masquée (transferts encore actifs)
             dlg: null,
         };
+        var _escHandler = null;
 
         var els = {};
         var root = document.createElement("div");
@@ -204,6 +226,11 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         els.rows = document.createElement("div");
         els.rows.className = "aih-dlw-rows";
         root.appendChild(els.rows);
+
+        els.empty = document.createElement("div");
+        els.empty.className = "aih-dlw-empty";
+        els.empty.textContent = t("mb.dlwEmpty");
+        root.appendChild(els.empty);
 
         els.final = document.createElement("div");
         els.final.className = "aih-dlw-final";
@@ -235,11 +262,13 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             resizable: true,
             draggable: true,
             content: root,
-            onClose: function () {
-                state.closed = true;
-                stopAllPolls();
-            },
+            // Escape n'est PAS délégué au noyau : tant qu'un transfert est
+            // actif, fermer doit MASQUER (le suivi ne doit pas être perdu).
+            closeOnEscape: false,
+            onClose: _onDialogClosed,
         });
+
+        _installDismissHandlers();
 
         // ── Helpers d'état ──────────────────────────────────────────────────
         function _updateGlobal() {
@@ -248,6 +277,82 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             });
             var pct = state.total > 0 ? Math.round((state.finished * 100) / state.total) : 0;
             els.globalFill.style.width = pct + "%";
+            if (els.empty) {
+                els.empty.style.display = (state.total === 0 && !state.done) ? "" : "none";
+            }
+            // Badge permanent du Model Browser : nombre de transferts en
+            // cours + en file d'attente (jamais les lignes réglées).
+            _notify(state.total - state.finished);
+        }
+
+        // ── Fermeture / masquage ────────────────────────────────────────────
+        // Tant qu'il reste une ligne NON réglée, le ✕ (en-tête, Escape) MASQUE
+        // la fenêtre au lieu de la détruire : la progression continue d'être
+        // suivie et le bouton « Transferts » la rouvre. Sans transfert actif,
+        // le ✕ ferme réellement (comportement historique).
+        function _hasActive() {
+            return state.total > state.finished;
+        }
+
+        function hide() {
+            if (state.closed || state.masked) return;
+            state.masked = true;
+            if (state.dlg && state.dlg.el) state.dlg.el.style.display = "none";
+            _notify(state.total - state.finished);
+        }
+
+        function show() {
+            if (state.closed) return;
+            if (state.masked) {
+                state.masked = false;
+                if (state.dlg && state.dlg.el) state.dlg.el.style.display = "";
+            }
+            if (state.dlg && typeof state.dlg.bringToFront === "function") {
+                try { state.dlg.bringToFront(); } catch (e) { /* silencieux */ }
+            }
+        }
+
+        function dismiss() {
+            if (_hasActive()) hide();
+            else close();
+        }
+
+        function _onDialogClosed() {
+            state.closed = true;
+            state.masked = false;
+            stopAllPolls();
+            if (_escHandler) {
+                document.removeEventListener("keydown", _escHandler, true);
+                _escHandler = null;
+            }
+            _notify(0);
+        }
+
+        function _installDismissHandlers() {
+            var el = state.dlg && state.dlg.el;
+            if (!el) return;
+            // Le noyau câble son propre ✕ sur .aih-dialog-close : on remplace le
+            // bouton (clone = écouteurs retirés) pour rediriger vers dismiss().
+            var closeIcon = el.querySelector(".aih-dialog-close");
+            if (closeIcon && closeIcon.parentNode) {
+                var replacement = closeIcon.cloneNode(true);
+                closeIcon.parentNode.replaceChild(replacement, closeIcon);
+                replacement.addEventListener("click", function (e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    dismiss();
+                });
+            }
+            // Escape : capture pour intercepter avant tout autre gestionnaire.
+            _escHandler = function (e) {
+                if (state.closed || e.key !== "Escape") return;
+                if (state.masked) return; // déjà masquée : laisser passer
+                if (!el || el.style.display === "none") return;
+                e.preventDefault();
+                e.stopPropagation();
+                dismiss();
+            };
+            document.addEventListener("keydown", _escHandler, true);
         }
 
         function _setPhase(h, phase) {
@@ -439,9 +544,8 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
         }
 
         function close() {
-            state.closed = true;
             stopAllPolls();
-            state.dlg.close();
+            state.dlg.close(); // onClose (_onDialogClosed) finalise l'état.
         }
 
         return {
@@ -451,19 +555,65 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             done: done,
             stats: stats,
             close: close,
+            hide: hide,
+            show: show,
+            dismiss: dismiss,
             isOpen: function () { return !state.closed; },
+            isVisible: function () { return !state.closed && !state.masked; },
+            pending: function () { return Math.max(0, state.total - state.finished); },
+            hasActive: _hasActive,
             el: state.dlg.el,
         };
     }
 
     // ─── Singleton : une seule fenêtre, réutilisée d'un download à l'autre ──
+    // La fenêtre SURVIT à un masquage (transferts actifs) : `open()` la
+    // redonne visible. Elle n'est réellement détruite que sur un ✕/Escape sans
+    // transfert en cours ou via le bouton « Fermer » de l'état final.
     var current = null;
 
     function open() {
-        if (current && current.isOpen()) return current;
+        if (current && current.isOpen()) {
+            current.show();
+            return current;
+        }
         current = _createWindow();
         return current;
     }
 
-    AIH.DownloadWindow = { open: open };
+    function activeCount() {
+        return current && current.isOpen() ? current.pending() : 0;
+    }
+
+    function isVisible() {
+        return !!(current && current.isOpen() && current.isVisible());
+    }
+
+    function isOpen() {
+        return !!(current && current.isOpen());
+    }
+
+    AIH.DownloadWindow = {
+        open: open,
+        // Masque la fenêtre si des transferts sont actifs, sinon la ferme.
+        dismiss: function () {
+            if (current && current.isOpen()) current.dismiss();
+        },
+        hide: function () {
+            if (current && current.isOpen()) current.hide();
+        },
+        activeCount: activeCount,
+        isVisible: isVisible,
+        isOpen: isOpen,
+        // Abonnement au compteur (badge). Renvoie une fonction de désabonnement.
+        onChange: function (cb) {
+            if (typeof cb !== "function") return function () {};
+            _changeListeners.push(cb);
+            try { cb(activeCount()); } catch (e) { /* silencieux */ }
+            return function () {
+                var i = _changeListeners.indexOf(cb);
+                if (i >= 0) _changeListeners.splice(i, 1);
+            };
+        },
+    };
 })();

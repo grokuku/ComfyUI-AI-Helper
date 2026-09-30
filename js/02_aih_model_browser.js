@@ -6,6 +6,16 @@
  *
  * Fonctions exportées sur window :
  *   - openModelBrowser()    → ouvre la fenêtre Model Browser
+ *
+ * Multi-sélection : clic simple = sélection unique ; Ctrl/Cmd+clic =
+ * ajouter/retirer ; Maj+clic = plage ; case « tout sélectionner » par panneau
+ * (sur le résultat filtré) ; barre « N sélectionné(s) » + lot + effacement.
+ * Les modifieurs sont lus sur le CLIC (jamais sur 'change', qui ne les porte
+ * pas dans un navigateur réel).
+ *
+ * Transferts : bouton permanent « Transferts » (badge = transferts en cours +
+ * en attente) ; le double-clic d'une ligne DISTANTE télécharge et ouvre la
+ * fenêtre (js/aih_download_window.js), délégué sur le conteneur de liste.
  */
 
 import "./aih_dialog.js";
@@ -230,6 +240,20 @@ var WF_REMOTE_MAX_PAGES = 20;
             ".mb-batch-btn:disabled { opacity: 0.4; cursor: default; }",
             ".mb-batch-upload { background: var(--aih-accent, #D8700D); color: #fff; }",
             ".mb-batch-download { background: #22c55e; color: #fff; }",
+            /* Barre d'outils + point d'entrée permanent « Transferts » */
+            ".mb-toolbar { display: flex; align-items: center; gap: 8px; padding: 2px 0 6px; flex-shrink: 0; }",
+            ".mb-transfers-btn { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 6px; border: 1px solid #444; background: #1e1e22; color: #ddd; font-size: 11px; font-weight: 600; cursor: pointer; transition: border-color 0.15s, background 0.15s; }",
+            ".mb-transfers-btn:hover { border-color: var(--aih-accent, #D8700D); background: #2a2a2e; }",
+            ".mb-transfers-badge { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--aih-accent, #D8700D); color: #fff; font-size: 10px; font-weight: 700; line-height: 18px; text-align: center; }",
+            ".mb-transfers-badge.is-empty { background: #444; color: #999; }",
+            /* Sélection : barre de compteur + effacement */
+            ".mb-selection-bar { display: flex; align-items: center; gap: 8px; padding: 6px 0 0; flex-shrink: 0; }",
+            ".mb-selection-count { font-size: 10px; color: #9ca3af; white-space: nowrap; }",
+            ".mb-clear-selection { padding: 5px 10px; border-radius: 6px; border: 1px solid #444; background: transparent; color: #bbb; font-size: 10px; cursor: pointer; }",
+            ".mb-clear-selection:hover { border-color: #f87171; color: #f87171; }",
+            ".mb-clear-selection:disabled { opacity: 0.4; cursor: default; }",
+            ".mb-select-all-row { display: inline-flex; align-items: center; gap: 4px; font-weight: 400; color: #888; font-size: 10px; cursor: pointer; user-select: none; margin-left: 8px; }",
+            ".mb-select-all-row input { accent-color: var(--aih-accent, #D8700D); }",
             /* Destination input — toujours visible, 80px */
             ".mb-dest-input { width: 80px; padding: 2px 4px; border-radius: 3px; border: 1px solid #555; background: #1e1e22; color: #ccc; font-size: 10px; outline: none; flex-shrink: 0; }",
             ".mb-dest-input:focus { border-color: var(--aih-accent, #D8700D); }",
@@ -516,16 +540,67 @@ var WF_REMOTE_MAX_PAGES = 20;
         });
     }
 
-    // ─── Helpers multi-sélection ───────────────────────────────────────────────
-    function getSelected(items) {
-        return items.filter(function (i) { return i._selected; });
+    // ─── Helpers multi-sélection (source de vérité = cases cochées du DOM) ─────
+    // La sélection vit dans le DOM : elle reste correcte après un re-render,
+    // un changement de filtre ou une pagination (aucun état fantôme possible
+    // dans les listes complètes, contrairement à un flag sur les items).
+    function getSelectedItems(list) {
+        if (!list) return [];
+        var rows = list.querySelectorAll('.mb-item');
+        var out = [];
+        for (var i = 0; i < rows.length; i++) {
+            var cb = rows[i].querySelector('.mb-checkbox');
+            if (cb && cb.checked && rows[i]._aihItem) out.push(rows[i]._aihItem);
+        }
+        return out;
+    }
+
+    function _countChecked(list) {
+        return getSelectedItems(list).length;
+    }
+
+    function _setRowChecked(row, selected, items) {
+        if (!row) return;
+        var cb = row.querySelector('.mb-checkbox');
+        if (cb) cb.checked = !!selected;
+        var idx = parseInt(row.dataset.index, 10);
+        if (!isNaN(idx) && items && items[idx]) items[idx]._selected = !!selected;
+        row.classList.toggle('selected', !!selected);
+    }
+
+    function clearSelection(list, m) {
+        if (!list) return;
+        var rows = list.querySelectorAll('.mb-item');
+        for (var i = 0; i < rows.length; i++) {
+            _setRowChecked(rows[i], false, null);
+            if (rows[i]._aihItem) rows[i]._aihItem._selected = false;
+        }
+        if (m) {
+            if (list === m._localList) m._lastCheckedLocal = -1;
+            else m._lastCheckedRemote = -1;
+            updateBatchButtons(m);
+        }
+    }
+
+    function setAllRows(m, list, items, state) {
+        if (!list) return;
+        var rows = list.querySelectorAll('.mb-item');
+        for (var i = 0; i < rows.length; i++) {
+            var cb = rows[i].querySelector('.mb-checkbox');
+            if (cb) cb.checked = !!state;
+            var it = rows[i]._aihItem;
+            if (it) it._selected = !!state;
+            rows[i].classList.toggle('selected', !!state);
+        }
+        if (m) updateBatchButtons(m);
     }
 
     function updateBatchButtons(m) {
-        var localSel = getSelected(m._localItems || []).length;
-        var remoteSel = getSelected(m._remoteItems || []).length;
-        var localBtn = m.modal ? m.modal.querySelector('.mb-batch-upload') : null;
-        var remoteBtn = m.modal ? m.modal.querySelector('.mb-batch-download') : null;
+        if (!m || !m.modal) return;
+        var localSel = _countChecked(m._localList);
+        var remoteSel = _countChecked(m._remoteList);
+        var localBtn = m.modal.querySelector('.mb-batch-upload');
+        var remoteBtn = m.modal.querySelector('.mb-batch-download');
         if (localBtn) {
             localBtn.disabled = localSel === 0;
             localBtn.textContent = t('mb.uploadSelected', { count: localSel });
@@ -534,18 +609,89 @@ var WF_REMOTE_MAX_PAGES = 20;
             remoteBtn.disabled = remoteSel === 0;
             remoteBtn.textContent = t('mb.downloadSelected', { count: remoteSel });
         }
+        var lc = m.modal.querySelector('.mb-selection-count[data-scope="local"]');
+        if (lc) lc.textContent = t('mb.selectionCount', { count: localSel });
+        var rc = m.modal.querySelector('.mb-selection-count[data-scope="remote"]');
+        if (rc) rc.textContent = t('mb.selectionCount', { count: remoteSel });
+        var lb = m.modal.querySelector('.mb-clear-selection[data-scope="local"]');
+        if (lb) lb.disabled = localSel === 0;
+        var rb = m.modal.querySelector('.mb-clear-selection[data-scope="remote"]');
+        if (rb) rb.disabled = remoteSel === 0;
+        _syncSelectAll(m, m._localList, 'local');
+        _syncSelectAll(m, m._remoteList, 'remote');
     }
 
-    function toggleItemSelect(checkbox, selected, items) {
-        if (!checkbox) return;
-        var itemEl = checkbox.closest ? checkbox.closest('.mb-item') : null;
-        if (!itemEl) itemEl = checkbox;
-        if (!itemEl) return;
-        var idx = parseInt(itemEl.dataset.index);
-        if (!isNaN(idx) && items && items[idx]) {
-            items[idx]._selected = selected;
+    function _syncSelectAll(m, list, scope) {
+        var rows = list ? list.querySelectorAll('.mb-item') : [];
+        var total = rows.length;
+        var checked = _countChecked(list);
+        var box = m.modal.querySelector('.mb-select-all-row[data-scope="' + scope + '"] .mb-select-all-cb');
+        if (!box) return;
+        box.checked = total > 0 && checked === total;
+        box.indeterminate = checked > 0 && checked < total;
+    }
+
+    // Sélection par clic : Ctrl/Cmd = ajouter/retirer, Maj = plage, clic simple
+    // = sélection unique. Les modifieurs sont lus sur l'évènement SOURIS (click) :
+    // dans un vrai navigateur, un évènement 'change' de case à cocher ne porte
+    // PAS shiftKey/ctrlKey (undefined) — cause du multi-sélection impossible
+    // (chaque case décochait les autres, même avec Ctrl enfoncé).
+    function _selectionClick(e, row, list, items, m) {
+        var cb = row.querySelector('.mb-checkbox');
+        if (!cb) return;
+        var allRows = Array.prototype.slice.call(list.querySelectorAll('.mb-item'));
+        var domIdx = allRows.indexOf(row);
+        if (domIdx < 0) return;
+        var isShift = !!e.shiftKey;
+        var isCtrl = !!(e.ctrlKey || e.metaKey);
+        var clickedCheckbox = (e.target === cb);
+        var globalIdx = parseInt(row.dataset.index, 10);
+        if (isNaN(globalIdx)) globalIdx = domIdx;
+        var anchorKey = (list === m._localList) ? '_lastCheckedLocal' : '_lastCheckedRemote';
+        var anchor = (typeof m[anchorKey] === 'number') ? m[anchorKey] : -1;
+
+        function rowAt(g) { return list.querySelector('.mb-item[data-index="' + g + '"]'); }
+
+        if (isShift && anchor >= 0) {
+            var anchorRow = rowAt(anchor) || allRows[anchor];
+            var anchorCb = anchorRow ? anchorRow.querySelector('.mb-checkbox') : null;
+            var fill = anchorCb ? anchorCb.checked : true;
+            var s = Math.min(anchor, globalIdx);
+            var en = Math.max(anchor, globalIdx);
+            for (var g = s; g <= en; g++) {
+                var rEl = rowAt(g);
+                if (rEl) _setRowChecked(rEl, fill, items);
+            }
+        } else if (isCtrl) {
+            _setRowChecked(row, clickedCheckbox ? cb.checked : !cb.checked, items);
+            m[anchorKey] = globalIdx;
+        } else {
+            allRows.forEach(function (rEl) {
+                _setRowChecked(rEl, rEl === row, items);
+            });
+            m[anchorKey] = globalIdx;
         }
-        itemEl.classList.toggle('selected', selected);
+        updateBatchButtons(m);
+    }
+
+    // Double-clic délégué sur la liste : ligne → action (download distant,
+    // upload local). Ignore les contrôles interactifs (case, champ, bouton).
+    function _onListDblClick(e, m, isRemote) {
+        var row = e.target && e.target.closest ? e.target.closest('.mb-item') : null;
+        if (!row) return;
+        if (e.target.closest && e.target.closest('input, button, select, textarea, a')) return;
+        var item = row._aihItem;
+        if (!item) return;
+        if (isRemote) {
+            var uploadId = item.id || item.upload_id || item._id;
+            var destInput = row.querySelector('.mb-dest-input');
+            var destSubdir = (destInput && destInput.value.trim()) || getDefaultDestDir(item) || '';
+            downloadRemoteModel(m, uploadId, item.name || item.filename || '?',
+                getEffectiveType(item), destSubdir, item.size);
+        } else {
+            uploadLocalModel(m, item.path || item.filepath, getEffectiveType(item),
+                item.name || item.filename);
+        }
     }
 
     // ─── uploadFile (promise-based, pour batch) ────────────────────────────────
@@ -651,7 +797,7 @@ var WF_REMOTE_MAX_PAGES = 20;
 
     // ─── batchUpload ────────────────────────────────────────────────────────────
     function batchUpload(m) {
-        var selected = getSelected(m._localItems || []);
+        var selected = getSelectedItems(m._localList);
         if (selected.length === 0) return;
         var btn = m.modal.querySelector('.mb-batch-upload');
         if (!btn) return;
@@ -667,7 +813,7 @@ var WF_REMOTE_MAX_PAGES = 20;
                     btn.disabled = true;
                 }, 2000);
                 // Désélectionner tout
-                selected.forEach(function (i) { i._selected = false; });
+                clearSelection(m._localList, m);
                 m._remotePage = 1;
                 m._remoteHasMore = true;
                 loadRemoteModels(m);
@@ -689,7 +835,7 @@ var WF_REMOTE_MAX_PAGES = 20;
 
     // ─── batchDownload ──────────────────────────────────────────────────────────
     function batchDownload(m) {
-        var selected = getSelected(m._remoteItems || []);
+        var selected = getSelectedItems(m._remoteList);
         if (selected.length === 0) return;
         var btn = m.modal.querySelector('.mb-batch-download');
         if (!btn) return;
@@ -716,7 +862,7 @@ var WF_REMOTE_MAX_PAGES = 20;
                     btn.disabled = true;
                 }, 2000);
                 // Désélectionner tout
-                selected.forEach(function (i) { i._selected = false; });
+                clearSelection(m._remoteList, m);
                 m._remotePage = 1;
                 m._remoteHasMore = true;
                 loadRemoteModels(m);
@@ -774,6 +920,7 @@ var WF_REMOTE_MAX_PAGES = 20;
 
         _mbInjectCSS();
 
+        var _mRef = { controller: null };
         var m = aihOpenModalV2({
             id: "aih-modal-model-browser",
             title: t("mb.title"),
@@ -785,7 +932,17 @@ var WF_REMOTE_MAX_PAGES = 20;
             persistSize: true,
             persistPos: true,
             className: "aih-model-browser",
+            // Désabonne le badge du compteur de transferts quand la fenêtre est
+            // fermée (aucune fuite d'abonné d'une ouverture à l'autre).
+            onClose: function () {
+                var c = _mRef.controller;
+                if (c && typeof c._transfersUnsub === "function") {
+                    try { c._transfersUnsub(); } catch (e) { /* silencieux */ }
+                    c._transfersUnsub = null;
+                }
+            },
         });
+        _mRef.controller = m;
         renderModelBrowser(m);
 
     };
@@ -798,20 +955,34 @@ var WF_REMOTE_MAX_PAGES = 20;
 
         m.body.innerHTML = "" +
             '<div class="mb-filters" id="mb-filters"></div>' +
+            '<div class="mb-toolbar" id="mb-toolbar">' +
+            '  <button type="button" class="mb-transfers-btn" title="' + t('mb.transfersTitle') + '">' +
+            '    <span class="mb-transfers-label">' + t('mb.transfers') + '</span>' +
+            '    <span class="mb-transfers-badge is-empty">0</span>' +
+            '  </button>' +
+            '</div>' +
             '<div class="mb-panels" id="mb-panels">' +
             '  <div class="mb-panel mb-panel-local">' +
-            '    <div class="mb-panel-header">' + t('mb.panelLocal') + '</div>' +
+            '    <div class="mb-panel-header">' + t('mb.panelLocal') +
+            '      <label class="mb-select-all-row" data-scope="local"><input type="checkbox" class="mb-select-all-cb"> ' + t('mb.selectAllRows') + '</label>' +
+            '    </div>' +
             '    <div class="mb-panel-list" id="mb-local-list"></div>' +
             '    <div class="mb-panel-footer mb-panel-footer-local">' +
+            '      <span class="mb-selection-count" data-scope="local">' + t('mb.selectionCount', { count: 0 }) + '</span>' +
             '      <button class="mb-batch-btn mb-batch-upload" disabled>' + t('mb.uploadSelected', { count: 0 }) + '</button>' +
+            '      <button type="button" class="mb-clear-selection" data-scope="local" disabled>' + t('mb.clearSelection') + '</button>' +
             '    </div>' +
             '  </div>' +
             '  <div class="mb-divider"></div>' +
             '  <div class="mb-panel mb-panel-remote">' +
-            '    <div class="mb-panel-header">' + t('mb.panelRemote') + '</div>' +
+            '    <div class="mb-panel-header">' + t('mb.panelRemote') +
+            '      <label class="mb-select-all-row" data-scope="remote"><input type="checkbox" class="mb-select-all-cb"> ' + t('mb.selectAllRows') + '</label>' +
+            '    </div>' +
             '    <div class="mb-panel-list" id="mb-remote-list"></div>' +
             '    <div class="mb-panel-footer mb-panel-footer-remote">' +
+            '      <span class="mb-selection-count" data-scope="remote">' + t('mb.selectionCount', { count: 0 }) + '</span>' +
             '      <button class="mb-batch-btn mb-batch-download" disabled>' + t('mb.downloadSelected', { count: 0 }) + '</button>' +
+            '      <button type="button" class="mb-clear-selection" data-scope="remote" disabled>' + t('mb.clearSelection') + '</button>' +
             '    </div>' +
             '  </div>' +
             '</div>' +
@@ -892,6 +1063,57 @@ var WF_REMOTE_MAX_PAGES = 20;
             batchDownloadBtn.addEventListener('click', function () {
                 batchDownload(m);
             });
+        }
+
+        // Point d'entrée PERMANENT « Transferts » : ouvre (ou rouvre) la
+        // fenêtre de progression à tout moment, même après un masquage.
+        var transfersBtn = m.modal.querySelector('.mb-transfers-btn');
+        if (transfersBtn) {
+            transfersBtn.addEventListener('click', function () {
+                if (window.AIH && window.AIH.DownloadWindow) window.AIH.DownloadWindow.open();
+            });
+        }
+
+        // Badge : reflète en continu le nombre de transferts en cours + en file.
+        m._transfersUnsub = null;
+        if (window.AIH && window.AIH.DownloadWindow && typeof window.AIH.DownloadWindow.onChange === 'function') {
+            var badgeEl = m.modal.querySelector('.mb-transfers-badge');
+            m._transfersUnsub = window.AIH.DownloadWindow.onChange(function (count) {
+                if (!badgeEl || !badgeEl.isConnected) return;
+                badgeEl.textContent = String(count);
+                badgeEl.classList.toggle('is-empty', count === 0);
+                badgeEl.title = t('mb.transfersBadgeTitle', { count: count });
+            });
+        }
+
+        // Effacer la sélection par panneau.
+        m.modal.querySelectorAll('.mb-clear-selection').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var scope = btn.dataset.scope;
+                clearSelection(scope === 'local' ? m._localList : m._remoteList, m);
+            });
+        });
+
+        // Case « tout sélectionner » sur le résultat filtré, par panneau.
+        m.modal.querySelectorAll('.mb-select-all-row').forEach(function (label) {
+            var box = label.querySelector('.mb-select-all-cb');
+            if (!box) return;
+            box.addEventListener('change', function () {
+                var scope = label.dataset.scope;
+                setAllRows(m, scope === 'local' ? m._localList : m._remoteList,
+                    scope === 'local' ? m._localItems : m._remoteItems, box.checked);
+            });
+        });
+
+        // DELÉGATION du double-clic sur les listes : le handler survit à tout
+        // re-render (auth/me, changement de filtre, pagination) sans re-câblage
+        // par ligne — cause possible d'un double-clic muet si une ligne était
+        // remplacée sans son binding.
+        if (m._localList) {
+            m._localList.addEventListener('dblclick', function (e) { _onListDblClick(e, m, false); });
+        }
+        if (m._remoteList) {
+            m._remoteList.addEventListener('dblclick', function (e) { _onListDblClick(e, m, true); });
         }
 
     }
@@ -1168,6 +1390,7 @@ var WF_REMOTE_MAX_PAGES = 20;
         if (!items || items.length === 0) {
             list.innerHTML = '<div class="mb-empty">' + t(_emptyFilteredKey(m, 'mb.noLocal')) + '</div>';
             updateWorkflowSummary(m);
+            updateBatchButtons(m);
             return;
         }
 
@@ -1181,50 +1404,30 @@ var WF_REMOTE_MAX_PAGES = 20;
             }
         }
 
-        // Variable pour le Shift+Click
-        if (typeof m._lastCheckedIndex === 'undefined') m._lastCheckedIndex = -1;
+        // Ancrage Shift+Click propre à CE panneau (local ≠ distant).
+        if (typeof m._lastCheckedLocal !== 'number') m._lastCheckedLocal = -1;
 
         items.forEach(function (item, idx) {
             var div = document.createElement('div');
             div.className = 'mb-item';
             div.dataset.index = idx;
-            item._selected = false;
+            div._aihItem = item;
 
-            // ── Checkbox + multi-sélection (shift, ctrl) ──
+            // ── Checkbox + multi-sélection (clic, Ctrl/Cmd, Maj) ──
             var cb = document.createElement('input');
             cb.type = 'checkbox';
             cb.className = 'mb-checkbox';
-            cb.addEventListener('change', function (e) {
-                var isShift = e.shiftKey;
-                var isCtrl = e.ctrlKey || e.metaKey;
-                var allCbs = list.querySelectorAll('.mb-checkbox');
-                var currentIdx = Array.prototype.indexOf.call(allCbs, this);
-
-                if (isShift && m._lastCheckedIndex >= 0) {
-                    // Shift+Click : sélection par plage
-                    var start = Math.min(m._lastCheckedIndex, currentIdx);
-                    var end = Math.max(m._lastCheckedIndex, currentIdx);
-                    for (var si = start; si <= end; si++) {
-                        allCbs[si].checked = this.checked;
-                        toggleItemSelect(allCbs[si], this.checked, items);
-                    }
-                } else if (!isCtrl) {
-                    // Click normal sans modifieur : sélection unique
-                    allCbs.forEach(function (c, i) {
-                        var checked = (i === currentIdx) ? this.checked : false;
-                        c.checked = checked;
-                        toggleItemSelect(c, checked, items);
-                    }, this);
-                } else {
-                    // Ctrl+Click : toggle uniquement celui-ci
-                    toggleItemSelect(this, this.checked, items);
-                }
-
-                m._lastCheckedIndex = currentIdx;
-                updateBatchButtons(m);
+            cb.addEventListener('click', function (e) {
+                _selectionClick(e, div, list, items, m);
                 e.stopPropagation();
             });
             div.appendChild(cb);
+
+            // ── Clic sur la ligne → sélection (Ctrl/Cmd = toggle, Maj = plage) ──
+            div.addEventListener('click', function (e) {
+                if (e.target && e.target.closest && e.target.closest('input, button, select, textarea, a')) return;
+                _selectionClick(e, div, list, items, m);
+            });
 
             // ── Badge type ──
             var typeInfo = getTypeInfo(getEffectiveType(item));
@@ -1306,15 +1509,13 @@ var WF_REMOTE_MAX_PAGES = 20;
                 div.appendChild(check);
             }
 
-            // ── Double-clic → upload direct ──
-            div.addEventListener('dblclick', function () {
-                uploadLocalModel(m, item.path || item.filepath, getEffectiveType(item), item.name || item.filename);
-            });
+            // ── Double-clic → upload direct (délégué sur la liste) ──
 
             list.appendChild(div);
         });
 
         updateWorkflowSummary(m);
+        updateBatchButtons(m);
     }
 
     // ─── renderRemotePanel ─────────────────────────────────────────────────────
@@ -1366,60 +1567,35 @@ var WF_REMOTE_MAX_PAGES = 20;
         if (displayItems.length === 0 && page === 1 && !m._remoteHasMore) {
             list.innerHTML = '<div class="mb-empty">' + t(_emptyFilteredKey(m, 'mb.noRemote')) + '</div>';
             updateWorkflowSummary(m);
+            updateBatchButtons(m);
             return;
         }
 
-        // Variable pour le Shift+Click
-        if (typeof m._lastCheckedIndex === 'undefined') m._lastCheckedIndex = -1;
+        // Ancrage Shift+Click propre à CE panneau (local ≠ distant).
+        if (typeof m._lastCheckedRemote !== 'number') m._lastCheckedRemote = -1;
 
         displayItems.forEach(function (item, idx) {
             var globalIdx = globalOffset + idx;
             var div = document.createElement('div');
             div.className = 'mb-item';
             div.dataset.index = globalIdx;
-            item._selected = false;
+            div._aihItem = item;
 
-            // ── Checkbox + multi-sélection (shift, ctrl) ──
+            // ── Checkbox + multi-sélection (clic, Ctrl/Cmd, Maj) ──
             var cb = document.createElement('input');
             cb.type = 'checkbox';
             cb.className = 'mb-checkbox';
-            cb.addEventListener('change', function (e) {
-                var isShift = e.shiftKey;
-                var isCtrl = e.ctrlKey || e.metaKey;
-                var allCbs = list.querySelectorAll('.mb-checkbox');
-                var currentIdx = Array.prototype.indexOf.call(allCbs, this);
-                var currentGlobalIdx = globalOffset + currentIdx;
-                var remoteAll = m._remoteItems || [];
-
-                if (isShift && m._lastCheckedIndex >= 0) {
-                    // Shift+Click : sélection par plage
-                    var start = Math.min(m._lastCheckedIndex, currentGlobalIdx);
-                    var end = Math.max(m._lastCheckedIndex, currentGlobalIdx);
-                    for (var si = start; si <= end; si++) {
-                        var sEl = list.querySelector('.mb-item[data-index="' + si + '"]');
-                        if (sEl) {
-                            var sCb = sEl.querySelector('.mb-checkbox');
-                            if (sCb) sCb.checked = this.checked;
-                            toggleItemSelect(sCb || sEl, this.checked, remoteAll);
-                        }
-                    }
-                } else if (!isCtrl) {
-                    // Click normal sans modifieur : sélection unique
-                    allCbs.forEach(function (c, i) {
-                        var checked = (i === currentIdx) ? this.checked : false;
-                        c.checked = checked;
-                        toggleItemSelect(c, checked, remoteAll);
-                    }, this);
-                } else {
-                    // Ctrl+Click : toggle uniquement celui-ci
-                    toggleItemSelect(this, this.checked, remoteAll);
-                }
-
-                m._lastCheckedIndex = currentGlobalIdx;
-                updateBatchButtons(m);
+            cb.addEventListener('click', function (e) {
+                _selectionClick(e, div, list, m._remoteItems || [], m);
                 e.stopPropagation();
             });
             div.appendChild(cb);
+
+            // ── Clic sur la ligne → sélection (Ctrl/Cmd = toggle, Maj = plage) ──
+            div.addEventListener('click', function (e) {
+                if (e.target && e.target.closest && e.target.closest('input, button, select, textarea, a')) return;
+                _selectionClick(e, div, list, m._remoteItems || [], m);
+            });
 
             // ── Badge type ──
             var typeInfo = getTypeInfo(getEffectiveType(item));
@@ -1548,12 +1724,7 @@ var WF_REMOTE_MAX_PAGES = 20;
                 div.appendChild(delBtn);
             }
 
-            // ── Double-clic → download direct ──
-            div.addEventListener('dblclick', function () {
-                var uploadId = item.id || item.upload_id || item._id;
-                var destSubdir = destInput.value.trim() || getDefaultDestDir(item) || '';
-                downloadRemoteModel(m, uploadId, displayName, getEffectiveType(item), destSubdir, item.size);
-            });
+            // ── Double-clic → download direct (délégué sur la liste) ──
 
             list.appendChild(div);
         });
@@ -1569,6 +1740,7 @@ var WF_REMOTE_MAX_PAGES = 20;
         }
 
         updateWorkflowSummary(m);
+        updateBatchButtons(m);
     }
 
     // ─── getEffectiveType ───────────────────────────────────────────────────────
