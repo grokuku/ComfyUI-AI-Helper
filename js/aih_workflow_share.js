@@ -79,7 +79,11 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
       // Mettre a jour le temps ecoule pour les uploads en cours
       for (var fn in rows) {
         var r = rows[fn];
-        if (r.status.textContent === "⏳") {
+        // Les lignes pilotées par le polling (/upload/progress) affichent le
+        // débit RÉEL mesuré côté serveur : ne pas l'écraser par une moyenne
+        // locale taille/durée (absurde tant que tout le fichier n'est pas
+        // transmis, ex. « 449 MB/s » pour un 13 Go encore en vol).
+        if (r.status.textContent === "⏳" && !r.pollInterval) {
           var elapsed = ((Date.now() - r.startTime) / 1000).toFixed(1);
           var mbps = (r.sizeBytes / 1048576 / elapsed).toFixed(1); r.speedEl.textContent = mbps + " MB/s";
         }
@@ -144,15 +148,20 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
         if (!r) return;
         if (r.pollInterval) { clearInterval(r.pollInterval); r.pollInterval = null; }
         doneCount++;
-        var elapsed = (Date.now() - r.startTime) / 1000;
-        var speed = (r.sizeBytes / 1048576 / elapsed).toFixed(1);
-        r.speedEl.textContent = speed + " MB/s";
         if (success) {
+          // Débit moyen RÉEL du transfert réussi.
+          var elapsed = (Date.now() - r.startTime) / 1000;
+          var speed = (r.sizeBytes / 1048576 / elapsed).toFixed(1);
+          r.speedEl.textContent = speed + " MB/s";
           r.status.textContent = "✅";
           r.fill.style.background = "#16a34a";
           r.fill.style.width = "100%";
           r.row.style.background = "rgba(22,163,74,0.15)";
         } else {
+          // Transfert ÉCHOUÉ : « taille / durée » n'a AUCUN sens (un 13 Go qui
+          // échoue au bout de 30 s afficherait 449 Mo/s). On n'invente pas de
+          // débit : le détail de l'erreur est affiché sous la ligne.
+          r.speedEl.textContent = "—";
           r.status.textContent = "❌";
           r.fill.style.background = "#dc2626";
           r.fill.style.width = "100%";
@@ -477,7 +486,14 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     try {
       return await HolafFetch.request('/api/aih/models/upload', {
         method: 'POST',
-        body: { path: filepath, type: fileType }
+        body: { path: filepath, type: fileType },
+        // TRANSFERT LONG : un modèle de plusieurs Go prend plusieurs minutes.
+        // Le timeout client par défaut (30 s, holaf-fetch.js) ABORDAIT le
+        // transfert en plein vol → « Erreur: timeout » dès ~450 Mo (tout
+        // fichier dont l'envoi dépasse 30 s). `timeout: 0` = aucun plafond
+        // client ; la progression réelle est suivie par le polling
+        // /upload/progress et le serveur borne chaque opération.
+        timeout: 0,
       });
     } catch (e) {
       return { success: false, error: e.message };
@@ -489,7 +505,11 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     try {
       var body = { upload_id: uploadId, filename: filename, type: fileType };
       if (destPath) body.dest_path = destPath;
-      return await HolafFetch.request('/api/aih/models/download', { method: 'POST', body: body });
+      // Téléchargement de modèle (plusieurs Go) : même plafond client de 30 s
+      // à désactiver que pour l'upload.
+      return await HolafFetch.request('/api/aih/models/download', {
+        method: 'POST', body: body, timeout: 0,
+      });
     } catch (e) {
       return { success: false, error: e.message };
     }
@@ -1541,7 +1561,10 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                           filename: it.origName,
                           type: it.type,
                           dest_path: it.newName,
-                        }
+                        },
+                        // Install d'un workflow : les modèles peuvent peser
+                        // plusieurs Go → pas de plafond client de 30 s.
+                        timeout: 0,
                       }).then(function(result) {
                         if (!result.success && !result.error) {
                           result.error = t('wf.unknownError');

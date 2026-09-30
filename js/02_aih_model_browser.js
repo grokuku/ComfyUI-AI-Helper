@@ -518,6 +518,9 @@ var WF_REMOTE_MAX_PAGES = 20;
                     path: filepath,
                     type: fileType,
                 },
+                // Transfert LONG (modèle de plusieurs Go) : le timeout client
+                // par défaut (30 s) abandonnerait l'envoi → « Erreur: timeout ».
+                timeout: 0,
             })
                 .then(function (data) {
                     if (data.status === 'ok' || data.success) {
@@ -558,6 +561,8 @@ var WF_REMOTE_MAX_PAGES = 20;
                     type: fileType,
                     dest_path: destSubdir,
                 },
+                // Téléchargement LONG (modèle de plusieurs Go) : pas de plafond client de 30 s.
+                timeout: 0,
             })
                 .then(function (data) {
                     if (data.status === 'ok' || data.success) {
@@ -1535,6 +1540,8 @@ var WF_REMOTE_MAX_PAGES = 20;
                 path: filepath,
                 type: fileType || 'model',
             },
+            // Transfert LONG (modèle de plusieurs Go) : pas de plafond client de 30 s.
+            timeout: 0,
         })
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
@@ -1570,6 +1577,8 @@ var WF_REMOTE_MAX_PAGES = 20;
                 type: fileType || 'model',
                 dest_path: destSubdir || '',
             },
+            // Téléchargement LONG (modèle de plusieurs Go) : pas de plafond client de 30 s.
+            timeout: 0,
         })
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
@@ -1634,6 +1643,8 @@ var WF_REMOTE_MAX_PAGES = 20;
         // Route locale /api/aih/* → HolafFetch SANS auth (same-origin transparente).
         HolafFetch.post('/api/aih/models/download', {
             body: body,
+            // Téléchargement LONG (modèle de plusieurs Go) : pas de plafond client de 30 s.
+            timeout: 0,
         })
             .then(function (data) {
                 if (data.status === 'ok' || data.success) {
