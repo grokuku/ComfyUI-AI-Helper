@@ -1591,11 +1591,36 @@ const holafImageViewer = {
         return container;
     },
 
+    /**
+     * Affiche un état de chargement/erreur DANS la zone de galerie SANS détruire
+     * la grille virtualisée (HolafGrid).
+     *
+     * L'ancienne version faisait `galleryEl.innerHTML = …`, ce qui arrachait le
+     * root/sizer/surface de la grille du DOM : plus rien ne pouvait ensuite y
+     * être rendu, et le libellé restait affiché indéfiniment — symptôme « la
+     * galerie serveur reste bloquée sur “Application des filtres…” » (le
+     * correctif précédent, en supprimant le court-circuit vide côté serveur,
+     * avait rendu ce chemin atteignable pour la source distante).
+     *
+     * On pose donc un message DÉDIÉ (premier enfant, donc visible) et on masque
+     * la grille le temps du chargement. `syncGallery()` nettoie le message et
+     * ré-affiche la grille en fin de chargement ; en cas d'échec, le message
+     * d'erreur reste — jamais d'état de chargement éternel.
+     */
     setLoadingState(message) {
-        if (this.panelElements) {
-            const g = document.getElementById("holaf-viewer-gallery");
-            if (g) g.innerHTML = `<p class="holaf-viewer-message">${message}</p>`;
+        if (!this.panelElements) return;
+        const g = document.getElementById("holaf-viewer-gallery");
+        if (!g) return;
+        let el = g.querySelector('.holaf-viewer-loading-message');
+        if (!el) {
+            el = document.createElement('p');
+            el.className = 'holaf-viewer-message holaf-viewer-loading-message';
+            g.insertBefore(el, g.firstChild);
         }
+        el.textContent = message;
+        // La grille reste dans le DOM (ne JAMAIS la détruire) : on la masque.
+        const root = g.querySelector('.holaf-grid-root');
+        if (root) root.style.display = 'none';
     },
 
     async _updateViewerActivity(isActive) {

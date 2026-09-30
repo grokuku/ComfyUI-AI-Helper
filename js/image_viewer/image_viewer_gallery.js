@@ -743,6 +743,23 @@ function renderVisibleItems() {
     applyActiveClass();
 }
 
+/**
+ * Retire le message de chargement/erreur posé par `setLoadingState()` (hôte
+ * holaf_image_viewer.js) et ré-affiche la grille masquée pendant le chargement.
+ * Idempotent : sans message ni grille masquée, c'est un no-op. Appelé par
+ * syncGallery() sur TOUS les chemins (rebuild complet et mise à jour en place),
+ * ce qui garantit qu'un état de chargement ne peut jamais rester affiché.
+ */
+function clearLoadingState() {
+    if (!galleryEl) return;
+    // Retire TOUT message d'état posé dans la zone de galerie : le placeholder
+    // statique « Chargement des images… » injecté par le template de l'UI
+    // (image_viewer_ui.js) ET le message de setLoadingState() de l'hôte.
+    galleryEl.querySelectorAll('.holaf-viewer-message').forEach((el) => el.remove());
+    const root = galleryEl.querySelector('.holaf-grid-root');
+    if (root && root.style.display === 'none') root.style.display = '';
+}
+
 function syncGallery(viewer, images) {
     // Switch de source éventuel : le cache de vignettes doit suivre la source
     // active (transport local same-origin vs serveur /api/media + Bearer).
@@ -773,6 +790,14 @@ function syncGallery(viewer, images) {
         }
     }
 
+    // ── Nettoyage de l'état de chargement (toujours, quel que soit le chemin) ─
+    // `setLoadingState()` pose un message ET masque la grille : le chargement
+    // peut se terminer par un rebuild complet OU par la mise à jour en place
+    // ci-dessous, et dans les DEUX cas le message doit disparaître et la grille
+    // redevenir visible. Sans ce nettoyage central, le libellé « Application des
+    // filtres… » restait affiché pour toujours (galerie serveur bloquée).
+    clearLoadingState();
+
     if (!needsFullRebuild) {
         // Same images, maybe just metadata changed — just re-render without destroying cache.
         // IMPORTANT: loadFilteredImages updates state.images BEFORE calling syncGallery, so the
@@ -795,9 +820,6 @@ function syncGallery(viewer, images) {
 
     // Keep LRU Cache alive! Don't clear it — thumbnails are still valid.
     // thumbnailCache.clear();
-
-    const messageEl = galleryEl.querySelector('.holaf-viewer-message');
-    if (messageEl) messageEl.remove();
 
     if (images && images.length > 0) {
         galleryEl.scrollTop = 0;
