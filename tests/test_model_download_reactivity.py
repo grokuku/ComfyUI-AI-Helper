@@ -111,6 +111,14 @@ def _register(app, blocking_download=False):
 def _make_backend(known_ids, size, rate_bps, cut_after=None):
     """Stub backend AI-Helper : contrat réel, débit et coupure contrôlés."""
 
+    async def health(request):
+        # Contrat réel du backend courant : la capacité de streaming est
+        # déclarée (le pack la vérifie AVANT le transfert).
+        return web.json_response({
+            "ok": True, "service": "ai-helper-backend",
+            "features": {"download_streaming": True},
+        })
+
     async def info(request):
         uid = request.match_info["uid"]
         if uid not in known_ids:
@@ -146,6 +154,7 @@ def _make_backend(known_ids, size, rate_bps, cut_after=None):
         return resp
 
     app = web.Application()
+    app.router.add_get("/api/health", health)
     app.router.add_get("/api/files/{uid}/download-info", info)
     app.router.add_get("/api/files/{uid}/download", download)
     return app

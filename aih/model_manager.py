@@ -49,6 +49,7 @@ import json
 import logging
 import hashlib
 import shutil
+import threading
 import time
 
 try:
@@ -59,6 +60,14 @@ except Exception:
 
 # Chunk size pour l'upload (doit correspondre au backend)
 CHUNK_SIZE = 25 * 1024 * 1024  # 25 MB
+
+# Morceaux lus de la réponse HTTP de DOWNLOAD. Ne PAS réutiliser CHUNK_SIZE
+# (25 Mo = taille d'upload) : à 1,3 Mo/s un morceau de 25 Mo ne publiait la
+# progression que toutes les ~19 s (la fenêtre de transferts affichait « serveur
+# muet » à tort) et retardait l'annulation. 1 Mo : progression/annulation
+# réactives, mise à jour toutes les ~20 ms à 50 Mo/s, coût nul (mesuré : débit
+# identique à 25 Mo).
+DOWNLOAD_READ_CHUNK = 1024 * 1024
 
 
 # ── Connexion SFTP sécurisée (TOFU sur la host key, anti-MITM) ────────
@@ -236,6 +245,157 @@ def _server_side_timeout(size_bytes):
             size / (_SERVER_SYNC_MIN_MBPS * 1024 * 1024),
         )
     return (_SERVER_SYNC_CONNECT_TIMEOUT, read_timeout)
+
+
+# ── Watchdog de download : jamais d'attente silencieuse INFINIE ────────
+# Un backend ANTÉRIEUR au correctif de streaming précharge TOUT le fichier du
+# stockage avant d'envoyer le 1er octet : pour 13,5 Go, des minutes à 0 octet
+# (« Préparation côté serveur… »). Un flux de stockage muet donne le MÊME
+# symptôme. Le transfert est donc abandonné (erreur explicite actionnable,
+# partiel nettoyé) dès qu'AUCUN octet n'est arrivé pendant
+# ``DOWNLOAD_STALL_TIMEOUT`` secondes — jamais d'attente sans fin. C'est aussi
+# le read timeout par lecture socket de la requête HTTP.
+# Surchargeable via ``AIH_DL_STALL_TIMEOUT`` (secondes, plancher 10 s).
+try:
+    DOWNLOAD_STALL_TIMEOUT = max(10.0, float(os.environ.get("AIH_DL_STALL_TIMEOUT", "60")))
+except (TypeError, ValueError):
+    DOWNLOAD_STALL_TIMEOUT = 60.0
+
+# Seuil d'affichage côté fenêtre de transferts : au-delà de N secondes sans le
+# moindre octet, la phase dit EXPLICITEMENT que le serveur est muet (l'utilisateur
+# voit la cause probable au lieu d'un « Préparation… » qui n'en finit pas).
+DOWNLOAD_IDLE_WARN_S = 15.0
+
+
+def _quiet_close(obj):
+    """Ferme un objet sans jamais lever (utilisé par le watchdog)."""
+    if obj is None:
+        return
+    try:
+        obj.close()
+    except Exception:
+        pass
+
+
+class _DownloadStallWatchdog:
+    """Abandonne un transfert qui ne reçoit AUCUN octet pendant ``timeout`` s.
+
+    Un thread daemon surveille ``last_activity`` (remis à zéro à chaque octet
+    reçu) ; au dépassement il marque ``stalled`` puis appelle ``on_stall`` —
+    fermeture de la réponse HTTP ou de la connexion SFTP — ce qui débloque la
+    lecture en cours. L'appelant consulte ``stalled`` pour produire un message
+    actionnable au lieu d'attendre indéfiniment.
+
+    ``stop()`` est idempotent et sans attente : appelable dans un ``finally``.
+    """
+
+    def __init__(self, timeout, on_stall=None):
+        self._timeout = max(0.1, float(timeout))
+        # Sondage plus fin que le délai (délais courts en test → pas de flakiness).
+        self._interval = max(0.02, min(1.0, self._timeout / 4.0))
+        self._on_stall = on_stall
+        self._last = time.monotonic()
+        self._stop = threading.Event()
+        self._stalled = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, name="aih-dl-stall-watchdog", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def touch(self):
+        """Signale un octet reçu (progression réelle du transfert)."""
+        self._last = time.monotonic()
+
+    @property
+    def stalled(self):
+        return self._stalled.is_set()
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            if time.monotonic() - self._last >= self._timeout:
+                self._stalled.set()
+                if self._on_stall is not None:
+                    try:
+                        self._on_stall()
+                    except Exception:
+                        pass
+                return
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+
+def _backend_streaming_capability(api_url, auth_headers, timeout=10):
+    """Interroge ``GET <api_url>/health`` : le backend STREAME-t-il les downloads ?
+
+    Retourne ``(True, '')`` si la capacité est déclarée ; ``(False, raison)`` si
+    le backend est manifestement ANTÉRIEUR au correctif (404 sur ``/api/health``
+    ou 200 sans ``features.download_streaming``) ; ``(None, raison)`` si le
+    verdict est impossible (réseau, 401/403/5xx, corps illisible) — dans ce cas
+    on NE bloque PAS (un proxy restrictif ne doit pas empêcher un backend
+    moderne), le watchdog de transfert reste la ceinture de sécurité.
+    """
+    import requests
+    try:
+        resp = requests.get(f"{api_url}/health", headers=auth_headers, timeout=timeout)
+    except Exception as e:
+        return None, f"sonde impossible ({e})"
+    if resp.status_code == 404:
+        return False, "route /api/health absente (backend antérieur au streaming)"
+    if resp.status_code != 200:
+        return None, f"sonde HTTP {resp.status_code}"
+    try:
+        data = resp.json()
+    except Exception:
+        return None, "réponse /api/health illisible"
+    features = data.get("features") if isinstance(data, dict) else None
+    if isinstance(features, dict) and features.get("download_streaming") is True:
+        return True, ""
+    return False, "le backend ne déclare pas features.download_streaming"
+
+
+def _backend_outdated_error(api_url, detail):
+    """Refus IMMÉDIAT (5 s) d'un backend qui ne streame pas.
+
+    Un backend ancien précharge le fichier complet avant le 1er octet : pour
+    13,5 Go c'est le symptôme « 0 octet pendant des minutes ». Mieux vaut
+    refuser tout de suite avec la marche à suivre que laisser attendre.
+    """
+    return (
+        f"Backend AI-Helper obsolète : {detail}. Il précharge le fichier complet "
+        f"avant le 1er octet (des minutes à 0 % pour un gros modèle). "
+        f"Démarre/redémarre le service backend, puis vérifie "
+        f"GET {api_url}/health (features.download_streaming doit valoir true), "
+        f"et relance le téléchargement."
+    )
+
+
+def _download_stall_error(api_url, stall_s, received, total):
+    """Message d'abandon EXPLICITE et actionnable (ni muet, ni générique)."""
+    hint = (
+        f"Redémarre le backend s'il vient d'être mis à jour, puis vérifie "
+        f"GET {api_url}/health (features.download_streaming=true)."
+    )
+    if received <= 0:
+        return (
+            f"Aucun octet reçu pendant {stall_s:.0f} s — transfert abandonné. "
+            f"Le backend AI-Helper n'envoie rien : il est peut-être ANTÉRIEUR au "
+            f"correctif de streaming (préchargement complet avant le 1er octet) ou "
+            f"le flux de stockage est bloqué. {hint}"
+        )
+    total_txt = f"{total}" if total else "?"
+    return (
+        f"Flux figé ou coupé par le backend : reçu {received} sur {total_txt}, "
+        f"plus aucun octet depuis {stall_s:.0f} s — transfert abandonné, le "
+        f"stockage du backend ne fournit plus de données. {hint}"
+    )
 
 
 # Toutes les categories de models connues par ComfyUI
@@ -715,6 +875,11 @@ def get_download_progress(upload_id):
         return None
     pct = round(p['bytes_recv'] / p['bytes_total'] * 100, 1) if p['bytes_total'] > 0 else 0
     elapsed = max(0.0, time.time() - p.get('start', time.time()))
+    # ``idle_s`` = secondes depuis le DERNIER octet reçu (ou depuis le début si
+    # aucun). La fenêtre de transferts s'en sert pour dire EXPLICITEMENT
+    # « serveur muet depuis N s » au-delà de ``DOWNLOAD_IDLE_WARN_S`` — au lieu
+    # d'un « Préparation côté serveur… » muet qui dure des minutes.
+    idle = max(0.0, time.monotonic() - p.get('last_activity', time.monotonic()))
     return {
         'bytes_recv': p['bytes_recv'],
         'bytes_total': p['bytes_total'],
@@ -722,6 +887,8 @@ def get_download_progress(upload_id):
         'speed_mbs': p['speed_mbs'],
         'phase': 'transferring' if p['bytes_recv'] > 0 else 'preparing',
         'elapsed_s': round(elapsed, 1),
+        'idle_s': round(idle, 1),
+        'backend_streaming': p.get('backend_streaming'),
     }
 
 
@@ -868,6 +1035,17 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
     except OSError as e:
         return {'success': False, 'error': f'Dossier de destination invalide: {e}'}
 
+    # 0. Préflight SANTÉ/VERSION du backend (5 s au lieu de minutes) : un
+    # backend antérieur au correctif de streaming précharge 13,5 Go avant le
+    # 1er octet → refus immédiat avec la marche à suivre, jamais une fenêtre
+    # bloquée à 0 octet. Sonde impossible (réseau/proxy) = on continue
+    # (best effort : le watchdog du transfert reste la ceinture de sécurité).
+    streaming_ok, streaming_detail = _backend_streaming_capability(api_url, auth_headers)
+    if streaming_ok is False:
+        logging.warning("[AIH] Backend sans streaming (%s) — download refusé", streaming_detail)
+        return {'success': False, 'backend_outdated': True,
+                'error': _backend_outdated_error(api_url, streaming_detail)}
+
     # 1. Récupérer la config de download (SFTP direct ou HTTP fallback)
     try:
         info_resp = requests.get(f"{api_url}/files/{upload_id}/download-info",
@@ -906,9 +1084,18 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
         _download_progress[upload_id] = {
             'bytes_recv': 0, 'bytes_total': file_size,
             'speed_mbs': 0.0, 'start': time.time(), 'last_time': time.time(),
+            'backend_streaming': streaming_ok, 'last_activity': time.monotonic(),
         }
+        ssh = None
+        watchdog = None
         try:
             ssh = _sftp_connect(sftp_cfg)
+            # Même watchdog que le chemin HTTP : une connexion SFTP qui ne rend
+            # rien est fermée de force → échec explicite au lieu d'un attente
+            # sans fin (le callback de progression ne rappelle que sur octets).
+            watchdog = _DownloadStallWatchdog(
+                DOWNLOAD_STALL_TIMEOUT, on_stall=lambda: _quiet_close(ssh)
+            ).start()
             try:
                 sftp = ssh.open_sftp()
                 sftp.sftp_chunk_size = 2 * 1024 * 1024
@@ -920,12 +1107,14 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
                 def _dl_cb(sent, total):
                     if upload_id in _download_cancel:
                         raise DownloadCancelled()
+                    watchdog.touch()
                     now = time.time()
                     elapsed = now - _download_progress[upload_id]['start']
                     speed = (sent / 1048576) / elapsed if elapsed > 0 else 0
                     _download_progress[upload_id].update({
                         'bytes_recv': sent,
                         'speed_mbs': round(speed, 1),
+                        'last_activity': time.monotonic(),
                     })
 
                 sftp.get(full_remote, tmp_path, callback=_dl_cb)
@@ -938,38 +1127,60 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
         except DownloadCancelled:
             return {'success': False, 'cancelled': True, 'error': 'Téléchargement annulé'}
         except Exception as e:
+            if watchdog is not None and watchdog.stalled:
+                return {'success': False, 'stalled': True,
+                        'error': _download_stall_error(
+                            api_url, DOWNLOAD_STALL_TIMEOUT,
+                            _download_progress.get(upload_id, {}).get('bytes_recv', 0),
+                            file_size)}
             return {'success': False, 'error': f'SFTP download failed: {e}'}
         finally:
+            if watchdog is not None:
+                watchdog.stop()
             _download_progress.pop(upload_id, None)
             _download_cancel.discard(upload_id)
             _cleanup_partial(tmp_path)
     else:
-        # ── Mode HTTP fallback (storage local) ──
+        # ── Mode HTTP (storage du backend) ──
+        # Entrée de progression créée AVANT la requête : la fenêtre de transferts
+        # voit « en préparation » dès la 1re seconde et ``idle_s`` grandir, MÊME
+        # quand le backend n'a pas encore envoyé ses en-têtes (préchargement
+        # d'un backend ancien = exactement le symptôme signalé).
+        _download_progress[upload_id] = {
+            'bytes_recv': 0, 'bytes_total': file_size,
+            'speed_mbs': 0.0, 'start': time.time(), 'last_time': time.time(),
+            'backend_streaming': streaming_ok, 'last_activity': time.monotonic(),
+        }
+        resp = None
+        received = 0
+        total = 0
+        watchdog = _DownloadStallWatchdog(
+            DOWNLOAD_STALL_TIMEOUT, on_stall=lambda: _quiet_close(resp)
+        ).start()
         try:
-            # Le backend précharge TOUT le fichier du stockage vers un temp
-            # local AVANT de streame : pendant ce préchargement le client ne
-            # reçoit aucun octet → le read timeout s'applique à cette durée, qui
-            # croît avec la taille. Même correctif que /files/complete.
+            # Le read timeout EST le délai d'inactivité du watchdog : un backend
+            # qui n'envoie AUCUN octet (ancien préchargement, stockage muet) fait
+            # lever ReadTimeout au lieu d'attendre ~56 min pour 13,5 Go.
             resp = requests.get(f"{api_url}/files/{upload_id}/download",
                                headers=auth_headers, stream=True,
-                               timeout=_server_side_timeout(file_size if file_size else 0))
+                               timeout=(_SERVER_SYNC_CONNECT_TIMEOUT,
+                                        max(10.0, DOWNLOAD_STALL_TIMEOUT)))
+            watchdog.touch()
             try:
                 if not resp.ok:
                     return {'success': False, 'error': _download_http_error(resp)}
 
                 total = int(resp.headers.get('Content-Length', 0))
-                _download_progress[upload_id] = {
-                    'bytes_recv': 0, 'bytes_total': total or file_size,
-                    'speed_mbs': 0.0, 'start': time.time(), 'last_time': time.time(),
-                }
+                if total:
+                    _download_progress[upload_id]['bytes_total'] = total
 
-                received = 0
                 with open(tmp_path, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                    for chunk in resp.iter_content(chunk_size=DOWNLOAD_READ_CHUNK):
                         if upload_id in _download_cancel:
                             raise DownloadCancelled()
                         f.write(chunk)
                         received += len(chunk)
+                        watchdog.touch()
                         now = time.time()
                         chunk_elapsed = now - _download_progress[upload_id].get('last_time', now)
                         chunk_mb = len(chunk) / 1048576
@@ -978,17 +1189,19 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
                             'bytes_recv': received,
                             'speed_mbs': round(speed, 1),
                             'last_time': now,
+                            'last_activity': time.monotonic(),
                         })
 
                 expected = total or file_size
                 if expected and received < expected:
+                    if watchdog.stalled:
+                        return {'success': False, 'stalled': True,
+                                'error': _download_stall_error(
+                                    api_url, DOWNLOAD_STALL_TIMEOUT, received, total)}
                     raise IOError(f'Transfert incomplet: {received} octets recus sur {expected}')
             finally:
                 # Libère la connexion même en cas d'annulation/erreur.
-                try:
-                    resp.close()
-                except Exception:
-                    pass
+                _quiet_close(resp)
 
             _replace_download_file(tmp_path, dest_path)
             logging.info(f"[AIH] Downloaded {filename} → {dest_path}")
@@ -996,8 +1209,35 @@ def download_model_from_server(upload_id, filename, file_type="model", dest_path
         except DownloadCancelled:
             return {'success': False, 'cancelled': True, 'error': 'Téléchargement annulé'}
         except Exception as e:
+            if watchdog.stalled or isinstance(e, requests.exceptions.ReadTimeout):
+                logging.warning("[AIH] Download %s figé (%s s sans octet) : %s",
+                                upload_id, DOWNLOAD_STALL_TIMEOUT, e)
+                return {'success': False, 'stalled': True,
+                        'error': _download_stall_error(
+                            api_url, DOWNLOAD_STALL_TIMEOUT, received, total)}
+            if received > 0 and isinstance(
+                e, (requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ConnectionError)
+            ):
+                # Le backend a coupé le flux en plein transfert (cas réel : son
+                # propre watchdog d'inactivité a abandonné un stockage muet) :
+                # message explicite au lieu d'un « connection reset » brut.
+                logging.warning("[AIH] Download %s coupé en plein flux : %s", upload_id, e)
+                return {'success': False, 'stalled': True,
+                        'error': _download_stall_error(
+                            api_url, DOWNLOAD_STALL_TIMEOUT, received, total)}
+            if isinstance(e, requests.exceptions.ConnectTimeout):
+                return {'success': False, 'error': (
+                    f"Connexion au backend AI-Helper impossible ({e}). "
+                    f"Vérifie que le service backend tourne et que l'URL "
+                    f"({api_url}) est correcte.")}
+            if isinstance(e, requests.exceptions.ConnectionError):
+                return {'success': False, 'error': (
+                    f"Connexion au backend AI-Helper interrompue ({e}). Vérifie que "
+                    f"le service backend tourne et que GET {api_url}/health répond.")}
             return {'success': False, 'error': f'Transfert interrompu : {e}'}
         finally:
+            watchdog.stop()
             _download_progress.pop(upload_id, None)
             _download_cancel.discard(upload_id)
             _cleanup_partial(tmp_path)

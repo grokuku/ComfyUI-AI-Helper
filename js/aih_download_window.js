@@ -51,8 +51,15 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 
     // Marqueur de build (diagnostic d'obsolescence, même motif que Workflow Share
     // et 02_aih_model_browser.js).
-    var AIH_DLW_BUILD = "download-window-2026-09-30-r7";
+    var AIH_DLW_BUILD = "download-window-2026-10-01-r8";
     var _dlgUnavailableWarned = false;
+
+    // Au-delà de N secondes sans le moindre octet reçu, la phase dit
+    // EXPLICITEMENT que le serveur est muet (idle_s publié par le backend du
+    // pack) : l'utilisateur voit la cause probable au lieu d'un « Préparation
+    // côté serveur… » figé. Le transfert est ensuite abandonné côté pack
+    // (watchdog, AIH_DL_STALL_TIMEOUT) avec un message actionnable.
+    var STALL_WARN_S = 15;
 
     // Abonnés au NOMBRE de transferts en cours + en file d'attente (badge du
     // Model Browser). Module-level : survit à la (re)création de la fenêtre.
@@ -105,6 +112,7 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             ".aih-dlw-name { flex: 1; min-width: 0; font-size: 12px; color: #ddd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
             ".aih-dlw-phase { flex-shrink: 0; font-size: 10px; color: #9ca3af; white-space: nowrap; }",
             ".aih-dlw-row.is-transfer .aih-dlw-phase { color: #fbbf24; }",
+            ".aih-dlw-row.is-stalled .aih-dlw-phase { color: #f87171; }",
             ".aih-dlw-cancel { flex-shrink: 0; width: 20px; height: 20px; line-height: 1; padding: 0; border: 1px solid #555; border-radius: 4px; background: transparent; color: #aaa; font-size: 11px; cursor: pointer; }",
             ".aih-dlw-cancel:hover { color: #f87171; border-color: #f87171; }",
             ".aih-dlw-cancel:disabled { opacity: 0.5; cursor: default; }",
@@ -371,13 +379,17 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
             document.addEventListener("keydown", _escHandler, true);
         }
 
-        function _setPhase(h, phase) {
+        function _setPhase(h, phase, params) {
             if (h.settled && phase !== "settled") return;
             h.phase = phase;
             h.root.classList.toggle("is-transfer", phase === "transferring");
+            h.root.classList.toggle("is-stalled", phase === "stalled");
             if (phase === "queued") h.els.phaseEl.textContent = t("mb.dlwQueued");
             else if (phase === "preparing") h.els.phaseEl.textContent = t("mb.dlwPhasePreparing");
             else if (phase === "transferring") h.els.phaseEl.textContent = t("mb.dlwPhaseTransferring");
+            else if (phase === "stalled") {
+                h.els.phaseEl.textContent = t("mb.dlwPhaseStalled", params || {});
+            }
         }
 
         function _applyProgress(h, p) {
@@ -389,8 +401,13 @@ import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
                 ? p.percent
                 : (total > 0 ? (recv * 100) / total : 0);
             var serverPhase = p && p.phase;
+            var idleS = p && typeof p.idle_s === "number" ? p.idle_s : null;
             if (recv > 0 || serverPhase === "transferring") _setPhase(h, "transferring");
-            else _setPhase(h, "preparing");
+            else if (idleS !== null && idleS >= STALL_WARN_S) {
+                // Serveur muet : le dire (couleur + compteur), au lieu de laisser
+                // « Préparation côté serveur… » sans explication pendant des minutes.
+                _setPhase(h, "stalled", { s: Math.round(idleS) });
+            } else _setPhase(h, "preparing");
 
             pct = Math.max(0, Math.min(100, pct));
             h.fillWidth = pct;

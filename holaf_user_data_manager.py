@@ -5,8 +5,6 @@ class UserDataManager:
     """
     Manages data storage locations within the ComfyUI user directory.
     Target structure: ComfyUI/user/[user]/AI-Helper/[subsystem]/
-    (legacy data under ComfyUI-Holaf-Utilities/ is migrated automatically
-    by holaf_migration.run_data_migration() at startup)
     """
     
     ROOT_NAME = "AI-Helper"

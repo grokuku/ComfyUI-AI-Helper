@@ -71,7 +71,8 @@ await import("./aih_strings.js");
 
 const DLW_KEYS = [
     "mb.dlwTitle", "mb.dlwGlobal", "mb.dlwQueued", "mb.dlwPhasePreparing",
-    "mb.dlwPhaseTransferring", "mb.dlwEta", "mb.dlwDoneTitle", "mb.dlwRecap",
+    "mb.dlwPhaseTransferring", "mb.dlwPhaseStalled", "mb.dlwEta", "mb.dlwDoneTitle",
+    "mb.dlwRecap",
 ];
 for (const key of DLW_KEYS) {
     assert.ok(dictionaries.fr && key in dictionaries.fr, `clé ${key} absente en FR`);
@@ -190,15 +191,24 @@ assert.ok(calls.progress.includes("uid-1"), "progression ciblée par upload_id")
 assert.strictEqual(phaseOf(0), "Préparation côté serveur…", "0 octet → phase préparation (pas un 0 % muet)");
 assert.strictEqual(rowEl(0).querySelector(".aih-dlw-speed").textContent, "— MB/s", "aucun débit inventé");
 
-progressByUid["uid-1"] = { percent: 37, speed_mbs: 12.5, bytes_recv: 4995000000, bytes_total: 13500000000, phase: "transferring" };
+// Serveur MUET : aucun octet depuis 25 s (idle_s publié par le pack) → la
+// phase le DIT explicitement (couleur + secondes), au lieu du « Préparation… »
+// muet qui laissait croire à une activité pendant des minutes.
+progressByUid["uid-1"] = { percent: 0, speed_mbs: 0, bytes_recv: 0, bytes_total: 13500000000, phase: "preparing", idle_s: 25 };
+await sleep(950);
+assert.strictEqual(phaseOf(0), "Serveur muet depuis 25 s…", "idle_s ≥ 15 → phase « serveur muet » chiffrée");
+assert.ok(rowEl(0).classList.contains("is-stalled"), "ligne marquée is-stalled (couleur d'alerte)");
+
+progressByUid["uid-1"] = { percent: 37, speed_mbs: 12.5, bytes_recv: 4995000000, bytes_total: 13500000000, phase: "transferring", idle_s: 0.2 };
 await sleep(950);
 assert.strictEqual(phaseOf(0), "Transfert", "des octets arrivent → phase transfert");
+assert.ok(!rowEl(0).classList.contains("is-stalled"), "l'alerte muet est levée dès le retour des octets");
 assert.strictEqual(rowEl(0).querySelector(".aih-dlw-fill").style.width, "37%", "barre = % serveur");
 assert.strictEqual(rowEl(0).querySelector(".aih-dlw-pct").textContent, "37%", "pourcentage affiché");
 assert.ok(/GB/.test(rowEl(0).querySelector(".aih-dlw-bytes").textContent), "octets transférés/total affichés");
 assert.ok(/MB\/s/.test(rowEl(0).querySelector(".aih-dlw-speed").textContent), "débit MB/s affiché");
 assert.ok(/reste ~/.test(rowEl(0).querySelector(".aih-dlw-time").textContent), "temps écoulé + ETA affichés");
-ok("préparation → transfert, 37 %, octets/total, MB/s et ETA");
+ok("préparation → serveur muet (25 s) → transfert, 37 %, octets/total, MB/s et ETA");
 
 /* ─── 5. ✕ par ligne → route d'annulation ──────────────────────────────── */
 console.log("4. Annulation par ligne");

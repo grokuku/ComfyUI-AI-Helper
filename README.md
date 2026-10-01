@@ -83,15 +83,27 @@ paths, SFTP URL validation, refusal of `git` URLs containing credentials, a
 
 2.  Clone this repository:
     ```bash
-    git clone https://github.com/grokuku/ComfyUI-Holaf-Utilities
+    git clone https://github.com/grokuku/ComfyUI-AI-Helper
     ```
 
 3.  Install the required Python dependencies. Navigate into the new directory and use `pip`:
     ```bash
-    cd ComfyUI-Holaf-Utilities
+    cd ComfyUI-AI-Helper
     pip install -r requirements.txt
     ```
     *Note: This will install packages like `pywinpty` on Windows to provide a full terminal experience.*
+
+    > The pack's historical folder name was `ComfyUI-Holaf-Utilities`. If an old
+    > `custom_nodes/ComfyUI-Holaf-Utilities` (or `ComfyUI-Holaf`) folder is still
+    > present next to this one and you do not need it, DELETE it manually:
+    > keeping both makes ComfyUI load two copies of the front-end scripts (the
+    > stale Model Browser JS then overwrites the current one).
+    >
+    > This pack NEVER modifies those folders: it only logs a warning when it finds
+    > PROOF that another loadable folder still serves an old copy of its own
+    > Model Browser JS (a file without the `AIH_MB_BUILD` marker). The historical
+    > names `ComfyUI-Holaf*` remain fully usable for future packs — nothing is
+    > ever blocked, moved, renamed or quarantined based on a folder name.
 
 4.  Restart ComfyUI.
 

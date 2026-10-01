@@ -333,17 +333,32 @@ def test_front_handles_finalizing_phase():
     assert strings.index(token, en_idx) > 0, "clé wf.uploadFinalizing absente du bloc EN"
 
 
-# ── 5. Le download est concerné par le MÊME piège (préchargement serveur) ──
+# ── 5. Le download n'attend plus le préchargement : abandon BORNÉ ─────────
+# (l'ancien comportement — budget dimensionné sur la taille — laissait la
+#  fenêtre de transferts à 0 B pendant ~56 min pour 13,5 Go : supprimé.)
 
-def test_download_uses_scaled_timeout(model_manager):
-    """Le download HTTP précharge TOUT le fichier côté serveur avant de
-    streame : un timeout fixe (600 s) y reproduirait le même bug sur les gros
-    fichiers. Il doit lui aussi être dimensionné sur la taille."""
+def test_download_bounded_by_stall_timeout(model_manager):
+    """Le download HTTP n'est plus dimensionné pour ATTENDRE un préchargement
+    serveur (des dizaines de minutes pour 13,5 Go) : son read timeout est le
+    seuil de BLOCAGE (``DOWNLOAD_STALL_TIMEOUT``, défaut 60 s) — un backend qui
+    n'envoie AUCUN octet échoue en ≤ 1 min avec un message actionnable, jamais
+    une fenêtre « Préparation côté serveur… » à 0 B pendant 56 min.
+
+    Le préchargement (ancien backend) est par ailleurs REFUSÉ AVANT le
+    transfert via la sonde /api/health (tests/test_model_download_stall.py).
+
+    Contrôle négatif : remettre ``_server_side_timeout(size)`` (~56 min pour
+    13,5 Go) rougit ici.
+    """
     src = (PACKAGE_DIR / "aih" / "model_manager.py").read_text(encoding="utf-8")
     idx = src.index('f"{api_url}/files/{upload_id}/download"')
-    window = src[idx:idx + 400]
+    window = src[idx:idx + 500]
     assert "timeout=600" not in window, "plafond fixe de 600 s réintroduit sur le download"
-    assert "_server_side_timeout(" in window, "le download doit utiliser le budget dimensionné"
+    assert "_server_side_timeout(" not in window, (
+        "le download ne doit PAS se dimensionner sur la durée de préchargement "
+        "(il doit échouer borné à DOWNLOAD_STALL_TIMEOUT)")
+    assert "DOWNLOAD_STALL_TIMEOUT" in window, (
+        "le read timeout du download doit être le seuil de blocage borné")
 
 
 if __name__ == "__main__":

@@ -30,16 +30,19 @@ _holaf_mimetypes.add_type("image/webp", ".webp")
 # Prevent Python from writing __pycache__ / .pyc files in the source tree
 os.environ.setdefault('PYTHONDONTWRITEBYTECODE', '1')
 
-# --- Legacy Data Migration (extension folder was renamed) ---
-# MUST run before ANY other initialisation opens the database, the thumbnail
-# cache, config.ini, the temp directories or the user data root: holaf_database
-# computes its DB path at import time and holaf_utils creates/cleans temp dirs
-# at import time. Late import keeps this module free of sibling dependencies.
+# --- Startup check: stale duplicate web assets (read-only, non-blocking) ---
+# If another LOADABLE custom_nodes folder provably serves an old copy of THIS
+# pack's Model Browser JS (one of our asset paths, containing the ownership
+# marker `openModelBrowser`, WITHOUT the `AIH_MB_BUILD` marker), a warning is
+# printed explaining the possible UI overwrite. Nothing is ever created,
+# moved, renamed or modified — in particular the historical names
+# "ComfyUI-Holaf*" stay fully usable for future packs. Late import keeps this
+# module free of sibling dependencies.
 try:
-    from .holaf_migration import run_data_migration
-    run_data_migration()
-except Exception as _mig_err:
-    print(f"🔴 [Holaf-Migration] Unexpected error during startup migration: {_mig_err}")
+    from .holaf_startup_checks import run_startup_checks
+    run_startup_checks()
+except Exception as _startup_check_err:
+    print(f"🔴 [Holaf-Startup] Unexpected error during startup check: {_startup_check_err}")
 
 # --- AIH shared backend package bootstrap -----------------------------------
 # The shared AIH backend lives in the 'aih/' subpackage at the root of this
