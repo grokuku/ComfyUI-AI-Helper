@@ -97,6 +97,61 @@ def _migrate_zone_a_artifact(name, old_dir, new_dir):
     return "moved"
 
 
+def find_legacy_extension_double_load(current_dir):
+    """
+    Détecte un dossier legacy SIBLING encore chargé par ComfyUI (double pack).
+
+    Pourquoi : la migration ne supprime JAMAIS le dossier legacy. Or ComfyUI
+    charge TOUT dossier de ``custom_nodes/`` exposant ``WEB_DIRECTORY`` : si
+    ``ComfyUI-Holaf-Utilities/`` existe encore à côté du dossier courant, ses
+    anciens ``__init__.py``/``js/`` sont chargés EN PLUS des nouveaux. Le front
+    importe alors TOUS les .js des deux préfixes ``/extensions/<nom>/`` en
+    parallèle : deux copies de ``02_aih_model_browser.js`` coexistent, une
+    copie périmée peut écraser ``window.openModelBrowser`` et l'UI ouverte est
+    l'ancienne (pas de bouton « Transferts », pas de fenêtre de transferts,
+    progression en ligne seule) — même si le fichier SERVI et
+    ``window.AIH_MB.build`` sont à jour.
+
+    @param current_dir: dossier du pack courant (racine de l'extension).
+    @returns: chemin du dossier legacy s'il est encore chargeable, sinon None.
+    """
+    try:
+        current = os.path.abspath(current_dir)
+        legacy = os.path.join(os.path.dirname(current), LEGACY_EXTENSION_DIR_NAME)
+        if _same_path(legacy, current) or not os.path.isdir(legacy):
+            return None
+        # Un dossier sans __init__.py n'est PAS chargé par ComfyUI : rien à
+        # signaler (l'utilisateur a déjà neutralisé l'ancien pack).
+        if not os.path.isfile(os.path.join(legacy, "__init__.py")):
+            return None
+        return legacy
+    except Exception:
+        return None
+
+
+def _warn_legacy_double_load(current_dir):
+    """Avertit BRUYAMMENT tant que le pack legacy est encore chargeable.
+
+    Appelée à CHAQUE démarrage (pas seulement quand quelque chose a été
+    migré) : sans ce signal, un utilisateur peut ne jamais comprendre pourquoi
+    son navigateur exécute encore l'ancien JS d'un pack doublement chargé.
+    """
+    legacy = find_legacy_extension_double_load(current_dir)
+    if not legacy:
+        return
+    print(
+        "⚠️  [Holaf-Migration] DOUBLE CHARGEMENT DÉTECTÉ : le dossier legacy\n"
+        f"    '{legacy}'\n"
+        "    est encore chargeable par ComfyUI en plus du pack courant.\n"
+        "    Deux copies des mêmes scripts JS seront servies sous deux préfixes\n"
+        "    '/extensions/<nom>/' et importées EN PARALLÈLE : une copie PÉRIMÉE\n"
+        "    peut écraser window.openModelBrowser (UI ancienne sans bouton\n"
+        "    « Transferts » ni fenêtre de transferts, alors que le fichier servi\n"
+        "    est à jour). Remède : supprimer (ou renommer) le dossier legacy,\n"
+        "    puis redémarrer ComfyUI et recharger la page en forcé.\n"
+    )
+
+
 def _migrate_zone_a(stats):
     """
     Zone A: migrate artefacts from the legacy sibling extension folder into
@@ -192,6 +247,14 @@ def run_data_migration():
     except Exception as e:
         stats["errors"] += 1
         print(f"🔴 [Holaf-Migration] Unexpected Zone B failure: {e}")
+
+    # Toujours : signaler un éventuel pack legacy ENCORE chargé par ComfyUI
+    # (double import des scripts front — cause prouvée d'UI « ancienne » malgré
+    # un fichier servi à jour).
+    try:
+        _warn_legacy_double_load(os.path.dirname(os.path.abspath(__file__)))
+    except Exception as e:
+        print(f"🟡 [Holaf-Migration] Legacy double-load check failed: {e}")
 
     if stats["moved"] or stats["conflicts"] or stats["errors"]:
         print(f"✅ [Holaf-Migration] Data migration finished: "

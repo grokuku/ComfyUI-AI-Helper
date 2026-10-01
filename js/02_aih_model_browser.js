@@ -61,16 +61,58 @@ var WF_REMOTE_MAX_PAGES = 20;
     var AIH_MB_BUILD = "mb-transfers-2026-09-30-r7";
     var AIH_MB_BUILD_RX = /AIH_MB_BUILD\s*=\s*["']([^"']+)["']/;
     var _mbStaleWarned = false;
+    var _mbProbeErrorWarned = false;
+    var _mbLastStale = null;
 
     function _mbExtractBuild(text) {
         var m = AIH_MB_BUILD_RX.exec(String(text == null ? "" : text));
         return m ? m[1] : null;
     }
 
+    // Affiche le bandeau « build obsolète » s'il est présent dans le DOM.
+    // (À l'ouverture du navigateur de modèles ; idempotent.)
+    function _mbShowStaleBanner(served) {
+        var el = document.getElementById("mb-stale-banner");
+        if (!el) return;
+        el.textContent = t('mb.staleBuild', { running: AIH_MB_BUILD });
+        el.style.display = 'block';
+        el.dataset.servedBuild = served == null ? "sans-marqueur" : String(served);
+    }
+
+    function _mbWarnStale(served) {
+        if (!_mbStaleWarned) {
+            _mbStaleWarned = true;
+            console.error("[AIH] Model Browser OBSOLÈTE — exécuté " + AIH_MB_BUILD
+                + " / servi " + (served == null ? "SANS marqueur de build" : served)
+                + " : le navigateur exécute un JS périmé. Recharge FORCÉE"
+                + " (Ctrl+Shift+R / Cmd+Shift+R).");
+        }
+        _mbShowStaleBanner(served);
+    }
+
+    function _mbWarnProbeIndeterminate(reason, err) {
+        if (!_mbProbeErrorWarned) {
+            _mbProbeErrorWarned = true;
+            console.warn("[AIH] Model Browser : sonde de fraîcheur INDÉTERMINÉE ("
+                + reason + ")" + (err ? " — " + (err.message || err) : "")
+                + " : impossible de comparer le build exécuté (" + AIH_MB_BUILD
+                + ") au fichier servi (stale reste null).");
+        }
+        if (window.AIH_MB) window.AIH_MB.probe = "indeterminate";
+    }
+
     // Compare le marqueur EN COURS à celui du fichier réellement servi.
     // @returns {Promise<boolean|null>} true=obsolète, false=à jour, null=indéterminé.
+    // NB (bug « stale: null » corrigé) :
+    //   - la sonde est lancée DÈS LE CHARGEMENT du module (voir plus bas), pas
+    //     seulement à l'ouverture du navigateur : window.AIH_MB.stale conclut
+    //     (false/true) même si l'utilisateur n'ouvre rien ;
+    //   - un fichier servi SANS marqueur de build est forcément antérieur au
+    //     versionnage → stale = true (avant, ce cas était classé « à jour ») ;
+    //   - un échec HTTP/réseau reste null mais devient BRUYANT (console).
     function checkServedBuildFreshness() {
         if (typeof fetch !== "function" || typeof window === "undefined") {
+            _mbWarnProbeIndeterminate("fetch indisponible");
             return Promise.resolve(null);
         }
         var url;
@@ -78,69 +120,159 @@ var WF_REMOTE_MAX_PAGES = 20;
             url = new URL(import.meta.url, window.location.href);
             url.searchParams.set("aih_build_probe", String(Date.now()));
         } catch (e) {
+            _mbWarnProbeIndeterminate("URL du module illisible", e);
             return Promise.resolve(null);
         }
         return fetch(url.toString(), { cache: "no-store" })
-            .then(function (res) { return res && res.ok ? res.text() : null; })
-            .then(function (text) {
-                var served = _mbExtractBuild(text);
-                var stale = served !== null && served !== AIH_MB_BUILD;
-                if (window.AIH_MB) window.AIH_MB.stale = stale;
-                if (stale && !_mbStaleWarned) {
-                    _mbStaleWarned = true;
-                    console.error("[AIH] Model Browser OBSOLÈTE — exécuté " + AIH_MB_BUILD
-                        + " / servi " + served
-                        + " : le navigateur exécute un JS périmé. Recharge FORCÉE"
-                        + " (Ctrl+Shift+R / Cmd+Shift+R).");
+            .then(function (res) {
+                if (!res || !res.ok) {
+                    _mbWarnProbeIndeterminate("HTTP " + (res ? res.status : "?")
+                        + " sur le fichier servi");
+                    return null;
                 }
+                return res.text();
+            })
+            .then(function (text) {
+                if (text === null || text === undefined) {
+                    return null; // déjà signalé (HTTP non-OK)
+                }
+                var served = _mbExtractBuild(text);
+                if (served === null && String(text).indexOf("AIH Model Browser") === -1) {
+                    // La réponse n'est PAS notre module (page d'erreur, proxy,
+                    // stub de test…) : on ne peut PAS conclure → null + cri.
+                    _mbWarnProbeIndeterminate("réponse servie non reconnue comme le module");
+                    return null;
+                }
+                // Pas de marqueur dans le fichier servi = version antérieure au
+                // versionnage → certitude que le code en cours n'est PAS servi.
+                var stale = (served === null) ? true : (served !== AIH_MB_BUILD);
+                _mbLastStale = stale;
+                if (window.AIH_MB) {
+                    // Un écrasement refusé (page avec copie périmée) reste
+                    // signalé : la sonde ne doit pas l'effacer.
+                    if (!window.AIH_MB.clobberedBy) window.AIH_MB.stale = stale;
+                    window.AIH_MB.servedBuild = served;
+                    window.AIH_MB.probe = "ok";
+                }
+                if (stale) _mbWarnStale(served);
                 return stale;
             })
-            .catch(function () { return null; });
+            .catch(function (err) {
+                _mbWarnProbeIndeterminate("fetch du fichier servi impossible", err);
+                return null;
+            });
     }
 
     // Exposé pour les tests et le diagnostic utilisateur.
     window.AIH_MB = {
         build: AIH_MB_BUILD,
         stale: null,
+        servedBuild: null,
+        probe: "pending",
         checkServedBuildFreshness: checkServedBuildFreshness,
     };
+
+    // Sonde IMMÉDIATE (avant toute ouverture) : « stale: null » ne doit pas
+    // rester indéfiniment quand le fichier servi est à jour — c'est le cas
+    // quand la sonde n'était déclenchée que par renderModelBrowser (jamais
+    // appelé si une copie périmée du module rendait l'UI à la place).
+    checkServedBuildFreshness();
 
     // ─── Fenêtre de progression dédiée (js/aih_download_window.js) ─────────────
     // Ouverte AU LANCEMENT d'un téléchargement (unitaire ET lot) : c'est la vue
     // demandée (nom du fichier, PHASE explicite, %, octets/total, MB/s, ETA,
     // ✕ par ligne, progression globale N/M, récap final). La progression « en
     // ligne » de la liste reste en place (aucune régression). Si AIH.DownloadWindow
-    // est absent (build périmé ou module non chargé), on le SIGNALE bruyamment
-    // une seule fois au lieu de continuer en silence sans fenêtre.
+    // est absent (build périmé ou module non chargé), on le SIGNALE bruyamment :
+    // console.error UNE fois + bandeau VISIBLE dans le Model Browser + toast —
+    // jamais un échec silencieux qui laisse croire que la fenêtre « n'existe pas ».
     var _dlWindow = null;
     var _dlWinUnavailableWarned = false;
-    function _dlWinOpen() {
-        if (!(window.AIH && window.AIH.DownloadWindow)) {
-            if (!_dlWinUnavailableWarned) {
-                _dlWinUnavailableWarned = true;
-                console.error("[AIH] Fenêtre de transferts INDISPONIBLE : "
-                    + "window.AIH.DownloadWindow absent (build " + AIH_MB_BUILD
-                    + " / module aih_download_window.js non chargé). Recharge FORCÉE"
-                    + " (Ctrl+Shift+R / Cmd+Shift+R).");
-            }
-            return null;
+
+    // Cherche le Model Browser ouvert (transmis explicitement quand connu).
+    function _mbModalEl(m) {
+        if (m && m.modal) return m.modal;
+        return document.getElementById("aih-modal-model-browser");
+    }
+
+    // Échec BRUYANT ET VISIBLE d'ouverture de la fenêtre de transferts.
+    // Retourne null (jamais d'exception : les downloads continuent en ligne).
+    function _dlWinUnavailable(m, reason) {
+        if (!_dlWinUnavailableWarned) {
+            _dlWinUnavailableWarned = true;
+            console.error("[AIH] Fenêtre de transferts INDISPONIBLE : " + reason
+                + " (build " + AIH_MB_BUILD + " / module aih_download_window.js non chargé)."
+                + " Les transferts restent suivis par la progression EN LIGNE, mais la"
+                + " fenêtre dédiée est ABSENTE — recharge FORCÉE (Ctrl+Shift+R / Cmd+Shift+R).");
         }
-        _dlWindow = window.AIH.DownloadWindow.open();
+        if (window.AIH_MB) {
+            window.AIH_MB.downloadWindow = "unavailable";
+            window.AIH_MB.downloadWindowReason = reason;
+        }
+        try {
+            var root = _mbModalEl(m);
+            if (root && !root.querySelector("#mb-dlw-unavailable")) {
+                var banner = document.createElement("div");
+                banner.id = "mb-dlw-unavailable";
+                banner.className = "mb-stale-banner";
+                banner.textContent = t('mb.dlwUnavailable');
+                var panels = root.querySelector(".mb-panels");
+                if (panels && panels.parentNode) panels.parentNode.insertBefore(banner, panels);
+                else if (root.querySelector(".aih-dialog-body")) {
+                    root.querySelector(".aih-dialog-body").appendChild(banner);
+                }
+            }
+            if (window.AIHToast && typeof window.AIHToast.show === "function") {
+                window.AIHToast.show({ message: t('mb.dlwUnavailable'), type: "error", duration: 0 });
+            }
+        } catch (e) {
+            // On ne re-masque JAMAIS l'erreur : elle est déjà en console.
+        }
+        return null;
+    }
+
+    function _dlWinOpen(m) {
+        var DW = window.AIH && window.AIH.DownloadWindow;
+        if (!DW || typeof DW.open !== "function") {
+            return _dlWinUnavailable(m, "window.AIH.DownloadWindow absent");
+        }
+        try {
+            _dlWindow = DW.open();
+        } catch (err) {
+            return _dlWinUnavailable(m, "AIH.DownloadWindow.open() a jeté : "
+                + (err && err.message ? err.message : err));
+        }
+        if (!_dlWindow) {
+            return _dlWinUnavailable(m, "AIH.DownloadWindow.open() a renvoyé null");
+        }
+        if (window.AIH_MB) window.AIH_MB.downloadWindow = "available";
         return _dlWindow;
     }
-    function _dlWinAdd(uploadId, name, sizeBytes) {
-        var w = _dlWinOpen();
+    function _dlWinAdd(m, uploadId, name, sizeBytes) {
+        var w = _dlWinOpen(m);
         return w ? w.addFile(name, { uploadId: uploadId, sizeBytes: sizeBytes }) : null;
     }
-    function _dlWinStart(uploadId) {
-        var w = _dlWinOpen();
+    function _dlWinStart(m, uploadId) {
+        var w = _dlWinOpen(m);
         if (w) w.startFile(uploadId);
     }
+    // Contrôleur VIVANT de la fenêtre, même si _dlWindow date d'une ouverture
+    // antérieure (ex. module chargé tardivement) : on résout à l'appel.
+    function _dlWinLive() {
+        var DW = window.AIH && window.AIH.DownloadWindow;
+        if (DW && typeof DW.isOpen === "function" && DW.isOpen()) {
+            if (_dlWindow && _dlWindow.isOpen && _dlWindow.isOpen()) return _dlWindow;
+            if (typeof DW.open === "function") return DW.open();
+        }
+        return (_dlWindow && _dlWindow.isOpen && _dlWindow.isOpen()) ? _dlWindow : null;
+    }
     function _dlWinSettle(uploadId, kind, message) {
-        if (_dlWindow && _dlWindow.isOpen()) _dlWindow.setResult(uploadId, kind, message);
+        var w = _dlWinLive();
+        if (w) w.setResult(uploadId, kind, message);
     }
     function _dlWinDone() {
-        if (_dlWindow && _dlWindow.isOpen()) _dlWindow.done();
+        var w = _dlWinLive();
+        if (w) w.done();
     }
 
     // ─── Injection CSS (une seule fois) ──────────────────────────────────────────
@@ -820,7 +952,7 @@ var WF_REMOTE_MAX_PAGES = 20;
             // Fenêtre de progression dédiée : la ligne a été créée au lancement
             // du lot (état « En attente ») ; startFile bascule vers
             // « Préparation côté serveur… » puis « Transfert ».
-            _dlWinStart(uploadId);
+            _dlWinStart(m, uploadId);
 
             // Progression live + bouton d'annulation (voir _downloadRequest).
             _downloadRequest({
@@ -913,7 +1045,7 @@ var WF_REMOTE_MAX_PAGES = 20;
         // Fenêtre de progression : une ligne par fichier AVANT le premier
         // transfert (« En attente ») → progression globale N/M exacte et
         // visibilité immédiate du lot (demande utilisateur).
-        var win = _dlWinOpen();
+        var win = _dlWinOpen(m);
         if (win) {
             selected.forEach(function (it) {
                 var uid = it.id || it.upload_id || it._id;
@@ -973,7 +1105,12 @@ var WF_REMOTE_MAX_PAGES = 20;
     }
 
     // ─── openModelBrowser ────────────────────────────────────────────────────────
-    window.openModelBrowser = function () {
+    // NB : la fonction est publiée sur window par un GARDE ANTI-ÉCRASEMENT en
+    // fin de fichier (_mbPublishOpenModelBrowser) : une copie PÉRIMÉE du module
+    // (chargée sous un autre préfixe d'URL / depuis un dossier legacy) ne peut
+    // plus reprendre la main en silence et faire disparaître le bouton
+    // « Transferts » / la fenêtre dédiée.
+    function openModelBrowserImpl() {
         // Comportement dégradé : la liste distante dépend du backend AIH ;
         // sans URL configurée, on invite à configurer au lieu de laisser
         // le panneau distant échouer avec une erreur réseau confuse.
@@ -1012,8 +1149,96 @@ var WF_REMOTE_MAX_PAGES = 20;
         });
         _mRef.controller = m;
         renderModelBrowser(m);
+    }
 
-    };
+    // ─── Barre d'outils « Transferts » : construction + auto-réparation ───────
+    // Le HTML est construit par cette fonction UNIQUE, utilisée par le rendu
+    // complet ET par la réinsertion de secours. Si un autre code (copie
+    // périmée, re-rendu sauvage) retire la barre après coup, _ensure... le DIT
+    // (console.error) et la réinsère au lieu de laisser un échec silencieux.
+    function _mbToolbarInnerHtml() {
+        return '  <button type="button" class="mb-transfers-btn" title="' + t('mb.transfersTitle') + '">' +
+            '    <span class="mb-transfers-label">' + t('mb.transfers') + '</span>' +
+            '    <span class="mb-transfers-badge is-empty">0</span>' +
+            '  </button>' +
+            '  <span class="mb-build-label">' + _esc(AIH_MB_BUILD) + '</span>';
+    }
+
+    function _mbBadgeEl(root) {
+        return root ? root.querySelector('.mb-transfers-badge') : null;
+    }
+
+    // Câble le bouton « Transferts » (ouverture/réouverture de la fenêtre) et
+    // l'abonnement du badge. Idempotent : flags posés sur les ÉLÉMENTS du DOM
+    // (le modal est réutilisé par le garde anti-doublon, le badge est recréé à
+    // chaque re-rendu → la souscription vit sur la racine, pas sur le body).
+    function _mbWireTransfersToolbar(m) {
+        var root = _mbModalEl(m);
+        if (!root) return;
+        var transfersBtn = root.querySelector('.mb-transfers-btn');
+        if (transfersBtn && !transfersBtn._aihWired) {
+            transfersBtn._aihWired = true;
+            transfersBtn.addEventListener('click', function () {
+                var w = _dlWinOpen(m);
+                if (!w && typeof window.aihShowAlert === 'function') {
+                    window.aihShowAlert(t('dialog.error'), t('mb.dlwUnavailable'), 'error');
+                }
+            });
+        }
+        // Badge : reflète en continu le nombre de transferts en cours + en file.
+        if (!root._aihTransfersWired) {
+            root._aihTransfersWired = true;
+            root._aihTransfersUnsub = null;
+            var DW = window.AIH && window.AIH.DownloadWindow;
+            if (DW && typeof DW.onChange === 'function') {
+                root._aihTransfersUnsub = DW.onChange(function (count) {
+                    var badgeEl = _mbBadgeEl(root);
+                    if (!badgeEl || !badgeEl.isConnected) return;
+                    badgeEl.textContent = String(count);
+                    badgeEl.classList.toggle('is-empty', count === 0);
+                    badgeEl.title = t('mb.transfersBadgeTitle', { count: count });
+                });
+            } else {
+                // Fenêtre absente : l'ÉCHEC D'AFFICHAGE doit être bruyant ET
+                // visible (bandeau + toast), pas un badge muet à 0.
+                _dlWinUnavailable(m, "window.AIH.DownloadWindow absent à l'ouverture du Model Browser");
+            }
+            if (m && typeof m === 'object') m._transfersUnsub = root._aihTransfersUnsub;
+        }
+    }
+
+    // Vérifie que la barre d'outils complète (bouton + libellé de build) est
+    // RÉELLEMENT dans le DOM après le rendu ; sinon le dit et la réinsère.
+    // @returns {boolean} true si la barre est présente (après réparation).
+    function _mbEnsureTransfersToolbar(m) {
+        var root = _mbModalEl(m);
+        if (!root) return false;
+        var ok = !!(root.querySelector('.mb-transfers-btn') && root.querySelector('.mb-build-label'));
+        if (ok) return true;
+        console.error("[AIH] Model Browser : barre d'outils « Transferts » ABSENTE du DOM"
+            + " après rendu (build " + AIH_MB_BUILD + ") — réinsertion d'urgence.");
+        if (window.AIH_MB) window.AIH_MB.toolbarRepaired = (window.AIH_MB.toolbarRepaired || 0) + 1;
+        var toolbar = root.querySelector('#mb-toolbar');
+        if (!toolbar) {
+            toolbar = document.createElement('div');
+            toolbar.className = 'mb-toolbar';
+            toolbar.id = 'mb-toolbar';
+            var panels = root.querySelector('.mb-panels');
+            if (panels && panels.parentNode) panels.parentNode.insertBefore(toolbar, panels);
+            else {
+                var body = root.querySelector('.aih-dialog-body') || root;
+                body.appendChild(toolbar);
+            }
+        }
+        toolbar.innerHTML = _mbToolbarInnerHtml();
+        _mbWireTransfersToolbar({ modal: root, body: toolbar });
+        ok = !!(root.querySelector('.mb-transfers-btn') && root.querySelector('.mb-build-label'));
+        if (!ok) {
+            console.error("[AIH] Model Browser : RÉINSERTION de la barre d'outils INEFFICACE"
+                + " — le bouton « Transferts » restera invisible (build " + AIH_MB_BUILD + ").");
+        }
+        return ok;
+    }
 
     // ─── renderModelBrowser ──────────────────────────────────────────────────────
     function renderModelBrowser(m) {
@@ -1026,13 +1251,7 @@ var WF_REMOTE_MAX_PAGES = 20;
             // Bandeau « build obsolète » : rempli par la sonde de fraîcheur
             // (voir checkServedBuildFreshness). Masqué par défaut.
             '<div id="mb-stale-banner" class="mb-stale-banner" style="display:none;"></div>' +
-            '<div class="mb-toolbar" id="mb-toolbar">' +
-            '  <button type="button" class="mb-transfers-btn" title="' + t('mb.transfersTitle') + '">' +
-            '    <span class="mb-transfers-label">' + t('mb.transfers') + '</span>' +
-            '    <span class="mb-transfers-badge is-empty">0</span>' +
-            '  </button>' +
-            '  <span class="mb-build-label">' + _esc(AIH_MB_BUILD) + '</span>' +
-            '</div>' +
+            '<div class="mb-toolbar" id="mb-toolbar">' + _mbToolbarInnerHtml() + '</div>' +
             '<div class="mb-panels" id="mb-panels">' +
             '  <div class="mb-panel mb-panel-local">' +
             '    <div class="mb-panel-header">' + t('mb.panelLocal') +
@@ -1137,26 +1356,9 @@ var WF_REMOTE_MAX_PAGES = 20;
             });
         }
 
-        // Point d'entrée PERMANENT « Transferts » : ouvre (ou rouvre) la
-        // fenêtre de progression à tout moment, même après un masquage.
-        var transfersBtn = m.modal.querySelector('.mb-transfers-btn');
-        if (transfersBtn) {
-            transfersBtn.addEventListener('click', function () {
-                if (window.AIH && window.AIH.DownloadWindow) window.AIH.DownloadWindow.open();
-            });
-        }
-
-        // Badge : reflète en continu le nombre de transferts en cours + en file.
-        m._transfersUnsub = null;
-        if (window.AIH && window.AIH.DownloadWindow && typeof window.AIH.DownloadWindow.onChange === 'function') {
-            var badgeEl = m.modal.querySelector('.mb-transfers-badge');
-            m._transfersUnsub = window.AIH.DownloadWindow.onChange(function (count) {
-                if (!badgeEl || !badgeEl.isConnected) return;
-                badgeEl.textContent = String(count);
-                badgeEl.classList.toggle('is-empty', count === 0);
-                badgeEl.title = t('mb.transfersBadgeTitle', { count: count });
-            });
-        }
+        // Point d'entrée PERMANENT « Transferts » + badge : câblage idempotent
+        // (ouverture/réouverture de la fenêtre, abonnement du compteur).
+        _mbWireTransfersToolbar(m);
 
         // Effacer la sélection par panneau.
         m.modal.querySelectorAll('.mb-clear-selection').forEach(function (btn) {
@@ -1188,15 +1390,21 @@ var WF_REMOTE_MAX_PAGES = 20;
             m._remoteList.addEventListener('dblclick', function (e) { _onListDblClick(e, m, true); });
         }
 
+        // Garantie de dernière ligne : le bouton « Transferts » ET le libellé de
+        // build doivent être dans le DOM. Sinon, on le dit et on réinsère.
+        _mbEnsureTransfersToolbar(m);
+
         // Sonde de fraîcheur : si le fichier SERVI contient un marqueur de build
         // différent de celui en cours, ce code est PÉRIMÉ. On l'affiche au lieu
         // de laisser croire à une fonctionnalité cassée.
         var staleBanner = m.modal.querySelector('#mb-stale-banner');
         if (staleBanner) {
+            if ((window.AIH_MB && window.AIH_MB.clobberedBy) || _mbLastStale === true) {
+                _mbShowStaleBanner(window.AIH_MB && window.AIH_MB.servedBuild);
+            }
             checkServedBuildFreshness().then(function (stale) {
                 if (!stale || !staleBanner.isConnected) return;
-                staleBanner.textContent = t('mb.staleBuild', { running: AIH_MB_BUILD });
-                staleBanner.style.display = 'block';
+                _mbShowStaleBanner(window.AIH_MB && window.AIH_MB.servedBuild);
             });
         }
 
@@ -1901,8 +2109,8 @@ var WF_REMOTE_MAX_PAGES = 20;
         }
 
         // Fenêtre de progression dédiée (téléchargement unitaire).
-        _dlWinAdd(uploadId, filename, sizeBytes);
-        _dlWinStart(uploadId);
+        _dlWinAdd(m, uploadId, filename, sizeBytes);
+        _dlWinStart(m, uploadId);
 
         var progressEl = showProgress(m, filename, { cancelable: true });
 
@@ -1995,7 +2203,7 @@ var WF_REMOTE_MAX_PAGES = 20;
 
         // Le transfert REDÉMARRE après résolution du conflit : la ligne de la
         // fenêtre repasse en « Préparation côté serveur… » avec un chrono neuf.
-        _dlWinStart(uploadId);
+        _dlWinStart(m, uploadId);
 
         // Progression live + bouton d'annulation (voir _downloadRequest).
         _downloadRequest(body, progressEl)
@@ -2179,5 +2387,108 @@ var WF_REMOTE_MAX_PAGES = 20;
                 throw err;
             });
     }
+
+    // ─── Publication de openModelBrowser + GARDE ANTI-ÉCRASEMENT ───────────────
+    // Scénario réel (reproduit au harnais Chromium) : DEUX copies du module
+    // peuvent coexister dans la même page — ComfyUI charge CHAQUE dossier
+    // custom_nodes qui expose WEB_DIRECTORY (dossier legacy conservé) et le
+    // front importe TOUS les .js en parallèle : l'ordre d'exécution n'est pas
+    // déterministe. Une copie PÉRIMÉE qui s'exécute en dernier écrasait
+    // window.openModelBrowser : l'UI ouverte était l'ANCIENNE (aucun bouton
+    // « Transferts », aucune fenêtre dédiée, progression en ligne seule)
+    // pendant que window.AIH_MB.build affichait le build COURANT et que
+    // window.AIH_MB.stale restait null (la sonde du build courant n'était
+    // jamais appelée).
+    //
+    // Ici : la copie courante est estampillée __aihMbBuild et le setter REFUSE
+    // un écrasement par une copie SANS marqueur (périmée). Une copie PLUS
+    // RÉCENTE (marqueur « …-YYYY-MM-DD-rN » comparé par rang) reste prioritaire.
+    // Tout refus est JOURNALISÉ (console.error) et affiché.
+    function _mbBuildRank(build) {
+        var m = /(\d{4})-(\d{2})-(\d{2})-r(\d+)\s*$/.exec(String(build || ""));
+        if (!m) return null;
+        return Number(m[1] + m[2] + m[3]) * 10000 + Number(m[4]);
+    }
+
+    function _mbIsNewerBuild(marker) {
+        var a = _mbBuildRank(marker);
+        var b = _mbBuildRank(AIH_MB_BUILD);
+        return a !== null && b !== null && a > b;
+    }
+
+    function _mbReportClobber(marker) {
+        var label = marker ? ("build " + marker) : "copie SANS marqueur de build (périmée)";
+        console.error("[AIH] Model Browser : window.openModelBrowser ÉCRASÉ par une " + label
+            + " — écrasement REFUSÉ : la copie " + AIH_MB_BUILD + " (cette page) reste active."
+            + " Cause probable : deux copies du pack chargées en parallèle"
+            + " (dossier legacy conservé, plusieurs préfixes /extensions/<nom>/).");
+        if (window.AIH_MB) {
+            window.AIH_MB.clobberedBy = marker || "sans-marqueur";
+            window.AIH_MB.clobberRefused = (window.AIH_MB.clobberRefused || 0) + 1;
+            window.AIH_MB.stale = true;
+        }
+        _mbShowStaleBanner(marker || "sans-marqueur");
+    }
+
+    var _mbOpenModelBrowserRef = openModelBrowserImpl;
+    openModelBrowserImpl.__aihMbBuild = AIH_MB_BUILD;
+
+    (function _mbPublishOpenModelBrowser() {
+        var getter = function () { return _mbOpenModelBrowserRef; };
+        getter.__aihMbGuard = true;
+        var setter = function (fn) {
+            if (typeof fn !== "function") return;
+            var marker = fn.__aihMbBuild || null;
+            if (marker === AIH_MB_BUILD || _mbIsNewerBuild(marker)
+                || !_mbOpenModelBrowserRef) {
+                _mbOpenModelBrowserRef = fn;
+                return;
+            }
+            _mbReportClobber(marker);
+        };
+        try {
+            var prior = window.openModelBrowser;
+            if (typeof prior === "function" && prior !== openModelBrowserImpl) {
+                var priorMarker = prior.__aihMbBuild || null;
+                if (_mbIsNewerBuild(priorMarker)) {
+                    // Une copie plus récente s'est installée avant nous : elle
+                    // reste prioritaire (aucune régression de version).
+                    console.info("[AIH] Model Browser : copie plus récente déjà active (build "
+                        + priorMarker + ") — cette copie " + AIH_MB_BUILD + " ne la remplace pas.");
+                    _mbOpenModelBrowserRef = prior;
+                } else if (priorMarker === AIH_MB_BUILD) {
+                    // Même build (deux instances du même fichier) : reprise
+                    // silencieuse, aucune alerte d'obsolescence.
+                    _mbOpenModelBrowserRef = openModelBrowserImpl;
+                } else {
+                    // Copie périmée/sans marqueur déjà installée : reprise de la
+                    // main + cri. (Sans ce garde, TOUTE l'UI restait l'ancienne.)
+                    _mbReportClobber(priorMarker);
+                }
+            }
+            Object.defineProperty(window, "openModelBrowser", {
+                configurable: true,
+                enumerable: true,
+                get: getter,
+                set: setter,
+            });
+        } catch (e) {
+            console.error("[AIH] Model Browser : garde anti-écrasement NON installée ("
+                + (e && e.message ? e.message : e) + ") — openModelBrowser en écriture directe.", e);
+        }
+        // Publication de la copie courante : uniquement si une copie plus
+        // RÉCENTE n'est pas déjà active (sinon on la préserve).
+        if (_mbOpenModelBrowserRef === openModelBrowserImpl) {
+            window.openModelBrowser = openModelBrowserImpl; // via le setter
+        }
+        if (window.AIH_MB) {
+            window.AIH_MB.openModelBrowser = _mbOpenModelBrowserRef;
+            // API de diagnostic/réparation : réinsère la barre d'outils du
+            // Model Browser s'il en manque (l'échec est journalisé).
+            window.AIH_MB.ensureTransfersToolbar = function () {
+                return _mbEnsureTransfersToolbar({ modal: _mbModalEl(null) });
+            };
+        }
+    })();
 
 })();

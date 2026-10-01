@@ -195,6 +195,7 @@ import "./aih_i18n.js";
         "mb.dlwDoneTitle": "Téléchargement terminé",
         "mb.dlwRecap": "{ok} réussi(s) · {cancelled} annulé(s) · {failed} échec(s)",
         "mb.dlwEmpty": "Aucun transfert en cours. Les téléchargements lancés depuis la liste distante apparaîtront ici.",
+        "mb.dlwUnavailable": "⚠️ Fenêtre de transferts INDISPONIBLE (module aih_download_window.js non chargé) : les téléchargements sont suivis par la progression en ligne. Rechargez la page en FORCÉ (Ctrl+Shift+R / Cmd+Shift+R).",
 
         /* Point d'entrée permanent « Transferts » + multi-sélection */
         "mb.transfers": "⬇️ Transferts",
@@ -1450,6 +1451,7 @@ import "./aih_i18n.js";
         "mb.dlwDoneTitle": "Download complete",
         "mb.dlwRecap": "{ok} succeeded · {cancelled} cancelled · {failed} failed",
         "mb.dlwEmpty": "No transfer in progress. Downloads started from the remote list will appear here.",
+        "mb.dlwUnavailable": "⚠️ Transfers window UNAVAILABLE (module aih_download_window.js not loaded): downloads are tracked by inline progress. Hard-reload the page (Ctrl+Shift+R / Cmd+Shift+R).",
 
         /* Permanent “Transfers” entry point + multi-selection */
         "mb.transfers": "⬇️ Transfers",
