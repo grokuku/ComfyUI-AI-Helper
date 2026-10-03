@@ -1738,6 +1738,289 @@ function makeNewNode() {
     ok("(I3) change_node_type : fonctionne DANS un subgraph (subgraph + locator uuid:id), racine intacte");
 }
 
+// ══════ 6quinquies. change_node_type : ÉTAT RÉEL DU GRAPHE (pas un compteur) ══
+// On vérifie, pour CHAQUE lien d'origine, les 5 invariants d'état : (i) le lien
+// existe dans graph.links, (ii) origine/cible + slots pointent la NOUVELLE node,
+// (iii) la nouvelle node a ses références dans inputs[k].link / outputs[j].links,
+// (iv) aucune référence PENDANTE ne subsiste (slots ↔ registre cohérents), (v)
+// l'ancienne node est retirée. Fixture à liens en Map (forme du frontend récent)
+// pour coller au LiteGraph réel (outputs[].links peut être null).
+
+/** Nouvelle node de test (slots déclarés ; links null comme le vrai LiteGraph). */
+function makeNewNodeOf({ id = 99, inputs = [], outputs = [], widgets = [] } = {}) {
+    const n = makeNode({ id, type: "New", title: "New", pos: [0, 0], widgets });
+    n.size = [210, 100];
+    n.inputs = inputs.map((i) => ({ name: i.name, type: i.type, link: null }));
+    n.outputs = outputs.map((o) => ({ name: o.name, type: o.type, links: null }));
+    return n;
+}
+
+/** Graphe à liens en Map (forme frontend) + serialize()/loadGraphData() réels. */
+function makeMapRetypeFixture(nodeDefs, linkList) {
+    const buildNode = (d) => {
+        const n = makeNode({
+            id: d.id, type: d.type, title: d.title, pos: d.pos, mode: d.mode,
+            widgets: (d.widgets || []).map((w) => ({ name: w.name, type: w.type, value: w.value })),
+        });
+        n.color = d.color; n.bgcolor = d.bgcolor;
+        n.pos = new Float64Array(d.pos || [0, 0]);
+        n.size = new Float64Array(d.size || [100, 50]);
+        n.inputs = (d.inputs || []).map((i) => ({ name: i.name, type: i.type, link: i.link === undefined ? null : i.link }));
+        n.outputs = (d.outputs || []).map((o) => ({ name: o.name, type: o.type, links: o.links === undefined || o.links === null ? null : o.links.slice() }));
+        return n;
+    };
+    const root = {
+        id: "root", _nodes: [], _nodes_by_id: {}, links: new Map(), _groups: [], subgraphs: new Map(), rootGraph: null,
+        get nodes() { return this._nodes; },
+        set nodes(v) { this._nodes = v; },
+        getNodeById(id) { return this._nodes.find((n) => String(n.id) === String(id)) || null; },
+        setDirtyCanvas() {}, change() {}, updateExecutionOrder() {},
+        serialize() {
+            return {
+                version: 1,
+                nodes: this._nodes.map((n) => ({
+                    id: n.id, type: n.type, title: n.title,
+                    pos: [n.pos[0], n.pos[1]], size: [n.size[0], n.size[1]], mode: n.mode,
+                    color: n.color, bgcolor: n.bgcolor,
+                    widgets: (n.widgets || []).map((w) => ({ name: w.name, type: w.type, value: w.value })),
+                    inputs: (n.inputs || []).map((i) => ({ name: i.name, type: i.type, link: i.link })),
+                    outputs: (n.outputs || []).map((o) => ({ name: o.name, type: o.type, links: o.links ? o.links.slice() : null })),
+                })),
+                links: [...this.links.values()].map((l) => ({ ...l })),
+            };
+        },
+        loadGraphData(data) {
+            this.links = new Map();
+            (data.links || []).forEach((l) => this.links.set(l.id, { ...l }));
+            this._nodes = (data.nodes || []).map((d) => { const n = buildNode(d); n.graph = this; return n; });
+            this._nodes_by_id = {};
+            this._nodes.forEach((n) => { this._nodes_by_id[n.id] = n; });
+            return Promise.resolve();
+        },
+    };
+    for (const d of nodeDefs) { const n = buildNode(d); n.graph = root; root._nodes.push(n); root._nodes_by_id[n.id] = n; }
+    for (const l of linkList) root.links.set(l.id, { ...l });
+    root.rootGraph = root;
+    const app = { graph: root, rootGraph: root, canvas: { setDirtyCanvas() {} }, loadGraphData(data) { return root.loadGraphData(data); } };
+    return { app, root };
+}
+
+/**
+ * Invariants d'état de graphe (renvoie la liste des problèmes, [] = cohérent).
+ * spec.kept : { <linkId>: { origin:'new'|'other', origin_id?, origin_slot?, target:'new'|'other', target_id?, target_slot? } }
+ * spec.gone : [ linkId, ... ] liens qui DOIVENT avoir disparu partout.
+ */
+function graphStateProblems(g, newNodeId, spec) {
+    const problems = [];
+    const newNode = g.getNodeById(newNodeId);
+    if (!newNode) return ["nouvelle node absente du graphe"];
+    const refCount = new Map();
+    for (const n of g.nodes) {
+        for (const i of n.inputs || []) if (i.link !== null && i.link !== undefined) refCount.set(String(i.link), (refCount.get(String(i.link)) || 0) + 1);
+        for (const o of n.outputs || []) for (const lid of o.links || []) if (lid !== null && lid !== undefined) refCount.set(String(lid), (refCount.get(String(lid)) || 0) + 1);
+    }
+    for (const [lid, exp] of Object.entries(spec.kept || {})) {
+        const link = g.links.get(Number(lid)) || g.links.get(lid);
+        if (!link) { problems.push(`lien ${lid} absent de graph.links`); continue; }
+        if (exp.origin === "new" && String(link.origin_id) !== String(newNodeId)) problems.push(`lien ${lid}: origin_id=${link.origin_id} ≠ ${newNodeId}`);
+        if (exp.target === "new" && String(link.target_id) !== String(newNodeId)) problems.push(`lien ${lid}: target_id=${link.target_id} ≠ ${newNodeId}`);
+        if (exp.origin_slot !== undefined && Number(link.origin_slot) !== exp.origin_slot) problems.push(`lien ${lid}: origin_slot=${link.origin_slot} ≠ ${exp.origin_slot}`);
+        if (exp.target_slot !== undefined && Number(link.target_slot) !== exp.target_slot) problems.push(`lien ${lid}: target_slot=${link.target_slot} ≠ ${exp.target_slot}`);
+        if (exp.target === "new") {
+            const s = newNode.inputs[exp.target_slot];
+            if (!s || String(s.link) !== String(lid)) problems.push(`nouvelle node : inputs[${exp.target_slot}].link=${s && s.link} ≠ ${lid}`);
+        }
+        if (exp.origin === "new") {
+            const s = newNode.outputs[exp.origin_slot];
+            if (!s || !(s.links || []).some((x) => String(x) === String(lid))) problems.push(`nouvelle node : outputs[${exp.origin_slot}].links ne contient pas ${lid}`);
+        }
+        if (exp.origin === "other") {
+            const src = g.getNodeById(exp.origin_id);
+            if (!src || !(src.outputs || []).some((o) => (o.links || []).some((x) => String(x) === String(lid)))) problems.push(`lien ${lid}: sortie source (node ${exp.origin_id}) ne référence plus le lien`);
+        }
+        if (exp.target === "other") {
+            const tgt = g.getNodeById(exp.target_id);
+            if (!tgt || !(tgt.inputs || []).some((i) => String(i.link) === String(lid))) problems.push(`lien ${lid}: entrée cible (node ${exp.target_id}) ne référence plus le lien`);
+        }
+    }
+    for (const [lid] of refCount) {
+        if (!g.links.get(Number(lid)) && !g.links.get(lid)) problems.push(`RÉFÉRENCE PENDANTE : linkId ${lid} référencé par un slot mais absent de graph.links`);
+    }
+    for (const lid of spec.gone || []) {
+        if (g.links.get(Number(lid)) || g.links.get(lid)) problems.push(`lien ${lid} (sans équivalent) toujours dans graph.links`);
+        if (refCount.has(String(lid))) problems.push(`lien ${lid} encore référencé quelque part (devrait être détaché partout)`);
+    }
+    return problems;
+}
+
+// ── (I4) entrées ET sorties, sortie multi-liens, node au milieu d'une chaîne ──
+{
+    clearUndo();
+    const fx = makeMapRetypeFixture(
+        [
+            { id: 10, type: "Loader", outputs: [{ name: "MODEL", type: "MODEL", links: [101] }] },
+            { id: 11, type: "Loader2", outputs: [{ name: "MODEL", type: "MODEL", links: [102] }] },
+            { id: 1, type: "Legacy", title: "T", pos: [5, 6],
+              inputs: [{ name: "model", type: "MODEL", link: 101 }, { name: "model2", type: "MODEL", link: 102 }],
+              outputs: [{ name: "IMAGE", type: "IMAGE", links: [103, 104] }] },
+            { id: 20, type: "Saver", inputs: [{ name: "images", type: "IMAGE", link: 103 }] },
+            { id: 21, type: "Saver2", inputs: [{ name: "images", type: "IMAGE", link: 104 }] },
+        ],
+        [
+            { id: 101, origin_id: 10, origin_slot: 0, target_id: 1, target_slot: 0, type: "MODEL" },
+            { id: 102, origin_id: 11, origin_slot: 0, target_id: 1, target_slot: 1, type: "MODEL" },
+            { id: 103, origin_id: 1, origin_slot: 0, target_id: 20, target_slot: 0, type: "IMAGE" },
+            { id: 104, origin_id: 1, origin_slot: 0, target_id: 21, target_slot: 0, type: "IMAGE" },
+        ],
+    );
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New" }, {
+        app: fx.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ inputs: [{ name: "model", type: "MODEL" }, { name: "model2", type: "MODEL" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.data.links_reconnected, 4, "4 liens conservés");
+    assert.strictEqual(res.data.links_lost, 0, "aucun lien perdu (slots équivalents)");
+    const problems = graphStateProblems(fx.root, 1, {
+        kept: {
+            101: { origin: "other", origin_id: 10, target: "new", target_slot: 0 },
+            102: { origin: "other", origin_id: 11, target: "new", target_slot: 1 },
+            103: { origin: "new", origin_slot: 0, target: "other", target_id: 20 },
+            104: { origin: "new", origin_slot: 0, target: "other", target_id: 21 },
+        },
+    });
+    assert.deepStrictEqual(problems, [], `état de graphe (I4) : ${problems.join(" | ")}`);
+    assert.strictEqual(fx.root.nodes.filter((n) => String(n.id) === "1").length, 1, "ancienne node retirée (une seule node d'id 1)");
+    ok("(I4) milieu de chaîne + sortie multi-liens : 4 liens conservés, origine/cible/slots corrects, zéro pendant");
+}
+
+// ── (I5) slots incompatibles : perte LÉGITIME, détachement PROPRE, message non alarmant ──
+{
+    clearUndo();
+    const fx = makeMapRetypeFixture(
+        [
+            { id: 10, type: "Loader", outputs: [{ name: "MODEL", type: "MODEL", links: [101] }] },
+            { id: 11, type: "Control", outputs: [{ name: "CONTROL", type: "CONTROL", links: [102] }] },
+            { id: 1, type: "Legacy", inputs: [{ name: "model", type: "MODEL", link: 101 }, { name: "ctrl", type: "CONTROL", link: 102 }] },
+        ],
+        [
+            { id: 101, origin_id: 10, origin_slot: 0, target_id: 1, target_slot: 0, type: "MODEL" },
+            { id: 102, origin_id: 11, origin_slot: 0, target_id: 1, target_slot: 1, type: "CONTROL" },
+        ],
+    );
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New" }, {
+        app: fx.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ inputs: [{ name: "model", type: "MODEL" }] }),
+    });
+    assert.strictEqual(res.data.links_reconnected, 1, "1 lien compatible conservé");
+    assert.strictEqual(res.data.links_lost, 1, "1 lien sans équivalent détaché");
+    assert.deepStrictEqual(res.data.lost_inputs, ["ctrl"]);
+    const problems = graphStateProblems(fx.root, 1, {
+        kept: { 101: { origin: "other", origin_id: 10, target: "new", target_slot: 0 } },
+        gone: [102],
+    });
+    assert.deepStrictEqual(problems, [], `état de graphe (I5) : ${problems.join(" | ")}`);
+    assert.strictEqual(typeof res.data.notice, "string", "notice présent dans le résultat");
+    assert.ok(/conserv/.test(res.data.notice) && /détach/.test(res.data.notice), `notice distingue conservé/détaché : ${res.data.notice}`);
+    ok("(I5) slots incompatibles : perte légitime détachée proprement (102 retiré partout) + message non alarmant");
+}
+
+// ── (I6) retype DANS un subgraph : liens internes conservés (état vérifié) ──
+{
+    clearUndo();
+    const sg = makeMapRetypeFixture(
+        [
+            { id: 30, type: "Load", outputs: [{ name: "MODEL", type: "MODEL", links: [201] }] },
+            { id: 1, type: "Legacy", inputs: [{ name: "model", type: "MODEL", link: 201 }], outputs: [{ name: "IMAGE", type: "IMAGE", links: [202] }] },
+            { id: 31, type: "Save", inputs: [{ name: "images", type: "IMAGE", link: 202 }] },
+        ],
+        [
+            { id: 201, origin_id: 30, origin_slot: 0, target_id: 1, target_slot: 0, type: "MODEL" },
+            { id: 202, origin_id: 1, origin_slot: 0, target_id: 31, target_slot: 0, type: "IMAGE" },
+        ],
+    ).root;
+    sg.id = SG_ID; sg.name = "Chain";
+    const root = makeMapRetypeFixture([], []).root;
+    root.subgraphs.set(SG_ID, sg);
+    const inst = makeNode({ id: 10, type: SG_ID, title: "Chain", pos: [0, 0] });
+    inst.size = [200, 80]; inst.subgraph = sg; inst.isSubgraphNode = () => true; inst.graph = root;
+    root._nodes.push(inst); root._nodes_by_id[10] = inst;
+    const app = { graph: root, rootGraph: root, canvas: { setDirtyCanvas() {} }, loadGraphData: (d) => root.loadGraphData(d) };
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New", subgraph: SG_ID }, {
+        app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ id: 55, inputs: [{ name: "model", type: "MODEL" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.data.subgraph.id, SG_ID);
+    const problems = graphStateProblems(sg, 1, {
+        kept: {
+            201: { origin: "other", origin_id: 30, target: "new", target_slot: 0 },
+            202: { origin: "new", origin_slot: 0, target: "other", target_id: 31 },
+        },
+    });
+    assert.deepStrictEqual(problems, [], `état de graphe (I6) : ${problems.join(" | ")}`);
+    assert.strictEqual(root.getNodeById(1), null, "racine : aucun nœud d'id 1 (retype bien DANS le subgraph)");
+    clearUndo();
+    ok("(I6) subgraph : liens internes conservés (origine/cible/slots + zéro pendant)");
+}
+
+// ── (I7) undo restaure type ET liens (état de graphe vérifié) ──
+{
+    clearUndo();
+    const fx = makeMapRetypeFixture(
+        [
+            { id: 10, type: "L", outputs: [{ name: "MODEL", type: "MODEL", links: [101] }] },
+            { id: 1, type: "Legacy", inputs: [{ name: "model", type: "MODEL", link: 101 }], outputs: [{ name: "OUT", type: "IMAGE", links: [102] }] },
+            { id: 20, type: "S", inputs: [{ name: "x", type: "IMAGE", link: 102 }] },
+        ],
+        [
+            { id: 101, origin_id: 10, origin_slot: 0, target_id: 1, target_slot: 0, type: "MODEL" },
+            { id: 102, origin_id: 1, origin_slot: 0, target_id: 20, target_slot: 0, type: "IMAGE" },
+        ],
+    );
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New" }, {
+        app: fx.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ inputs: [{ name: "model", type: "MODEL" }], outputs: [{ name: "OUT", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true);
+    const u = await undoSnapshot(res.snapshotId, { app: fx.app });
+    assert.strictEqual(u.ok, true, "undo via loadGraphData");
+    assert.strictEqual(fx.root.getNodeById(1).type, "Legacy", "undo : type restauré");
+    const problems = graphStateProblems(fx.root, 1, {
+        kept: {
+            101: { origin: "other", origin_id: 10, target: "new", target_slot: 0 },
+            102: { origin: "new", origin_slot: 0, target: "other", target_id: 20 },
+        },
+    });
+    assert.deepStrictEqual(problems, [], `état de graphe après undo (I7) : ${problems.join(" | ")}`);
+    clearUndo();
+    ok("(I7) undo restaure type ET liens (état de graphe vérifié des deux côtés)");
+}
+
+// ── (I8) garde anti-lien-pendant : un id de lien absent du registre n'est jamais recréé ──
+{
+    clearUndo();
+    // Node 1 : sortie IMAGE dont l'id de lien (999) n'existe PAS dans graph.links
+    // (référence pendante PRÉEXISTANTE). Après retype, l'outil ne doit ni la
+    // recréer ni la compter « recâblée » — le graphe reste sans aucune pendante.
+    const fx = makeMapRetypeFixture(
+        [
+            { id: 1, type: "Legacy", inputs: [{ name: "model", type: "MODEL", link: null }], outputs: [{ name: "IMAGE", type: "IMAGE", links: [999] }] },
+        ],
+        [],
+    );
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New" }, {
+        app: fx.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ inputs: [{ name: "model", type: "MODEL" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.data.links_reconnected, 0, "lien pendant 999 NON compté recâblé");
+    assert.strictEqual(res.data.links_lost, 1, "lien pendant 999 compté détaché");
+    const problems = graphStateProblems(fx.root, 1, { kept: {}, gone: [999] });
+    assert.deepStrictEqual(problems, [], `état de graphe (I8) : ${problems.join(" | ")}`);
+    assert.deepStrictEqual(fx.root.getNodeById(1).outputs.find((o) => o.name === "IMAGE").links, [], "nouvelle node : sortie sans référence pendante");
+    clearUndo();
+    ok("(I8) garde anti-lien-pendant : id de lien absent du registre jamais recréé (zéro référence pendante)");
+}
+
 console.log(`\n✅ Partie 1 (pure) : ${n} groupes d'assertions PASS — suite jsdom…`);
 
 /* ════════════════════════════════════════════════════════════════════════

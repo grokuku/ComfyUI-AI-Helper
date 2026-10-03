@@ -1999,7 +1999,7 @@ registerTool({
 
 registerTool({
     name: "change_node_type",
-    description: "Change la CLASSE (le type ComfyUI) d'un nœud EXISTANT, SANS le supprimer ni le recréer : le nœud garde sa position, sa taille, son titre, sa couleur et son mode (enable/mute/bypass), et ses liens sont RECÂBLÉS vers les slots de même NOM (puis de même TYPE de données) de la nouvelle classe. Idéal pour RÉPARER un workflow dont un nœud a un type manquant/supprimé (ex. ancien alias 'Holaf*' → 'AIH*'). Les widgets et les liens SANS équivalent dans la nouvelle classe sont PERDUS et listés dans le résultat (jamais en silence) ; les liens non recâblés sont détachés. La nouvelle classe doit exister (erreur claire sinon — vérifie son nom exact avec get_object_info). Retyper vers le MÊME type est un no-op signalé. Mutatif (annulable). Pour un nœud dans un subgraph, fournis subgraph (UUID, nom, ou 'current').",
+    description: "Change la CLASSE (le type ComfyUI) d'un nœud EXISTANT, SANS le supprimer ni le recréer : le nœud garde sa position, sa taille, son titre, sa couleur et son mode (enable/mute/bypass). Les CONNEXIONS EXISTANTES SONT CONSERVÉES : chaque lien est recâblé vers le slot de même NOM (puis de même TYPE de données) de la nouvelle classe — les liaisons compatibles ne sont donc PAS cassées. Seuls les liens qui n'ont AUCUN slot équivalent dans la nouvelle classe sont détachés PROPREMENT (jamais de lien pendant) et comptés (links_lost / lost_inputs / lost_outputs) : c'est le comportement normal d'un changement de classe, PAS une connexion cassée. Idéal pour RÉPARER un workflow dont un nœud a un type manquant/supprimé (ex. ancien alias 'Holaf*' → 'AIH*'). Les widgets absents de la nouvelle classe sont également listés (lost_widgets). La nouvelle classe doit exister (erreur claire sinon — vérifie son nom exact avec get_object_info). Retyper vers le MÊME type est un no-op signalé. Mutatif (annulable). Pour un nœud dans un subgraph, fournis subgraph (UUID, nom, ou 'current').",
     schema: {
         type: "object",
         properties: {
@@ -2065,6 +2065,14 @@ registerTool({
         const keptPos = numberPair(oldNode.pos);
         const keptSize = numberPair(oldNode.size);
         try { if (oldNode.id !== undefined) newNode.id = oldNode.id; } catch { /* id figé ? tant pis */ }
+        // Frontend récent : re-binder chaque widget sur l'id (définitif) du nœud.
+        // Les widgets créés par `createNode` visent un id non assigné ; sans ce
+        // setNodeId, leurs valeurs peuvent perdre leur liaison (WidgetValueStore)
+        // après le remplacement. Le frontend de référence le fait dans
+        // replaceWithMapping (isNodeBindable(widget) → widget.setNodeId(id)).
+        for (const w of (Array.isArray(newNode.widgets) ? newNode.widgets : [])) {
+            if (w && typeof w.setNodeId === "function") { try { w.setNodeId(newNode.id); } catch { /* widget non bindable */ } }
+        }
         if (keptPos) { try { newNode.pos = [keptPos[0], keptPos[1]]; } catch { /* ignore */ } }
         if (keptSize) { try { newNode.size = [keptSize[0], keptSize[1]]; } catch { /* ignore */ } }
         if (oldNode.order !== undefined) { try { newNode.order = oldNode.order; } catch { /* ignore */ } }
@@ -2175,9 +2183,18 @@ registerTool({
             for (const lid of outLinks) {
                 try {
                     const link = getLinkById(owner, lid);
-                    if (link) { link.origin_id = newNode.id; link.origin_slot = no; }
-                    newOutputs[no].links.push(lid);
-                    reconnected++;
+                    if (link) {
+                        link.origin_id = newNode.id; link.origin_slot = no;
+                        newOutputs[no].links.push(lid);
+                        reconnected++;
+                    } else {
+                        // Lien absent du registre (référence pendante préexistante) :
+                        // on ne RECRÉE pas la référence — on la nettoie partout
+                        // (jamais de lien pendant, pas de faux « recâblé »).
+                        linksLost++;
+                        clearLinkRefs(owner, lid, newNode);
+                        removeGraphLink(owner, lid);
+                    }
                 } catch { linksLost++; clearLinkRefs(owner, lid, newNode); removeGraphLink(owner, lid); }
             }
             try { oldOut.links = []; } catch { /* ignore */ }
@@ -2199,12 +2216,23 @@ registerTool({
         try { if (typeof oldNode.onRemoved === "function") oldNode.onRemoved(); } catch { /* ignore */ }
         dirtyCanvas(ctx);
 
+        // Message NON ALARMANT pour Blobby/l'utilisateur : distinguer explicitement
+        // les connexions CONSERVÉES des liens sans équivalent DÉTACHÉS proprement,
+        // pour ne pas présenter un détachement légitime comme « les connexions
+        // sont cassées ». `notice` est le champ lu par le LLM (renderToolContent).
+        const notice = linksLost > 0
+            ? label(ctx, "bl.toolRes.changeNodeTypeKeptLost", { kept: String(reconnected), lost: String(linksLost) },
+                "{kept} connexion(s) conservée(s) ; {lost} détachée(s) proprement (aucun slot équivalent dans la nouvelle classe — normal lors d'un changement de classe)")
+            : label(ctx, "bl.toolRes.changeNodeTypeAllKept", { kept: String(reconnected) },
+                "{kept} connexion(s) conservée(s) (tous les slots ont un équivalent dans la nouvelle classe)");
+
         return {
             data: {
                 node: newNode.id,
                 previous_type: oldType || null,
                 type: newType,
                 noop: false, changed: true,
+                notice: notice,
                 kept: {
                     pos: keptPos, size: keptSize,
                     title: customTitle,

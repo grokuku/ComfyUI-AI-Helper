@@ -866,6 +866,8 @@ import "./aih_i18n.js";
         /* Retype de nœud (change_node_type) */
         "bl.toolAct.changeNodeType": "🔁 {name} : {from} → {to}",
         "bl.toolAct.changeNodeTypeNoop": "⏭️ {name} est déjà de type {type} (aucun changement)",
+        "bl.toolRes.changeNodeTypeAllKept": "{kept} connexion(s) conservée(s) (tous les slots ont un équivalent dans la nouvelle classe)",
+        "bl.toolRes.changeNodeTypeKeptLost": "{kept} connexion(s) conservée(s) ; {lost} détachée(s) proprement (aucun slot équivalent dans la nouvelle classe — normal lors d'un changement de classe)",
         "bl.toolErr.changeFailed": "changement de type impossible : {error}",
 
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
@@ -2206,6 +2208,8 @@ import "./aih_i18n.js";
         /* Node retype (change_node_type) */
         "bl.toolAct.changeNodeType": "🔁 {name}: {from} → {to}",
         "bl.toolAct.changeNodeTypeNoop": "⏭️ {name} is already of type {type} (no change)",
+        "bl.toolRes.changeNodeTypeAllKept": "{kept} preserved connection(s) (every slot has an equivalent in the new class)",
+        "bl.toolRes.changeNodeTypeKeptLost": "{kept} preserved connection(s); {lost} cleanly detached (no equivalent slot in the new class — normal when changing class)",
         "bl.toolErr.changeFailed": "cannot change the node type: {error}",
 
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
