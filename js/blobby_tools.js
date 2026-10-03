@@ -217,6 +217,95 @@ function nodeTitle(node) {
     return (node && (node.title || node.comfyClass || node.type)) || "?";
 }
 
+/**
+ * Lit une paire [x, y] depuis une position/taille LiteGraph.
+ * ⚠️ Dans LiteGraph récent (frontend ComfyUI de référence), `node.pos` et
+ * `node.size` — ainsi que ceux d'un `LGraphGroup` — sont des `Float64Array`
+ * (Rectangle.subarray), PAS des `Array` : `Array.isArray()` y renvoie `false`
+ * et une lecture naïve `Array.isArray(v) ? [...] : null` produit `null`.
+ * On indexe donc la valeur (Array OU typed array) et on renvoie TOUJOURS un
+ * Array de deux nombres finis (jamais le typed array lui-même, qui ne se
+ * sérialise pas en JSON comme un tableau), sinon `null`.
+ */
+function numberPair(v) {
+    if (v === undefined || v === null || typeof v !== "object") return null;
+    const a = Number(v[0]);
+    const b = Number(v[1]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+    return [a, b];
+}
+
+/**
+ * Liens d'un graphe sous forme de liste, quelle que soit la forme exposée :
+ * Map (frontend récent — accesseur `.get` + accès indexé via Proxy), Array
+ * (LiteGraph historique) ou objet indexé par id.
+ */
+function graphLinks(graph) {
+    const L = graph && graph.links;
+    if (!L) return [];
+    if (typeof L.values === "function") { try { return [...L.values()]; } catch { /* forme suivante */ } }
+    if (Array.isArray(L)) return L.filter(Boolean);
+    return Object.keys(L).map((k) => L[k]).filter(Boolean);
+}
+
+/** Lien du graphe par id (Map/Array/objet ; jamais de crash). */
+function getLinkById(graph, linkId) {
+    if (!graph || !graph.links || linkId === undefined || linkId === null) return null;
+    try { if (typeof graph.links.get === "function") { const l = graph.links.get(linkId); if (l) return l; } } catch { /* forme suivante */ }
+    try { if (graph.links[linkId]) return graph.links[linkId]; } catch { /* forme suivante */ }
+    return graphLinks(graph).find((l) => l && String(l.id) === String(linkId)) || null;
+}
+
+/** Retire un lien du registre du graphe (Map ou objet indexé). */
+function removeGraphLink(graph, linkId) {
+    if (!graph || !graph.links) return;
+    try { if (typeof graph.links.delete === "function") { graph.links.delete(linkId); return; } } catch { /* ignore */ }
+    try { delete graph.links[linkId]; } catch { /* ignore */ }
+}
+
+/**
+ * Efface TOUTE référence à `linkId` dans les entrées/sorties des nœuds du
+ * graphe (sauf `excludeNode`). Sert à détacher proprement un lien non
+ * recâblable (jamais de lien orphelin après un retype).
+ */
+function clearLinkRefs(graph, linkId, excludeNode) {
+    if (!graph || linkId === undefined || linkId === null) return;
+    const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    for (const n of nodes) {
+        if (!n || n === excludeNode) continue;
+        if (Array.isArray(n.inputs)) {
+            for (const inp of n.inputs) {
+                if (inp && inp.link !== undefined && String(inp.link) === String(linkId)) inp.link = null;
+            }
+        }
+        if (Array.isArray(n.outputs)) {
+            for (const out of n.outputs) {
+                if (out && Array.isArray(out.links)) out.links = out.links.filter((id) => String(id) !== String(linkId));
+            }
+        }
+    }
+}
+
+/**
+ * Index du slot de `newSlots` correspondant à `oldSlot` : d'abord par NOM
+ * (exact, insensible à la casse), sinon par TYPE de données. `used` (Set
+ * d'index déjà pris) évite de réutiliser un slot. -1 si aucun équivalent.
+ */
+function matchNewSlot(oldSlot, newSlots, used) {
+    if (!oldSlot || !Array.isArray(newSlots)) return -1;
+    const name = oldSlot.name === undefined || oldSlot.name === null ? "" : String(oldSlot.name).toLowerCase().trim();
+    if (name) {
+        const i = newSlots.findIndex((s, idx) => !used.has(idx) && s && s.name !== undefined && s.name !== null && String(s.name).toLowerCase().trim() === name);
+        if (i >= 0) return i;
+    }
+    const type = oldSlot.type === undefined || oldSlot.type === null ? "" : String(oldSlot.type);
+    if (type && type !== "*") {
+        const j = newSlots.findIndex((s, idx) => !used.has(idx) && s && s.type !== undefined && String(s.type) === type);
+        if (j >= 0) return j;
+    }
+    return -1;
+}
+
 // ─── Subgraphs (frontend « Subgraph Blueprints ») ────────────────────────────
 // API réellement disponible (frontend ComfyUI récent — vérifié sur la source
 // 1.47.11 de référence du pack) :
@@ -461,8 +550,8 @@ function nodeBoundsRect(item) {
         && Number.isFinite(br[0]) && Number.isFinite(br[1]) && Number.isFinite(br[2]) && Number.isFinite(br[3])) {
         return [br[0], br[1], br[2], br[3]];
     }
-    const p = Array.isArray(item.pos) ? item.pos : [0, 0];
-    const s = Array.isArray(item.size) ? item.size : [0, 0];
+    const p = numberPair(item.pos) || [0, 0];
+    const s = numberPair(item.size) || [0, 0];
     return [Number(p[0]) || 0, Number(p[1]) || 0, Number(s[0]) || 0, Number(s[1]) || 0];
 }
 
@@ -974,7 +1063,7 @@ registerTool({
         return {
             data: graph.nodes.map((n) => ({
                 id: n.id, type: n.type, title: n.title || n.comfyClass || n.type,
-                pos: Array.isArray(n.pos) ? [n.pos[0], n.pos[1]] : null,
+                pos: numberPair(n.pos),
             })),
         };
     },
@@ -996,7 +1085,7 @@ registerTool({
         return {
             data: {
                 id: n.id, type: n.type, title: n.title || n.comfyClass || n.type,
-                mode: n.mode, mode_name: nodeModeName(n.mode), pos: Array.isArray(n.pos) ? n.pos : null, size: n.size || null,
+                mode: n.mode, mode_name: nodeModeName(n.mode), pos: numberPair(n.pos), size: numberPair(n.size),
                 subgraph: subgraphScopeInfo(r.subgraph),
                 properties: n.properties || {},
                 widgets: Array.isArray(n.widgets)
@@ -1220,8 +1309,8 @@ registerTool({
         return {
             data: {
                 id: n.id, type: n.type, title: nodeTitle(n),
-                pos: Array.isArray(n.pos) ? [n.pos[0], n.pos[1]] : null,
-                size: Array.isArray(n.size) ? [n.size[0], n.size[1]] : null,
+                pos: numberPair(n.pos),
+                size: numberPair(n.size),
                 subgraph: subgraphScopeInfo(r.subgraph),
             },
         };
@@ -1282,8 +1371,8 @@ registerTool({
             return {
                 id: n.id, type: n.type, title: nodeTitle(n),
                 mode: n.mode, mode_name: nodeModeName(n.mode),
-                pos: Array.isArray(n.pos) ? [n.pos[0], n.pos[1]] : null,
-                size: Array.isArray(n.size) ? [n.size[0], n.size[1]] : null,
+                pos: numberPair(n.pos),
+                size: numberPair(n.size),
                 is_subgraph: !!subgraphIdOf(n),
                 widgets: widgets,
             };
@@ -1331,8 +1420,8 @@ registerTool({
             const nodes = recomputeGroupNodes(g);
             return {
                 id: g.id, title: g.title || null, color: g.color || null,
-                pos: Array.isArray(g.pos) ? [g.pos[0], g.pos[1]] : null,
-                size: Array.isArray(g.size) ? [g.size[0], g.size[1]] : null,
+                pos: numberPair(g.pos),
+                size: numberPair(g.size),
                 node_count: nodes.length,
                 node_ids: nodes.map((n) => n && n.id),
             };
@@ -1768,7 +1857,7 @@ registerTool({
             return { error: label(ctx, "bl.toolErr.invalidValue", { detail: "x/y doivent être des nombres" }, "valeur invalide : {detail}"), code: "invalid_value" };
         }
         const node = r.node;
-        const previous = Array.isArray(node.pos) ? node.pos.slice() : null;
+        const previous = numberPair(node.pos);
         node.pos = [x, y];
         dirtyCanvas(ctx);
         return {
@@ -1802,14 +1891,14 @@ registerTool({
             return { error: label(ctx, "bl.toolErr.invalidValue", { detail: "width/height doivent être des nombres > 0" }, "valeur invalide : {detail}"), code: "invalid_value" };
         }
         const node = r.node;
-        const previous = Array.isArray(node.size) ? node.size.slice() : null;
+        const previous = numberPair(node.size);
         try {
             if (typeof node.setSize === "function") node.setSize([w, h]);
             else node.size = [w, h];
         } catch (e) {
             return { error: label(ctx, "bl.toolErr.exec", { error: (e && e.message) || String(e) }, "échec de l'outil : {error}"), code: "exec_error" };
         }
-        const size = Array.isArray(node.size) ? [node.size[0], node.size[1]] : [w, h];
+        const size = numberPair(node.size) || [w, h];
         dirtyCanvas(ctx);
         return {
             data: { node: node.id, title: nodeTitle(node), size: size, previous: previous, subgraph: subgraphScopeInfo(r.subgraph) },
@@ -1904,6 +1993,235 @@ registerTool({
                 subgraph: subgraphScopeInfo(scope),
             },
             action: label(ctx, "bl.toolAct.setNodeMode", { count: String(results.length), mode: nodeModeName(m) }, "⚡ {count} nœud(s) → {mode}"),
+        };
+    },
+});
+
+registerTool({
+    name: "change_node_type",
+    description: "Change la CLASSE (le type ComfyUI) d'un nœud EXISTANT, SANS le supprimer ni le recréer : le nœud garde sa position, sa taille, son titre, sa couleur et son mode (enable/mute/bypass), et ses liens sont RECÂBLÉS vers les slots de même NOM (puis de même TYPE de données) de la nouvelle classe. Idéal pour RÉPARER un workflow dont un nœud a un type manquant/supprimé (ex. ancien alias 'Holaf*' → 'AIH*'). Les widgets et les liens SANS équivalent dans la nouvelle classe sont PERDUS et listés dans le résultat (jamais en silence) ; les liens non recâblés sont détachés. La nouvelle classe doit exister (erreur claire sinon — vérifie son nom exact avec get_object_info). Retyper vers le MÊME type est un no-op signalé. Mutatif (annulable). Pour un nœud dans un subgraph, fournis subgraph (UUID, nom, ou 'current').",
+    schema: {
+        type: "object",
+        properties: {
+            id: { type: ["number", "string"], description: "Identifiant du nœud à retyper (accepte aussi le locator « uuid-subgraph:id »)." },
+            type: { type: "string", description: "Nouvelle classe/type ComfyUI du nœud (ex. 'KSampler' ; le nom exact se vérifie avec get_object_info)." },
+            subgraph: subgraphProp(),
+        },
+        required: ["id", "type"],
+    },
+    mode: "active",
+    undoable: true,
+    async exec(args, ctx) {
+        const r = findNode(ctx, args.id, args);
+        if (r.error) return r;
+        const oldNode = r.node;
+        const newType = String(args.type === undefined || args.type === null ? "" : args.type).trim();
+        if (!newType) {
+            return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "type manquant" }, "arguments invalides : {detail}"), code: "invalid_args" };
+        }
+        const owner = (oldNode && oldNode.graph) || r.subgraph || getGraph(ctx);
+        if (!owner) {
+            return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        }
+        const oldType = String(oldNode.type || oldNode.comfyClass || "");
+        // Même type → no-op explicitement signalé (aucune mutation).
+        if (oldType && oldType === newType) {
+            return {
+                data: {
+                    node: oldNode.id, previous_type: oldType, type: newType,
+                    noop: true, changed: false,
+                    pos: numberPair(oldNode.pos), size: numberPair(oldNode.size),
+                    subgraph: subgraphScopeInfo(r.subgraph),
+                },
+                action: label(ctx, "bl.toolAct.changeNodeTypeNoop", { name: nodeTitle(oldNode), type: newType }, "⏭️ {name} est déjà de type {type} (aucun changement)"),
+            };
+        }
+        // 1) Créer l'instance de la nouvelle classe. C'est la VALIDATION
+        //    d'existence : LiteGraph.createNode renvoie null pour un type non
+        //    enregistré (ce que get_object_info signalerait sans argument).
+        let newNode = null;
+        try {
+            if (ctx && typeof ctx.createNodeImpl === "function") newNode = ctx.createNodeImpl(newType, ctx);
+            else if (typeof window !== "undefined" && window.LiteGraph && typeof window.LiteGraph.createNode === "function") newNode = window.LiteGraph.createNode(newType);
+            else if (typeof owner.createNode === "function") newNode = owner.createNode(newType);
+        } catch { newNode = null; }
+        if (!newNode) {
+            return {
+                error: label(ctx, "bl.toolErr.classUnknown", { class: newType }, "type de nœud '{class}' inconnu (get_object_info sans argument liste les types disponibles)"),
+                code: "class_unknown",
+            };
+        }
+        const changeFail = (detail) => ({
+            error: label(ctx, "bl.toolErr.changeFailed", { error: detail }, "changement de type impossible : {error}"),
+            code: "change_failed",
+        });
+
+        // 2) Sérialisation de l'ancien nœud (properties + titre personnalisé).
+        let serialized = null;
+        try { serialized = (typeof oldNode.serialize === "function") ? oldNode.serialize() : null; } catch { serialized = null; }
+
+        // 3) Préserver identité & présentation : id, pos, size, order, mode,
+        //    flags, couleur, titre personnalisé, properties.
+        const keptPos = numberPair(oldNode.pos);
+        const keptSize = numberPair(oldNode.size);
+        try { if (oldNode.id !== undefined) newNode.id = oldNode.id; } catch { /* id figé ? tant pis */ }
+        if (keptPos) { try { newNode.pos = [keptPos[0], keptPos[1]]; } catch { /* ignore */ } }
+        if (keptSize) { try { newNode.size = [keptSize[0], keptSize[1]]; } catch { /* ignore */ } }
+        if (oldNode.order !== undefined) { try { newNode.order = oldNode.order; } catch { /* ignore */ } }
+        if (oldNode.mode !== undefined) { try { newNode.mode = oldNode.mode; } catch { /* ignore */ } }
+        if (oldNode.flags) { try { newNode.flags = Object.assign({}, oldNode.flags); } catch { /* ignore */ } }
+        if (oldNode.color !== undefined) { try { newNode.color = oldNode.color; } catch { /* ignore */ } }
+        if (oldNode.bgcolor !== undefined) { try { newNode.bgcolor = oldNode.bgcolor; } catch { /* ignore */ } }
+        // Titre : on conserve le titre PERSONNALISÉ (celui de serialize(), sinon
+        // un titre live qui n'est ni l'ancien type ni l'ancienne comfyClass).
+        let customTitle = null;
+        if (serialized && serialized.title !== undefined && serialized.title !== null && serialized.title !== "") customTitle = String(serialized.title);
+        else if (typeof oldNode.title === "string" && oldNode.title && oldNode.title !== oldType && oldNode.title !== String(oldNode.comfyClass || "")) customTitle = oldNode.title;
+        if (customTitle !== null) { try { newNode.title = customTitle; } catch { /* ignore */ } }
+        // Propriétés : recopie + « Node name for S&R » aligné sur la nouvelle classe.
+        const props = (serialized && serialized.properties) || oldNode.properties;
+        if (props && typeof props === "object") {
+            const copy = Object.assign({}, props);
+            if ("Node name for S&R" in copy) copy["Node name for S&R"] = newType;
+            try { newNode.properties = copy; } catch { /* ignore */ }
+        }
+
+        // 4) Widgets : recopie par NOM (valeur + callback). Les widgets de
+        //    l'ancien nœud absents de la nouvelle classe sont PERDUS → listés.
+        const oldWidgets = Array.isArray(oldNode.widgets) ? oldNode.widgets.filter((w) => w && w.name !== undefined) : [];
+        const newWidgets = Array.isArray(newNode.widgets) ? newNode.widgets.filter((w) => w && w.name !== undefined) : [];
+        const lostWidgets = [];
+        let widgetsCopied = 0;
+        for (const w of oldWidgets) {
+            const target = newWidgets.find((x) => String(x.name) === String(w.name));
+            if (!target) { lostWidgets.push({ name: w.name, value: w.value }); continue; }
+            try {
+                target.value = w.value;
+                if (typeof target.callback === "function") target.callback(target.value);
+                widgetsCopied++;
+            } catch { lostWidgets.push({ name: w.name, value: w.value }); }
+        }
+        const newOnlyWidgets = newWidgets.filter((x) => !oldWidgets.some((w) => String(w.name) === String(x.name))).map((x) => x.name);
+
+        // 5) Liens : rattacher chaque entrée/sortie de l'ancien nœud au slot
+        //    correspondant de la nouvelle classe (nom exact, puis type). Ce qui
+        //    n'a pas d'équivalent est DÉTACHÉ et listé (jamais de lien orphelin).
+        const oldInputs = Array.isArray(oldNode.inputs) ? oldNode.inputs : [];
+        const newInputs = Array.isArray(newNode.inputs) ? newNode.inputs : [];
+        const oldOutputs = Array.isArray(oldNode.outputs) ? oldNode.outputs : [];
+        const newOutputs = Array.isArray(newNode.outputs) ? newNode.outputs : [];
+        const usedIn = new Set();
+        const usedOut = new Set();
+        let reconnected = 0;
+        let linksLost = 0;
+        const lostInputs = [];
+        const lostOutputs = [];
+        const slotLabel = (slot, idx) => (slot && slot.name !== undefined && slot.name !== null ? slot.name : idx);
+
+        for (let oi = 0; oi < oldInputs.length; oi++) {
+            const oldIn = oldInputs[oi];
+            if (!oldIn) continue;
+            const ni = matchNewSlot(oldIn, newInputs, usedIn);
+            if (ni < 0) {
+                // Slot sans équivalent → signalé « perdu » (lien détaché s'il existait).
+                lostInputs.push(slotLabel(oldIn, oi));
+                if (oldIn.link !== undefined && oldIn.link !== null) {
+                    const lostLinkId = oldIn.link;
+                    linksLost++;
+                    clearLinkRefs(owner, lostLinkId, newNode);
+                    removeGraphLink(owner, lostLinkId);
+                    try { oldIn.link = null; } catch { /* ignore */ }
+                }
+                continue;
+            }
+            const linkId = oldIn.link;
+            if (linkId === undefined || linkId === null) { usedIn.add(ni); continue; }
+            try {
+                const link = getLinkById(owner, linkId);
+                if (link) { link.target_id = newNode.id; link.target_slot = ni; }
+                else {
+                    // Lien non enregistré (forme défensive) : on vérifie qu'aucun
+                    // autre câble ne pointe déjà sur le nouveau slot.
+                    const dup = newInputs[ni].link;
+                    if (dup !== undefined && dup !== null) { clearLinkRefs(owner, dup, newNode); removeGraphLink(owner, dup); }
+                }
+                newInputs[ni].link = linkId;
+                oldIn.link = null;
+                usedIn.add(ni);
+                reconnected++;
+            } catch {
+                lostInputs.push(slotLabel(oldIn, oi));
+                linksLost++;
+                clearLinkRefs(owner, linkId, newNode);
+                removeGraphLink(owner, linkId);
+                try { oldIn.link = null; } catch { /* ignore */ }
+            }
+        }
+
+        for (let oo = 0; oo < oldOutputs.length; oo++) {
+            const oldOut = oldOutputs[oo];
+            if (!oldOut) continue;
+            const outLinks = Array.isArray(oldOut.links) ? oldOut.links.slice() : (oldOut.links === undefined || oldOut.links === null ? [] : [oldOut.links]);
+            const no = matchNewSlot(oldOut, newOutputs, usedOut);
+            if (no < 0) {
+                lostOutputs.push(slotLabel(oldOut, oo));
+                linksLost += outLinks.length;
+                for (const lid of outLinks) { clearLinkRefs(owner, lid, newNode); removeGraphLink(owner, lid); }
+                try { oldOut.links = []; } catch { /* ignore */ }
+                continue;
+            }
+            usedOut.add(no);
+            if (!Array.isArray(newOutputs[no].links)) newOutputs[no].links = [];
+            for (const lid of outLinks) {
+                try {
+                    const link = getLinkById(owner, lid);
+                    if (link) { link.origin_id = newNode.id; link.origin_slot = no; }
+                    newOutputs[no].links.push(lid);
+                    reconnected++;
+                } catch { linksLost++; clearLinkRefs(owner, lid, newNode); removeGraphLink(owner, lid); }
+            }
+            try { oldOut.links = []; } catch { /* ignore */ }
+        }
+
+        // 6) Remplacement EN PLACE dans le graphe propriétaire (identité conservée).
+        const nodesArr = Array.isArray(owner.nodes) ? owner.nodes : (Array.isArray(owner._nodes) ? owner._nodes : null);
+        if (!nodesArr) return changeFail("liste de nœuds du graphe introuvable");
+        const idx = nodesArr.indexOf(oldNode);
+        if (idx < 0) return changeFail("nœud absent de la liste du graphe");
+        try { nodesArr[idx] = newNode; } catch (e) { return changeFail((e && e.message) || String(e)); }
+        try { if (owner._nodes_by_id && typeof owner._nodes_by_id === "object") owner._nodes_by_id[newNode.id] = newNode; } catch { /* ignore */ }
+        try { newNode.graph = owner; } catch { /* ignore */ }
+        // Vue réactive (le remplacement contourne graph.add) + ordre d'exécution
+        // + hook de retrait de l'ancien nœud (nettoyage custom).
+        try { if (typeof owner.onNodeAdded === "function") owner.onNodeAdded(newNode); } catch { /* ignore */ }
+        try { if (typeof owner.updateExecutionOrder === "function") owner.updateExecutionOrder(); } catch { /* ignore */ }
+        try { if (typeof owner.change === "function") owner.change(); } catch { /* ignore */ }
+        try { if (typeof oldNode.onRemoved === "function") oldNode.onRemoved(); } catch { /* ignore */ }
+        dirtyCanvas(ctx);
+
+        return {
+            data: {
+                node: newNode.id,
+                previous_type: oldType || null,
+                type: newType,
+                noop: false, changed: true,
+                kept: {
+                    pos: keptPos, size: keptSize,
+                    title: customTitle,
+                    color: oldNode.color !== undefined ? oldNode.color : null,
+                    bgcolor: oldNode.bgcolor !== undefined ? oldNode.bgcolor : null,
+                    mode: oldNode.mode, mode_name: nodeModeName(oldNode.mode),
+                },
+                widgets_copied: widgetsCopied,
+                lost_widgets: lostWidgets,
+                new_widgets: newOnlyWidgets,
+                links_reconnected: reconnected,
+                links_lost: linksLost,
+                lost_inputs: lostInputs,
+                lost_outputs: lostOutputs,
+                subgraph: subgraphScopeInfo(r.subgraph),
+            },
+            action: label(ctx, "bl.toolAct.changeNodeType", { name: nodeTitle(oldNode), from: oldType || "?", to: newType }, "🔁 {name} : {from} → {to}"),
         };
     },
 });
@@ -2225,7 +2543,7 @@ registerTool({
         if (!addGroupToGraph(graph, group)) return groupFail("ajout au graphe impossible (graph.add/groups)");
         try { if (typeof group.recomputeInsideNodes === "function") group.recomputeInsideNodes(); } catch { /* best-effort */ }
         dirtyCanvas(ctx);
-        const size = Array.isArray(group.size) ? [group.size[0], group.size[1]] : [w, h];
+        const size = numberPair(group.size) || [w, h];
         return {
             data: {
                 id: group.id, title: group.title, color: group.color || null,
@@ -2276,8 +2594,8 @@ registerTool({
         const previous = {
             title: group.title,
             color: group.color || null,
-            pos: Array.isArray(group.pos) ? group.pos.slice() : null,
-            size: Array.isArray(group.size) ? group.size.slice() : null,
+            pos: numberPair(group.pos),
+            size: numberPair(group.size),
         };
         let changed = false;
         if (args.title !== undefined && args.title !== null) {
@@ -2314,8 +2632,8 @@ registerTool({
         try { if (typeof group.recomputeInsideNodes === "function") group.recomputeInsideNodes(); } catch { /* best-effort */ }
         try { if (typeof graph.change === "function") graph.change(); } catch { /* best-effort */ }
         dirtyCanvas(ctx);
-        const pos = Array.isArray(group.pos) ? [group.pos[0], group.pos[1]] : null;
-        const size = Array.isArray(group.size) ? [group.size[0], group.size[1]] : null;
+        const pos = numberPair(group.pos);
+        const size = numberPair(group.size);
         return {
             data: {
                 id: group.id, title: group.title, color: group.color || null,

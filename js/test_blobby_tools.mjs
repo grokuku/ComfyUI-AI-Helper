@@ -149,7 +149,7 @@ const SEED = [
 console.log("1. Filtrage du schéma par mode (getToolsForMode)");
 
 const READ_EXPECTED = ["describe_workflow", "list_nodes", "get_node_by_id", "get_node_widgets", "get_node_widget", "get_node_connections", "get_object_info", "get_queue_status", "get_execution_status", "get_node_position", "list_subgraphs", "get_subgraph", "list_groups", "open_subgraph", "close_subgraph", "focus_view", "select_node"];
-const ACTIVE_ONLY = ["set_widget_value", "set_node_title", "set_node_color", "move_node", "resize_node", "set_node_mode", "add_node", "remove_node", "connect_nodes", "disconnect_nodes", "create_group", "edit_group", "create_subgraph", "convert_to_subgraph", "unpack_subgraph", "queue_prompt", "interrupt"];
+const ACTIVE_ONLY = ["set_widget_value", "set_node_title", "set_node_color", "move_node", "resize_node", "set_node_mode", "change_node_type", "add_node", "remove_node", "connect_nodes", "disconnect_nodes", "create_group", "edit_group", "create_subgraph", "convert_to_subgraph", "unpack_subgraph", "queue_prompt", "interrupt"];
 
 const readTools = getToolsForMode("read");
 const readNames = readTools.map((x) => x.function.name);
@@ -161,7 +161,7 @@ const activeTools = getToolsForMode("active");
 const activeNames = activeTools.map((x) => x.function.name);
 // Défaut sûr : sans shellAccess, l'outil shell n'est PAS proposé (1ʳᵉ barrière).
 assert.deepStrictEqual(activeNames.sort(), READ_EXPECTED.concat(ACTIVE_ONLY).sort(), "mode active (shell off) : tous les outils SAUF run_shell");
-assert.strictEqual(activeTools.length, listTools().length - 1, "shell off : run_shell retiré (34 des 35 outils du registre)");
+assert.strictEqual(activeTools.length, listTools().length - 1, "shell off : run_shell retiré (35 des 36 outils du registre)");
 ok(`mode active (shell off) : ${activeNames.length} outils (run_shell filtré)`);
 
 const activeShellTools = getToolsForMode("active", { shellAccess: true });
@@ -1500,6 +1500,244 @@ clearUndo();
     ok("select_node : sélection/surlignage en lecture, recentrage optionnel, clear, ouverture subgraph");
 }
 
+// ══════════ 6quater. change_node_type + correction pos/size (Float64Array) ══
+// ⚠️ BUG RÉEL corrigé ici : dans le LiteGraph récent, `node.pos`/`node.size`
+// (et ceux d'un groupe) sont des Float64Array (Rectangle.subarray), PAS des
+// Array → `Array.isArray()` renvoie false et l'ancien code produisait `null`.
+console.log("\n6quater. change_node_type + correction pos/size (Float64Array LiteGraph)");
+
+// Fixture dédiée au retype : liens ENREGISTRÉS (graph.links) + pos/size en
+// Float64Array (comme le LiteGraph réel), serialize()/loadGraphData() qui font
+// un VRAI aller-retour nœuds+liens (pour tester l'undo).
+function makeRetypeFixture() {
+    const DEF = {
+        1: { id: 1, type: "LegacyNode", title: "Mon titre", pos: [10, 20], size: [120, 80], mode: 4,
+             color: "#FF8F00", bgcolor: "#222",
+             widgets: [{ name: "steps", type: "number", value: 20 }, { name: "seed", type: "number", value: 5 }],
+             inputs: [{ name: "model", type: "MODEL", link: 501 }, { name: "control", type: "CONTROL", link: 503 }, { name: "vae_alias", type: "VAE", link: 504 }],
+             outputs: [{ name: "IMAGE", type: "IMAGE", links: [502] }] },
+        2: { id: 2, type: "CheckpointLoader", pos: [0, 0], size: [100, 50], outputs: [{ name: "MODEL", type: "MODEL", links: [501] }] },
+        3: { id: 3, type: "SaveImage", pos: [400, 0], size: [100, 50], inputs: [{ name: "images", type: "IMAGE", link: 502 }] },
+        4: { id: 4, type: "VAELoader", pos: [0, 200], size: [100, 50], outputs: [{ name: "VAE", type: "VAE", links: [504] }] },
+        5: { id: 5, type: "ControlNetLoader", pos: [0, 400], size: [100, 50], outputs: [{ name: "CONTROL", type: "CONTROL", links: [503] }] },
+    };
+    const LINKS = {
+        501: { id: 501, origin_id: 2, origin_slot: 0, target_id: 1, target_slot: 0, type: "MODEL" },
+        502: { id: 502, origin_id: 1, origin_slot: 0, target_id: 3, target_slot: 0, type: "IMAGE" },
+        503: { id: 503, origin_id: 5, origin_slot: 0, target_id: 1, target_slot: 1, type: "CONTROL" },
+        504: { id: 504, origin_id: 4, origin_slot: 0, target_id: 1, target_slot: 2, type: "VAE" },
+    };
+    const buildNode = (d) => {
+        const n = makeNode({
+            id: d.id, type: d.type, title: d.title, pos: d.pos, mode: d.mode,
+            widgets: (d.widgets || []).map((w) => ({ name: w.name, type: w.type, value: w.value })),
+        });
+        n.color = d.color; n.bgcolor = d.bgcolor;
+        n.pos = new Float64Array(d.pos || [0, 0]);
+        n.size = new Float64Array(d.size || [100, 50]);
+        n.inputs = (d.inputs || []).map((i) => ({ name: i.name, type: i.type, link: i.link === undefined ? null : i.link }));
+        n.outputs = (d.outputs || []).map((o) => ({ name: o.name, type: o.type, links: (o.links || []).slice() }));
+        return n;
+    };
+    const root = {
+        id: "root", _nodes: [], links: {}, _groups: [], subgraphs: new Map(), rootGraph: null,
+        get nodes() { return this._nodes; },
+        set nodes(v) { this._nodes = v; },
+        getNodeById(id) { return this._nodes.find((n) => String(n.id) === String(id)) || null; },
+        setDirtyCanvas() {}, change() {},
+        serialize() {
+            return {
+                version: 1,
+                nodes: this._nodes.map((n) => ({
+                    id: n.id, type: n.type, title: n.title,
+                    pos: [n.pos[0], n.pos[1]], size: [n.size[0], n.size[1]], mode: n.mode,
+                    color: n.color, bgcolor: n.bgcolor,
+                    widgets: (n.widgets || []).map((w) => ({ name: w.name, type: w.type, value: w.value })),
+                    inputs: (n.inputs || []).map((i) => ({ name: i.name, type: i.type, link: i.link })),
+                    outputs: (n.outputs || []).map((o) => ({ name: o.name, type: o.type, links: (o.links || []).slice() })),
+                })),
+                links: Object.keys(this.links).map((k) => Object.assign({}, this.links[k])),
+            };
+        },
+        loadGraphData(data) {
+            this.links = {};
+            (data.links || []).forEach((l) => { this.links[l.id] = Object.assign({}, l); });
+            this._nodes = (data.nodes || []).map((d) => {
+                const n = buildNode(d);
+                n.graph = this;
+                return n;
+            });
+            return Promise.resolve();
+        },
+    };
+    for (const d of Object.values(DEF)) { const n = buildNode(d); n.graph = root; root._nodes.push(n); }
+    Object.assign(root.links, LINKS);
+    root.rootGraph = root;
+    const app = { graph: root, rootGraph: root, canvas: { setDirtyCanvas() {} }, loadGraphData(data) { return root.loadGraphData(data); } };
+    return { app, root, LINKS };
+}
+
+function makeNewNode() {
+    const n = makeNode({
+        id: 77, type: "NewNode", title: "NewNode", pos: [0, 0],
+        widgets: [{ name: "steps", type: "number", value: 0 }],
+        inputs: [{ name: "model", type: "MODEL" }, { name: "vae", type: "VAE" }],
+        outputs: [{ name: "IMAGE", type: "IMAGE" }, { name: "LATENT", type: "LATENT" }],
+    });
+    n.size = [210, 100];
+    return n;
+}
+
+// ── (H1) pos/size en Float64Array : jamais null + erreur claire si absente ──
+{
+    const fx = makeRetypeFixture();
+    let res = await dispatchToolCall("get_node_position", { id: 1 }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true);
+    assert.deepStrictEqual(res.data.pos, [10, 20], "get_node_position : pos [x,y] (Float64Array lu)");
+    assert.deepStrictEqual(res.data.size, [120, 80], "get_node_position : size [w,h]");
+    assert.strictEqual(res.data.type, "LegacyNode");
+    assert.strictEqual(res.data.title, "Mon titre");
+    assert.strictEqual(res.snapshotId, null, "lecture : aucun snapshot");
+    res = await dispatchToolCall("list_nodes", {}, { app: fx.app, mode: "read" });
+    const ln1 = res.data.find((x) => x.id === 1);
+    assert.deepStrictEqual(ln1.pos, [10, 20], "list_nodes : pos non nulle pour un Float64Array");
+    res = await dispatchToolCall("get_node_by_id", { id: 1 }, { app: fx.app, mode: "read" });
+    assert.deepStrictEqual(res.data.pos, [10, 20], "get_node_by_id : pos non nulle");
+    assert.deepStrictEqual(res.data.size, [120, 80], "get_node_by_id : size en tableau");
+    assert.ok(Array.isArray(res.data.size), "size sérialisable en tableau JSON (pas un typed array brut)");
+    res = await dispatchToolCall("get_node_position", { id: 999 }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, "not_found", "cible inexistante → erreur claire (pas de null silencieux)");
+    ok("(H1) get_node_position/list_nodes/get_node_by_id : pos & size (Float64Array) non nuls + erreur claire si absente");
+}
+
+// ── (H2) root + subgraph + locator uuid:id (pos en Float64Array) ──
+{
+    const fx = makeSubgraphFixture();
+    fx.inner1.pos = new Float64Array([5, 6]);
+    fx.inner1.size = new Float64Array([210, 100]);
+    let res = await dispatchToolCall("get_node_position", { id: 1, subgraph: SG_ID }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true);
+    assert.deepStrictEqual(res.data.pos, [5, 6], "subgraph : pos lue (Float64Array)");
+    assert.deepStrictEqual(res.data.size, [210, 100]);
+    res = await dispatchToolCall("get_node_position", { id: SG_ID + ":1" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true, "locator uuid:id résolu");
+    assert.deepStrictEqual(res.data.pos, [5, 6], "locator uuid:id : pos lue");
+    res = await dispatchToolCall("get_node_position", { id: 7, subgraph: SG2_ID }, { app: fx.app, mode: "read" });
+    assert.deepStrictEqual(res.data.pos, [1, 2], "sous-subgraph : pos lue");
+    ok("(H2) get_node_position : racine + subgraph + locator uuid:id (Float64Array), taille renvoyée");
+}
+
+// ── (I0) l'outil est ABSENT de la liste read et présent en actif ──
+{
+    const readNames = getToolsForMode("read").map((x) => x.function.name);
+    const activeNames = getToolsForMode("active").map((x) => x.function.name);
+    assert.ok(!readNames.includes("change_node_type"), "change_node_type ABSENT de la liste Lecture seule");
+    assert.ok(activeNames.includes("change_node_type"), "change_node_type présent en mode Actif");
+    ok("(I0) change_node_type : absent en Lecture seule, présent en Actif");
+}
+
+// ── (I1) retype : préservation + liens + widgets perdus + undo ──
+{
+    clearUndo();
+    const fx = makeRetypeFixture();
+    let res0 = await dispatchToolCall("change_node_type", { id: 1, type: "NewNode" }, { app: fx.app, mode: "read", createNodeImpl: () => makeNewNode() });
+    assert.strictEqual(res0.code, "mode_forbidden", "retypage interdit en Lecture seule");
+    assert.strictEqual(fx.root.getNodeById(1).type, "LegacyNode", "type intact en read");
+    assert.strictEqual(canUndo(), false, "aucun snapshot poussé en read");
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "NewNode" }, { app: fx.app, mode: "active", createNodeImpl: () => makeNewNode() });
+    assert.strictEqual(res.ok, true, "contrôle négatif in-suite : active passe");
+    assert.ok(res.snapshotId, "snapshot avant retype (annulable)");
+    const n1 = fx.root.getNodeById(1);
+    assert.ok(n1, "le nœud (id conservé) est toujours dans le graphe");
+    assert.strictEqual(n1.type, "NewNode", "classe changée EN PLACE");
+    assert.deepStrictEqual(n1.pos, [10, 20], "position préservée");
+    assert.deepStrictEqual(n1.size, [120, 80], "taille préservée");
+    assert.strictEqual(n1.title, "Mon titre", "titre personnalisé préservé");
+    assert.strictEqual(n1.color, "#FF8F00", "couleur préservée");
+    assert.strictEqual(n1.bgcolor, "#222", "couleur de fond préservée");
+    assert.strictEqual(n1.mode, 4, "mode (bypass) préservé");
+    assert.strictEqual(res.data.kept.mode_name, "bypass");
+    assert.strictEqual(res.data.links_reconnected, 3, "3 liens recâblés (MODEL nom + VAE type + IMAGE nom)");
+    assert.strictEqual(res.data.links_lost, 1, "1 lien perdu (CONTROL sans équivalent)");
+    assert.strictEqual(n1.inputs.find((i) => i.name === "model").link, 501, "MODEL recâblé par NOM");
+    assert.strictEqual(n1.inputs.find((i) => i.name === "vae").link, 504, "VAE recâblé par TYPE (vae_alias → vae)");
+    assert.strictEqual(n1.outputs.find((o) => o.name === "IMAGE").links[0], 502, "IMAGE recâblé par NOM");
+    assert.strictEqual(fx.root.links[501].target_id, 1, "lien 501 pointe sur le nœud retypé");
+    assert.strictEqual(fx.root.links[504].target_slot, 1, "lien 504 pointe sur le slot vae");
+    assert.strictEqual(fx.root.links[502].origin_id, 1, "lien de sortie 502 : origine = nœud retypé");
+    assert.ok(fx.root.getNodeById(2).outputs[0].links.indexOf(501) >= 0, "source MODEL inchangée");
+    assert.strictEqual(fx.root.links[503], undefined, "lien CONTROL détaché du graphe (jamais orphelin)");
+    assert.deepStrictEqual(fx.root.getNodeById(5).outputs[0].links, [], "sortie source CONTROL nettoyée");
+    assert.deepStrictEqual(res.data.lost_inputs, ["control"], "slot d'entrée non transférable listé");
+    assert.deepStrictEqual(res.data.lost_outputs, [], "aucune sortie perdue");
+    assert.ok(res.data.lost_widgets.some((w) => w.name === "seed"), "widget perdu listé (seed)");
+    assert.strictEqual(res.data.widgets_copied, 1, "widget steps recopié");
+    assert.ok(res.action.includes("LegacyNode") && res.action.includes("NewNode"), `ligne d'action : ${res.action}`);
+    const u = await undoSnapshot(res.snapshotId, { app: fx.app });
+    assert.strictEqual(u.ok, true, "undo via loadGraphData");
+    const back = fx.root.getNodeById(1);
+    assert.strictEqual(back.type, "LegacyNode", "undo restaure la classe précédente");
+    assert.ok(fx.root.links[503], "undo restaure le lien CONTROL");
+    assert.strictEqual(back.inputs.find((i) => i.name === "control").link, 503, "undo restaure l'entrée control");
+    assert.strictEqual(back.inputs.find((i) => i.name === "model").link, 501, "undo restaure l'entrée model");
+    assert.strictEqual(back.outputs.find((o) => o.name === "IMAGE").links[0], 502, "undo restaure la sortie IMAGE");
+    clearUndo();
+    ok("(I1) change_node_type : pos/taille/titre/couleur/mode préservés, liens recâblés (nom+type), perdus listés, undo restaure type & liens");
+}
+
+// ── (I2) même type (no-op), classe inconnue, nœud inexistant, type manquant ──
+{
+    clearUndo();
+    const fx = makeRetypeFixture();
+    let used = 0;
+    const mkNew = () => { used++; return makeNewNode(); };
+    let res = await dispatchToolCall("change_node_type", { id: 1, type: "LegacyNode" }, { app: fx.app, mode: "active", createNodeImpl: mkNew });
+    assert.strictEqual(res.ok, true, "même type → succès (no-op)");
+    assert.strictEqual(res.data.noop, true, "no-op signalé");
+    assert.strictEqual(res.data.changed, false);
+    assert.strictEqual(used, 0, "aucune création de nœud pour un no-op");
+    assert.strictEqual(fx.root.getNodeById(1).type, "LegacyNode", "type inchangé");
+    res = await dispatchToolCall("change_node_type", { id: 1, type: "DoesNotExist" }, { app: fx.app, mode: "active", createNodeImpl: () => null });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, "class_unknown", "classe inexistante → erreur claire");
+    assert.ok(res.error.includes("get_object_info"), "message oriente vers get_object_info");
+    assert.strictEqual(fx.root.getNodeById(1).type, "LegacyNode", "type intact après erreur");
+    res = await dispatchToolCall("change_node_type", { id: 999, type: "NewNode" }, { app: fx.app, mode: "active", createNodeImpl: mkNew });
+    assert.strictEqual(res.code, "not_found", "nœud inexistant → erreur claire");
+    res = await dispatchToolCall("change_node_type", { id: 1 }, { app: fx.app, mode: "active", createNodeImpl: mkNew });
+    assert.strictEqual(res.code, "invalid_args", "type manquant → erreur");
+    clearUndo();
+    ok("(I2) change_node_type : même type = no-op signalé ; classe inconnue & nœud inexistant & type manquant = erreurs claires");
+}
+
+// ── (I3) retype DANS un subgraph (paramètre subgraph + locator uuid:id) ──
+{
+    clearUndo();
+    const fx = makeSubgraphFixture();
+    fx.inner1.pos = new Float64Array([5, 6]);
+    fx.inner1.size = new Float64Array([210, 100]);
+    let res = await dispatchToolCall("change_node_type", { id: 1, type: "NewInner", subgraph: SG_ID }, {
+        app: fx.app, mode: "active",
+        createNodeImpl: () => makeNode({ id: 55, type: "NewInner", title: "NewInner", pos: [0, 0], widgets: [{ name: "steps", type: "number", value: 0 }] }),
+    });
+    assert.strictEqual(res.ok, true, "retype DANS le subgraph");
+    assert.strictEqual(res.data.subgraph.id, SG_ID, "scope rapporté");
+    const inner = fx.sg.getNodeById(1);
+    assert.strictEqual(inner.type, "NewInner", "type interne changé en place");
+    assert.deepStrictEqual(inner.pos, [5, 6], "position interne préservée (Float64Array)");
+    assert.strictEqual(fx.root.getNodeById(1).type, "CheckpointLoaderSimple", "racine intacte (id 1 = racine)");
+    const fx2 = makeSubgraphFixture();
+    const res2 = await dispatchToolCall("change_node_type", { id: SG_ID + ":1", type: "NewInner2" }, {
+        app: fx2.app, mode: "active",
+        createNodeImpl: () => makeNode({ id: 56, type: "NewInner2", title: "NewInner2", pos: [0, 0], widgets: [] }),
+    });
+    assert.strictEqual(res2.ok, true, "locator uuid:id résolu");
+    assert.strictEqual(fx2.sg.getNodeById(1).type, "NewInner2");
+    clearUndo();
+    ok("(I3) change_node_type : fonctionne DANS un subgraph (subgraph + locator uuid:id), racine intacte");
+}
+
 console.log(`\n✅ Partie 1 (pure) : ${n} groupes d'assertions PASS — suite jsdom…`);
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1642,7 +1880,7 @@ await tick();
 const llmPostsD = llmPosts();
 assert.strictEqual(llmPostsD.length, 2, "2 tours LLM (tool_calls puis final)");
 assert.strictEqual(llmPostsD[0].body.preset_id, 3, "preset_id transmis");
-assert.ok(Array.isArray(llmPostsD[0].body.tools) && llmPostsD[0].body.tools.length === listTools().length - 1, "tools envoyés (shell off ⇒ 34 des 35, run_shell filtré)");
+assert.ok(Array.isArray(llmPostsD[0].body.tools) && llmPostsD[0].body.tools.length === listTools().length - 1, "tools envoyés (shell off ⇒ 35 des 36, run_shell filtré)");
 assert.ok(!llmPostsD[0].body.tools.some((t) => t.function.name === "run_shell"), "shell off : run_shell absent des tools");
 assert.strictEqual(llmPostsD[0].body.tool_choice, "auto", "tool_choice auto");
 assert.ok(!("instruction" in llmPostsD[0].body), "nouveau contrat : PAS de champ instruction quand messages est fourni");
@@ -1754,7 +1992,7 @@ const setActions = msgs("action");
 assert.strictEqual(setActions.length, 1, "ligne d'action pour [SET…]");
 assert.ok(setActions[0].querySelector("button[data-undo-id]"), "bouton Annuler (snapshot pris)");
 const llmPostsSet = llmPosts();
-assert.strictEqual(llmPostsSet[0].body.tools.length, listTools().length - 1, "mode actif + shell off : tools au POST (34/35 ; le modèle a ignoré les outils, [SET…] texte reste compris)");
+assert.strictEqual(llmPostsSet[0].body.tools.length, listTools().length - 1, "mode actif + shell off : tools au POST (35/36 ; le modèle a ignoré les outils, [SET…] texte reste compris)");
 assert.ok(msgs("blobby")[0].textContent.includes("steps = 45"), "commande [SET…] remplacée par le rendu d'action dans la réponse");
 ok("(f) bis : [SET…] en actif → exécuté via le dispatcher (enforcement + snapshot), sans boucle tool supplémentaire");
 

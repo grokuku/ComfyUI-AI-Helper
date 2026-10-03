@@ -863,6 +863,11 @@ import "./aih_i18n.js";
         "bl.toolAct.selectNode": "👁️ {name} sélectionné",
         "bl.toolAct.deselect": "👁️ Sélection effacée",
 
+        /* Retype de nœud (change_node_type) */
+        "bl.toolAct.changeNodeType": "🔁 {name} : {from} → {to}",
+        "bl.toolAct.changeNodeTypeNoop": "⏭️ {name} est déjà de type {type} (aucun changement)",
+        "bl.toolErr.changeFailed": "changement de type impossible : {error}",
+
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
         "iv.operationProcessed": "Opération traitée.",
         "iv.fsClose": "Fermer (Échap)",
@@ -2197,6 +2202,11 @@ import "./aih_i18n.js";
         "bl.toolAct.focusView": "🎯 View refocused on {target}",
         "bl.toolAct.selectNode": "👁️ {name} selected",
         "bl.toolAct.deselect": "👁️ Selection cleared",
+
+        /* Node retype (change_node_type) */
+        "bl.toolAct.changeNodeType": "🔁 {name}: {from} → {to}",
+        "bl.toolAct.changeNodeTypeNoop": "⏭️ {name} is already of type {type} (no change)",
+        "bl.toolErr.changeFailed": "cannot change the node type: {error}",
 
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
         "iv.operationProcessed": "Operation processed.",
