@@ -15,9 +15,8 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { saveWindowRect, loadWindowRect } from "./holaf_window_utils.js";
-import { remoteGet, remotePost, HolafFetch, normalizeServerUrl, isMaskedApiKey } from "./aih_fetch_bridge.js";
+import { remoteGet, remotePost, remoteRequest, HolafFetch, normalizeServerUrl, isMaskedApiKey } from "./aih_fetch_bridge.js";
 import { formatContextBar, applyContextBar } from "./aih_context_utils.js";
-import { escapeHtml } from "./holaf_dom_utils.js";
 // Registre d'outils + dispatcher + enforcement de mode + undo (étape 2).
 import BlobbyTools from "./blobby_tools.js";
 
@@ -148,6 +147,31 @@ function _blobbyLoadFps(def) { return _blobbyLoad('fps', def); }
 function _blobbySaveMode(mode) { _blobbySave('blobbyMode', mode); }
 function _blobbyLoadMode(def) { return _blobbyLoad('blobbyMode', def); }
 
+// ── Accès shell (nouveau) : booléen, défaut FALSE (sécurité) ──
+// Même mécanisme de persistance que le mode (localStorage AIH_config.blobbyData
+// + sync `/api/settings`). En plus, on publie l'état vers le pack LOCAL via
+// POST /aih/blobby/save (blobby.json) : c'est le seul état que la route
+// d'exécution /aih/blobby/exec (même origine ComfyUI) peut lire pour sa propre
+// barrière — le pack n'a pas accès au backend AI-Helper distant.
+function _blobbySaveShellAccess(enabled) { _blobbySave('blobbyShellAccess', !!enabled); }
+function _blobbyLoadShellAccess(def) {
+    var v = _blobbyLoad('blobbyShellAccess', def);
+    return v === true || v === 'true' || v === 1 || v === '1' || v === 'on';
+}
+
+/** Publie l'état d'autorisation shell vers le pack local (best-effort). */
+function _blobbyPublishShellAccess(enabled) {
+    try {
+        if (typeof window === 'undefined' || !window.location || !window.location.origin) return;
+        if (typeof HolafFetch === 'undefined' || !HolafFetch || typeof HolafFetch.request !== 'function') return;
+        var localUrl = window.location.origin.replace(/\/+$/, '');
+        HolafFetch.request(localUrl + '/aih/blobby/save', {
+            method: 'POST',
+            body: { key: 'blobbyShellAccess', data: !!enabled }
+        }).catch(function() { /* pack injoignable : la barrière serveur reste fail-closed */ });
+    } catch { /* jamais bloquant */ }
+}
+
 // ── CSS de la barre de mode du chat (étape 3) ────────────────────────────
 // Injecté une seule fois (idempotent) : pas de feuille externe à charger, le
 // chat reste autonome. Les classes blobby-mode-read / blobby-mode-active
@@ -173,6 +197,26 @@ function _blobbyEnsureChatCSS() {
         '  cursor: pointer; outline: none; max-width: 150px;',
         '}',
         '.blobby-chat-mode-select:focus { border-color: var(--aih-accent, #D8700D); }',
+        '.blobby-chat-shell {',
+        '  display: inline-flex; align-items: center; gap: 4px; margin-left: auto;',
+        '  cursor: pointer; font-size: 11px; color: #94a3b8; white-space: nowrap;',
+        '  user-select: none;',
+        '}',
+        '.blobby-chat-shell input { margin: 0; cursor: pointer; accent-color: #D8700D; }',
+        '.blobby-chat-shell span { font-weight: 600; }',
+        '.blobby-chat-shell.blobby-shell-on { color: #f59e0b; }',
+        '.blobby-chat-shell.blobby-shell-off span { opacity: .6; }',
+        // Puces d'outils EN FLUX : les actions consécutives partagent UNE seule
+        // rangée (flex-wrap) au lieu d'une pleine ligne chacune. Largeur bornée
+        // à la zone de conversation (100 %) ; jamais de débordement horizontal.
+        '.blobby-action-row {',
+        '  display: flex; flex-wrap: wrap; align-items: center;',
+        '  justify-content: center; align-self: stretch;',
+        '  gap: 6px; max-width: 100%; min-width: 0; box-sizing: border-box;',
+        '}',
+        '.blobby-action-row > .blobby-msg[data-role="action"] {',
+        '  align-self: auto; margin: 0; min-width: 0; max-width: 100%;',
+        '}',
     ].join('\n');
     (document.head || document.documentElement).appendChild(style);
 }
@@ -224,6 +268,194 @@ function _blobbyGetBackendUrl() {
 function _blobbyGetApiKey() {
     try { return JSON.parse(localStorage.getItem('AIH_config'))?.apiKey || ''; }
     catch { return ''; }
+}
+
+// ── Chat Blobby : STREAMING + watchdog d'INACTIVITÉ ──────────────────────
+// Le chat ne doit JAMAIS être coupé par un plafond de DURÉE TOTALE : une tâche
+// longue mais ACTIVE doit aboutir. On lit donc la réponse du backend en FLUX
+// (NDJSON, route /api/keywords/llm-process/stream) et on ne coupe que sur un
+// SILENCE prolongé. Le seuil est RÉARMÉ à chaque morceau reçu (delta/keepalive).
+// Réglable SANS toucher au code : window.AIH_BLOBBY_IDLE_TIMEOUT_MS (ms).
+// Le backend a son propre watchdog d'inactivité (AIH_LLM_IDLE_TIMEOUT, 120 s)
+// et émet un keepalive ~toutes les 5 s : ce seuil front ne se déclenche donc
+// que si plus AUCUN octet n'arrive (transport réellement muet).
+var BL_CHAT_IDLE_TIMEOUT_MS = 45000; // 45 s d'INACTIVITÉ — jamais une durée totale
+
+function _blobbyIdleTimeoutMs() {
+    var raw = (typeof window !== 'undefined') ? window.AIH_BLOBBY_IDLE_TIMEOUT_MS : undefined;
+    var n = parseInt(raw, 10);
+    return (isFinite(n) && n > 0) ? n : BL_CHAT_IDLE_TIMEOUT_MS;
+}
+
+// Erreur typée du chat : un CODE distinct distingue un vrai silence (stream_idle
+// / llm_idle_timeout) d'une erreur réseau (stream_network) ou HTTP (http_error).
+function _blobbyChatError(code, message, data) {
+    var err = new Error(message);
+    err.code = code;
+    err.data = data || { code: code };
+    return err;
+}
+
+// Message d'erreur affichable : corps serveur (data.error) puis message local.
+function _blobbyErrText(e) {
+    if (!e) return '';
+    if (e.data && e.data.error) return String(e.data.error);
+    if (e.message) return String(e.message);
+    return '';
+}
+
+// Lit une réponse JSON (repli quand le flux n'est pas disponible : backend
+// non-stream, ou stub de test sans corps lisible). Lève pour un statut non-OK.
+async function _blobbyParseJsonReply(res) {
+    var data = null;
+    try { data = await res.json(); }
+    catch (e) {
+        try { data = JSON.parse(await res.text()); } catch (e2) { data = null; }
+    }
+    if (res && res.ok === false) {
+        var msg = (data && (data.error || data.detail)) || ('HTTP ' + (res.status || '?'));
+        throw _blobbyChatError('http_error', msg, data);
+    }
+    return data || {};
+}
+
+// POST streaming vers le backend AI-Helper, piloté par un watchdog d'INACTIVITÉ
+// (réarmé à chaque morceau). Aucun plafond de durée totale (timeout: 0).
+//   opts.onDelta(text) : fragment de contenu ; appelé avec null en fin de tour
+//     (retrait de l'affichage progressif).
+async function _blobbyLlmStream(baseUrl, path, body, opts) {
+    opts = opts || {};
+    var url = String(baseUrl).replace(/\/+$/, '') + path;
+    var idleMs = _blobbyIdleTimeoutMs();
+    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = null;
+    var timedOut = false;
+    function arm() {
+        disarm();
+        timer = setTimeout(function () {
+            timedOut = true;
+            if (controller) { try { controller.abort(); } catch (e) {} }
+        }, idleMs);
+    }
+    function disarm() { if (timer) { clearTimeout(timer); timer = null; } }
+
+    // ── Requête (timeout: 0 → aucun plafond de durée totale côté brique) ──
+    var res;
+    try {
+        arm();
+        res = await remoteRequest(url, {
+            method: 'POST',
+            body: body,
+            raw: true,
+            timeout: 0,
+            signal: controller ? controller.signal : undefined,
+            headers: { 'Accept': 'application/x-ndjson' },
+        });
+        disarm();
+    } catch (e) {
+        disarm();
+        if (timedOut) throw _blobbyChatError('stream_idle', t('bl.llmIdle', { seconds: Math.round(idleMs / 1000) }));
+        throw e;
+    }
+
+    // Corps non lisible OU réponse non-stream (erreur 400/401 JSON émise AVANT
+    // le flux) → repli JSON classique.
+    var ctype = '';
+    try { ctype = String((res && res.headers && res.headers.get('content-type')) || '').toLowerCase(); }
+    catch (e) { ctype = ''; }
+    var looksStream = ctype.indexOf('ndjson') >= 0 || ctype.indexOf('event-stream') >= 0;
+    if (!res || !res.body || typeof res.body.getReader !== 'function' || (ctype && !looksStream)) {
+        disarm();
+        return _blobbyParseJsonReply(res);
+    }
+
+    var reader;
+    try { reader = res.body.getReader(); }
+    catch (e) { disarm(); return _blobbyParseJsonReply(res); }
+
+    var decoder = (typeof TextDecoder !== 'undefined') ? new TextDecoder() : null;
+    var buffer = '';
+    var donePayload = null;
+    var serverError = null;
+    try {
+        while (true) {
+            arm();
+            var chunk;
+            try { chunk = await reader.read(); }
+            catch (readErr) {
+                disarm();
+                if (timedOut) throw _blobbyChatError('stream_idle', t('bl.llmIdle', { seconds: Math.round(idleMs / 1000) }));
+                throw _blobbyChatError('stream_network', t('bl.networkError') + ' ' + ((readErr && readErr.message) || readErr));
+            }
+            disarm();
+            if (chunk.done) break;
+            buffer += decoder ? decoder.decode(chunk.value, { stream: true }) : String(chunk.value || '');
+            var lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i].trim();
+                if (!line) continue;
+                var evt;
+                try { evt = JSON.parse(line); } catch (e) { continue; }
+                if (!evt || typeof evt !== 'object') continue;
+                if (evt.status === 'delta') {
+                    if (opts.onDelta && evt.text) { try { opts.onDelta(evt.text); } catch (e) {} }
+                } else if (evt.status === 'done') {
+                    donePayload = evt;
+                } else if (evt.status === 'error') {
+                    serverError = _blobbyChatError(evt.code || 'llm_error', evt.error || t('bl.llmIdle', { seconds: '?' }), evt);
+                }
+                // 'start' / 'keepalive' : simple activité — le watchdog est réarmé.
+            }
+            if (serverError) break;
+        }
+    } finally {
+        disarm();
+        // Annulation PROPRE : libère le lecteur sans jamais produire de rejet
+        // non capturé (cancel() sur un flux déjà en erreur rejette sa promesse).
+        try {
+            if (reader && reader.cancel) {
+                var cancelP = reader.cancel();
+                if (cancelP && typeof cancelP.catch === 'function') cancelP.catch(function () {});
+            }
+        } catch (e) { /* ignore */ }
+        if (controller) { try { controller.abort(); } catch (e) {} }
+        if (opts.onDelta) { try { opts.onDelta(null); } catch (e) {} }
+    }
+    if (serverError) throw serverError;
+    if (!donePayload) throw _blobbyChatError('stream_network', t('bl.networkError'));
+    return donePayload;
+}
+
+// Affichage progressif : bulle temporaire remplie au fil des deltas, retirée
+// en fin de tour (la réponse finale est rendue par _addChatMessage). Aucune
+// entrée d'historique n'est écrite pour cette bulle (pas de pollution).
+function _blobbyMakeStreamRenderer(container) {
+    var el = null;
+    var buf = '';
+    return function (piece) {
+        if (piece === null) {
+            if (el && el.parentNode) el.parentNode.removeChild(el);
+            el = null; buf = '';
+            return;
+        }
+        if (!el) {
+            el = document.createElement('div');
+            el.className = 'blobby-msg blobby-msg-streaming';
+            el.dataset.role = 'blobby';
+            el.dataset.streaming = '1';
+            Object.assign(el.style, {
+                padding: '6px 10px', borderRadius: '8px', fontSize: '12px',
+                lineHeight: '1.4', maxWidth: '85%', wordBreak: 'break-word',
+                whiteSpace: 'normal', background: '#2a2a2e', color: '#e2e8f0',
+                alignSelf: 'flex-start', border: '1px solid #444',
+            });
+            container.appendChild(el);
+        }
+        buf += piece;
+        el.innerHTML = _blobbyMarkdownToHtml(buf);
+        container.scrollTop = container.scrollHeight;
+    };
 }
 
 // ── Barre de contexte : estimation locale + rendu honnête ────────────────
@@ -430,6 +662,101 @@ function _blobbyPopulateSettings() {
     container.appendChild(memDiv);
 }
 
+// ── Puces d'outils : conteneur en FLUX (côte à côte + retour à la ligne) ──
+// Les lignes d'action CONSÉCUTIVES partagent une même rangée div.blobby-action-row
+// (flex-wrap) au lieu d'un bloc pleine largeur chacune. Toute autre ligne du fil
+// (blobby/system/streaming) interrompt la rangée : l'action suivante en ouvre une
+// nouvelle → l'ordre du fil reste strictement préservé. Les puces gardent la
+// classe .blobby-msg (historique, undo, comptage de contexte inchangés).
+//
+// REGROUPEMENT ⚡ nom ×N : deux appels IDENTIQUES ne fusionnent que si le second
+// suit IMMÉDIATEMENT le premier (dernière puce de la rangée COURANTE). Règle de
+// séparation STRICTE : toute action différente — ou toute autre ligne du fil —
+// coupe le groupe ; la même action qui réapparaît plus tard démarre un NOUVEAU
+// groupe (jamais de fusion par-dessus une interruption, jamais de total agrégé
+// à distance). Un appel portant un undoId n'est JAMAIS fusionné : chaque mutation
+// doit rester annulable individuellement (marqueur conservé à la restauration).
+function _blobbyChipHasUndo(chip) {
+    if (!chip || !chip.dataset) return false;
+    if (chip.dataset.undoId) return true;        // snapshot vivant (session courante)
+    if (chip.dataset.undo === '1') return true;  // mutation restaurée (pile undo morte)
+    return !!(chip.querySelector && chip.querySelector('button[data-undo-id]'));
+}
+
+// Texte affiché d'une puce : « ⚡ libellé », plus « ×N » SEULEMENT à partir de
+// 2 appels (format i18n `bl.actionCount` ; un appel isolé reste une puce normale).
+function _blobbyActionChipText(label, count) {
+    var base = '⚡ ' + label;
+    var n = parseInt(count, 10);
+    if (!isFinite(n) || n < 2) return base;
+    return t('bl.actionCount', { label: base, count: n });
+}
+
+// Applique libellé + compteur SANS recréer de nœud DOM (mise à jour LIVE) : seul
+// le <span> de libellé est re-rendu, un éventuel bouton « Annuler » reste intact.
+// dataset.actionLabel garde le libellé BRUT (sans ⚡ ni ×N) : base de comparaison
+// du regroupement et de la persistance.
+function _blobbyApplyActionLabel(chip, label, count) {
+    var raw = (label === undefined || label === null) ? '' : String(label);
+    var n = parseInt(count, 10);
+    if (!isFinite(n) || n < 1) n = 1;
+    chip.dataset.actionLabel = raw;
+    if (n >= 2) chip.dataset.actionCount = String(n);
+    else delete chip.dataset.actionCount;
+    var labelEl = chip.querySelector('.blobby-action-label');
+    if (!labelEl) {
+        labelEl = document.createElement('span');
+        labelEl.className = 'blobby-action-label';
+        chip.insertBefore(labelEl, chip.firstChild);
+    }
+    labelEl.textContent = _blobbyActionChipText(raw, n);
+}
+
+// Normalise le texte d'action PERSISTÉ : les historiques antérieurs au regroupement
+// stockaient le rendu HTML (« ⚡ libellé ») — on retire ce préfixe pour ne pas
+// doubler le ⚡ à la restauration — ainsi qu'un éventuel « ×N » déjà rendu (le
+// compteur est désormais persisté à part, dans msg.count).
+function _blobbyActionRawLabel(saved) {
+    var s = (saved === undefined || saved === null) ? '' : String(saved);
+    s = s.replace(/^\s*⚡\s*/, '');
+    return s.replace(/\s+×\s*(\d+)\s*$/, function (m, n) {
+        return parseInt(n, 10) >= 2 ? '' : m;
+    });
+}
+
+function _blobbyAppendChatEl(container, el) {
+    if (!container || !el) return;
+    if (el.dataset && el.dataset.role === 'action') {
+        var last = container.lastElementChild;
+        var row = (last && last.classList && last.classList.contains('blobby-action-row')) ? last : null;
+        if (row) {
+            // Seule la DERNIÈRE puce de la rangée courante peut absorber
+            // l'appel identique qui arrive : au premier changement d'action,
+            // le groupe est coupé (et une ligne non-action ferme déjà la
+            // rangée → la même action repart sur une nouvelle puce).
+            var prev = row.lastElementChild;
+            if (prev && prev.dataset && prev.dataset.role === 'action'
+                && prev.dataset.actionLabel !== undefined && el.dataset.actionLabel !== undefined
+                && String(prev.dataset.actionLabel) === String(el.dataset.actionLabel)
+                && !_blobbyChipHasUndo(prev) && !_blobbyChipHasUndo(el)) {
+                var n = parseInt(prev.dataset.actionCount, 10);
+                if (!isFinite(n) || n < 1) n = 1;
+                var m = parseInt(el.dataset.actionCount, 10);
+                if (!isFinite(m) || m < 1) m = 1;
+                _blobbyApplyActionLabel(prev, prev.dataset.actionLabel, n + m);
+                return;
+            }
+        } else {
+            row = document.createElement('div');
+            row.className = 'blobby-action-row';
+            container.appendChild(row);
+        }
+        row.appendChild(el);
+    } else {
+        container.appendChild(el);
+    }
+}
+
 const Blobby = {
     x: 400,
     y: 300,
@@ -481,6 +808,35 @@ const Blobby = {
         // Persistance (défaut 'read') : valeur inconnue/corrompue → repli
         // silencieux sur 'read' via normalizeMode (défensif).
         return this.setMode(_blobbyLoadMode("read"));
+    },
+
+    // ── Accès shell (nouveau) : barrière orthogonale au mode ────────────────
+    // Défaut FALSE. L'autorisation EFFECTIVE n'existe qu'en mode 'active' (le
+    // mode est la 1ʳᵉ barrière) : read + shell cochée ⇒ rien ne s'exécute.
+    // Persistance : exactement le même mécanisme que le mode (blobbyData),
+    // + publication vers le pack local (blobby.json) pour la barrière serveur.
+    shellAccess: false,
+    setShellAccess(enabled) {
+        const v = (enabled === true || enabled === 'true' || enabled === 1 || enabled === '1' || enabled === 'on');
+        if (v !== this.shellAccess) {
+            Blobby.shellAccess = v;
+            _blobbySaveShellAccess(v);
+            console.log("%c🧡 Blobby accès shell : " + (v ? "🖥️ AUTORISÉ" : "🚫 désactivé"), "color:#FF8F00;font-weight:bold;");
+        }
+        // Re-publie systématiquement (idempotent) : l'état serveur reste aligné
+        // sur l'UI (aucun faux positif après rechargement).
+        _blobbyPublishShellAccess(v);
+        return Blobby.shellAccess;
+    },
+    getShellAccess() { return this.shellAccess === true; },
+    /** Autorisation EFFECTIVE : le mode Actif reste la 1ʳᵉ barrière du shell. */
+    isShellAllowed() { return this.getMode() === 'active' && this.getShellAccess(); },
+    _initShellAccess() {
+        // Défaut FALSE (sécurité). Re-publie vers le pack pour aligner la
+        // barrière serveur sur l'état réel au chargement.
+        Blobby.shellAccess = _blobbyLoadShellAccess(false);
+        _blobbyPublishShellAccess(Blobby.shellAccess);
+        return Blobby.shellAccess;
     },
 
     mood: "happy",
@@ -1626,14 +1982,26 @@ const Blobby = {
         if (!msgs) return;
         var history = [];
         msgs.querySelectorAll('.blobby-msg').forEach(function(el) {
-            var html = el.innerHTML;
             if (el.dataset.role === 'action') {
                 // Les boutons « Annuler » ne sont vivants que pour la session
                 // courante (la pile undo n'est pas persistée) : on ne stocke
-                // pas leur HTML mort dans l'historique.
-                html = html.replace(/<button[^>]*data-undo-btn[\s\S]*?<\/button>/g, '');
+                // pas leur HTML mort. On persiste le libellé BRUT + le compteur
+                // ×N → la restauration re-rend les puces groupées à l'identique
+                // (idempotent) ; msg.undo garde le caractère non fusionnable
+                // d'une mutation restaurée.
+                var entry = {
+                    role: 'action',
+                    text: (el.dataset.actionLabel !== undefined)
+                        ? el.dataset.actionLabel
+                        : _blobbyActionRawLabel((el.querySelector('.blobby-action-label') || el).textContent || ''),
+                };
+                var c = parseInt(el.dataset.actionCount, 10);
+                if (isFinite(c) && c >= 2) entry.count = c;
+                if (_blobbyChipHasUndo(el)) entry.undo = true;
+                history.push(entry);
+                return;
             }
-            history.push({ role: el.dataset.role, text: html });
+            history.push({ role: el.dataset.role, text: el.innerHTML });
         });
         if (history.length > 50) history = history.slice(-50);
         _blobbySaveChatHistory(history);
@@ -1721,6 +2089,32 @@ const Blobby = {
         optActiveBody.textContent = t('bl.mode.active'); // 🟠 Actif
         modeSelect.appendChild(optReadBody);
         modeSelect.appendChild(optActiveBody);
+        // ── Case « Autoriser l'accès au shell » (à côté du sélecteur de mode) ──
+        // Défaut décochée ; l'autorisation effective n'existe qu'en mode Actif.
+        // Le titre porte l'avertissement (exécution réelle de commandes).
+        var shellWrap = document.createElement('label');
+        shellWrap.id = 'blobby-chat-shell';
+        shellWrap.className = 'blobby-chat-shell';
+        shellWrap.setAttribute('for', 'blobby-chat-shell-checkbox');
+        var shellCheck = document.createElement('input');
+        shellCheck.type = 'checkbox';
+        shellCheck.id = 'blobby-chat-shell-checkbox';
+        shellCheck.className = 'blobby-chat-shell-check';
+        var shellText = document.createElement('span');
+        shellText.textContent = t('bl.shell.label');
+        shellWrap.appendChild(shellCheck);
+        shellWrap.appendChild(shellText);
+        function _syncShellBar() {
+            // Reflète TOUJOURS l'état persisté réel (jamais un état tenté).
+            var mode = _self.getMode();
+            var on = _self.getShellAccess();
+            var effective = _self.isShellAllowed();
+            shellCheck.checked = on;
+            shellWrap.title = (mode === 'active') ? t('bl.shell.tooltip') : (t('bl.shell.tooltip') + ' — ' + t('bl.shell.needsActive'));
+            shellCheck.setAttribute('aria-label', t('bl.shell.tooltip'));
+            shellWrap.classList.toggle('blobby-shell-on', effective);
+            shellWrap.classList.toggle('blobby-shell-off', !effective);
+        }
         function _syncModeBar() {
             // Reflète TOUJOURS l'état réellement APPLIQUÉ (jamais l'état tenté) :
             // une valeur inconnue serait rejetée par setMode, le <select> ne
@@ -1730,6 +2124,8 @@ const Blobby = {
             modeSelect.title = t('bl.mode.tooltip');
             modeBar.classList.toggle('blobby-mode-read', applied === 'read');
             modeBar.classList.toggle('blobby-mode-active', applied === 'active');
+            // Le mode est la 1ʳᵉ barrière : changer de mode re-rend l'état shell effectif.
+            _syncShellBar();
         }
         modeSelect.onchange = function(e) {
             e.stopPropagation();
@@ -1747,9 +2143,22 @@ const Blobby = {
                 _self._addChatMessage(messages, 'system', t('bl.mode.switched', { mode: applied === 'active' ? t('bl.mode.active') : t('bl.mode.read') }));
             }
         };
+        shellCheck.onchange = function(e) {
+            e.stopPropagation();
+            // setShellAccess est la SEULE fenêtre de changement : il valide,
+            // persiste (blobbyData) et publie vers le pack (blobby.json).
+            var applied = _self.setShellAccess(shellCheck.checked);
+            _syncShellBar();
+            var mode = _self.getMode();
+            _self._addChatMessage(messages, 'system',
+                applied
+                    ? (mode === 'active' ? t('bl.shell.enabled') : t('bl.shell.needsActive'))
+                    : t('bl.shell.disabled'));
+        };
         _syncModeBar();
         modeBar.appendChild(modeBarLabel);
         modeBar.appendChild(modeSelect);
+        modeBar.appendChild(shellWrap);
 
         // Messages area
         var messages = document.createElement('div');
@@ -1787,9 +2196,13 @@ const Blobby = {
                 div.style.background = '#1a3a1a'; div.style.color = '#86efac';
                 div.style.alignSelf = 'center'; div.style.fontSize = '11px';
                 div.style.border = '1px solid #166534';
-                div.innerHTML = '⚡ ' + msg.text;
+                // Libellé BRUT + compteur persistés : re-rendu identique au live
+                // (idempotent) ; une mutation restaurée (msg.undo) garde son
+                // marqueur de non-fusion même si sa pile undo est morte.
+                _blobbyApplyActionLabel(div, _blobbyActionRawLabel(msg.text), msg.count);
+                if (msg.undo) div.dataset.undo = '1';
             }
-            messages.appendChild(div);
+            _blobbyAppendChatEl(messages, div);
         });
 
         if (messages.children.length === 0) {
@@ -2048,9 +2461,15 @@ const Blobby = {
             div.style.alignSelf = 'center';
             div.style.fontSize = '11px';
             div.style.border = '1px solid #166534';
-            // Valeurs du workflow interpolées dans du HTML → escapeHtml.
-            div.innerHTML = '⚡ ' + escapeHtml(text);
+            // Libellé dans un <span> dédié, posé en textContent : les valeurs du
+            // workflow sont échappées par construction (pas d'innerHTML) et le
+            // regroupement ×N ne re-rend QUE ce span — jamais la puce ni un
+            // bouton « Annuler » éventuel.
+            _blobbyApplyActionLabel(div, text);
             if (opts && opts.undoId) {
+                // Marqueur de non-fusion : une mutation reste annulable
+                // individuellement (jamais absorbée dans un ⚡ nom ×N).
+                div.dataset.undoId = String(opts.undoId);
                 // Ligne d'action issue d'une mutation (mode Actif) : bouton
                 // « Annuler » qui restaure le snapshot d'avant l'action. La
                 // pile étant runtime-only, le bouton n'est vivant que pour
@@ -2075,7 +2494,7 @@ const Blobby = {
                 div.appendChild(ub);
             }
         }
-        container.appendChild(div);
+        _blobbyAppendChatEl(container, div);
         container.scrollTop = container.scrollHeight;
         this._saveChatHistory();
         // Mettre a jour la barre de contexte (valeur + source reelles, jamais inventees)
@@ -2121,6 +2540,9 @@ const Blobby = {
     },
 
     async _handleChatMessage(container, userText) {
+        var self = this;
+        // Affichage progressif (bulle temporaire) alimenté par les deltas du flux.
+        var renderStream = _blobbyMakeStreamRenderer(container);
         this._addChatMessage(container, 'system', t("bl.thinking"));
 
         try {
@@ -2158,6 +2580,16 @@ const Blobby = {
                 : this.mood === 'surprised' ? t("bl.moodSurprisedDesc")
                 : this.mood === 'sleepy' ? t("bl.moodSleepyDesc")
                 : t("bl.moodNeutralDesc");
+            // Accès shell effectif (mode Actif ET case cochée) : la commande
+            // [SHELL …] n'est ANNONCÉE au LLM que si elle est autorisée
+            // (1ʳᵉ barrière front : pas de shell proposé/évoqué quand décoché).
+            var shellAllowed = this.isShellAllowed();
+            var shellHelp = shellAllowed
+                ? '  [SHELL commande] - Execute une commande shell. Ex: [SHELL ls -la], [SHELL dir], [SHELL git status], [SHELL python --version]\n'
+                : '  (Accès shell NON autorisé : n\'écris JAMAIS de commande [SHELL …] ni de commande système. Si une action nécessite le shell, réponds que l\'utilisateur doit cocher « Autoriser l\'accès au shell » en mode Actif.)\n';
+            var shellTerminalNote = shellAllowed
+                ? 'Note : Tu as un VRAI terminal. Reflechis aux commandes a executer. Sauvegarde les procedures qui marchent comme skills. Ne fais pas que parler, agis !\n'
+                : 'Note : Tu n\'as PAS accès au shell (case « Autoriser l\'accès au shell » décochée ou mode Lecture seule). N\'exécute aucune commande système.\n';
             var instruction = character + memoryBlock + '\n\n'
                 + 'Humeur actuelle : ' + moodDesc + '\n'
                 + '(Ton \"Blobby\" doit refletter cette humeur)\n\n'
@@ -2165,7 +2597,7 @@ const Blobby = {
                 + 'Instructions :\n'
                 + '- Si l\'utilisateur demande une action, reponds avec la commande entre crochets.\n'
                 + '- Commandes disponibles :\n'
-                + '  [SHELL commande] - Execute une commande shell. Ex: [SHELL ls -la], [SHELL dir], [SHELL git status], [SHELL python --version]\n'
+                + shellHelp
                 + '  [SKILL_SAVE nom | description | commande] - Sauvegarde une procedure pour la reutilisee. Ex: [SKILL_SAVE check_updates | Verifier les mises a jour des nodes | cd custom_nodes && for /d %d in (*) do git -C \"%d\" fetch --quiet && git -C \"%d\" log HEAD..origin/main --oneline]\n'
                 + '  [SKILL_RUN nom] - Execute une skill sauvegardee\n'
                 + '  [SKILL_LIST] - Liste toutes les skills disponibles\n'
@@ -2174,13 +2606,13 @@ const Blobby = {
                 + '  [FOCUS nom] - Met en surbrillance un noeud\n'
                 + 'Skills disponibles : ' + JSON.stringify(_blobbyGetSkills().map(function(s){return s.name;})) + '\n'
                 + 'Tu peux utiliser le Markdown pour mettre en forme tes reponses (gras, listes, titres, code).\n'
-                + 'Note : Tu as un VRAI terminal. Reflechis aux commandes a executer. Sauvegarde les procedures qui marchent comme skills. Ne fais pas que parler, agis !\n'
+                + shellTerminalNote
                 + 'Environnement :\n'
                 + '- OS : ' + (navigator.platform || 'inconnu') + '\n'
-                + '- Shell : /bin/bash (Linux) ou cmd (Windows) — utilise des commandes simples et compatibles\n'
+                + (shellAllowed ? '- Shell : /bin/bash (Linux) ou cmd (Windows) — utilise des commandes simples et compatibles\n' : '')
                 + '- ComfyUI est installe dans le dossier custom_nodes/ de ComfyUI\n'
                 + '- Le repo AIH Tools est dans custom_nodes/AIH_Tools/\n'
-                + '- Pour les boucles, prefere des commandes simples (ex: ls, find, xargs) plutot que des scripts complexes\n'
+                + (shellAllowed ? '- Pour les boucles, prefere des commandes simples (ex: ls, find, xargs) plutot que des scripts complexes\n' : '')
                 + '\n'
                 + this._modeInstruction() + '\n\n'
                 + 'Message de l\'utilisateur : ' + userText;
@@ -2211,7 +2643,9 @@ const Blobby = {
             var toolFallbackText = false;
             var toolSchemas = null;
             if (this.getMode() === 'active') {
-                try { toolSchemas = BlobbyTools.getToolsForMode('active'); } catch (eTool) { toolSchemas = null; }
+                // 1ʳᵉ barrière shell : sans autorisation, `run_shell` n'est PAS
+                // dans la liste d'outils envoyée au LLM.
+                try { toolSchemas = BlobbyTools.getToolsForMode('active', { shellAccess: this.getShellAccess() }); } catch (eTool) { toolSchemas = null; }
                 if (!toolSchemas || toolSchemas.length === 0) toolSchemas = null; // registre vide → repli texte
             }
             if (toolSchemas) {
@@ -2259,14 +2693,15 @@ const Blobby = {
 
                 var data;
                 try {
-                    data = await remotePost(baseUrl + '/api/keywords/llm-process', {
+                    // Streaming + watchdog d'INACTIVITÉ : aucune durée totale.
+                    data = await _blobbyLlmStream(baseUrl, '/api/keywords/llm-process/stream', {
                         preset_id: parseInt(presetId),
                         instruction: currentInstruction
-                    });
+                    }, { onDelta: renderStream });
                 } catch (e) {
                     var th = container.querySelector('div:last-child');
                     if (th && th.textContent.indexOf('Blobby') >= 0) th.remove();
-                    this._addChatMessage(container, 'blobby', t("bl.sorry", { error: (e && e.data && e.data.error) || t("bl.errorStatus", { status: e.status }) }));
+                    this._addChatMessage(container, 'blobby', t("bl.sorry", { error: _blobbyErrText(e) || t("bl.errorStatus", { status: e && e.status }) }));
                     return;
                 }
 
@@ -2303,6 +2738,17 @@ const Blobby = {
 
                 // Verifier les [SHELL] AVANT _executeCommands
                 var hasShellCommands = /\[SHELL\s+.+\]/i.test(reply);
+
+                // 2ᵉ barrière front « shell » : sans autorisation EFFECTIVE
+                // (mode Actif + case cochée), aucun [SHELL] n'est exécuté —
+                // refus clair affiché, jamais d'appel réseau (aucun échec silencieux).
+                if (hasShellCommands && !this.isShellAllowed()) {
+                    reply = reply.replace(/\[SHELL\s+.+\]/gi, t('bl.shell.refused'));
+                    reply = await this._executeCommands(reply, container);
+                    finalReply = reply;
+                    this._addChatMessage(container, 'system', t('bl.shell.refused'));
+                    break;
+                }
 
                 // Executer les commandes locales (MOVE_TO, SET, FOCUS) — [SET…]
                 // passe par le dispatcher d'outils (enforcement + undo), les
@@ -2377,7 +2823,7 @@ const Blobby = {
                     + 'Reste concis (max 200 caracteres). Reponds UNIQUEMENT avec la nouvelle description de personnalite.\n\n'
                     + 'Personnalite actuelle: ' + character + '\n\n'
                     + 'Derniers echanges: ' + userText.substring(0, 200);
-                remotePost(baseUrl + '/api/keywords/llm-process', {
+                _blobbyLlmStream(baseUrl, '/api/keywords/llm-process/stream', {
                     preset_id: parseInt(presetId),
                     instruction: updateInstruction
                 }).then(function(d) {
@@ -2412,17 +2858,21 @@ const Blobby = {
         var self = this;
         var app = window.app || window.comfyAPI?.app?.app;
         var messages = this._buildToolModeMessages(p);
+        // Affichage progressif partagé par tous les tours de la boucle d'outils.
+        var renderStream = _blobbyMakeStreamRenderer(container);
 
         var result = await BlobbyTools.runToolLoop({
             messages: messages,
             maxTurns: 100, // même garde anti-boucle que la boucle agentic texte
             send: async function(convo) {
-                var data = await remotePost(p.baseUrl + '/api/keywords/llm-process', {
+                // Streaming + watchdog d'INACTIVITÉ : un outil/LLM long mais actif
+                // n'est plus coupé par le plafond de 30 s de la brique HolafFetch.
+                var data = await _blobbyLlmStream(p.baseUrl, '/api/keywords/llm-process/stream', {
                     preset_id: parseInt(p.presetId),
                     messages: convo,
                     tools: p.tools,
                     tool_choice: 'auto'
-                });
+                }, { onDelta: renderStream });
                 // Fenêtre de contexte renvoyée par llm-process : max_context
                 // (int OU null) + context_source — même mise à jour honnête
                 // de la barre que le chemin texte (jamais de repli chiffré).
@@ -2445,6 +2895,7 @@ const Blobby = {
                 return BlobbyTools.dispatchToolCall(name, args, {
                     app: app,
                     mode: self.getMode(), // enforcement 2ᵉ barrière (blobby_tools)
+                    shellAccess: self.getShellAccess(), // enforcement shell (2ᵉ barrière)
                     t: t
                 });
             },
@@ -2452,6 +2903,11 @@ const Blobby = {
                 var labelTxt = (res && res.action) ? res.action : String(BlobbyTools.toolCallName(tc));
                 var undoId = (res && res.ok && res.snapshotId) ? res.snapshotId : null;
                 self._addChatMessage(container, 'action', labelTxt, { undoId: undoId });
+                // Refus shell (désactivé côté front OU serveur) : message
+                // compréhensible VISIBLE, jamais un échec silencieux.
+                if (res && res.ok === false && res.code === 'shell_forbidden') {
+                    self._addChatMessage(container, 'system', t('bl.shell.refused'));
+                }
             }
         });
 
@@ -2462,6 +2918,15 @@ const Blobby = {
             // snapshot/undo). [SHELL]/[SKILL_*] ne sont traités que par la
             // boucle texte historique (fournisseurs sans tools / read).
             var reply = result.finalReply;
+            // [SHELL] résiduel dans le chemin outils : jamais exécuté ici. S'il
+            // apparaît alors que l'accès shell n'est pas autorisé, on le
+            // remplace par un refus explicite (jamais un placeholder trompeur) ;
+            // s'il est autorisé, le texte est conservé (le modèle doit utiliser
+            // l'outil run_shell, on n'exécute pas de commande hors dispatcher).
+            if (/\[SHELL\s+.+\]/i.test(reply) && !self.isShellAllowed()) {
+                reply = reply.replace(/\[SHELL\s+.+\]/gi, t('bl.shell.refused'));
+                self._addChatMessage(container, 'system', t('bl.shell.refused'));
+            }
             try { reply = await self._executeCommands(reply, container); } catch { /* jamais bloquant */ }
             return { ok: true, finalReply: reply, turns: result.turns };
         }
@@ -2499,6 +2964,7 @@ const Blobby = {
         if (msgs.length && msgs[msgs.length - 1].role === 'user' && msgs[msgs.length - 1].content === p.userText) {
             msgs.pop();
         }
+        var shellOn = this.getShellAccess();
         var instruction = p.character + (p.memoryBlock || '') + '\n\n'
             + 'Humeur actuelle : ' + p.moodDesc + '\n'
             + '(Ton "Blobby" doit refletter cette humeur)\n\n'
@@ -2508,15 +2974,23 @@ const Blobby = {
             + 'modifier et exécuter le workflow ComfyUI : describe_workflow, list_nodes, get_node_by_id,\n'
             + 'get_node_widgets, get_node_widget, get_node_connections, get_object_info, get_queue_status,\n'
             + 'get_execution_status, set_widget_value, set_node_title, set_node_color, move_node, add_node,\n'
-            + 'remove_node, connect_nodes, disconnect_nodes, queue_prompt, interrupt.\n'
+            + 'remove_node, connect_nodes, disconnect_nodes, queue_prompt, interrupt'
+            + (shellOn ? ', run_shell' : '') + '.\n'
             + '- Pour agir, ÉMETS un tool_call (ne décris pas l\'action, fais-la).\n'
             + '- Les résultats d\'outils te seront renvoyés : analyse-les, enchaîne si nécessaire, puis\n'
             + '  donne ta réponse finale en Markdown.\n'
-            + '- Les commandes texte [SHELL]/[SKILL_*] ne sont traitées qu\'en mode Lecture seule ; ici,\n'
-            + '  utilise les outils ([SET…]/[MOVE_TO] dans le texte restent compris, mais préfère les outils).\n'
+            + (shellOn
+                ? '- L\'accès au shell est AUTORISÉ : tu peux exécuter des commandes locales avec l\'outil run_shell\n'
+                  + '  (plafond dur de 15 s). ⚠️ Les commandes s\'exécutent réellement ; n\'en lance que sur demande claire.\n'
+                  + '- Les commandes texte [SHELL]/[SKILL_*] ne sont PAS traitées ici ; utilise l\'outil run_shell.\n'
+                  + '  ([SET…]/[MOVE_TO] dans le texte restent compris, mais préfère les outils.)\n'
+                : '- L\'accès au shell est DÉSACTIVÉ : l\'outil run_shell ne t\'est PAS fourni et n\'est pas autorisé.\n'
+                  + '  N\'exécute aucune commande système ; si besoin, demande à l\'utilisateur de cocher\n'
+                  + '  « Autoriser l\'accès au shell » dans le chat. Les commandes texte [SHELL]/[SKILL_*] ne sont PAS traitées ici.\n'
+                  + '  ([SET…]/[MOVE_TO] dans le texte restent compris, mais préfère les outils.)\n')
             + 'Environnement :\n'
             + '- OS : ' + (navigator.platform || 'inconnu') + '\n'
-            + '- Shell : /bin/bash (Linux) ou cmd (Windows) — utilise des commandes simples et compatibles\n'
+            + (shellOn ? '- Shell : /bin/bash (Linux) ou cmd (Windows) — utilise des commandes simples et compatibles\n' : '')
             + '- ComfyUI est installe dans le dossier custom_nodes/ de ComfyUI\n'
             + '- Le repo AIH Tools est dans custom_nodes/AIH_Tools/\n'
             + 'Tu peux utiliser le Markdown pour mettre en forme tes reponses.\n\n'
@@ -2688,6 +3162,11 @@ const Blobby = {
         var headers = { 'Content-Type': 'application/json' };
         var results = [];
 
+        // 2ᵉ barrière front « shell » : sans autorisation effective (mode Actif
+        // ET case cochée), AUCUNE commande n'atteint la route serveur ; chaque
+        // commande reçoit un refus explicite (jamais un échec silencieux).
+        var allowed = this.isShellAllowed();
+
         // Extraire toutes les commandes [SHELL ...]
         var commands = [];
         var textWithoutShell = reply.replace(/\[SHELL\s+(.+)\]/gi, function(match, cmd) {
@@ -2697,6 +3176,10 @@ const Blobby = {
 
         // Executer chaque commande sequentiellement
         for (var i = 0; i < commands.length; i++) {
+            if (!allowed) {
+                results.push({ command: commands[i], output: t('bl.shell.refused') });
+                continue;
+            }
             try {
                 var execOpts = {
                     method: 'POST',
@@ -2705,7 +3188,10 @@ const Blobby = {
                 };
                 var r = await HolafFetch.request(localUrl + '/aih/blobby/exec', execOpts);
                 var data = await r.json().catch(() => ({}));
-                var output = data.output || (data.ok ? t("bl.done") : t("bl.error"));
+                // Refus serveur (barrière 3) : message traduit si le code est connu.
+                var output = (data && data.error === 'shell_forbidden')
+                    ? t('bl.shell.refused')
+                    : (data.output || (data.ok ? t("bl.done") : t("bl.error")));
                 results.push({ command: commands[i], output: output });
             } catch(e) {
                 results.push({ command: commands[i], output: t("bl.networkError") + ' ' + e.message });
@@ -2785,6 +3271,16 @@ const Blobby = {
         });
 
         if (commands.length === 0) {
+            if (callback) callback(output);
+            return;
+        }
+
+        // 2ᵉ barrière front « shell » (même règle que _executeShellCommandsAsync) :
+        // sans autorisation effective (mode Actif ET case cochée), on remplace
+        // chaque placeholder par un refus explicite et on n'appelle AUCUNE
+        // route d'exécution.
+        if (!this.isShellAllowed()) {
+            output = output.replace(/⏳/g, '\n\n' + t('bl.shell.refused'));
             if (callback) callback(output);
             return;
         }
@@ -2876,6 +3372,9 @@ window.Blobby = Blobby;
             // persistance via setMode() — la seule fenêtre de changement
             // (l'UI dropdown de l'étape 3 s'y branchera).
             Blobby._initMode();
+            // Accès shell : désactivé par défaut, restauré depuis la persistance
+            // et re-publié vers le pack (barrière serveur).
+            Blobby._initShellAccess();
 
             const cfg = _getAIHConfig();
             if (cfg.blobbyActive) {

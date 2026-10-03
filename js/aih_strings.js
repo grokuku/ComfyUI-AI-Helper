@@ -722,6 +722,7 @@ import "./aih_i18n.js";
         "bl.done": "✅ Fait",
         "bl.doneExclam": "✅ Fait !",
         "bl.networkError": "❌ Erreur réseau :",
+        "bl.llmIdle": "⏳ Blobby n'a reçu AUCUN morceau depuis {seconds} s — le modèle ne renvoie plus rien (appel interrompu, pas une erreur réseau). Réessaie, ou vérifie le serveur LLM.",
         "bl.skillSaved": "✅ Skill \"{name}\" sauvegardée !",
         "bl.skillFormat": "⚠️ Format : [SKILL_SAVE nom | description | commande]",
         "bl.noSkills": "Aucune skill sauvegardée.",
@@ -740,6 +741,9 @@ import "./aih_i18n.js";
         "bl.setFormat": "⚠️ Format : [SET nom param valeur]",
         "bl.toolsUnsupported": "🧭 Ce modèle ne sait pas utiliser d'outils (tool calling) — le mode Actif reste sans effet ici. Passe en Lecture seule (🔵) pour discuter normalement.",
         "bl.toolRunning": "⚡ Blobby exécute l'outil {name}...",
+        // Regroupement des appels identiques et consécutifs : compteur « ×N »
+        // affiché SEULEMENT à partir de 2 appels (sinon puce normale sans compteur).
+        "bl.actionCount": "{label} ×{count}",
         "bl.undoAction": "↩ Annuler",
         "bl.undoTooltip": "Restaurer le workflow tel qu'il était avant cette action",
         "bl.undoDone": "✅ Workflow restauré (état avant : {action})",
@@ -786,6 +790,19 @@ import "./aih_i18n.js";
         "bl.mode.label": "Mode",
         "bl.mode.readPrompt": "Mode d'agent : 🔵 LECTURE SEULE — tu ne peux PAS modifier le graphe ni lancer/interrompre un prompt. Si l'utilisateur te demande une action sur le graphe, réponds EXACTEMENT : « Je suis en Lecture seule, je ne peux pas modifier le graphe — passe en mode Actif si tu veux que je m'en occupe. » N'affirme jamais avoir exécuté une action.",
         "bl.mode.activePrompt": "Mode d'agent : 🟠 ACTIF — tu peux utiliser les outils fournis pour agir sur le workflow (sans confirmation humaine).",
+
+        /* Accès shell Blobby (case à cocher, orthogonale au mode) */
+        "bl.shell.label": "Autoriser l'accès au shell",
+        "bl.shell.tooltip": "Accès au shell : autorise Blobby (en mode Actif) à exécuter des commandes locales sur la machine où tourne ComfyUI. ⚠️ Désactivé par défaut ; chaque commande s'exécute réellement — à n'activer qu'en connaissance de cause.",
+        "bl.shell.needsActive": "Accès au shell inactif : passe d'abord en mode Actif (le mode reste la première barrière).",
+        "bl.shell.enabled": "⚠️ Accès au shell AUTORISÉ (mode Actif) : Blobby peut exécuter des commandes locales. Décoche pour désactiver.",
+        "bl.shell.disabled": "Accès au shell désactivé : Blobby n'exécute aucune commande locale.",
+        "bl.shell.refused": "Exécution shell refusée : l'accès au shell n'est pas autorisé (case « Autoriser l'accès au shell » décochée, ou mode Lecture seule).",
+        "bl.toolErr.shellAccessDisabled": "accès au shell désactivé — autorise-le avec la case « Autoriser l'accès au shell » dans le chat Blobby (et passe en mode Actif)",
+        "bl.toolErr.shellForbidden": "exécution shell refusée par le serveur (autorisation absente) : {detail}",
+        "bl.toolErr.shellFailed": "échec de la commande shell : {detail}",
+        "bl.toolErr.shellUnreachable": "exécution shell impossible : {error}",
+        "bl.toolAct.runShell": "🖥️ {command}",
 
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
         "iv.operationProcessed": "Opération traitée.",
@@ -1979,6 +1996,7 @@ import "./aih_i18n.js";
         "bl.done": "✅ Done",
         "bl.doneExclam": "✅ Done!",
         "bl.networkError": "❌ Network error:",
+        "bl.llmIdle": "⏳ Blobby received NO chunk for {seconds} s — the model has stopped responding (call aborted, not a network error). Try again, or check the LLM server.",
         "bl.skillSaved": "✅ Skill \"{name}\" saved!",
         "bl.skillFormat": "⚠️ Format: [SKILL_SAVE name | description | command]",
         "bl.noSkills": "No skill saved.",
@@ -1997,6 +2015,8 @@ import "./aih_i18n.js";
         "bl.setFormat": "⚠️ Format: [SET name param value]",
         "bl.toolsUnsupported": "🧭 This model can't use tools (tool calling) — Active mode stays ineffective here. Switch to Read-only (🔵) to chat normally.",
         "bl.toolRunning": "⚡ Blobby is running tool {name}...",
+        // Identical consecutive calls grouping: "×N" counter shown only from 2 calls.
+        "bl.actionCount": "{label} ×{count}",
         "bl.undoAction": "↩ Undo",
         "bl.undoTooltip": "Restore the workflow as it was before this action",
         "bl.undoDone": "✅ Workflow restored (state before: {action})",
@@ -2043,6 +2063,19 @@ import "./aih_i18n.js";
         "bl.mode.label": "Mode",
         "bl.mode.readPrompt": "Agent mode: 🔵 READ-ONLY — you CANNOT modify the graph or start/stop a prompt. If the user asks for a graph action, reply EXACTLY: “I am in Read-only mode, I cannot modify the graph — switch to Active mode if you want me to handle it.” Never claim you performed an action.",
         "bl.mode.activePrompt": "Agent mode: 🟠 ACTIVE — you may use the provided tools to act on the workflow (without human confirmation).",
+
+        /* Blobby shell access (checkbox, orthogonal to the mode) */
+        "bl.shell.label": "Allow shell access",
+        "bl.shell.tooltip": "Shell access: lets Blobby (in Active mode) run local commands on the machine where ComfyUI runs. ⚠️ Off by default; every command actually executes — enable only knowingly.",
+        "bl.shell.needsActive": "Shell access inactive: switch to Active mode first (the mode remains the first barrier).",
+        "bl.shell.enabled": "⚠️ Shell access ENABLED (Active mode): Blobby can run local commands. Uncheck to disable.",
+        "bl.shell.disabled": "Shell access disabled: Blobby runs no local command.",
+        "bl.shell.refused": "Shell execution refused: shell access is not granted (the “Allow shell access” box is unchecked, or the mode is Read-only).",
+        "bl.toolErr.shellAccessDisabled": "shell access disabled — enable it with the “Allow shell access” checkbox in the Blobby chat (and switch to Active mode)",
+        "bl.toolErr.shellForbidden": "shell execution refused by the server (no authorization): {detail}",
+        "bl.toolErr.shellFailed": "shell command failed: {detail}",
+        "bl.toolErr.shellUnreachable": "shell execution impossible: {error}",
+        "bl.toolAct.runShell": "🖥️ {command}",
 
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
         "iv.operationProcessed": "Operation processed.",

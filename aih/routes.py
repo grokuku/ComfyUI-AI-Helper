@@ -501,14 +501,36 @@ def _get_blobby_file():
     return blobby_file
 
 
+def _blobby_shell_access_enabled():
+    """True seulement si l'accès shell a été explicitement autorisé (blobby.json).
+
+    Barrière serveur de POST /aih/blobby/exec : la clé ``blobbyShellAccess``
+    est publiée par le companion (POST /aih/blobby/save, clé→valeur) et lue
+    ici. Fail-closed : fichier absent/corrompu, clé absente ou fausse ⇒
+    refus d'exécution (défaut = désactivé, sécurité).
+    """
+    try:
+        blobby_file = _get_blobby_file()
+        if not os.path.isfile(blobby_file):
+            return False
+        with open(blobby_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("blobbyShellAccess") is True
+    except Exception as e:
+        logging.warning(f"[Blobby] shell access state unreadable: {e}")
+        return False
+
+
 def _register_blobby_group(r):
     """Routes du Blobby Companion.
 
     - POST /aih/blobby/save + GET /aih/blobby/load : stockage JSON clé→valeur
       des paramètres du companion (fichier local).
-    - POST /aih/blobby/exec : exécution shell locale (plafond dur de 15 s).
-      AUCUN mot de passe applicatif : la protection est assurée par le
-      reverse-proxy (Caddy basic_auth / Authentik) devant ComfyUI.
+    - POST /aih/blobby/exec : exécution shell locale (plafond dur de 15 s),
+      REFUSÉE tant que l'accès shell n'est pas explicitement autorisé
+      (`blobbyShellAccess` dans blobby.json). AUCUN mot de passe applicatif :
+      la protection est assurée par le reverse-proxy (Caddy basic_auth /
+      Authentik) devant ComfyUI.
     """
 
     @r.post("/aih/blobby/save")
@@ -560,6 +582,15 @@ def _register_blobby_group(r):
             action = (data.get("action") or "").strip()
 
             if action == "shell":
+                # Barrière serveur (3ᵉ) : refus tant que l'accès shell n'est pas
+                # explicitement autorisé (état persisté), y compris en appel
+                # direct de la route. Défaut = désactivé (fail-closed).
+                if not _blobby_shell_access_enabled():
+                    return web.json_response(
+                        {"ok": False, "error": "shell_forbidden",
+                         "output": "⛔ Accès au shell non autorisé (case « Autoriser l'accès au shell » décochée)."},
+                        status=403,
+                    )
                 cmd = (data.get("command") or "").strip()
                 if not cmd:
                     return web.json_response({"ok": False, "output": "⚠️ Commande vide"}, status=400)

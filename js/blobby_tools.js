@@ -15,6 +15,13 @@
  *     précédée d'un snapshot COMPLET du workflow (app.graph.serialize()),
  *     empilé (borné à 10) pour alimenté le bouton « Annuler » du log d'action.
  *
+ * Accès shell (barrière supplémentaire, orthogonale au mode) : l'outil
+ * `run_shell` (mode 'active') porte `requiresShell: true`. Il n'est proposé au
+ * LLM que si `getToolsForMode(mode, { shellAccess: true })` (1ʳᵉ barrière
+ * shell), refusé par le dispatcher sans `ctx.shellAccess` (2ᵉ) et refusé par la
+ * route serveur POST /aih/blobby/exec tant que l'état persisté ne l'autorise
+ * pas (3ᵉ). Défaut = désactivé (fail-safe : absent/faux ⇒ refus).
+ *
  * Contrat backend (étape 1) : POST /api/keywords/llm-process accepte
  * `tools`, `tool_choice` et `messages` (liste complète, remplace la
  * construction system+user) ; la réponse contient `tool_calls` en forme
@@ -279,11 +286,18 @@ function listTools() {
 /**
  * Schémas filtrés par le mode (format function-calling). 1ʳᵉ barrière : en
  * mode 'read', les outils 'active' ne sont même pas proposés au LLM.
+ *
+ * `opts.shellAccess` (défaut FALSE, fail-safe) : les outils marqués
+ * `requiresShell` (ex. run_shell) ne sont proposés au LLM que si l'accès au
+ * shell est explicitement autorisé. C'est la 1ʳᵉ barrière « shell » ; le
+ * dispatcher applique la 2ᵉ (refus sans exécution) et la route serveur la 3ᵉ.
  */
-function getToolsForMode(mode) {
+function getToolsForMode(mode, opts) {
     const m = normalizeMode(mode);
+    const shellAccess = !!(opts && opts.shellAccess);
     return listTools()
         .filter((tl) => (MODE_RANK[tl.mode] === undefined ? 1 : MODE_RANK[tl.mode]) <= MODE_RANK[m])
+        .filter((tl) => tl.requiresShell !== true || shellAccess)
         .map((tl) => ({
             type: "function",
             function: { name: tl.name, description: tl.description, parameters: tl.schema },
@@ -315,6 +329,13 @@ async function dispatchToolCall(name, args, ctx) {
     if (toolRank > MODE_RANK[mode]) {
         // Enforcement : refus SANS exécution, message réinjectable au LLM.
         return _fail(ctx, "mode_forbidden", label(ctx, "bl.toolErr.forbidden", { name: name, mode: mode }, "outil '{name}' interdit en mode '{mode}' (réservé au mode Actif)"));
+    }
+    // 2ᵉ barrière « shell » : un outil qui exige l'accès shell est refusé SANS
+    // exécution tant que ctx.shellAccess n'est pas explicitement vrai (défaut
+    // sûr : absent/faux ⇒ refus). Le mode reste la 1ʳᵉ barrière (testée
+    // au-dessus) : en 'read', un outil shell est déjà refusé comme 'active'.
+    if (tool.requiresShell === true && !ctx.shellAccess) {
+        return _fail(ctx, "shell_forbidden", label(ctx, "bl.toolErr.shellAccessDisabled", {}, "accès au shell désactivé — autorise-le avec la case « Autoriser l'accès au shell » dans le chat Blobby (et passe en mode Actif)"));
     }
     let snapshotId = null;
     if (tool.undoable) {
@@ -1018,6 +1039,57 @@ registerTool({
         return {
             data: { queued: true, batch: Number.isFinite(batch) && batch >= 1 ? batch : 1 },
             action: label(ctx, "bl.toolAct.queue", {}, "▶️ Génération lancée"),
+        };
+    },
+});
+
+registerTool({
+    name: "run_shell",
+    description: "Exécute une commande shell locale sur la machine où tourne ComfyUI (bash/sh, plafond dur de 15 s) et renvoie sa sortie. ⚠️ Accès shell : la commande s'exécute réellement ; cet outil n'est disponible que si l'utilisateur a coché « Autoriser l'accès au shell » ET si le mode est Actif.",
+    schema: {
+        type: "object",
+        properties: { command: { type: "string", description: "Commande shell à exécuter (ex. 'ls -la', 'git status', 'python --version')." } },
+        required: ["command"],
+    },
+    // 'active' ⇒ jamais proposé/accepté en Lecture seule (1ʳᵉ barrière = mode).
+    mode: "active",
+    // requiresShell ⇒ filtré par getToolsForMode sans shellAccess et refusé
+    // par le dispatcher (2ᵉ barrière) puis par la route serveur (3ᵉ).
+    requiresShell: true,
+    // Non undoable : un snapshot de workflow ne peut pas annuler une commande
+    // déjà lancée sur le système (même raisonnement que queue_prompt).
+    async exec(args, ctx) {
+        const cmd = String(args && args.command !== undefined && args.command !== null ? args.command : "").trim();
+        if (!cmd) {
+            return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "command manquante" }, "arguments invalides : {detail}"), code: "invalid_args" };
+        }
+        let res;
+        try {
+            res = await sameOriginFetch(ctx, "/aih/blobby/exec", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "shell", command: cmd }),
+            });
+        } catch (e) {
+            return { error: label(ctx, "bl.toolErr.shellUnreachable", { error: (e && e.message) || String(e) }, "exécution shell impossible : {error}"), code: "shell_unreachable" };
+        }
+        let data = null;
+        try { data = await res.json(); } catch { /* corps illisible → data null */ }
+        if (!res || !res.ok) {
+            // Refus serveur (403 shell_forbidden, 400 commande vide…) : message
+            // clair réinjecté au LLM, JAMAIS un échec silencieux.
+            const detail = data && (data.output || data.error) ? String(data.output || data.error) : "";
+            return {
+                error: label(ctx, "bl.toolErr.shellForbidden", { status: res ? res.status : 0, detail: detail ? " — " + detail : "" }, "exécution shell refusée par le serveur (autorisation absente) : {detail}"),
+                code: "shell_forbidden",
+            };
+        }
+        if (data && data.ok === false) {
+            return { error: label(ctx, "bl.toolErr.shellFailed", { detail: String(data.output || data.error || "") }, "échec de la commande shell : {detail}"), code: "shell_failed" };
+        }
+        return {
+            data: { command: cmd, output: data ? data.output : null },
+            action: label(ctx, "bl.toolAct.runShell", { command: cmd }, "🖥️ {command}"),
         };
     },
 });

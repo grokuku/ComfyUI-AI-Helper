@@ -153,9 +153,21 @@ ok("mode read : 9 outils de lecture, 0 outil actif");
 
 const activeTools = getToolsForMode("active");
 const activeNames = activeTools.map((x) => x.function.name);
-assert.deepStrictEqual(activeNames.sort(), READ_EXPECTED.concat(ACTIVE_ONLY).sort(), "mode active : tous les outils");
-assert.strictEqual(activeTools.length, listTools().length, "getToolsForMode('active') === registre complet");
-ok(`mode active : ${activeNames.length} outils (registre complet)`);
+// Défaut sûr : sans shellAccess, l'outil shell n'est PAS proposé (1ʳᵉ barrière).
+assert.deepStrictEqual(activeNames.sort(), READ_EXPECTED.concat(ACTIVE_ONLY).sort(), "mode active (shell off) : tous les outils SAUF run_shell");
+assert.strictEqual(activeTools.length, listTools().length - 1, "shell off : run_shell retiré (19 des 20 outils du registre)");
+ok(`mode active (shell off) : ${activeNames.length} outils (run_shell filtré)`);
+
+const activeShellTools = getToolsForMode("active", { shellAccess: true });
+const activeShellNames = activeShellTools.map((x) => x.function.name);
+assert.deepStrictEqual(activeShellNames.sort(), READ_EXPECTED.concat(ACTIVE_ONLY, ["run_shell"]).sort(), "mode active (shell on) : registre complet + run_shell");
+assert.strictEqual(activeShellTools.length, listTools().length, "shell on : getToolsForMode('active') === registre complet");
+ok(`mode active (shell on) : ${activeShellNames.length} outils (run_shell proposé)`);
+
+// Le mode reste la 1ʳᵉ barrière : même avec shellAccess, rien de shell en read.
+const readShellNames = getToolsForMode("read", { shellAccess: true }).map((x) => x.function.name);
+assert.ok(!readShellNames.includes("run_shell"), "read + shell on : run_shell ABSENT (le mode prime)");
+ok("read + shellAccess:true : run_shell reste absent (mode = 1ʳᵉ barrière)");
 
 // Format function-calling exploitable par le LLM.
 for (const tl of activeTools) {
@@ -596,6 +608,36 @@ console.log("6. Mutations restantes + formes défensives API");
     ok("app/graph absents → erreur structurée no_app");
 }
 
+// ── Shell (run_shell) : 1ʳᵉ/2ᵉ barrière au niveau du registre/dispatcher ──
+{
+    const namesOff = getToolsForMode("active").map((x) => x.function.name);
+    const namesOn = getToolsForMode("active", { shellAccess: true }).map((x) => x.function.name);
+    assert.ok(!namesOff.includes("run_shell") && namesOn.includes("run_shell"), "run_shell : filtré sans shellAccess, présent avec (1ʳᵉ barrière)");
+
+    let called = 0;
+    const execImpl = () => { called++; return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, output: "sortie" }) }); };
+    // Refus SANS exécution quand shellAccess absent/faux.
+    let r = await dispatchToolCall("run_shell", { command: "ls" }, { mode: "active", fetchImpl: execImpl });
+    assert.strictEqual(r.ok, false, "refusé sans shellAccess");
+    assert.strictEqual(r.code, "shell_forbidden", "code shell_forbidden");
+    assert.strictEqual(called, 0, "exécuteur JAMAIS appelé (aucune requête réseau)");
+    // Le mode reste prioritaire : read + shell on → refus mode, toujours aucune requête.
+    r = await dispatchToolCall("run_shell", { command: "ls" }, { mode: "read", shellAccess: true, fetchImpl: execImpl });
+    assert.strictEqual(r.code, "mode_forbidden", "read + shell on → mode_forbidden (le mode prime)");
+    assert.strictEqual(called, 0, "toujours aucune requête");
+    // Contrôle négatif IN-SUITE : active + shell on → exécuté (la différence EST l'autorisation).
+    r = await dispatchToolCall("run_shell", { command: "ls" }, { mode: "active", shellAccess: true, fetchImpl: execImpl });
+    assert.strictEqual(r.ok, true, "autorisé avec shellAccess + active");
+    assert.strictEqual(called, 1, "exécuteur appelé une fois");
+    assert.ok(r.action && r.action.includes("ls"), "ligne d'action pour la commande");
+    // Refus serveur (403 shell_forbidden) → erreur structurée claire, pas de crash.
+    r = await dispatchToolCall("run_shell", { command: "x" }, { mode: "active", shellAccess: true, fetchImpl: () => Promise.resolve({ ok: false, status: 403, json: async () => ({ ok: false, error: "shell_forbidden", output: "refus" }) }) });
+    assert.strictEqual(r.ok, false, "refus serveur → ok:false");
+    assert.strictEqual(r.code, "shell_forbidden", "code shell_forbidden remonté");
+    assert.ok(r.error.includes("serveur"), `message clair : ${r.error}`);
+    ok("run_shell : filtré/refusé sans shellAccess, autorisé avec (contrôle négatif in-suite), refus serveur propagé");
+}
+
 console.log(`\n✅ Partie 1 (pure) : ${n} groupes d'assertions PASS — suite jsdom…`);
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -697,6 +739,7 @@ const chat = domWindow.document.getElementById("blobby-chat-msgs") || (() => {
 function resetChat() {
     chat.innerHTML = "";
     clearUndo();
+    Blobby.setShellAccess(false); // défaut sûr : chaque groupe fixe explicitement l'état shell
     httpCalls.length = 0;
     llmQueue.length = 0;
     globalThis.window.app = freshApp();
@@ -737,7 +780,8 @@ await tick();
 const llmPostsD = llmPosts();
 assert.strictEqual(llmPostsD.length, 2, "2 tours LLM (tool_calls puis final)");
 assert.strictEqual(llmPostsD[0].body.preset_id, 3, "preset_id transmis");
-assert.ok(Array.isArray(llmPostsD[0].body.tools) && llmPostsD[0].body.tools.length === listTools().length, "tools (schémas filtrés par mode) envoyés");
+assert.ok(Array.isArray(llmPostsD[0].body.tools) && llmPostsD[0].body.tools.length === listTools().length - 1, "tools envoyés (shell off ⇒ 19 des 20, run_shell filtré)");
+assert.ok(!llmPostsD[0].body.tools.some((t) => t.function.name === "run_shell"), "shell off : run_shell absent des tools");
 assert.strictEqual(llmPostsD[0].body.tool_choice, "auto", "tool_choice auto");
 assert.ok(!("instruction" in llmPostsD[0].body), "nouveau contrat : PAS de champ instruction quand messages est fourni");
 assert.ok(Array.isArray(llmPostsD[0].body.messages) && llmPostsD[0].body.messages.length === 1, "messages = liste complète (user)");
@@ -848,28 +892,86 @@ const setActions = msgs("action");
 assert.strictEqual(setActions.length, 1, "ligne d'action pour [SET…]");
 assert.ok(setActions[0].querySelector("button[data-undo-id]"), "bouton Annuler (snapshot pris)");
 const llmPostsSet = llmPosts();
-assert.strictEqual(llmPostsSet[0].body.tools.length, listTools().length, "mode actif : tools au POST (le modèle a ignoré les outils, [SET…] texte reste compris)");
+assert.strictEqual(llmPostsSet[0].body.tools.length, listTools().length - 1, "mode actif + shell off : tools au POST (19/20 ; le modèle a ignoré les outils, [SET…] texte reste compris)");
 assert.ok(msgs("blobby")[0].textContent.includes("steps = 45"), "commande [SET…] remplacée par le rendu d'action dans la réponse");
 ok("(f) bis : [SET…] en actif → exécuté via le dispatcher (enforcement + snapshot), sans boucle tool supplémentaire");
 
-/* ── (f) ter : [SHELL] continue de marcher en Lecture seule ── */
+/* ── (f) ter : matrice mode × shell — READ + shell coché → REFUS ── */
 resetChat();
 Blobby.setMode("read");
-llmQueue.push(
-    { output: "Je vérifie. [SHELL echo hello]" },
-    { output: "Résultat obtenu !" },
-);
+Blobby.setShellAccess(true); // même coché, le mode read doit tout bloquer
+llmQueue.push({ output: "Je vérifie. [SHELL echo hello]" });
 await Blobby._handleChatMessage(chat, "lance un shell");
 await tick();
+assert.strictEqual(httpCalls.filter((c) => c.url.includes("/aih/blobby/exec")).length, 0, "read : AUCUN appel à /aih/blobby/exec (mode = 1ʳᵉ barrière)");
+assert.ok(/refus/i.test(chat.textContent), `refus clair affiché : ${chat.textContent}`);
+assert.ok(!chat.textContent.includes("❌ Erreur"), "aucun crash");
+ok("(f) ter : read + shell coché → [SHELL] REFUSÉ sans exécution (le mode prime)");
+
+/* ── (f) quater A : ACTIF + shell décoché → [SHELL] texte refusé ── */
+resetChat();
+Blobby.setMode("active");
+Blobby.setShellAccess(false);
+llmQueue.push({ output: "Je vérifie. [SHELL echo secret]" });
+await Blobby._handleChatMessage(chat, "lance un shell");
+await tick();
+assert.strictEqual(httpCalls.filter((c) => c.url.includes("/aih/blobby/exec")).length, 0, "actif + shell off : aucun appel exec");
+assert.ok(/refus/i.test(chat.textContent), "refus shell explicite (message système)");
+ok("(f) quater A : actif + shell décoché → [SHELL] refusé, zéro appel exec");
+
+/* ── (f) quater B : ACTIF + shell coché → run_shell exécuté (outil) ── */
+resetChat();
+Blobby.setMode("active");
+Blobby.setShellAccess(true);
+llmQueue.push(
+    { tool_calls: [{ id: "s1", type: "function", function: { name: "run_shell", arguments: '{"command":"echo hello"}' } }] },
+    { output: "C'est fait." },
+);
+await Blobby._handleChatMessage(chat, "lance echo hello");
+await tick();
 const execCalls = httpCalls.filter((c) => c.url.includes("/aih/blobby/exec"));
-assert.strictEqual(execCalls.length, 1, "[SHELL] → POST /aih/blobby/exec");
+assert.strictEqual(execCalls.length, 1, "actif + shell on : run_shell → POST /aih/blobby/exec");
 assert.strictEqual(execCalls[0].body.command, "echo hello", "commande transmise");
-const llmPostsShell = llmPosts();
-assert.strictEqual(llmPostsShell.length, 2, "boucle agentic texte : 2 tours");
-assert.ok(!("tools" in llmPostsShell[0].body), "aucun tools en read");
-assert.ok(llmPostsShell[1].body.instruction.includes("Résultat"), "résultats réinjectés au tour suivant (chemin historique)");
-assert.ok(msgs("blobby")[0].textContent.includes("Résultat obtenu !"), "réponse finale");
-ok("(f) ter : [SHELL] et la boucle agentic texte inchangés en Lecture seule");
+assert.strictEqual(execCalls[0].body.action, "shell", "action shell");
+assert.ok(msgs("action").length >= 1, "ligne d'action pour run_shell");
+ok("(f) quater B : actif + shell coché → run_shell exécuté via le dispatcher");
+
+/* ── (f) quinquies : run_shell dans la liste `tools` envoyée au LLM ── */
+resetChat();
+Blobby.setMode("active");
+Blobby.setShellAccess(false);
+llmQueue.push({ output: "ok" });
+await Blobby._handleChatMessage(chat, "test tools off");
+await tick();
+let namesSent = llmPosts()[0].body.tools.map((t) => t.function.name);
+assert.ok(!namesSent.includes("run_shell"), "shell off : run_shell ABSENT de la liste tools envoyée au LLM");
+assert.ok(namesSent.includes("queue_prompt"), "les autres outils restent proposés");
+
+resetChat();
+Blobby.setMode("active");
+Blobby.setShellAccess(true);
+llmQueue.push({ output: "ok" });
+await Blobby._handleChatMessage(chat, "test tools on");
+await tick();
+namesSent = llmPosts()[0].body.tools.map((t) => t.function.name);
+assert.ok(namesSent.includes("run_shell"), "shell on : run_shell PRÉSENT dans la liste tools envoyée au LLM");
+ok("(f) quinquies : run_shell retiré/ajouté de la liste `tools` selon la case");
+
+/* ── (f) sexies : 2ᵉ barrière front — tool_call run_shell alors que shell off ── */
+resetChat();
+Blobby.setMode("active");
+Blobby.setShellAccess(false);
+llmQueue.push(
+    { tool_calls: [{ id: "s2", type: "function", function: { name: "run_shell", arguments: '{"command":"echo secret"}' } }] },
+    { output: "Je ne peux pas exécuter." },
+);
+await Blobby._handleChatMessage(chat, "tente une commande");
+await tick();
+assert.strictEqual(httpCalls.filter((c) => c.url.includes("/aih/blobby/exec")).length, 0, "2ᵉ barrière : run_shell refusé, ZÉRO exec malgré le tool_call");
+const convoShell = llmPosts()[1].body.messages;
+const toolMsgShell = convoShell.find((m) => m.role === "tool");
+assert.ok(toolMsgShell && /shell/i.test(toolMsgShell.content), "erreur shell réinjectée au LLM (role:'tool')");
+ok("(f) sexies : tool_call run_shell alors que shell off → dispatcher refuse (zéro exec), message clair injecté");
 
 /* ── Persistance du mode ── */
 Blobby.setMode("active");
