@@ -217,6 +217,28 @@ function _blobbyEnsureChatCSS() {
         '.blobby-action-row > .blobby-msg[data-role="action"] {',
         '  align-self: auto; margin: 0; min-width: 0; max-width: 100%;',
         '}',
+        // Indicateur d'ACTIVITÉ du tour : barre HORS de la zone de défilement
+        // (le texte streame PENDANT que l'indicateur reste visible). Animé par
+        // 3 points qui pulsent ; visible tant qu'un tour est actif (classe .on).
+        '.blobby-chat-activity {',
+        '  display: none; align-items: center; gap: 8px;',
+        '  padding: 4px 12px; font-size: 11px; color: #f59e0b;',
+        '  background: #242428; flex-shrink: 0; user-select: none;',
+        '  border-top: 1px solid #2a2a2e;',
+        '}',
+        '.blobby-chat-activity.on { display: flex; }',
+        '.blobby-activity-dots { display: inline-flex; gap: 3px; }',
+        '.blobby-activity-dots i {',
+        '  width: 5px; height: 5px; border-radius: 50%;',
+        '  background: #f59e0b; opacity: .35;',
+        '  animation: blobby-activity-pulse 1s infinite ease-in-out;',
+        '}',
+        '.blobby-activity-dots i:nth-child(2) { animation-delay: .15s; }',
+        '.blobby-activity-dots i:nth-child(3) { animation-delay: .3s; }',
+        '@keyframes blobby-activity-pulse {',
+        '  0%, 100% { opacity: .25; transform: scale(.8); }',
+        '  50% { opacity: 1; transform: scale(1.15); }',
+        '}',
     ].join('\n');
     (document.head || document.documentElement).appendChild(style);
 }
@@ -304,6 +326,46 @@ function _blobbyErrText(e) {
     return '';
 }
 
+// Statuts HTTP qui signalent que la route de STREAMING est ABSENTE ou NON
+// SUPPORTÉE par le backend EN COURS (process pas redémarré, ancienne version,
+// service public GET-only, proxy…). On bascule alors SILENCIEUSEMENT sur la
+// route JSON /api/keywords/llm-process, qui existe et fonctionne toujours.
+//   404 Not Found         : route non déployée ;
+//   405 Method Not Allowed : catch-all SPA GET-only qui intercepte le POST
+//                            (symptôme réel « HTTP 405 » vu par l'utilisateur) ;
+//   501 Not Implemented   : variante non supportée ;
+//   502 Bad Gateway       : proxy / upstream indisponible.
+var _BLOBBY_STREAM_FALLBACK_STATUS = { 404: 1, 405: 1, 501: 1, 502: 1 };
+
+// Vrai si ce statut doit déclencher le repli vers la route JSON non streamée.
+function _blobbyStreamUnavailable(status) {
+    return _BLOBBY_STREAM_FALLBACK_STATUS[Number(status)] === 1;
+}
+
+// Chemin JSON non streamé correspondant à un chemin de streaming (.../stream).
+function _blobbyJsonPathFor(path) {
+    var p = String(path || '');
+    return /\/stream\/?$/.test(p) ? p.replace(/\/stream\/?$/, '') : p;
+}
+
+// Repli ROBUSTE vers la route JSON : toute erreur de transport/statut est
+// convertie en message CLAIR et lisible — jamais un « HTTP 405 » brut affiché.
+async function _blobbyLlmJson(baseUrl, jsonPath, body) {
+    var url = String(baseUrl).replace(/\/+$/, '') + jsonPath;
+    try {
+        var data = await remoteRequest(url, { method: 'POST', body: body });
+        return data || {};
+    } catch (e) {
+        var srvMsg = (e && e.data && typeof e.data.error === 'string' && e.data.error)
+            ? e.data.error
+            : ((e && e.data && typeof e.data.detail === 'string' && e.data.detail) ? e.data.detail : null);
+        if (srvMsg) throw _blobbyChatError('http_error', srvMsg, e.data);
+        var status = e && e.status;
+        if (status) throw _blobbyChatError('http_error', t('bl.llmUnavailable', { status: status }), (e && e.data) || null);
+        throw _blobbyChatError('stream_network', t('bl.networkError') + ' ' + ((e && e.message) || e));
+    }
+}
+
 // Lit une réponse JSON (repli quand le flux n'est pas disponible : backend
 // non-stream, ou stub de test sans corps lisible). Lève pour un statut non-OK.
 async function _blobbyParseJsonReply(res) {
@@ -313,7 +375,8 @@ async function _blobbyParseJsonReply(res) {
         try { data = JSON.parse(await res.text()); } catch (e2) { data = null; }
     }
     if (res && res.ok === false) {
-        var msg = (data && (data.error || data.detail)) || ('HTTP ' + (res.status || '?'));
+        // Jamais un « HTTP <code> » brut : corps serveur, sinon message clair.
+        var msg = (data && (data.error || data.detail)) || t('bl.llmUnavailable', { status: (res.status || '?') });
         throw _blobbyChatError('http_error', msg, data);
     }
     return data || {};
@@ -323,6 +386,9 @@ async function _blobbyParseJsonReply(res) {
 // (réarmé à chaque morceau). Aucun plafond de durée totale (timeout: 0).
 //   opts.onDelta(text) : fragment de contenu ; appelé avec null en fin de tour
 //     (retrait de l'affichage progressif).
+//   opts.signal : signal d'ABANDON VOLONTAIRE du tour (bouton ⏹). Distinct du
+//     watchdog d'inactivité : l'abandon lève une erreur code 'turn_aborted',
+//     l'inactivité un 'stream_idle' — jamais confondus.
 async function _blobbyLlmStream(baseUrl, path, body, opts) {
     opts = opts || {};
     var url = String(baseUrl).replace(/\/+$/, '') + path;
@@ -339,6 +405,24 @@ async function _blobbyLlmStream(baseUrl, path, body, opts) {
     }
     function disarm() { if (timer) { clearTimeout(timer); timer = null; } }
 
+    // ── Abandon VOLONTAIRE (signal externe du tour) ─────────────────────
+    // On relie le signal externe au controller INTERNE : l'annulation se
+    // propage au fetch en cours ET au reader (comme le vrai fetch). Aucun
+    // timer armé à ce stade ; le listener est retiré en sortie.
+    var extSignal = opts.signal || null;
+    var extAborted = false;
+    function onExtAbort() {
+        extAborted = true;
+        disarm();
+        if (controller) { try { controller.abort(); } catch (e) { /* ignore */ } }
+    }
+    if (extSignal) {
+        if (extSignal.aborted) throw _blobbyAbortError();
+        try { extSignal.addEventListener('abort', onExtAbort, { once: true }); } catch (e) { /* ignore */ }
+    }
+    function detachExt() { try { if (extSignal) extSignal.removeEventListener('abort', onExtAbort); } catch (e) { /* ignore */ } }
+    function abortCheck() { if (extAborted || (extSignal && extSignal.aborted)) throw _blobbyAbortError(); }
+
     // ── Requête (timeout: 0 → aucun plafond de durée totale côté brique) ──
     var res;
     try {
@@ -354,8 +438,21 @@ async function _blobbyLlmStream(baseUrl, path, body, opts) {
         disarm();
     } catch (e) {
         disarm();
+        detachExt();
+        if (extAborted) throw _blobbyAbortError();
         if (timedOut) throw _blobbyChatError('stream_idle', t('bl.llmIdle', { seconds: Math.round(idleMs / 1000) }));
         throw e;
+    }
+
+    // ── Repli ROBUSTE : route de streaming absente/non supportée ──
+    // 404/405/501/502 → bascule SILENCIEUSE sur la route JSON (qui fonctionne),
+    // plutôt que d'échouer avec un « HTTP 405 ». Le 405 est le symptôme d'un
+    // backend pas redémarré : le catch-all SPA (GET-only) intercepte le POST.
+    if (res && res.ok === false && _blobbyStreamUnavailable(res.status)) {
+        disarm();
+        detachExt();
+        abortCheck();
+        return _blobbyLlmJson(baseUrl, _blobbyJsonPathFor(path), body);
     }
 
     // Corps non lisible OU réponse non-stream (erreur 400/401 JSON émise AVANT
@@ -366,12 +463,14 @@ async function _blobbyLlmStream(baseUrl, path, body, opts) {
     var looksStream = ctype.indexOf('ndjson') >= 0 || ctype.indexOf('event-stream') >= 0;
     if (!res || !res.body || typeof res.body.getReader !== 'function' || (ctype && !looksStream)) {
         disarm();
+        detachExt();
+        abortCheck();
         return _blobbyParseJsonReply(res);
     }
 
     var reader;
     try { reader = res.body.getReader(); }
-    catch (e) { disarm(); return _blobbyParseJsonReply(res); }
+    catch (e) { disarm(); detachExt(); abortCheck(); return _blobbyParseJsonReply(res); }
 
     var decoder = (typeof TextDecoder !== 'undefined') ? new TextDecoder() : null;
     var buffer = '';
@@ -384,6 +483,7 @@ async function _blobbyLlmStream(baseUrl, path, body, opts) {
             try { chunk = await reader.read(); }
             catch (readErr) {
                 disarm();
+                if (extAborted) throw _blobbyAbortError();
                 if (timedOut) throw _blobbyChatError('stream_idle', t('bl.llmIdle', { seconds: Math.round(idleMs / 1000) }));
                 throw _blobbyChatError('stream_network', t('bl.networkError') + ' ' + ((readErr && readErr.message) || readErr));
             }
@@ -411,6 +511,7 @@ async function _blobbyLlmStream(baseUrl, path, body, opts) {
         }
     } finally {
         disarm();
+        detachExt();
         // Annulation PROPRE : libère le lecteur sans jamais produire de rejet
         // non capturé (cancel() sur un flux déjà en erreur rejette sa promesse).
         try {
@@ -422,6 +523,7 @@ async function _blobbyLlmStream(baseUrl, path, body, opts) {
         if (controller) { try { controller.abort(); } catch (e) {} }
         if (opts.onDelta) { try { opts.onDelta(null); } catch (e) {} }
     }
+    abortCheck();
     if (serverError) throw serverError;
     if (!donePayload) throw _blobbyChatError('stream_network', t('bl.networkError'));
     return donePayload;
@@ -456,6 +558,147 @@ function _blobbyMakeStreamRenderer(container) {
         el.innerHTML = _blobbyMarkdownToHtml(buf);
         container.scrollTop = container.scrollHeight;
     };
+}
+
+// ── Contrôle du TOUR de chat : indicateur d'activité + abandon ───────────
+// Un « tour » = UN envoi utilisateur : attente du 1ᵉʳ morceau, streaming,
+// exécution d'outil(s), tours d'outils successifs. Tant qu'un tour est actif :
+//   - l'indicateur d'activité animé est VISIBLE (jamais un résidu après la fin) ;
+//   - le bouton d'envoi devient ⏹ Stop et permet d'ABANDONNER le tour.
+// L'état est GLOBAL au module et unique : un seul tour à la fois.
+var _blobbyTurn = null;          // { container, controller, aborted, ended, toolActive }
+var _blobbyChatSendBtn = null;   // bouton d'envoi de la modale ouverte (null hors modale)
+
+function _blobbyTurnActive() {
+    return !!(_blobbyTurn && !_blobbyTurn.ended);
+}
+
+// Erreur d'abandon : CODE dédié, jamais confondu avec stream_idle ou http_error.
+function _blobbyAbortError() {
+    return _blobbyChatError('turn_aborted', t('bl.interrupted'));
+}
+
+// Vrai si le tour courant a été abandonné : garde AVANT chaque étape (aucun
+// tour d'outil suivant n'est lancé après un abandon).
+function _blobbyTurnAborted() {
+    if (!_blobbyTurn) return false;
+    if (_blobbyTurn.aborted) return true;
+    var c = _blobbyTurn.controller;
+    return !!(c && c.signal && c.signal.aborted);
+}
+
+// Signal d'abandon passé au streaming et à la boucle d'outils (undefined hors tour).
+function _blobbyTurnSignal() {
+    return _blobbyTurnActive() && _blobbyTurn.controller ? _blobbyTurn.controller.signal : undefined;
+}
+
+// Message d'interruption, distinct du message d'inactivité (bl.llmIdle). Si un
+// outil était en vol AU MOMENT de l'abandon, on prévient qu'il peut finir seul.
+function _blobbyInterruptedText() {
+    var note = (_blobbyTurn && _blobbyTurn.abortedDuringTool) ? (' ' + t('bl.interruptedNote')) : '';
+    return t('bl.interrupted') + note;
+}
+
+// Barre d'activité : HORS zone de défilement (le texte streame PENDANT que
+// l'indicateur reste visible). Créée dans la modale ; pour un conteneur nu
+// (tests, appels directs), un élément de repli est fabriqué à la volée.
+function _blobbyActivityEl(container, create) {
+    var scope = (container && container.parentNode) ? container.parentNode : document;
+    var el = scope.querySelector ? scope.querySelector('.blobby-chat-activity') : null;
+    if (!el && document.querySelector) el = document.querySelector('.blobby-chat-activity');
+    if (!el && create) {
+        el = document.createElement('div');
+        el.className = 'blobby-chat-activity';
+        el.setAttribute('role', 'status');
+        el.setAttribute('aria-live', 'polite');
+        var dot = document.createElement('span');
+        dot.className = 'blobby-activity-dots';
+        dot.appendChild(document.createElement('i'));
+        dot.appendChild(document.createElement('i'));
+        dot.appendChild(document.createElement('i'));
+        var label = document.createElement('span');
+        label.className = 'blobby-activity-label';
+        el.appendChild(dot);
+        el.appendChild(label);
+        if (container && container.parentNode) container.parentNode.insertBefore(el, container.nextSibling);
+        else (document.body || document.documentElement).appendChild(el);
+    }
+    return el;
+}
+
+// Affiche (text != null) ou masque (text == null) l'indicateur d'activité.
+// Masquage TOUJOURS effectué en fin de tour — aucun indicateur fantôme.
+function _blobbySetActivity(container, text) {
+    var el = _blobbyActivityEl(container, text != null);
+    if (!el) return;
+    var label = el.querySelector('.blobby-activity-label');
+    if (text == null) {
+        el.classList.remove('on');
+        el.style.display = 'none';
+        if (label) label.textContent = '';
+        el.setAttribute('aria-hidden', 'true');
+    } else {
+        if (label) label.textContent = text;
+        el.classList.add('on');
+        el.style.display = 'flex';
+        el.removeAttribute('aria-hidden');
+    }
+}
+
+// Synchronise le bouton d'envoi : ➤ quand rien ne tourne, ⏹ Stop pendant un tour.
+function _blobbySyncSendBtn() {
+    var btn = _blobbyChatSendBtn;
+    if (!btn) return;
+    var active = _blobbyTurnActive();
+    btn.textContent = active ? t('bl.stop') : '➤';
+    btn.title = active ? t('bl.stopTitle') : t('bl.sendTitle');
+    btn.setAttribute('aria-label', btn.title);
+    btn.classList.toggle('blobby-chat-stop', active);
+    btn.style.background = active ? '#b91c1c' : 'var(--aih-accent, #D8700D)';
+}
+
+// Ouvre un tour : arme l'indicateur + le bouton ⏹ Stop et fournit l'AbortController.
+function _blobbyTurnBegin(container) {
+    // Un tour résiduel (jamais terminé proprement) est nettoyé d'abord : aucun
+    // indicateur ni timer fantôme ne survit d'un envoi à l'autre.
+    if (_blobbyTurn) _blobbyTurnEnd();
+    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    _blobbyTurn = {
+        container: container || null,
+        controller: controller,
+        aborted: false,
+        ended: false,
+        toolActive: false,
+    };
+    _blobbySetActivity(container, t('bl.thinking'));
+    _blobbySyncSendBtn();
+    return _blobbyTurn;
+}
+
+// Ferme le tour : masque TOUJOURS l'indicateur et restaure le bouton d'envoi.
+function _blobbyTurnEnd() {
+    var turn = _blobbyTurn;
+    if (!turn) return turn;
+    turn.ended = true;
+    _blobbySetActivity(turn.container, null);
+    _blobbyTurn = null;
+    _blobbySyncSendBtn();
+    return turn;
+}
+
+// Abandon VOLONTAIRE du tour en cours (bouton ⏹), distinct d'un watchdog
+// d'inactivité. Renvoie false si aucun tour actif (double-clic, clic APRÈS la
+// fin → inoffensif : jamais de ré-abandon ni d'erreur).
+function _blobbyAbortTurn() {
+    if (!_blobbyTurnActive()) return false;
+    if (_blobbyTurn.aborted) return false;
+    _blobbyTurn.aborted = true;
+    // Mémorise si un outil (non annulable) était EN VOL à l'instant de
+    // l'abandon : le message d'état prévient qu'il peut finir côté serveur.
+    _blobbyTurn.abortedDuringTool = !!_blobbyTurn.toolActive;
+    _blobbySetActivity(_blobbyTurn.container, t('bl.aborting'));
+    try { if (_blobbyTurn.controller) _blobbyTurn.controller.abort(); } catch (e) { /* ignore */ }
+    return true;
 }
 
 // ── Barre de contexte : estimation locale + rendu honnête ────────────────
@@ -535,7 +778,59 @@ async function _blobbyForgetAll() {
     try { await remotePost(url, {}); } catch {}
 }
 
-// Charger les souvenirs locaux au démarrage
+// ── Confirmation DESTRUCTIVE avant effacement de l'historique de chat ──
+// Réutilise le système de fenêtres UNIFIÉ du pack (AIH.Dialog via AIH.confirm),
+// JAMAIS window.confirm : bouton « Supprimer » en ROUGE (danger) mis en évidence,
+// « Annuler » par défaut. Échap / clic sur le fond / « Annuler » → false :
+// AUCUNE suppression n'est déclenchée (ni locale, ni distante). Fail-closed :
+// sans UI de confirmation disponible, on n'efface PAS (Promise.resolve(false)).
+function _blobbyConfirmClearChat() {
+    var I = window.AIH && window.AIH.I18n;
+    var tr = function (key, fallback) {
+        var v = (I && typeof I.t === 'function') ? I.t(key) : '';
+        return (v && v !== key) ? v : fallback;
+    };
+    var title = tr("bl.clearTitle", "Clear conversation");
+    var message = tr("bl.clearConfirm", "");
+    var dangerLabel = tr("bl.clearConfirmAction", "Delete");
+    var cancelLabel = tr("dialog.cancel", "Cancel");
+    var A = window.AIH;
+    if (A && typeof A.confirm === 'function') {
+        return A.confirm(title, message, { danger: true, confirmText: dangerLabel, cancelText: cancelLabel });
+    }
+    // Repli : helper unifié aihShowConfirm (mêmes garanties : Promise<boolean>).
+    if (typeof window.aihShowConfirm === 'function') {
+        return window.aihShowConfirm(title, message);
+    }
+    return Promise.resolve(false);
+}
+
+// ── Confirmation DESTRUCTIVE avant « Tout oublier » (mémoire Blobby) ──
+// MÊME système unifié (AIH.Dialog via AIH.confirm, danger:true), JAMAIS
+// window.confirm : bouton destructif ROUGE, « Annuler » par défaut. Échap / clic
+// sur le fond / « Annuler » → false : AUCUNE écriture locale et AUCUN POST
+// /api/blobby/memory/forget. Fail-closed : sans UI, on n'efface PAS.
+function _blobbyConfirmForgetAll() {
+    var I = window.AIH && window.AIH.I18n;
+    var tr = function (key, fallback) {
+        var v = (I && typeof I.t === 'function') ? I.t(key) : '';
+        return (v && v !== key) ? v : fallback;
+    };
+    var title = tr("bl.forgetTitle", "Forget everything");
+    var message = tr("bl.forgetConfirm", "");
+    var dangerLabel = tr("bl.forgetConfirmAction", "Delete");
+    var cancelLabel = tr("dialog.cancel", "Cancel");
+    var A = window.AIH;
+    if (A && typeof A.confirm === 'function') {
+        return A.confirm(title, message, { danger: true, confirmText: dangerLabel, cancelText: cancelLabel });
+    }
+    // Repli : helper unifié aihShowConfirm (mêmes garanties : Promise<boolean>).
+    if (typeof window.aihShowConfirm === 'function') {
+        return window.aihShowConfirm(title, message);
+    }
+    return Promise.resolve(false);
+}
+
 try { _blobbyLocalMemories = JSON.parse(localStorage.getItem('blobbyLocalMemories')) || []; } catch {}
 
 
@@ -2274,14 +2569,20 @@ const Blobby = {
         input.placeholder = t("bl.inputPlaceholder");
 
         var sendBtn = document.createElement('button');
+        sendBtn.type = 'button';
+        sendBtn.id = 'blobby-chat-send';
+        sendBtn.className = 'blobby-chat-send';
         sendBtn.textContent = '➤';
         Object.assign(sendBtn.style, {
             padding: '6px 12px', borderRadius: '6px', border: 'none',
             background: 'var(--aih-accent, #D8700D)', color: '#fff', cursor: 'pointer',
             fontSize: '14px', fontWeight: '600',
         });
-        sendBtn.onmouseenter = () => sendBtn.style.background = 'var(--aih-accent-hover, #F08020)';
-        sendBtn.onmouseleave = () => sendBtn.style.background = 'var(--aih-accent, #D8700D)';
+        // Enregistré pour que le cycle de tour (⏹ Stop) pilote CE bouton.
+        _blobbyChatSendBtn = sendBtn;
+        _blobbySyncSendBtn();
+        sendBtn.onmouseenter = () => { if (!_blobbyTurnActive()) sendBtn.style.background = 'var(--aih-accent-hover, #F08020)'; };
+        sendBtn.onmouseleave = () => { sendBtn.style.background = _blobbyTurnActive() ? '#b91c1c' : 'var(--aih-accent, #D8700D)'; };
 
         function sendMessage() {
             var text = input.value.trim();
@@ -2291,15 +2592,42 @@ const Blobby = {
             _self._handleChatMessage(messages, text);
         }
 
+        // Un clic = Envoyer (rien ne tourne) OU Abandonner (tour en cours).
+        // Double-clic / clic APRÈS la fin : inoffensif (_blobbyAbortTurn false).
+        function onSendClick(e) {
+            if (e && e.stopPropagation) e.stopPropagation();
+            if (_blobbyTurnActive()) { _blobbyAbortTurn(); return; }
+            sendMessage();
+        }
+
         input.onkeydown = (e) => { if (e.key === 'Enter') sendMessage(); };
-        sendBtn.onclick = sendMessage;
+        sendBtn.onclick = onSendClick;
 
         inputArea.appendChild(input);
         inputArea.appendChild(sendBtn);
 
+        // Indicateur d'ACTIVITÉ (hors zone de défilement) : visible pendant TOUT
+        // le tour, animé, toujours masqué à la fin (cf. _blobbySetActivity).
+        var activityBar = document.createElement('div');
+        activityBar.id = 'blobby-chat-activity';
+        activityBar.className = 'blobby-chat-activity';
+        activityBar.setAttribute('role', 'status');
+        activityBar.setAttribute('aria-live', 'polite');
+        activityBar.setAttribute('aria-hidden', 'true');
+        var actDots = document.createElement('span');
+        actDots.className = 'blobby-activity-dots';
+        actDots.appendChild(document.createElement('i'));
+        actDots.appendChild(document.createElement('i'));
+        actDots.appendChild(document.createElement('i'));
+        var actLabel = document.createElement('span');
+        actLabel.className = 'blobby-activity-label';
+        activityBar.appendChild(actDots);
+        activityBar.appendChild(actLabel);
+
         bodyWrapper.appendChild(modeBar);
         bodyWrapper.appendChild(messages);
         bodyWrapper.appendChild(ctxBar);
+        bodyWrapper.appendChild(activityBar);
         bodyWrapper.appendChild(inputArea);
 
         // ── Créer la modale via v2 (store unifié `aih:blobby-chat`) ──
@@ -2320,6 +2648,10 @@ const Blobby = {
             persistPos: true,
             closeOnEscape: false, // Le chat a son propre handling via l'input
             onClose: function() {
+                // Fermer le chat pendant un tour : on l'abandonne proprement
+                // (aucun flux/timer/listener orphelin) avant de perdre le conteneur.
+                if (_blobbyTurnActive()) _blobbyAbortTurn();
+                _blobbyChatSendBtn = null;
                 _saveChatState();
             },
         });
@@ -2375,8 +2707,13 @@ const Blobby = {
         Object.assign(clearBtn.style, { background: 'none', border: 'none', color: '#888', cursor: 'pointer', fontSize: '12px', padding: '0 4px' });
         clearBtn.onmouseenter = () => clearBtn.style.color = '#f87171';
         clearBtn.onmouseleave = () => clearBtn.style.color = '#888';
-        clearBtn.onclick = function(e) {
+        clearBtn.onclick = async function(e) {
             e.stopPropagation();
+            // Confirmation DESTRUCTIVE (AIH.Dialog) avant tout effet :
+            // Annuler / Échap / clic sur le fond → ok=false → AUCUNE suppression
+            // (ni locale, ni distante). Seul « Supprimer » poursuit.
+            var ok = await _blobbyConfirmClearChat();
+            if (!ok) return;
             // Cible la zone de messages de CETTE modale (fermeture sur `messages`),
             // jamais un getElementById global : avec une éventuelle modale
             // résiduelle, le 1er id du document serait le mauvais.
@@ -2397,15 +2734,14 @@ const Blobby = {
         forgetBtn.onmouseleave = () => forgetBtn.style.color = '#888';
         forgetBtn.onclick = async function(e) {
             e.stopPropagation();
-            var confirmed = await window.aihShowConfirm(
-                t("bl.forgetTitle"),
-                t("bl.forgetConfirm")
-            );
-            if (confirmed) {
-                _blobbyForgetAll();
-                _blobbyMsgCounter = 0;
-                _self._addChatMessage(document.getElementById('blobby-chat-msgs'), 'system', t("bl.forgotAll"));
-            }
+            // Confirmation DESTRUCTIVE (AIH.Dialog rouge) avant tout effet :
+            // Annuler / Échap / clic sur le fond → confirmed=false → AUCUNE
+            // écriture locale et AUCUN POST /api/blobby/memory/forget.
+            var confirmed = await _blobbyConfirmForgetAll();
+            if (!confirmed) return;
+            _blobbyForgetAll();
+            _blobbyMsgCounter = 0;
+            _self._addChatMessage(document.getElementById('blobby-chat-msgs'), 'system', t("bl.forgotAll"));
         };
         _appendHeaderBtn(forgetBtn);
 
@@ -2535,15 +2871,38 @@ const Blobby = {
         if (!container || !container.querySelectorAll) return;
         var sys = container.querySelectorAll('.blobby-msg[data-role="system"]');
         for (var i = sys.length - 1; i >= 0; i--) {
-            if ((sys[i].textContent || '').indexOf('Blobby') >= 0) { sys[i].remove(); break; }
+            // Uniquement les VRAIS marqueurs de réflexion (legacy) — jamais un
+            // message d'état légitime (shell, mode…) qui peut, lui aussi,
+            // mentionner « Blobby ». L'indicateur d'activité les a remplacés.
+            if (/^(🤔|🔄|⚡)\s*Blobby/.test(sys[i].textContent || '')) { sys[i].remove(); break; }
         }
     },
 
+    // API de contrôle du TOUR (indicateur + abandon) : utile à l'extérieur du
+    // chat (tests, intégration) — un abandon programmatique équivaut au ⏹ Stop.
+    _turnActive() { return _blobbyTurnActive(); },
+    _abortTurn() { return _blobbyAbortTurn(); },
+
+    // Enveloppe de tour : arme l'indicateur d'activité + le bouton ⏹ Stop,
+    // puis nettoie TOUJOURS en sortie (succès, erreur, abandon) via finally —
+    // aucun indicateur fantôme, aucun timer/écouteur orphelin.
     async _handleChatMessage(container, userText) {
+        _blobbyTurnBegin(container);
+        try {
+            await this._runChatTurn(container, userText);
+        } finally {
+            this._removeThinking(container);
+            _blobbyTurnEnd();
+        }
+    },
+
+    async _runChatTurn(container, userText) {
         var self = this;
         // Affichage progressif (bulle temporaire) alimenté par les deltas du flux.
         var renderStream = _blobbyMakeStreamRenderer(container);
-        this._addChatMessage(container, 'system', t("bl.thinking"));
+        // L'indicateur d'activité porte l'état « il travaille » : plus de
+        // message système défilant (aucune pollution de l'historique).
+        _blobbySetActivity(container, t("bl.thinking"));
 
         try {
             // Construire le contexte : workflow actuel
@@ -2622,8 +2981,7 @@ const Blobby = {
             // arbitraire.
             var baseUrl = _blobbyGetBackendUrl();
             if (!baseUrl) {
-                var thinkingEl = container.querySelector('div:last-child');
-                if (thinkingEl && thinkingEl.textContent.indexOf('Blobby') >= 0) thinkingEl.remove();
+                this._removeThinking(container);
                 this._addChatMessage(container, 'blobby', t("bl.notConfigured"));
                 return;
             }
@@ -2632,22 +2990,23 @@ const Blobby = {
             // (clé copiée par erreur depuis un champ masqué → 401).
             if (cfg.apiKey && !isMaskedApiKey(cfg.apiKey)) headers['Authorization'] = 'Bearer ' + cfg.apiKey;
 
-            // ── Étape 2 : chemin tool_calls (mode Actif + outils disponibles) ──
-            // En mode Actif, Blobby reçoit les schémas d'outils (déjà filtrés
-            // par le mode : getToolsForMode) et agit sur le workflow via des
-            // tool_calls. En mode Lecture seule (défaut), ce chemin n'est PAS
-            // emprunté : le parsing texte historique ([SHELL]/[SET…]/[MOVE_TO]…)
-            // reste seul en piste (conservé inchangé ci-dessous).
+            // ── Étape 2 : chemin tool_calls (les DEUX modes) ──────────────────
+            // La liste d'outils est TOUJOURS filtrée par le mode (getToolsForMode
+            // = 1ʳᵉ barrière) : en Lecture seule, seuls les outils 'read' sont
+            // envoyés au LLM (aucun outil mutant ne peut fuir) ; en Actif, tous
+            // les outils autorisés le sont. Le dispatcher applique la 2ᵉ barrière
+            // (mode_forbidden/shell_forbidden) pour tout appel mutant émis
+            // malgré tout → refus visible dans le chat. Le parsing texte
+            // historique ([SHELL]/[SET…]/[MOVE_TO]…) ne reste que comme repli 4b
+            // (fournisseur sans tool-calling) — conservé inchangé ci-dessous.
             var finalReply = '';
             var toolRan = false;
             var toolFallbackText = false;
             var toolSchemas = null;
-            if (this.getMode() === 'active') {
-                // 1ʳᵉ barrière shell : sans autorisation, `run_shell` n'est PAS
-                // dans la liste d'outils envoyée au LLM.
-                try { toolSchemas = BlobbyTools.getToolsForMode('active', { shellAccess: this.getShellAccess() }); } catch (eTool) { toolSchemas = null; }
-                if (!toolSchemas || toolSchemas.length === 0) toolSchemas = null; // registre vide → repli texte
-            }
+            // Shell effectif : `isShellAllowed()` reste faux en Lecture seule
+            // (le mode est la 1ʳᵉ barrière) → run_shell jamais proposé.
+            try { toolSchemas = BlobbyTools.getToolsForMode(this.getMode(), { shellAccess: this.isShellAllowed() }); } catch (eTool) { toolSchemas = null; }
+            if (!toolSchemas || toolSchemas.length === 0) toolSchemas = null; // registre vide → repli texte
             if (toolSchemas) {
                 var toolRun = await this._runToolModeChat(container, {
                     baseUrl: baseUrl, presetId: presetId, userText: userText,
@@ -2660,6 +3019,11 @@ const Blobby = {
                 } else if (toolRun.fallbackToText) {
                     // Repli 4b : le fournisseur/modèle ne gère pas les tools.
                     toolFallbackText = true; // le tour continue en chemin texte
+                } else if (toolRun.aborted) {
+                    // ABANDON VOLONTAIRE pendant le tour d'outils : état clair,
+                    // distinct de l'inactivité, aucun faux succès écrit.
+                    this._addChatMessage(container, 'system', _blobbyInterruptedText());
+                    return;
                 } else {
                     var toolErr = toolRun.sendError;
                     this._removeThinking(container);
@@ -2683,24 +3047,30 @@ const Blobby = {
             var repeatedCount = 0;  // 0 = première occurrence, 1 = 2ème occurrence identique → break
 
             for (var turn = 0; !toolRan && turn < 100; turn++) {  // 100 = sécurité, jamais atteint en pratique
-                // Mettre à jour l'indicateur
-                var thinking = container.querySelector('div:last-child');
-                if (thinking && thinking.textContent.indexOf('Blobby') >= 0) {
-                    thinking.textContent = turn === 0
-                        ? t("bl.thinking")
-                        : t("bl.analyzing", { turn: turn });
+                // Abandon entre deux tours d'outils : AUCUN tour suivant lancé.
+                if (_blobbyTurnAborted()) {
+                    this._addChatMessage(container, 'system', _blobbyInterruptedText());
+                    return;
                 }
+                // Indicateur d'activité : état du tour (réflexion / analyse).
+                _blobbySetActivity(container, turn === 0
+                    ? t("bl.thinking")
+                    : t("bl.analyzing", { turn: turn }));
 
                 var data;
                 try {
                     // Streaming + watchdog d'INACTIVITÉ : aucune durée totale.
+                    // `signal` relie l'ABANDON du tour (bouton ⏹) au flux.
                     data = await _blobbyLlmStream(baseUrl, '/api/keywords/llm-process/stream', {
                         preset_id: parseInt(presetId),
                         instruction: currentInstruction
-                    }, { onDelta: renderStream });
+                    }, { onDelta: renderStream, signal: _blobbyTurnSignal() });
                 } catch (e) {
-                    var th = container.querySelector('div:last-child');
-                    if (th && th.textContent.indexOf('Blobby') >= 0) th.remove();
+                    if ((e && e.code === 'turn_aborted') || _blobbyTurnAborted()) {
+                        this._addChatMessage(container, 'system', _blobbyInterruptedText());
+                        return;
+                    }
+                    this._removeThinking(container);
                     this._addChatMessage(container, 'blobby', t("bl.sorry", { error: _blobbyErrText(e) || t("bl.errorStatus", { status: e && e.status }) }));
                     return;
                 }
@@ -2756,14 +3126,19 @@ const Blobby = {
                 reply = await this._executeCommands(reply, container);
 
                 if (hasShellCommands) {
-                    // Mettre à jour l'indicateur pendant l'exécution
+                    // Indicateur d'activité pendant l'exécution des commandes.
                     var extCommands = (reply.match(/\[SHELL\s+.+?\]/gi) || []);
-                    if (thinking && thinking.textContent.indexOf('Blobby') >= 0) {
-                        thinking.textContent = t("bl.executing", { count: extCommands.length });
-                    }
+                    _blobbySetActivity(container, t("bl.executing", { count: extCommands.length }));
 
                     var turnResults = await this._executeShellCommandsAsync(reply);
                     allCommandResults = allCommandResults.concat(turnResults);
+
+                    // Abandon pendant l'exécution : on ne relance PAS de tour LLM
+                    // (la commande déjà lancée peut finir côté serveur — bornée à 15 s).
+                    if (_blobbyTurnAborted()) {
+                        this._addChatMessage(container, 'system', _blobbyInterruptedText());
+                        return;
+                    }
 
                     // Construire l'instruction pour le tour suivant
                     var resultsText = turnResults.map(function(r) {
@@ -2794,10 +3169,8 @@ const Blobby = {
             }
 
 
-            // Enlever le thinking (robuste : en mode tool_calls, les lignes
-            // d'action passent APRÈS l'indicateur, qui n'est plus last-child).
-            var thinkingEl = container.querySelector('div:last-child');
-            if (thinkingEl && thinkingEl.textContent.indexOf('Blobby') >= 0) thinkingEl.remove();
+            // Nettoyage des marqueurs de réflexion legacy : l'indicateur
+            // d'activité est masqué par la fin de tour (cf. _blobbyTurnEnd).
             this._removeThinking(container);
 
             // Nettoyer les placeholders restants
@@ -2836,13 +3209,18 @@ const Blobby = {
             }
 
         } catch (e) {
-            var thinking = container.querySelector('div:last-child');
-            if (thinking && thinking.textContent === t("bl.thinking")) thinking.remove();
+            // Abandon volontaire : état « interrompu » clair — jamais un faux
+            // message d'erreur (la coupure n'est pas un incident).
+            if ((e && e.code === 'turn_aborted') || _blobbyTurnAborted()) {
+                this._addChatMessage(container, 'system', _blobbyInterruptedText());
+                return;
+            }
+            this._removeThinking(container);
             this._addChatMessage(container, 'system', t("bl.error") + ' ' + (e.message || ''));
         }
     },
 
-    // ─── Étape 2 : boucle tool_calls (mode Actif) ──────────────────────────
+    // ─── Étape 2 : boucle tool_calls (les DEUX modes) ──────────────────────
     // Contrat backend (étape 1) : POST accepte `messages` (liste complète,
     // remplace la construction system+user), `tools` et `tool_choice` ; la
     // réponse contient `tool_calls` en forme PROVIDER VERBATIM
@@ -2865,6 +3243,9 @@ const Blobby = {
             messages: messages,
             maxTurns: 100, // même garde anti-boucle que la boucle agentic texte
             send: async function(convo) {
+                // ABANDON : on NE lance PAS le tour suivant (le signal du tour,
+                // s'il vient d'être aborté, coupe aussi le flux en cours).
+                if (_blobbyTurnAborted()) throw _blobbyAbortError();
                 // Streaming + watchdog d'INACTIVITÉ : un outil/LLM long mais actif
                 // n'est plus coupé par le plafond de 30 s de la brique HolafFetch.
                 var data = await _blobbyLlmStream(p.baseUrl, '/api/keywords/llm-process/stream', {
@@ -2872,7 +3253,7 @@ const Blobby = {
                     messages: convo,
                     tools: p.tools,
                     tool_choice: 'auto'
-                }, { onDelta: renderStream });
+                }, { onDelta: renderStream, signal: _blobbyTurnSignal() });
                 // Fenêtre de contexte renvoyée par llm-process : max_context
                 // (int OU null) + context_source — même mise à jour honnête
                 // de la barre que le chemin texte (jamais de repli chiffré).
@@ -2888,16 +3269,20 @@ const Blobby = {
                 return data;
             },
             dispatch: function(name, args) {
-                var thinking = container.querySelector('div:last-child');
-                if (thinking && thinking.textContent.indexOf('Blobby') >= 0) {
-                    thinking.textContent = t("bl.toolRunning", { name: name });
-                }
-                return BlobbyTools.dispatchToolCall(name, args, {
+                // Indicateur d'activité : outil en cours d'exécution ; `toolActive`
+                // est vrai TANT QUE l'outil tourne (message d'abandon adapté).
+                _blobbySetActivity(container, t("bl.toolRunning", { name: name }));
+                if (_blobbyTurn) _blobbyTurn.toolActive = true;
+                var dispatchP = BlobbyTools.dispatchToolCall(name, args, {
                     app: app,
                     mode: self.getMode(), // enforcement 2ᵉ barrière (blobby_tools)
                     shellAccess: self.getShellAccess(), // enforcement shell (2ᵉ barrière)
                     t: t
                 });
+                var done = function() { if (_blobbyTurn) _blobbyTurn.toolActive = false; };
+                if (dispatchP && typeof dispatchP.then === 'function') return dispatchP.then(function(r) { done(); return r; }, function(e) { done(); throw e; });
+                done();
+                return dispatchP;
             },
             onToolCall: function(res, tc) {
                 var labelTxt = (res && res.action) ? res.action : String(BlobbyTools.toolCallName(tc));
@@ -2907,6 +3292,14 @@ const Blobby = {
                 // compréhensible VISIBLE, jamais un échec silencieux.
                 if (res && res.ok === false && res.code === 'shell_forbidden') {
                     self._addChatMessage(container, 'system', t('bl.shell.refused'));
+                }
+                // Refus de MUTATION en Lecture seule (2ᵉ barrière dispatcher) :
+                // le tour N'EST PAS cassé (le refus repart au LLM comme résultat
+                // d'outil), mais l'utilisateur VOIT pourquoi l'action a échoué —
+                // jamais un refus silencieux.
+                if (res && res.ok === false && res.code === 'mode_forbidden') {
+                    var refusedName = String(BlobbyTools.toolCallName(tc) || '');
+                    self._addChatMessage(container, 'system', t('bl.toolErr.forbiddenChat', { name: refusedName, mode: self.getMode() }));
                 }
             }
         });
@@ -2947,6 +3340,11 @@ const Blobby = {
         }
 
         if (result.sendError) {
+            // Abandon volontaire (le signal a coupé le flux ou le send a refusé
+            // de démarrer) : état « interrompu », jamais une erreur d'outil.
+            if ((result.sendError && result.sendError.code === 'turn_aborted') || _blobbyTurnAborted()) {
+                return { ok: false, aborted: true };
+            }
             return { ok: false, sendError: result.sendError };
         }
         return { ok: false, sendError: new Error('tool loop: ' + JSON.stringify(result).substring(0, 200)) };
@@ -2964,23 +3362,27 @@ const Blobby = {
         if (msgs.length && msgs[msgs.length - 1].role === 'user' && msgs[msgs.length - 1].content === p.userText) {
             msgs.pop();
         }
-        var shellOn = this.getShellAccess();
+        var shellOn = this.isShellAllowed();
         // Liste DYNAMIQUE des outils réellement envoyés (p.tools = schémas déjà
         // filtrés par mode + accès shell) : plus de liste codée en dur à
         // maintenir quand le registre blobby_tools.js évolue (subgraphs, modes…).
         var toolNames = (Array.isArray(p.tools) ? p.tools : [])
             .map(function (tool) { return tool && tool.function ? tool.function.name : null; })
             .filter(function (name) { return !!name; });
+        // Instruction ADAPTÉE au mode : en Lecture seule le modèle doit savoir
+        // qu'il peut INSPECTER (outils 'read' fournis) mais PAS modifier — un
+        // éventuel appel mutant serait refusé par le dispatcher.
+        var readOnly = this.getMode() !== 'active';
         var instruction = p.character + (p.memoryBlock || '') + '\n\n'
             + 'Humeur actuelle : ' + p.moodDesc + '\n'
             + '(Ton "Blobby" doit refletter cette humeur)\n\n'
             + 'Workflow actuel :\n' + p.workflowDesc + '\n\n'
             + this._modeInstruction() + '\n'
-            + 'Tu disposes d\'OUTILS (schémas fournis avec la requête) pour lire,\n'
-            + 'modifier et exécuter le workflow ComfyUI : ' + toolNames.join(', ') + '.\n'
-            + '- Pour agir, ÉMETS un tool_call (ne décris pas l\'action, fais-la).\n'
-            + '- Les résultats d\'outils te seront renvoyés : analyse-les, enchaîne si nécessaire, puis\n'
-            + '  donne ta réponse finale en Markdown.\n'
+            + (readOnly
+                ? t('bl.toolsIntro.read', { tools: toolNames.join(', ') }) + '\n'
+                  + t('bl.toolsHow.read') + '\n'
+                : t('bl.toolsIntro.active', { tools: toolNames.join(', ') }) + '\n'
+                  + t('bl.toolsHow.active') + '\n')
             + (shellOn
                 ? '- L\'accès au shell est AUTORISÉ : tu peux exécuter des commandes locales avec l\'outil run_shell\n'
                   + '  (plafond dur de 15 s). ⚠️ Les commandes s\'exécutent réellement ; n\'en lance que sur demande claire.\n'

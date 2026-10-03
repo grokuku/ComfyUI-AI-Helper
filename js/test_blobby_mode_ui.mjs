@@ -10,8 +10,9 @@
 //       <select> se resynchronise sur l'état réel (aucune désynchronisation) ;
 //   (c) persistance round-trip : setMode → _blobbySave('blobbyMode'), fermeture
 //       puis réouverture → état restauré ;
-//   (d) la consigne de mode est dans le prompt LLM des DEUX chemins (texte read
-//       ET tool_calls active), avec le message de refus exact en Lecture seule ;
+//   (d) la consigne de mode est dans le prompt LLM des DEUX chemins (contrat
+//       messages+tools en read ET en active), avec le message de refus exact
+//       en Lecture seule + la mention explicite de l'inspection autorisée ;
 //   (e) CONTRÔLE NÉGATIF : sans l'injection du mode, le refus disparaît du
 //       prompt, ET un <select> de mode réintroduit dans le header rompt
 //       l'invariant d'unicité (preuve que l'assertion n'est pas vide) ;
@@ -272,21 +273,26 @@ ok("(c) round-trip : active et read persistés/restaurés à la réouverture");
 /* ══════════════════ (d) Consigne de mode dans le prompt LLM ═════════════ */
 console.log("(d) Consigne de mode dans le prompt (chemins read ET active)");
 
-// ── chemin texte READ ──
+// ── chemin tool_calls READ (outils de LECTURE seule) ──
+// La boucle d'outils tourne AUSSI en Lecture seule : contrat `messages` +
+// `tools` (uniquement les outils 'read').
 resetChat();
 Blobby.setMode("read");
 llmQueue.push({ output: "d'accord" });
 await Blobby._handleChatMessage(chat, "modifie les steps");
 await tick();
 let posts = llmPosts();
-assert.strictEqual(posts.length, 1, "read : un seul tour texte");
-const instrRead = posts[0].body.instruction;
-assert.ok(typeof instrRead === "string", "read : POST historique avec instruction");
+assert.strictEqual(posts.length, 1, "read : un seul tour (contrat messages + tools)");
+assert.ok(Array.isArray(posts[0].body.messages), "read : contrat messages (boucle d'outils en Lecture seule)");
+assert.ok(Array.isArray(posts[0].body.tools), "read : outils envoyés au LLM (boucle d'outils active)");
+const instrRead = posts[0].body.messages[posts[0].body.messages.length - 1].content;
+assert.ok(typeof instrRead === "string", "read : message final du contrat messages");
 assert.ok(instrRead.includes(READ_PROMPT), "read : consigne de mode injectée (bl.mode.readPrompt)");
 assert.ok(instrRead.includes(REFUSAL), "read : message de refus EXACT présent dans le prompt");
 assert.ok(instrRead.includes("LECTURE SEULE"), "read : mention explicite du mode Lecture seule");
+assert.ok(instrRead.includes("INSPECTER"), "read : mention explicite de l'inspection autorisée");
 assert.ok(!instrRead.includes(ACTIVE_PROMPT), "read : PAS la consigne active");
-ok("(d) chemin read : le prompt contient la consigne Lecture seule + le refus exact");
+ok("(d) chemin read : contrat messages+tools, consigne Lecture seule + refus exact + inspect");
 
 // ── chemin tool_calls ACTIVE ──
 resetChat();
@@ -314,9 +320,9 @@ Blobby.setMode("read");
 llmQueue.push({ output: "x" });
 await Blobby._handleChatMessage(chat, "fais une action");
 await tick();
-const instrNeg = llmPosts()[0].body.instruction;
+const instrNeg = llmPosts()[0].body.messages[llmPosts()[0].body.messages.length - 1].content;
 assert.ok(!instrNeg.includes(REFUSAL), "contrôle négatif : le refus DISPARAÎT sans injection");
-assert.ok(!instrNeg.includes("LECTURE SEULE"), "contrôle négatif : la mention du mode disparaît aussi");
+assert.ok(!instrNeg.includes("tu PEUX INSPECTER"), "contrôle négatif : la mention d'inspection du mode disparaît aussi");
 Blobby._modeInstruction = realModeInstruction; // RESTAURATION
 
 // Après restauration, la consigne revient (preuve que l'injection est bien la
@@ -325,7 +331,7 @@ resetChat();
 llmQueue.push({ output: "ok" });
 await Blobby._handleChatMessage(chat, "re-test");
 await tick();
-assert.ok(llmPosts()[0].body.instruction.includes(REFUSAL), "injection restaurée : le refus revient");
+assert.ok(llmPosts()[0].body.messages[llmPosts()[0].body.messages.length - 1].content.includes(REFUSAL), "injection restaurée : le refus revient");
 ok("(e) contrôle négatif prouvé : l'injection du mode est porteuse (patch → échec attendu → restauré)");
 
 /* ══════════════════ (f) Parité i18n FR/EN ═══════════════════════════════ */
@@ -383,6 +389,13 @@ assert.ok([...chatH.querySelectorAll(".blobby-msg")].some((e) => e.textContent.i
 const trash = [...m1.querySelectorAll(".aih-dialog-header-right button")].find((b) => b.textContent === "🗑");
 assert.ok(trash, "bouton 🗑 présent dans le header de la modale");
 trash.dispatchEvent(new domWindow.MouseEvent("click", { bubbles: true }));
+// Désormais une confirmation DESTRUCTIVE (AIH.Dialog) précède l'effacement :
+// le clic sur 🗑 ouvre la modale ; on confirme explicitement « Supprimer ».
+const confirmRoot = [...domWindow.document.querySelectorAll(".aih-dialog-root")]
+    .find((r) => r !== m1 && r.querySelector("[data-aih-ok]"));
+assert.ok(confirmRoot, "clic 🗑 → modale de confirmation ouverte (jamais d'effacement direct)");
+confirmRoot.querySelector("[data-aih-ok]").dispatchEvent(new domWindow.MouseEvent("click", { bubbles: true }));
+await tick();
 const roles = [...chatH.querySelectorAll(".blobby-msg")].map((e) => e.dataset.role);
 assert.strictEqual(roles.filter((r) => r === "user").length, 0, "conversation effacée (plus de message user)");
 assert.ok(!chatH.textContent.includes("message à effacer"), "ancien message retiré du DOM");

@@ -1,11 +1,43 @@
 import { app, api } from "./holaf_api_compat.js";
 import { makeDraggable, makeResizable, makeContentZoomable, aihWindowManager } from "./holaf_window_utils.js";
+import { escapeHtml } from "./holaf_dom_utils.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
     const I = window.AIH && window.AIH.I18n;
     return I && typeof I.t === "function" ? I.t(key, params) : key;
 };
+
+/**
+ * Confirmation DESTRUCTIVE avant suppression d'un raccourci persistant.
+ * Réutilise le système de fenêtres UNIFIÉ du pack (AIH.Dialog via AIH.confirm),
+ * JAMAIS window.confirm : bouton « Supprimer » en ROUGE (danger), « Annuler » par
+ * défaut. Échap / clic sur le fond / « Annuler » → false : AUCUNE suppression
+ * (ni état en mémoire, ni persistance graph.extra). Fail-closed : sans UI de
+ * confirmation disponible, on ne supprime PAS (Promise.resolve(false)).
+ */
+function _confirmDeleteShortcut(name) {
+    const I = window.AIH && window.AIH.I18n;
+    const tr = (key, fallback, params) => {
+        const v = (I && typeof I.t === "function") ? I.t(key, params) : "";
+        return (v && v !== key) ? v : fallback;
+    };
+    const title = tr("sc.deleteTitle", "Delete shortcut");
+    // Le nom est une donnée utilisateur (renommable) : échappé AVANT
+    // interpolation, car AIH.confirm insère le message en innerHTML (anti-XSS).
+    const message = tr("sc.deleteConfirm", "", { name: escapeHtml(name || "") });
+    const dangerLabel = tr("sc.deleteConfirmAction", "Delete");
+    const cancelLabel = tr("dialog.cancel", "Cancel");
+    const A = window.AIH;
+    if (A && typeof A.confirm === "function") {
+        return A.confirm(title, message, { danger: true, confirmText: dangerLabel, cancelText: cancelLabel });
+    }
+    // Repli : helper unifié aihShowConfirm (mêmes garanties : Promise<boolean>).
+    if (typeof window.aihShowConfirm === "function") {
+        return window.aihShowConfirm(title, message);
+    }
+    return Promise.resolve(false);
+}
 
 const HolafShortcuts = {
     name: "Holaf.Shortcuts",
@@ -173,10 +205,20 @@ const HolafShortcuts = {
         }
     },
 
-    deleteShortcut(id) {
+    async deleteShortcut(id) {
+        const item = this.shortcuts.find(s => s.id === id);
+        if (!item) return false;
+        // Confirmation DESTRUCTIVE avant tout effet : Annuler / Échap / clic sur
+        // le fond → ok=false → AUCUNE suppression, AUCUNE écriture de persistance.
+        const ok = await _confirmDeleteShortcut(item.name);
+        if (!ok) return false;
+        // L'état a pu changer pendant l'attente de la modale : on ne retire que
+        // si le raccourci est encore présent (évite une écriture inutile).
+        if (!this.shortcuts.some(s => s.id === id)) return false;
         this.shortcuts = this.shortcuts.filter(s => s.id !== id);
         this.syncToGraph();
         this.renderList();
+        return true;
     },
 
     renameShortcut(id, newName) {
@@ -320,7 +362,7 @@ const HolafShortcuts = {
             delBtn.className = "holaf-shortcut-btn";
             delBtn.onmouseenter = () => delBtn.style.color = "#ff5555";
             delBtn.onmouseleave = () => delBtn.style.color = "var(--holaf-text-secondary)";
-            delBtn.onclick = (e) => { e.stopPropagation(); this.deleteShortcut(s.id); };
+            delBtn.onclick = (e) => { e.stopPropagation(); this.deleteShortcut(s.id).catch(() => {}); };
 
             row.appendChild(nameLabel);
             row.appendChild(updateBtn);

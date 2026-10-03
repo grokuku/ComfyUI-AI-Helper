@@ -436,6 +436,278 @@ function findSubgraphInstanceNode(ctx, subgraphId) {
     return null;
 }
 
+// ─── Navigation / recadrage de la VUE (action de vue : aucun snapshot) ──────
+// API réellement disponible (frontend ComfyUI récent — vérifié sur la source de
+// référence 1.47.11 du pack) :
+//   - `canvas.ds` (DragAndScale) : `.offset` [x,y], `.scale`, `.min_scale`,
+//     `.max_scale`, `.fitToBounds(bounds, { zoom })` (cadrage SYNCHRONE),
+//     `.animateToBounds(...)` ;
+//   - `canvas.centerOnNode(node)` : centre en conservant l'échelle courante
+//     (mécanisme DÉJÀ utilisé par le pack : [FOCUS]/[MOVE_TO] du chat
+//     historique, blobby_companion.js) ;
+//   - `canvas.setGraph(g)` / `canvas.openSubgraph(sg, fromNode)` : navigation
+//     (déjà utilisée par open_subgraph/close_subgraph) ;
+//   - `canvas.selectItems(items)` / `.deselectAll()` : sélection = état de VUE.
+// `js/holaf_shortcuts.js` (mécanisme EXISTANT du pack) est réutilisé quand il
+// est chargé : `app.holafShortcuts.navigateToPath(path)` bascule de graphe (il
+// gère la hiérarchie des subgraphs), puis on applique offset/échelle comme un
+// raccourci enregistré. Repli direct openSubgraph/setGraph sinon.
+
+/** Boîte [x,y,w,h] d'un nœud OU d'un groupe (boundingRect réel, sinon pos/size). */
+function nodeBoundsRect(item) {
+    if (!item) return [0, 0, 0, 0];
+    const br = item.boundingRect;
+    if (br && typeof br.length === "number" && br.length >= 4
+        && Number.isFinite(br[0]) && Number.isFinite(br[1]) && Number.isFinite(br[2]) && Number.isFinite(br[3])) {
+        return [br[0], br[1], br[2], br[3]];
+    }
+    const p = Array.isArray(item.pos) ? item.pos : [0, 0];
+    const s = Array.isArray(item.size) ? item.size : [0, 0];
+    return [Number(p[0]) || 0, Number(p[1]) || 0, Number(s[0]) || 0, Number(s[1]) || 0];
+}
+
+/** Union de boîtes [x,y,w,h] (marge optionnelle) ; null si aucune boîte finie. */
+function unionBounds(rects, padding) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const r of rects) {
+        if (!r) continue;
+        minX = Math.min(minX, r[0]);
+        minY = Math.min(minY, r[1]);
+        maxX = Math.max(maxX, r[0] + r[2]);
+        maxY = Math.max(maxY, r[1] + r[3]);
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null;
+    const pad = Number.isFinite(Number(padding)) ? Number(padding) : 0;
+    return [minX - pad, minY - pad, (maxX - minX) + 2 * pad, (maxY - minY) + 2 * pad];
+}
+
+/** Taille CSS du viewport canvas [largeur, hauteur] (px CSS, comme fitToBounds). */
+function canvasViewportSize(canvas) {
+    const el = (canvas && canvas.canvas) || (canvas && canvas.ds && canvas.ds.element) || null;
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+    const w = el && Number.isFinite(Number(el.width)) && Number(el.width) > 0 ? Number(el.width) / dpr : 1024;
+    const h = el && Number.isFinite(Number(el.height)) && Number(el.height) > 0 ? Number(el.height) / dpr : 768;
+    return [w, h];
+}
+
+/** Centre du viewport exprimé en coordonnées du graphe (pour un placement par défaut). */
+function viewportCenter(ctx) {
+    const canvas = resolveCanvas(ctx);
+    const ds = canvas && canvas.ds;
+    if (!ds || !Array.isArray(ds.offset)) return [0, 0];
+    const scale = Number.isFinite(ds.scale) && ds.scale > 0 ? ds.scale : 1;
+    const [cw, ch] = canvasViewportSize(canvas);
+    return [(cw * 0.5) / scale - ds.offset[0], (ch * 0.5) / scale - ds.offset[1]];
+}
+
+/** Échelle bornée aux min/max de DragAndScale ; null si la valeur est invalide. */
+function clampScale(ds, value) {
+    const z = Number(value);
+    if (!Number.isFinite(z) || z <= 0) return null;
+    const lo = ds && Number.isFinite(ds.min_scale) ? ds.min_scale : 0.1;
+    const hi = ds && Number.isFinite(ds.max_scale) ? ds.max_scale : 10;
+    return Math.min(hi, Math.max(lo, z));
+}
+
+/**
+ * Applique un recadrage de vue. `opts` :
+ *   - singleNode : nœud unique, sans zoom explicite → `canvas.centerOnNode`
+ *     (mécanisme existant, échelle conservée) ;
+ *   - scale : échelle absolue (null = conserver l'échelle courante) ;
+ *   - fit : cadrer l'ensemble des bornes (tout le workflow) ; fitZoom = marge.
+ * Retourne { ok, via, scale, offset } ou { ok:false, code, error }.
+ */
+function applyFocusView(ctx, bounds, opts) {
+    const canvas = resolveCanvas(ctx);
+    const noCanvas = () => ({ ok: false, code: "no_canvas", error: label(ctx, "bl.toolErr.noCanvas", {}, "canvas ComfyUI indisponible (app.canvas introuvable)") });
+    if (!canvas) return noCanvas();
+    const ds = canvas.ds;
+    if (!ds || !Array.isArray(ds.offset)) return noCanvas();
+    const o = opts || {};
+    const b = Array.isArray(bounds) && bounds.length >= 4 ? bounds : [0, 0, 0, 0];
+    if (o.singleNode && o.scale === null && typeof canvas.centerOnNode === "function") {
+        canvas.centerOnNode(o.singleNode);
+        if (typeof canvas.setDirty === "function") canvas.setDirty(true, true);
+        return { ok: true, via: "centerOnNode", scale: ds.scale, offset: ds.offset.slice(0, 2) };
+    }
+    if (o.fit && o.scale === null && typeof ds.fitToBounds === "function") {
+        ds.fitToBounds(b, { zoom: o.fitZoom });
+        if (typeof canvas.setDirty === "function") canvas.setDirty(true, true);
+        return { ok: true, via: "fitToBounds", scale: ds.scale, offset: ds.offset.slice(0, 2) };
+    }
+    const [cw, ch] = canvasViewportSize(canvas);
+    let scale = o.scale !== null ? o.scale : ds.scale;
+    if (!Number.isFinite(scale) || scale <= 0) scale = 1;
+    if (o.fit && o.scale === null) {
+        const fitScale = Math.min(cw / Math.max(b[2], 1), ch / Math.max(b[3], 1)) * (o.fitZoom || 0.85);
+        const clamped = clampScale(ds, fitScale);
+        if (clamped !== null) scale = clamped;
+    }
+    ds.scale = scale;
+    // Même formule que DragAndScale.fitToBounds / centerOnNode : offset = centre
+    // de l'écran (en unités du graphe) − centre des bornes.
+    ds.offset[0] = -b[0] - b[2] * 0.5 + (cw / scale) * 0.5;
+    ds.offset[1] = -b[1] - b[3] * 0.5 + (ch / scale) * 0.5;
+    if (typeof canvas.setDirty === "function") canvas.setDirty(true, true);
+    return { ok: true, via: "offset", scale: ds.scale, offset: ds.offset.slice(0, 2) };
+}
+
+/** Bascule le canvas sur `targetGraph` (racine si null/root). Réutilise holaf_shortcuts. */
+function navigateToGraph(ctx, targetGraph) {
+    const canvas = resolveCanvas(ctx);
+    const root = getGraph(ctx);
+    if (!canvas) return { ok: false, code: "no_canvas", error: label(ctx, "bl.toolErr.noCanvas", {}, "canvas ComfyUI indisponible (app.canvas introuvable)") };
+    if (!root) return { ok: false, code: "no_app", error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)") };
+    const fail = (detail) => ({ ok: false, code: "focus_failed", error: label(ctx, "bl.toolErr.focusFailed", { error: detail }, "recadrage de la vue impossible : {error}") });
+    const app = resolveApp(ctx);
+    const hs = app && app.holafShortcuts;
+    const cur = activeSubgraph(ctx);
+    const targetIsRoot = !targetGraph || targetGraph === root;
+    if (targetIsRoot) {
+        if (!cur) return { ok: true, switched: false, at_root: true };
+        try {
+            if (hs && typeof hs.navigateToPath === "function") hs.navigateToPath([]);
+            else if (typeof canvas.setGraph === "function") canvas.setGraph(root);
+            else return fail("aucune API canvas (setGraph) pour revenir à la racine");
+        } catch (e) { return fail((e && e.message) || String(e)); }
+        if (activeSubgraph(ctx)) return fail("le canvas est toujours dans un subgraph");
+        return { ok: true, switched: true, at_root: true };
+    }
+    if (cur && String(cur.id) === String(targetGraph.id)) return { ok: true, switched: false };
+    // Réutilisation du mécanisme EXISTANT des raccourcis (chemin de nœuds racine→subgraph).
+    if (hs && typeof hs.findPathToGraph === "function" && typeof hs.navigateToPath === "function") {
+        try {
+            const path = hs.findPathToGraph(targetGraph, root);
+            if (path) {
+                hs.navigateToPath(path);
+                const now = activeSubgraph(ctx);
+                if (now && String(now.id) === String(targetGraph.id)) return { ok: true, switched: true, via: "holafShortcuts" };
+            }
+        } catch { /* repli direct ci-dessous */ }
+    }
+    try {
+        if (typeof canvas.openSubgraph === "function") canvas.openSubgraph(targetGraph, findSubgraphInstanceNode(ctx, targetGraph.id));
+        else if (typeof canvas.setGraph === "function") canvas.setGraph(targetGraph);
+        else return fail("aucune API canvas (openSubgraph/setGraph)");
+    } catch (e) { return fail((e && e.message) || String(e)); }
+    const now = activeSubgraph(ctx);
+    if (!now || String(now.id) !== String(targetGraph.id)) return fail("le canvas n'a pas changé de graphe");
+    return { ok: true, switched: true, via: "openSubgraph" };
+}
+
+/**
+ * Résout une cible « nœud/groupe » : exactement UNE forme parmi id, nodes ou
+ * group (avec `subgraph` optionnel pour le scope). Retourne
+ * { nodes, group, graph } ou { error, code }. Partagé par focus_view et select_node.
+ */
+function resolveNodeTargets(ctx, args) {
+    const a = args || {};
+    const hasId = a.id !== undefined && a.id !== null && a.id !== "";
+    const hasNodes = Array.isArray(a.nodes) && a.nodes.length > 0;
+    const hasGroup = a.group !== undefined && a.group !== null && String(a.group).trim() !== "";
+    if ((hasId ? 1 : 0) + (hasNodes ? 1 : 0) + (hasGroup ? 1 : 0) !== 1) {
+        return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "fournir UNE cible exactement : id, nodes ou group" }, "arguments invalides : {detail}"), code: "invalid_args" };
+    }
+    const scopeArgs = (a.subgraph !== undefined && a.subgraph !== null && String(a.subgraph).trim() !== "") ? { subgraph: a.subgraph } : {};
+    if (hasGroup) {
+        let graph = getGraph(ctx);
+        let scope = null;
+        if (scopeArgs.subgraph !== undefined) {
+            const rs = requireReachableSubgraph(ctx, resolveSubgraphRef(ctx, a.subgraph));
+            if (rs.error) return rs;
+            graph = rs.subgraph;
+            scope = rs.subgraph;
+        }
+        if (!graph) return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        const group = findGroup(graph, a.group);
+        if (!group) return { error: label(ctx, "bl.toolErr.groupNotFound", { ref: String(a.group) }, "groupe '{ref}' introuvable (utilise list_groups)"), code: "group_not_found" };
+        return { nodes: recomputeGroupNodes(group).slice(), group: group, graph: scope || group.graph || getGraph(ctx) };
+    }
+    const ids = hasId ? [a.id] : a.nodes.slice();
+    if (ids.length > 500) return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "1 à 500 ids maximum" }, "arguments invalides : {detail}"), code: "invalid_args" };
+    const nodes = [];
+    let graph = null;
+    for (const one of ids) {
+        const r = findNode(ctx, one, scopeArgs);
+        if (r.error) return r;
+        if (!nodes.includes(r.node)) nodes.push(r.node);
+        const g = r.subgraph || r.node.graph || getGraph(ctx);
+        if (!graph) graph = g;
+        else if (g !== graph && String(g && g.id) !== String(graph && graph.id)) {
+            return { error: label(ctx, "bl.toolErr.mixedGraph", {}, "les nœuds ciblés n'appartiennent pas tous au même graphe (cible un seul subgraph à la fois)"), code: "mixed_graph" };
+        }
+    }
+    return { nodes: nodes, group: null, graph: graph || getGraph(ctx) };
+}
+
+// ─── Groupes : création / édition ────────────────────────────────────────────
+
+/** Construit un LGraphGroup réel (LiteGraph courant), sinon le constructeur d'un groupe existant. */
+function buildGroup(ctx, graph, title) {
+    try { if (ctx && typeof ctx.createGroupImpl === "function") return ctx.createGroupImpl(graph, title); } catch { /* repli */ }
+    const LG = (typeof window !== "undefined" && window.LiteGraph) || (typeof globalThis !== "undefined" && globalThis.LiteGraph) || null;
+    if (LG && typeof LG.LGraphGroup === "function") {
+        try { return new LG.LGraphGroup(title); } catch { /* repli */ }
+    }
+    const existing = graphGroups(graph)[0];
+    if (existing && existing.constructor && existing.constructor !== Object) {
+        try { return new existing.constructor(title); } catch { /* repli */ }
+    }
+    return null;
+}
+
+/** Ajoute un groupe au graphe (graph.add, sinon poussée directe dans graph.groups). */
+function addGroupToGraph(graph, group) {
+    if (!graph || !group) return false;
+    const groups = graphGroups(graph);
+    try {
+        if (typeof graph.add === "function") {
+            graph.add(group, true);
+            if (groups.indexOf(group) >= 0) return true;
+        }
+    } catch { /* repli direct */ }
+    if (Array.isArray(groups) && groups.indexOf(group) < 0) {
+        groups.push(group);
+        try { group.graph = graph; } catch { /* ignore */ }
+        try { if (typeof graph.setDirtyCanvas === "function") graph.setDirtyCanvas(true, true); } catch { /* ignore */ }
+        return true;
+    }
+    return groups.indexOf(group) >= 0;
+}
+
+// ─── Subgraphs : création / conversion / dépaquetage ─────────────────────────
+
+/** UUID v4 (crypto.randomUUID si disponible, sinon repli Math.random). */
+function generateUuid() {
+    try { if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID(); } catch { /* repli */ }
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+        const r = (Math.random() * 16) | 0;
+        return ((c === "x" ? r : ((r & 0x3) | 0x8))).toString(16);
+    });
+}
+
+/** Données d'un subgraph VIDE (mêmes champs que ceux produits par convertToSubgraph). */
+function emptySubgraphData(id, name) {
+    return {
+        id: id,
+        name: name,
+        description: "",
+        inputNode: { id: -10, bounding: [0, 0, 75, 100] },
+        outputNode: { id: -20, bounding: [0, 0, 75, 100] },
+        inputs: [],
+        outputs: [],
+        widgets: [],
+        version: 1,
+        state: { lastGroupId: 0, lastNodeId: 0, lastLinkId: 0, lastRerouteId: 0 },
+        revision: 0,
+        config: {},
+        links: [],
+        nodes: [],
+        reroutes: [],
+        groups: [],
+    };
+}
+
 // ─── Modes de nœud (convention ComfyUI/LiteGraph) ────────────────────────────
 // LGraphEventMode : ALWAYS=0, ON_EVENT=1, NEVER=2 (mute), ON_TRIGGER=3,
 // BYPASS=4. Exposés : enable (0), mute (2), bypass (4) — les valeurs 1/3 ne
@@ -1040,7 +1312,7 @@ registerTool({
 
 registerTool({
     name: "list_groups",
-    description: "Liste les groupes (cadres) du graphe : titre, id, couleur, position/taille et ids des nœuds contenus. Cible ensuite un groupe entier avec set_node_mode (argument group). Pour les groupes d'un subgraph, fournis subgraph.",
+    description: "Liste les groupes (cadres) du graphe : titre, id, couleur, position/taille et ids des nœuds contenus. Cible ensuite un groupe entier avec set_node_mode (argument group), le MODIFIE avec edit_group, ou le CADRE avec focus_view. Pour les groupes d'un subgraph, fournis subgraph.",
     schema: { type: "object", properties: { subgraph: subgraphProp() }, required: [] },
     mode: "read",
     async exec(args, ctx) {
@@ -1151,6 +1423,183 @@ registerTool({
         return {
             data: { closed: true, closed_subgraph: subgraphScopeInfo(cur), active_graph: "root" },
             action: label(ctx, "bl.toolAct.closeSubgraph", {}, "📂 Retour au graphe racine"),
+        };
+    },
+});
+
+registerTool({
+    name: "focus_view",
+    description: "Recadre la VUE du canvas (pan/zoom) pour MONTRER une cible précise : un nœud (id), un lot (nodes), un groupe (group), une zone (area) ou tout le workflow (all). Ouvre automatiquement le subgraph qui contient la cible (subgraph) — utile pour montrer un nœud interne. Action de VUE uniquement : ne modifie PAS le workflow, aucun snapshot. zoom = échelle absolue optionnelle (1 = 100 %) ; sans zoom l'échelle courante est conservée (sauf all, qui cadre le workflow entier).",
+    schema: {
+        type: "object",
+        properties: {
+            id: { type: ["number", "string"], description: "Nœud à cadrer (alternative à nodes/group/area/all)." },
+            nodes: { type: "array", items: { type: ["number", "string"] }, description: "Lot de nœuds à cadrer (alternative à id/group/area/all)." },
+            group: { type: ["string", "number"], description: "Titre ou id d'un groupe à cadrer (alternative à id/nodes/area/all)." },
+            area: {
+                type: "object",
+                description: "Zone rectangulaire du graphe (unités du graphe).",
+                properties: { x: { type: "number" }, y: { type: "number" }, width: { type: "number" }, height: { type: "number" } },
+                required: ["x", "y", "width", "height"],
+            },
+            all: { type: "boolean", description: "true = cadrer tout le workflow (défaut si aucune autre cible)." },
+            subgraph: subgraphProp(),
+            zoom: { type: "number", description: "Échelle absolue optionnelle (1 = 100 %)." },
+        },
+        required: [],
+    },
+    mode: "read",
+    async exec(args, ctx) {
+        const canvas = resolveCanvas(ctx);
+        if (!canvas) return { error: label(ctx, "bl.toolErr.noCanvas", {}, "canvas ComfyUI indisponible (app.canvas introuvable)"), code: "no_canvas" };
+        const root = getGraph(ctx);
+        if (!root) return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        const hasId = args.id !== undefined && args.id !== null && args.id !== "";
+        const hasNodes = Array.isArray(args.nodes) && args.nodes.length > 0;
+        const hasGroup = args.group !== undefined && args.group !== null && String(args.group).trim() !== "";
+        const hasArea = !!args.area && typeof args.area === "object" && !Array.isArray(args.area);
+        const wantsAll = args.all === true;
+        const forms = ((hasId || hasNodes || hasGroup) ? 1 : 0) + (hasArea ? 1 : 0) + (wantsAll ? 1 : 0);
+        if (forms > 1) {
+            return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "fournir UNE cible exactement : id, nodes, group, area ou all" }, "arguments invalides : {detail}"), code: "invalid_args" };
+        }
+        let zoom = null;
+        if (args.zoom !== undefined && args.zoom !== null && args.zoom !== "") {
+            zoom = Number(args.zoom);
+            if (!Number.isFinite(zoom) || zoom <= 0) {
+                return { error: label(ctx, "bl.toolErr.invalidValue", { detail: "zoom '" + String(args.zoom) + "' (attendu un nombre > 0)" }, "valeur invalide : {detail}"), code: "invalid_value" };
+            }
+        }
+        const hasScope = args.subgraph !== undefined && args.subgraph !== null && String(args.subgraph).trim() !== "";
+        let scope = null;
+        if (hasScope) {
+            const rs = resolveSubgraphRef(ctx, args.subgraph);
+            if (rs.error) return rs;
+            scope = rs.subgraph;
+        }
+        let targetGraph = null;
+        let nodes = [];
+        let bounds = null;
+        let kind = "all";
+        let singleNode = null;
+        let targetDesc = label(ctx, "bl.focus.all", {}, "tout le workflow");
+        if (hasId || hasNodes || hasGroup) {
+            const rt = resolveNodeTargets(ctx, args);
+            if (rt.error) return rt;
+            nodes = rt.nodes;
+            targetGraph = rt.graph;
+            if (rt.group) {
+                kind = "group";
+                targetDesc = String(rt.group.title || args.group);
+                bounds = nodeBoundsRect(rt.group);
+            } else {
+                kind = "nodes";
+                if (nodes.length === 1) {
+                    singleNode = nodes[0];
+                    targetDesc = nodeTitle(nodes[0]);
+                } else {
+                    targetDesc = label(ctx, "bl.focus.nodes", { count: String(nodes.length) }, "{count} nœud(s)");
+                }
+                bounds = unionBounds(nodes.map(nodeBoundsRect), 20);
+            }
+            if (!bounds) bounds = [0, 0, 0, 0];
+        } else if (hasArea) {
+            const a = args.area;
+            const x = Number(a.x), y = Number(a.y), w = Number(a.width), h = Number(a.height);
+            if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) {
+                return { error: label(ctx, "bl.toolErr.invalidValue", { detail: "area requiert x/y/width/height numériques avec width>0 et height>0" }, "valeur invalide : {detail}"), code: "invalid_value" };
+            }
+            targetGraph = scope || activeSubgraph(ctx) || root;
+            kind = "area";
+            targetDesc = label(ctx, "bl.focus.zone", {}, "une zone");
+            bounds = [x, y, w, h];
+        } else {
+            targetGraph = scope || activeSubgraph(ctx) || root;
+            kind = "all";
+            const list = Array.isArray(targetGraph.nodes) ? targetGraph.nodes : [];
+            const rects = list.map(nodeBoundsRect).concat(graphGroups(targetGraph).map(nodeBoundsRect));
+            bounds = unionBounds(rects, 20) || [0, 0, 0, 0];
+            nodes = list.slice();
+        }
+        const nav = navigateToGraph(ctx, targetGraph);
+        if (!nav.ok) return { error: nav.error, code: nav.code };
+        const applied = applyFocusView(ctx, bounds, { singleNode: singleNode, scale: zoom, fit: kind === "all", fitZoom: 0.85 });
+        if (!applied.ok) return { error: applied.error, code: applied.code };
+        dirtyCanvas(ctx);
+        const cur = activeSubgraph(ctx);
+        return {
+            data: {
+                centered_on: kind,
+                graph: cur ? "subgraph" : "root",
+                subgraph: cur ? subgraphScopeInfo(cur) : null,
+                node_count: nodes.length,
+                bounds: [bounds[0], bounds[1], bounds[2], bounds[3]],
+                scale: applied.scale,
+                offset: applied.offset,
+                via: applied.via,
+            },
+            action: label(ctx, "bl.toolAct.focusView", { target: targetDesc }, "🎯 Vue recentrée sur {target}"),
+        };
+    },
+});
+
+registerTool({
+    name: "select_node",
+    description: "Sélectionne et surligne (état de sélection du canvas) un nœud (id), un lot (nodes) ou un groupe entier (group) pour attirer l'attention — action de VUE, aucune mutation, aucun snapshot. Ouvre le subgraph contenant la cible si nécessaire. clear=true efface la sélection. center=true recadre aussi la vue sur la sélection.",
+    schema: {
+        type: "object",
+        properties: {
+            id: { type: ["number", "string"], description: "Nœud à sélectionner (alternative à nodes/group)." },
+            nodes: { type: "array", items: { type: ["number", "string"] }, description: "Lot de nœuds à sélectionner (alternative à id/group)." },
+            group: { type: ["string", "number"], description: "Titre ou id d'un groupe : sélectionne TOUS ses nœuds (alternative à id/nodes)." },
+            subgraph: subgraphProp(),
+            clear: { type: "boolean", description: "true = désélectionner tout (ignore id/nodes/group)." },
+            center: { type: "boolean", description: "true = recadrer aussi la vue sur la sélection." },
+        },
+        required: [],
+    },
+    mode: "read",
+    async exec(args, ctx) {
+        const canvas = resolveCanvas(ctx);
+        if (!canvas) return { error: label(ctx, "bl.toolErr.noCanvas", {}, "canvas ComfyUI indisponible (app.canvas introuvable)"), code: "no_canvas" };
+        const selectUnavailable = () => ({ error: label(ctx, "bl.toolErr.selectUnavailable", {}, "sélection canvas indisponible (API selectItems/selectNodes absente)"), code: "select_unavailable" });
+        if (args.clear === true) {
+            if (typeof canvas.deselectAll === "function") canvas.deselectAll();
+            else if (typeof canvas.selectItems === "function") canvas.selectItems([]);
+            else return selectUnavailable();
+            dirtyCanvas(ctx);
+            return { data: { cleared: true, selected: [] }, action: label(ctx, "bl.toolAct.deselect", {}, "👁️ Sélection effacée") };
+        }
+        const rt = resolveNodeTargets(ctx, args);
+        if (rt.error) return rt;
+        if (!rt.nodes.length) {
+            return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "aucun nœud à sélectionner" }, "arguments invalides : {detail}"), code: "invalid_args" };
+        }
+        const nav = navigateToGraph(ctx, rt.graph);
+        if (!nav.ok) return { error: nav.error, code: nav.code };
+        let selected = false;
+        if (typeof canvas.selectItems === "function") { canvas.selectItems(rt.nodes, false); selected = true; }
+        else if (typeof canvas.selectNodes === "function") { canvas.selectNodes(rt.nodes, false); selected = true; }
+        else if (typeof canvas.selectNode === "function" && rt.nodes.length === 1) { canvas.selectNode(rt.nodes[0], false); selected = true; }
+        if (!selected) return selectUnavailable();
+        let centered = false;
+        if (args.center === true) {
+            const bounds = unionBounds(rt.nodes.map(nodeBoundsRect), 20) || [0, 0, 0, 0];
+            const applied = applyFocusView(ctx, bounds, { singleNode: rt.nodes.length === 1 ? rt.nodes[0] : null, scale: null, fit: false });
+            centered = !!applied.ok;
+        }
+        dirtyCanvas(ctx);
+        const name = rt.group
+            ? String(rt.group.title || args.group)
+            : (rt.nodes.length === 1 ? nodeTitle(rt.nodes[0]) : label(ctx, "bl.focus.nodes", { count: String(rt.nodes.length) }, "{count} nœud(s)"));
+        return {
+            data: {
+                selected: rt.nodes.map((n) => n.id),
+                group: rt.group ? String(rt.group.title || "") : null,
+                centered: centered,
+                subgraph: activeSubgraph(ctx) ? subgraphScopeInfo(activeSubgraph(ctx)) : null,
+            },
+            action: label(ctx, "bl.toolAct.selectNode", { name: name }, "👁️ {name} sélectionné"),
         };
     },
 });
@@ -1703,6 +2152,345 @@ registerTool({
     },
 });
 
+registerTool({
+    name: "create_group",
+    description: "Crée un groupe (cadre) dans le graphe : titre, couleur, position et taille. Un groupe organise et repère visuellement une zone du workflow. Mutatif (annulable). Pour créer le groupe DANS un subgraph, fournis subgraph. Pour le modifier ensuite : edit_group ; pour le cadrer : focus_view.",
+    schema: {
+        type: "object",
+        properties: {
+            title: { type: "string", description: "Titre du groupe (obligatoire)." },
+            color: { type: "string", description: "Couleur du cadre, ex. '#335' ou '#FF8F00' (optionnel)." },
+            x: { type: "number", description: "Position X (optionnel, défaut : centre de la vue)." },
+            y: { type: "number", description: "Position Y (optionnel, défaut : centre de la vue)." },
+            width: { type: "number", description: "Largeur > 0 (optionnel, défaut 140)." },
+            height: { type: "number", description: "Hauteur > 0 (optionnel, défaut 80)." },
+            subgraph: subgraphProp(),
+        },
+        required: ["title"],
+    },
+    mode: "active",
+    undoable: true,
+    async exec(args, ctx) {
+        const title = String(args.title === undefined || args.title === null ? "" : args.title).trim();
+        if (!title) {
+            return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "title manquant" }, "arguments invalides : {detail}"), code: "invalid_args" };
+        }
+        let graph = getGraph(ctx);
+        let scope = null;
+        if (args.subgraph !== undefined && args.subgraph !== null && String(args.subgraph).trim() !== "") {
+            const rs = requireReachableSubgraph(ctx, resolveSubgraphRef(ctx, args.subgraph));
+            if (rs.error) return rs;
+            graph = rs.subgraph;
+            scope = rs.subgraph;
+        }
+        if (!graph) {
+            return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        }
+        let color;
+        if (args.color !== undefined && args.color !== null) {
+            color = String(args.color).trim();
+            if (!COLOR_RE.test(color)) {
+                return { error: label(ctx, "bl.toolErr.invalidValue", { detail: "couleur '" + color + "' (attendu #RGB/#RRGGBB)" }, "valeur invalide : {detail}"), code: "invalid_value" };
+            }
+        }
+        const groupFail = (detail) => ({
+            error: label(ctx, "bl.toolErr.groupCreateFailed", { error: detail }, "création du groupe impossible : {error}"),
+            code: "group_create_failed",
+        });
+        const group = buildGroup(ctx, graph, title);
+        if (!group) return groupFail("API LGraphGroup indisponible");
+        try {
+            group.title = title;
+            if (color !== undefined) group.color = color;
+        } catch (e) {
+            return groupFail((e && e.message) || String(e));
+        }
+        let x = Number(args.x);
+        let y = Number(args.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+            const c = viewportCenter(ctx);
+            if (!Number.isFinite(x)) x = c[0] - 70;
+            if (!Number.isFinite(y)) y = c[1] - 40;
+        }
+        const wRaw = Number(args.width);
+        const hRaw = Number(args.height);
+        const w = Number.isFinite(wRaw) && wRaw > 0 ? wRaw : 140;
+        const h = Number.isFinite(hRaw) && hRaw > 0 ? hRaw : 80;
+        try {
+            group.pos = [x, y];
+            group.size = [w, h];
+        } catch (e) {
+            return groupFail((e && e.message) || String(e));
+        }
+        if (!addGroupToGraph(graph, group)) return groupFail("ajout au graphe impossible (graph.add/groups)");
+        try { if (typeof group.recomputeInsideNodes === "function") group.recomputeInsideNodes(); } catch { /* best-effort */ }
+        dirtyCanvas(ctx);
+        const size = Array.isArray(group.size) ? [group.size[0], group.size[1]] : [w, h];
+        return {
+            data: {
+                id: group.id, title: group.title, color: group.color || null,
+                pos: [x, y], size: size,
+                node_count: recomputeGroupNodes(group).length,
+                subgraph: subgraphScopeInfo(scope),
+            },
+            action: label(ctx, "bl.toolAct.createGroup", { title: String(group.title || title) }, "🆕 Groupe « {title} » créé"),
+        };
+    },
+});
+
+registerTool({
+    name: "edit_group",
+    description: "Modifie un groupe existant : titre, couleur, position (x+y ensemble), taille (width+height ensemble). Mutatif (annulable). Cible le groupe par son titre ou son id (vu dans list_groups) ; pour un groupe d'un subgraph, fournis subgraph. La position déplace le cadre ; la taille minimum du groupe est appliquée par LiteGraph.",
+    schema: {
+        type: "object",
+        properties: {
+            group: { type: ["string", "number"], description: "Titre ou id du groupe à modifier (obligatoire)." },
+            title: { type: "string", description: "Nouveau titre (optionnel)." },
+            color: { type: "string", description: "Nouvelle couleur, ex. '#335' (optionnel)." },
+            x: { type: "number", description: "Position X (avec y)." },
+            y: { type: "number", description: "Position Y (avec x)." },
+            width: { type: "number", description: "Largeur > 0 (avec height)." },
+            height: { type: "number", description: "Hauteur > 0 (avec width)." },
+            subgraph: subgraphProp(),
+        },
+        required: ["group"],
+    },
+    mode: "active",
+    undoable: true,
+    async exec(args, ctx) {
+        let graph = getGraph(ctx);
+        let scope = null;
+        if (args.subgraph !== undefined && args.subgraph !== null && String(args.subgraph).trim() !== "") {
+            const rs = requireReachableSubgraph(ctx, resolveSubgraphRef(ctx, args.subgraph));
+            if (rs.error) return rs;
+            graph = rs.subgraph;
+            scope = rs.subgraph;
+        }
+        if (!graph) {
+            return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        }
+        const group = findGroup(graph, args.group);
+        if (!group) {
+            return { error: label(ctx, "bl.toolErr.groupNotFound", { ref: String(args.group) }, "groupe '{ref}' introuvable (utilise list_groups)"), code: "group_not_found" };
+        }
+        const previous = {
+            title: group.title,
+            color: group.color || null,
+            pos: Array.isArray(group.pos) ? group.pos.slice() : null,
+            size: Array.isArray(group.size) ? group.size.slice() : null,
+        };
+        let changed = false;
+        if (args.title !== undefined && args.title !== null) {
+            try { group.title = String(args.title); changed = true; } catch (e) { return { error: label(ctx, "bl.toolErr.exec", { error: (e && e.message) || String(e) }, "échec de l'outil : {error}"), code: "exec_error" }; }
+        }
+        if (args.color !== undefined && args.color !== null) {
+            const color = String(args.color).trim();
+            if (!COLOR_RE.test(color)) {
+                return { error: label(ctx, "bl.toolErr.invalidValue", { detail: "couleur '" + color + "' (attendu #RGB/#RRGGBB)" }, "valeur invalide : {detail}"), code: "invalid_value" };
+            }
+            try { group.color = color; changed = true; } catch (e) { return { error: label(ctx, "bl.toolErr.exec", { error: (e && e.message) || String(e) }, "échec de l'outil : {error}"), code: "exec_error" }; }
+        }
+        const hasX = args.x !== undefined && args.x !== null;
+        const hasY = args.y !== undefined && args.y !== null;
+        if (hasX || hasY) {
+            const x = Number(args.x), y = Number(args.y);
+            if (!hasX || !hasY || !Number.isFinite(x) || !Number.isFinite(y)) {
+                return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "x et y doivent être fournis ENSEMBLE (nombres)" }, "arguments invalides : {detail}"), code: "invalid_args" };
+            }
+            try { group.pos = [x, y]; changed = true; } catch (e) { return { error: label(ctx, "bl.toolErr.exec", { error: (e && e.message) || String(e) }, "échec de l'outil : {error}"), code: "exec_error" }; }
+        }
+        const hasW = args.width !== undefined && args.width !== null;
+        const hasH = args.height !== undefined && args.height !== null;
+        if (hasW || hasH) {
+            const w = Number(args.width), h = Number(args.height);
+            if (!hasW || !hasH || !Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
+                return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "width et height doivent être fournis ENSEMBLE (nombres > 0)" }, "arguments invalides : {detail}"), code: "invalid_args" };
+            }
+            try { group.size = [w, h]; changed = true; } catch (e) { return { error: label(ctx, "bl.toolErr.exec", { error: (e && e.message) || String(e) }, "échec de l'outil : {error}"), code: "exec_error" }; }
+        }
+        if (!changed) {
+            return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "aucun champ à modifier (title, color, x+y, width+height)" }, "arguments invalides : {detail}"), code: "invalid_args" };
+        }
+        try { if (typeof group.recomputeInsideNodes === "function") group.recomputeInsideNodes(); } catch { /* best-effort */ }
+        try { if (typeof graph.change === "function") graph.change(); } catch { /* best-effort */ }
+        dirtyCanvas(ctx);
+        const pos = Array.isArray(group.pos) ? [group.pos[0], group.pos[1]] : null;
+        const size = Array.isArray(group.size) ? [group.size[0], group.size[1]] : null;
+        return {
+            data: {
+                id: group.id, title: group.title, color: group.color || null,
+                pos: pos, size: size, previous: previous,
+                node_count: recomputeGroupNodes(group).length,
+                subgraph: subgraphScopeInfo(scope),
+            },
+            action: label(ctx, "bl.toolAct.editGroup", { title: String(group.title || "") }, "🖊️ Groupe « {title} » modifié"),
+        };
+    },
+});
+
+registerTool({
+    name: "create_subgraph",
+    description: "Crée un NOUVEAU subgraph (blueprint) VIDE et l'instancie dans le workflow (nœud Subgraph). Mutatif (annulable). Remplis-le ensuite avec add_node / set_widget_value / connect_nodes (paramètre subgraph='<UUID ou nom>'), ou convertis des nœuds existants avec convert_to_subgraph. Ouvre-le pour le voir avec open_subgraph.",
+    schema: {
+        type: "object",
+        properties: {
+            name: { type: "string", description: "Nom du subgraph (optionnel, défaut « Nouveau subgraph »)." },
+            x: { type: "number", description: "Position X du nœud Subgraph (optionnel, défaut : centre de la vue)." },
+            y: { type: "number", description: "Position Y du nœud Subgraph (optionnel, défaut : centre de la vue)." },
+        },
+        required: [],
+    },
+    mode: "active",
+    undoable: true,
+    async exec(args, ctx) {
+        const root = getGraph(ctx);
+        if (!root) {
+            return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        }
+        const fail = (detail) => ({
+            error: label(ctx, "bl.toolErr.subgraphCreateFailed", { error: detail }, "création du subgraph impossible : {error}"),
+            code: "subgraph_create_failed",
+        });
+        if (typeof root.createSubgraph !== "function") return fail("API createSubgraph indisponible");
+        const name = (args.name !== undefined && args.name !== null && String(args.name).trim() !== "")
+            ? String(args.name).trim()
+            : label(ctx, "bl.subgraph.defaultName", {}, "Nouveau subgraph");
+        const id = generateUuid();
+        const data = emptySubgraphData(id, name);
+        let sg = null;
+        try { sg = root.createSubgraph(data); } catch (e) { return fail((e && e.message) || String(e)); }
+        if (!sg) return fail("createSubgraph n'a rien retourné");
+        // Comme convertToSubgraph : configure la définition (nœuds/liens)
+        // APRÈS l'enregistrement du type par l'événement 'subgraph-created'.
+        try { if (typeof sg.configure === "function") sg.configure(data); } catch { /* best-effort */ }
+        let node = null;
+        try { if (ctx && typeof ctx.createSubgraphNodeImpl === "function") node = ctx.createSubgraphNodeImpl(sg, ctx); } catch { node = null; }
+        if (!node) {
+            const LG = (typeof window !== "undefined" && window.LiteGraph) || (typeof globalThis !== "undefined" && globalThis.LiteGraph) || null;
+            try { if (LG && typeof LG.createNode === "function") node = LG.createNode(sg.id, sg.name); } catch { node = null; }
+        }
+        if (!node) return fail("instanciation impossible (LiteGraph.createNode indisponible)");
+        try { if (!node.subgraph) node.subgraph = sg; } catch { /* best-effort */ }
+        let x = Number(args.x);
+        let y = Number(args.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+            const c = viewportCenter(ctx);
+            if (!Number.isFinite(x)) x = c[0] - 100;
+            if (!Number.isFinite(y)) y = c[1] - 50;
+        }
+        try { node.pos = [x, y]; } catch { /* pos immuable ? tant pis */ }
+        let added = false;
+        try { if (typeof root.add === "function") { root.add(node); added = true; } } catch { /* forme inattendue */ }
+        if (!added && Array.isArray(root.nodes)) {
+            try { root.nodes.push(node); if (!node.graph) node.graph = root; added = true; } catch { /* ignore */ }
+        }
+        if (!added) return fail("ajout du nœud Subgraph au graphe impossible");
+        dirtyCanvas(ctx);
+        return {
+            data: {
+                id: sg.id, name: sg.name || name, node_id: node.id,
+                node_count: 0,
+            },
+            action: label(ctx, "bl.toolAct.createSubgraph", { name: String(sg.name || name) }, "🧩 Subgraph « {name} » créé"),
+        };
+    },
+});
+
+registerTool({
+    name: "convert_to_subgraph",
+    description: "Convertit des nœuds EXISTANTS en un subgraph : fournis nodes ([ids]) ou group (titre/id d'un groupe entier). Les nœuds sont déplacés DANS une nouvelle définition de subgraph et remplacés par un nœud Subgraph au même endroit (liens internes/entrants/sortants réécrits par ComfyUI). Mutatif (annulable). Inverse : unpack_subgraph.",
+    schema: {
+        type: "object",
+        properties: {
+            nodes: { type: "array", items: { type: ["number", "string"] }, description: "Ids des nœuds à convertir (alternative à group)." },
+            group: { type: ["string", "number"], description: "Titre ou id d'un groupe : convertit TOUS ses nœuds (alternative à nodes)." },
+            name: { type: "string", description: "Nom du subgraph créé (optionnel)." },
+            subgraph: subgraphProp(),
+        },
+        required: [],
+    },
+    mode: "active",
+    undoable: true,
+    async exec(args, ctx) {
+        const rt = resolveNodeTargets(ctx, args);
+        if (rt.error) return rt;
+        const fail = (detail) => ({
+            error: label(ctx, "bl.toolErr.subgraphConvertFailed", { error: detail }, "conversion en subgraph impossible : {error}"),
+            code: "subgraph_convert_failed",
+        });
+        if (!rt.nodes.length) {
+            if (rt.group) return { error: label(ctx, "bl.toolErr.groupEmpty", { ref: String(rt.group.title || args.group) }, "groupe '{ref}' sans nœud à modifier"), code: "group_empty" };
+            return { error: label(ctx, "bl.toolErr.nothingToConvert", {}, "aucun nœud à convertir en subgraph"), code: "invalid_args" };
+        }
+        const owner = rt.graph;
+        if (!owner || typeof owner.convertToSubgraph !== "function") {
+            return fail("API convertToSubgraph indisponible (cible des nœuds d'un même graphe)");
+        }
+        let res = null;
+        try { res = owner.convertToSubgraph(new Set(rt.nodes)); } catch (e) { return fail((e && e.message) || String(e)); }
+        if (!res || !res.subgraph) return fail("convertToSubgraph n'a rien retourné");
+        const name = (args.name !== undefined && args.name !== null && String(args.name).trim() !== "") ? String(args.name).trim() : null;
+        if (name) {
+            try { res.subgraph.name = name; } catch { /* best-effort */ }
+            try { if (res.node) res.node.title = name; } catch { /* best-effort */ }
+        }
+        dirtyCanvas(ctx);
+        return {
+            data: {
+                id: res.subgraph.id, name: res.subgraph.name || null,
+                node_id: res.node && res.node.id !== undefined ? res.node.id : null,
+                node_count: rt.nodes.length,
+            },
+            action: label(ctx, "bl.toolAct.convertSubgraph", { count: String(rt.nodes.length), name: String(res.subgraph.name || res.subgraph.id) }, "🧩 {count} nœud(s) → Subgraph « {name} »"),
+        };
+    },
+});
+
+registerTool({
+    name: "unpack_subgraph",
+    description: "Dépaquette un subgraph : le nœud Subgraph ciblé (id) est remplacé par le contenu de sa définition — ses nœuds internes remontent dans le graphe parent. Mutatif (annulable). Inverse de convert_to_subgraph. Le nœud peut être dans le graphe racine ou dans un subgraph (fournis subgraph).",
+    schema: {
+        type: "object",
+        properties: {
+            id: { type: ["number", "string"], description: "Id du nœud Subgraph à dépaquetter (vu dans list_nodes / list_subgraphs)." },
+            subgraph: subgraphProp(),
+        },
+        required: ["id"],
+    },
+    mode: "active",
+    undoable: true,
+    async exec(args, ctx) {
+        const scopeArgs = (args.subgraph !== undefined && args.subgraph !== null && String(args.subgraph).trim() !== "") ? { subgraph: args.subgraph } : {};
+        const r = findNode(ctx, args.id, scopeArgs);
+        if (r.error) return r;
+        const fail = (detail) => ({
+            error: label(ctx, "bl.toolErr.subgraphUnpackFailed", { error: detail }, "dépaquetage du subgraph impossible : {error}"),
+            code: "subgraph_unpack_failed",
+        });
+        const node = r.node;
+        const sg = subgraphIdOf(node);
+        if (!sg) {
+            return { error: label(ctx, "bl.toolErr.notSubgraphNode", { id: String(node.id) }, "le nœud #{id} n'est pas un nœud de subgraph (utilise list_subgraphs)"), code: "not_subgraph" };
+        }
+        const owner = node.graph || r.subgraph || getGraph(ctx);
+        if (!owner || typeof owner.unpackSubgraph !== "function") return fail("API unpackSubgraph indisponible");
+        const beforeIds = (Array.isArray(owner.nodes) ? owner.nodes : []).map((n) => String(n.id));
+        try { owner.unpackSubgraph(node, { skipMissingNodes: true }); } catch (e) { return fail((e && e.message) || String(e)); }
+        const after = Array.isArray(owner.nodes) ? owner.nodes : [];
+        const added = after.map((n) => n.id).filter((id) => beforeIds.indexOf(String(id)) < 0);
+        dirtyCanvas(ctx);
+        return {
+            data: {
+                unpacked: node.id,
+                subgraph: { id: sg.id, name: sg.name || null },
+                added_node_ids: added,
+                added_count: added.length,
+            },
+            action: label(ctx, "bl.toolAct.unpackSubgraph", { name: String(sg.name || sg.id), count: String(added.length) }, "🧩 Subgraph « {name} » dépaqueté ({count} nœuds)"),
+        };
+    },
+});
+
 // ─── Exécution ('active', NON undoable : un snapshot ne peut pas arrêter un job) ──
 
 registerTool({
@@ -1984,7 +2772,8 @@ async function runToolLoop(opts) {
  * detectToolsUnsupported(resp, err) — vrai uniquement sur des signaux CLAIRS
  * de refus du tool-calling (message d'erreur payload OU sortie du modèle).
  * Une 401 auth, une 5xx réseau/serveur ou un texte ordinaire ne déclenchent
- * PAS la détection. Appelé par le chat UNIQUEMENT au 1ᵉʳ tour du mode actif.
+ * PAS la détection. Appelé par le chat UNIQUEMENT au 1ᵉʳ tour (les DEUX modes :
+ * read et active), pour replier vers le chemin texte si le modèle ignore tools.
  */
 function detectToolsUnsupported(resp, err) {
     const hay = [];
