@@ -270,17 +270,35 @@ function removeGraphLink(graph, linkId) {
  */
 function clearLinkRefs(graph, linkId, excludeNode) {
     if (!graph || linkId === undefined || linkId === null) return;
+    const target = String(linkId);
     const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
     for (const n of nodes) {
         if (!n || n === excludeNode) continue;
         if (Array.isArray(n.inputs)) {
             for (const inp of n.inputs) {
-                if (inp && inp.link !== undefined && String(inp.link) === String(linkId)) inp.link = null;
+                if (inp && inp.link !== undefined && String(inp.link) === target) inp.link = null;
             }
         }
         if (Array.isArray(n.outputs)) {
             for (const out of n.outputs) {
-                if (out && Array.isArray(out.links)) out.links = out.links.filter((id) => String(id) !== String(linkId));
+                if (out && Array.isArray(out.links)) out.links = out.links.filter((id) => String(id) !== target);
+            }
+        }
+    }
+    // Slots d'ENTRÉE/SORTIE d'un SUBGRAPH : ils ne figurent PAS dans
+    // `graph.nodes` (nœuds d'I/O hors liste, cf. Subgraph.inputNode/outputNode)
+    // et portent leurs propres références de liens dans `linkIds`. Sans ce
+    // nettoyage, détacher un lien de FRONTIÈRE (nœud interne ↔ I/O du subgraph)
+    // laisserait une RÉFÉRENCE PENDANTE dans l'entrée/sortie du subgraph.
+    for (const list of [graph.inputs, graph.outputs]) {
+        if (!Array.isArray(list)) continue;
+        for (const slot of list) {
+            if (!slot || !Array.isArray(slot.linkIds)) continue;
+            const kept = slot.linkIds.filter((id) => String(id) !== target);
+            if (kept.length !== slot.linkIds.length) {
+                // Mutation EN PLACE (linkIds est `readonly` côté classes Subgraph).
+                slot.linkIds.length = 0;
+                for (const id of kept) slot.linkIds.push(id);
             }
         }
     }
@@ -2146,17 +2164,28 @@ registerTool({
             if (linkId === undefined || linkId === null) { usedIn.add(ni); continue; }
             try {
                 const link = getLinkById(owner, linkId);
-                if (link) { link.target_id = newNode.id; link.target_slot = ni; }
-                else {
-                    // Lien non enregistré (forme défensive) : on vérifie qu'aucun
-                    // autre câble ne pointe déjà sur le nouveau slot.
+                if (link) {
+                    link.target_id = newNode.id; link.target_slot = ni;
+                    newInputs[ni].link = linkId;
+                    oldIn.link = null;
+                    usedIn.add(ni);
+                    reconnected++;
+                } else {
+                    // Lien absent du registre (référence pendante PRÉEXISTANTE) :
+                    // on ne RECRÉE pas la référence sur la nouvelle node et on ne
+                    // la compte pas « recâblée » — on la nettoie partout, EXACTEMENT
+                    // comme la branche SORTIE (jamais de lien pendant, pas de faux
+                    // « conservé »). Un éventuel doublon posé par createNode est
+                    // nettoyé aussi.
                     const dup = newInputs[ni].link;
                     if (dup !== undefined && dup !== null) { clearLinkRefs(owner, dup, newNode); removeGraphLink(owner, dup); }
+                    newInputs[ni].link = null;
+                    oldIn.link = null;
+                    usedIn.add(ni);
+                    linksLost++;
+                    clearLinkRefs(owner, linkId, newNode);
+                    removeGraphLink(owner, linkId);
                 }
-                newInputs[ni].link = linkId;
-                oldIn.link = null;
-                usedIn.add(ni);
-                reconnected++;
             } catch {
                 lostInputs.push(slotLabel(oldIn, oi));
                 linksLost++;

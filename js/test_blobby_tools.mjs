@@ -1853,6 +1853,119 @@ function graphStateProblems(g, newNodeId, spec) {
     return problems;
 }
 
+/**
+ * Fixture SUBGRAPH RÉALISTE (corrige la simplification de l'ancienne fixture) :
+ *   - chaque graphe (RACINE, subgraph, subgraph IMBRIQUÉ) a SON PROPRE registre
+ *     de liens `_links` (Map), comme `Subgraph extends LGraph` de la référence ;
+ *   - les nœuds d'I/O du subgraph (-10/-20) ne sont PAS dans `subgraph.nodes`
+ *     (modèle RÉEL) : leurs liens vivent dans `linkIds` des slots exposés par
+ *     `subgraph.inputs` / `subgraph.outputs` ;
+ *   - un lien de FRONTIÈRE (nœud interne → nœud d'I/O) est posé ;
+ *   - un subgraph IMBRIQUÉ est instancié (nœud 20 dans sg) ;
+ *   - serialize()/loadGraphData() font un vrai aller-retour racine +
+ *     definitions.subgraphs (liens inclus) ⇒ l'undo restaure aussi les liens
+ *     internes.
+ * Retourne { app, root, sg, sg2, inst }.
+ */
+function makeRealSubgraphWorld() {
+    const mk = (o) => {
+        const n = makeNode({ id: o.id, type: o.type, title: o.title, pos: [0, 0], mode: o.mode });
+        n.size = new Float64Array(o.size || [100, 60]);
+        n.pos = new Float64Array(o.pos || [0, 0]);
+        n.inputs = (o.inputs || []).map((i) => ({ name: i.name, type: i.type, link: i.link === undefined ? null : i.link }));
+        n.outputs = (o.outputs || []).map((x) => ({ name: x.name, type: x.type, links: x.links ? x.links.slice() : [] }));
+        n.widgets = (o.widgets || []).map((w) => ({ name: w.name, type: w.type, value: w.value }));
+        return n;
+    };
+    const makeGraph = (id, name, rootGraph) => {
+        const g = {
+            id, name, _links: new Map(), _nodes: [], _nodes_by_id: {}, _groups: [],
+            get nodes() { return this._nodes; },
+            set nodes(v) { this._nodes = v; },
+            get isRootGraph() { return this === this.rootGraph; },
+            rootGraph,
+            getNodeById(nid) { return this._nodes_by_id[nid] || this._nodes.find((n) => String(n.id) === String(nid)) || null; },
+            add(n) { n.graph = this; this._nodes.push(n); this._nodes_by_id[n.id] = n; return n; },
+            setDirtyCanvas() {}, change() {}, updateExecutionOrder() {},
+        };
+        // `links` = accesseur du registre PROPRE au graphe (Map), comme le vrai
+        // `LGraph.links` (Proxy sur `_links`).
+        Object.defineProperty(g, "links", { get() { return this._links; } });
+        return g;
+    };
+    const serialNode = (n) => ({ id: n.id, type: n.type, title: n.title, mode: n.mode,
+        pos: [n.pos[0], n.pos[1]], size: [n.size[0], n.size[1]],
+        inputs: (n.inputs || []).map((i) => ({ name: i.name, type: i.type, link: i.link })),
+        outputs: (n.outputs || []).map((o) => ({ name: o.name, type: o.type, links: o.links ? o.links.slice() : [] })),
+        widgets: (n.widgets || []).map((w) => ({ name: w.name, type: w.type, value: w.value })) });
+    const restoreNode = (d) => mk({ id: d.id, type: d.type, title: d.title, mode: d.mode, pos: d.pos,
+        size: d.size, inputs: d.inputs, outputs: d.outputs, widgets: d.widgets });
+    const restoreLinks = (sd) => new Map((sd.links || []).map((l) => [l.id, { ...l }]));
+
+    const root = makeGraph("root", "root", null);
+    root.rootGraph = root;
+    root.subgraphs = new Map();
+    // sg2 (IMBRIQUÉ) : 6 Load → 7 Scale → 8 Save
+    const sg2 = makeGraph(SG2_ID, "Nested Blueprint", root);
+    // sg : 30 Load → 1 Legacy → 31 Save, + frontière I/O, + instance de sg2 (20)
+    const sg = makeGraph(SG_ID, "Upscale Chain", root);
+
+    sg2.add(mk({ id: 6, type: "Load", outputs: [{ name: "IMAGE", type: "IMAGE", links: [401] }] }));
+    sg2.add(mk({ id: 7, type: "ImageScale", inputs: [{ name: "image", type: "IMAGE", link: 401 }], outputs: [{ name: "IMAGE", type: "IMAGE", links: [402] }] }));
+    sg2.add(mk({ id: 8, type: "Save", inputs: [{ name: "images", type: "IMAGE", link: 402 }] }));
+    sg2._links.set(401, { id: 401, origin_id: 6, origin_slot: 0, target_id: 7, target_slot: 0, type: "IMAGE" });
+    sg2._links.set(402, { id: 402, origin_id: 7, origin_slot: 0, target_id: 8, target_slot: 0, type: "IMAGE" });
+
+    const inner30 = mk({ id: 30, type: "Load", outputs: [{ name: "MODEL", type: "MODEL", links: [201] }] });
+    const inner1 = mk({ id: 1, type: "Legacy", title: "Legacy",
+        inputs: [{ name: "model", type: "MODEL", link: 201 }, { name: "image", type: "IMAGE", link: 200 }],
+        outputs: [{ name: "IMAGE", type: "IMAGE", links: [202, 203] }] });
+    const inner31 = mk({ id: 31, type: "Save", inputs: [{ name: "images", type: "IMAGE", link: 202 }] });
+    const nestedInst = mk({ id: 20, type: SG2_ID, title: "Nested Blueprint", pos: [300, 0] });
+    nestedInst.subgraph = sg2; nestedInst.isSubgraphNode = () => true;
+    sg.add(inner30); sg.add(inner1); sg.add(inner31); sg.add(nestedInst);
+    sg._links.set(200, { id: 200, origin_id: -10, origin_slot: 0, target_id: 1, target_slot: 1, type: "IMAGE" });
+    sg._links.set(201, { id: 201, origin_id: 30, origin_slot: 0, target_id: 1, target_slot: 0, type: "MODEL" });
+    sg._links.set(202, { id: 202, origin_id: 1, origin_slot: 0, target_id: 31, target_slot: 0, type: "IMAGE" });
+    sg._links.set(203, { id: 203, origin_id: 1, origin_slot: 0, target_id: -20, target_slot: 0, type: "IMAGE" });
+    // Slots d'I/O du subgraph (nœuds -10/-20 hors `sg.nodes`, comme le vrai modèle).
+    sg.inputs = [{ name: "image", type: "IMAGE", displayName: "image", linkIds: [200] }];
+    sg.outputs = [{ name: "image", type: "IMAGE", displayName: "image", linkIds: [203] }];
+    sg.inputNode = { id: -10, slots: sg.inputs };
+    sg.outputNode = { id: -20, slots: sg.outputs };
+
+    const inst = mk({ id: 10, type: SG_ID, title: "Upscale Chain", pos: [100, 100] });
+    inst.subgraph = sg; inst.isSubgraphNode = () => true;
+    inst.outputs = [{ name: "IMAGE", type: "IMAGE", links: [901] }];
+    root.add(inst);
+    root.add(mk({ id: 40, type: "Preview", inputs: [{ name: "images", type: "IMAGE", link: 901 }] }));
+    root._links.set(901, { id: 901, origin_id: 10, origin_slot: 0, target_id: 40, target_slot: 0, type: "IMAGE" });
+    root.subgraphs.set(SG_ID, sg);
+    root.subgraphs.set(SG2_ID, sg2);
+
+    root.serialize = function () {
+        return { version: 1, nodes: this._nodes.map(serialNode), links: [...this._links.values()].map((l) => ({ ...l })),
+            definitions: { subgraphs: [sg, sg2].map((s) => ({ id: s.id, name: s.name, nodes: s._nodes.map(serialNode), links: [...s._links.values()].map((l) => ({ ...l })) })) } };
+    };
+    root.loadGraphData = function (d) {
+        for (const sd of (d.definitions && d.definitions.subgraphs) || []) {
+            const s = this.subgraphs.get(sd.id); if (!s) continue;
+            s._links = restoreLinks(sd);
+            s._nodes = (sd.nodes || []).map(restoreNode);
+            s._nodes_by_id = {}; s._nodes.forEach((n) => { s._nodes_by_id[n.id] = n; n.graph = s; });
+        }
+        this._links = new Map((d.links || []).map((l) => [l.id, { ...l }]));
+        this._nodes = (d.nodes || []).map(restoreNode);
+        this._nodes_by_id = {}; this._nodes.forEach((n) => { this._nodes_by_id[n.id] = n; n.graph = this; });
+        return Promise.resolve();
+    };
+    const app = { graph: root, rootGraph: root, canvas: { setDirtyCanvas() {} }, loadGraphData: (d) => root.loadGraphData(d) };
+    return { app, root, sg, sg2, inst };
+}
+
+/** Liens d'un graphe sous forme lisible « id:orig[slot]->target[slot] ». */
+function realLinks(g) { return [...g._links.values()].map((l) => `${l.id}:${l.origin_id}[${l.origin_slot}]->${l.target_id}[${l.target_slot}]`).join(", "); }
+
 // ── (I4) entrées ET sorties, sortie multi-liens, node au milieu d'une chaîne ──
 {
     clearUndo();
@@ -2019,6 +2132,152 @@ function graphStateProblems(g, newNodeId, spec) {
     assert.deepStrictEqual(fx.root.getNodeById(1).outputs.find((o) => o.name === "IMAGE").links, [], "nouvelle node : sortie sans référence pendante");
     clearUndo();
     ok("(I8) garde anti-lien-pendant : id de lien absent du registre jamais recréé (zéro référence pendante)");
+}
+
+// ══════ 6sexies. change_node_type DANS UN SUBGRAPH : modèle RÉEL (registre
+// par graphe). L'ancienne fixture I6 était déjà FIDÈLE sur l'axe du registre
+// (node.graph = subgraph, liens dans le Map du subgraph) ; elle était en
+// revanche SIMPLIFIÉE sur 3 points qui masquaient 2 défauts réels : (a) pas de
+// nœuds d'I/O (-10/-20) HORS `subgraph.nodes` donc pas de lien de FRONTIÈRE, ni
+// de nettoyage de leurs `linkIds` ; (b) pas de sous-subgraph IMBRIQUÉ instancié ;
+// (c) aucune assertion « registre RACINE non pollué » ni « node.graph === sg ».
+// Ce bloc les couvre avec makeRealSubgraphWorld().
+
+// ── (I6b) subgraph RÉEL : registre par graphe, frontière, racine non polluée ──
+{
+    clearUndo();
+    const w = makeRealSubgraphWorld();
+    const before = w.sg.nodes.length;
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New", subgraph: SG_ID }, {
+        app: w.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ id: 55, inputs: [{ name: "model", type: "MODEL" }, { name: "image", type: "IMAGE" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true, "retype interne OK");
+    assert.strictEqual(res.data.links_reconnected, 4, "4 liens conservés (entrées model+image, sortie multi-liens)");
+    assert.strictEqual(res.data.links_lost, 0, "aucun lien perdu (slots équivalents)");
+    // Registre PROPRE au subgraph intact ; racine NON polluée.
+    assert.strictEqual(realLinks(w.sg), "200:-10[0]->1[1], 201:30[0]->1[0], 202:1[0]->31[0], 203:1[0]->-20[0]", "registre du SUBGRAPH intact (ids/origine/cible/slots)");
+    assert.strictEqual(w.root._links.size, 1, "la racine ne garde QUE son lien 901 (aucune pollution par un lien interne)");
+    // Nœud propriétaire = subgraph ; refs de slot de la nouvelle node posées.
+    assert.strictEqual(w.sg.getNodeById(1).graph, w.sg, "nœud interne : owner = subgraph");
+    assert.strictEqual(w.sg.getNodeById(1).type, "New", "type changé en place");
+    assert.strictEqual(w.sg.getNodeById(1).inputs[0].link, 201, "inputs[model].link posé");
+    assert.strictEqual(w.sg.getNodeById(1).inputs[1].link, 200, "inputs[image].link (frontière) posé");
+    assert.deepStrictEqual(w.sg.getNodeById(1).outputs[0].links, [202, 203], "outputs[IMAGE].links posés (interne + frontière)");
+    // Ancienne node retirée ; nœuds d'I/O du subgraph intacts.
+    assert.strictEqual(w.sg.nodes.filter((n) => String(n.id) === "1").length, 1, "ancienne node retirée (une seule node d'id 1)");
+    assert.strictEqual(w.sg.nodes.length, before, "nombre de nœuds du subgraph inchangé");
+    assert.deepStrictEqual(w.sg.inputs[0].linkIds, [200], "entrée I/O du subgraph intacte");
+    assert.deepStrictEqual(w.sg.outputs[0].linkIds, [203], "sortie I/O du subgraph intacte");
+    // 5 invariants d'état de graphe (aucune référence pendante).
+    const problems = graphStateProblems(w.sg, 1, {
+        kept: {
+            201: { origin: "other", origin_id: 30, target: "new", target_slot: 0 },
+            200: { target: "new", target_slot: 1 },
+            202: { origin: "new", origin_slot: 0, target: "other", target_id: 31 },
+            203: { origin: "new", origin_slot: 0 },
+        },
+    });
+    assert.deepStrictEqual(problems, [], `état de graphe réel (I6b) : ${problems.join(" | ")}`);
+    clearUndo();
+    ok("(I6b) subgraph RÉEL : registre par graphe, frontière conservée, refs de slot + zéro pendant, racine non polluée");
+}
+
+// ── (I6n) subgraph IMBRIQUÉ : registre du sous-subgraph seul ──
+{
+    clearUndo();
+    const w = makeRealSubgraphWorld();
+    const res = await dispatchToolCall("change_node_type", { id: 7, type: "New", subgraph: SG2_ID }, {
+        app: w.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ id: 56, inputs: [{ name: "image", type: "IMAGE" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true, "retype dans le subgraph IMBRIQUÉ");
+    assert.strictEqual(res.data.links_reconnected, 2, "2 liens internes au sous-subgraph conservés");
+    assert.strictEqual(realLinks(w.sg2), "401:6[0]->7[0], 402:7[0]->8[0]", "registre du sous-subgraph intact");
+    assert.strictEqual(w.sg2.getNodeById(7).graph, w.sg2, "propriétaire = sous-subgraph");
+    assert.strictEqual(w.sg._links.has(401), false, "les liens du sous-subgraph ne remontent PAS dans le parent");
+    const problems = graphStateProblems(w.sg2, 7, {
+        kept: {
+            401: { origin: "other", origin_id: 6, target: "new", target_slot: 0 },
+            402: { origin: "new", origin_slot: 0, target: "other", target_id: 8 },
+        },
+    });
+    assert.deepStrictEqual(problems, [], `état de graphe imbriqué (I6n) : ${problems.join(" | ")}`);
+    clearUndo();
+    ok("(I6n) subgraph IMBRIQUÉ : retype d'un nœud interne, registre du sous-subgraph seul");
+}
+
+// ── (I6u) undo DANS un subgraph : type ET liens internes restaurés ──
+{
+    clearUndo();
+    const w = makeRealSubgraphWorld();
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New", subgraph: SG_ID }, {
+        app: w.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ id: 57, inputs: [{ name: "model", type: "MODEL" }, { name: "image", type: "IMAGE" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true);
+    const u = await undoSnapshot(res.snapshotId, { app: w.app });
+    assert.strictEqual(u.ok, true, "undo via loadGraphData (snapshot racine embarque definitions.subgraphs)");
+    assert.strictEqual(w.sg.getNodeById(1).type, "Legacy", "undo : type du nœud interne restauré");
+    assert.strictEqual(realLinks(w.sg), "200:-10[0]->1[1], 201:30[0]->1[0], 202:1[0]->31[0], 203:1[0]->-20[0]", "undo : liens INTERNES du subgraph restaurés");
+    const problems = graphStateProblems(w.sg, 1, {
+        kept: {
+            201: { origin: "other", origin_id: 30, target: "new", target_slot: 0 },
+            200: { target: "new", target_slot: 1 },
+            202: { origin: "new", origin_slot: 0, target: "other", target_id: 31 },
+            203: { origin: "new", origin_slot: 0 },
+        },
+    });
+    assert.deepStrictEqual(problems, [], `état après undo subgraph (I6u) : ${problems.join(" | ")}`);
+    clearUndo();
+    ok("(I6u) undo DANS un subgraph : restaure le type ET les liens internes");
+}
+
+// ── (I6io) lien de FRONTIÈRE détaché : I/O du subgraph nettoyée ──
+{
+    clearUndo();
+    const w = makeRealSubgraphWorld();
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New", subgraph: SG_ID }, {
+        app: w.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ id: 58, inputs: [{ name: "model", type: "MODEL" }, { name: "image", type: "IMAGE" }], outputs: [] }),
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.data.links_lost, 2, "2 liens de sortie (202,203) détachés faute d'équivalent");
+    assert.strictEqual(w.sg._links.has(203), false, "203 (frontière) retiré du registre du subgraph");
+    assert.deepStrictEqual(w.sg.outputs[0].linkIds, [], "sortie I/O du subgraph nettoyée (AUCUNE référence pendante)");
+    assert.deepStrictEqual(w.sg.inputs[0].linkIds, [200], "entrée I/O conservée intacte");
+    const problems = graphStateProblems(w.sg, 1, {
+        kept: {
+            201: { origin: "other", origin_id: 30, target: "new", target_slot: 0 },
+            200: { target: "new", target_slot: 1 },
+        },
+        gone: [202, 203],
+    });
+    assert.deepStrictEqual(problems, [], `état frontière (I6io) : ${problems.join(" | ")}`);
+    clearUndo();
+    ok("(I6io) lien de FRONTIÈRE détaché : I/O du subgraph nettoyée (zéro référence pendante)");
+}
+
+// ── (I8b) ENTRÉE pendante : jamais comptée « recâblée » (symétrie SORTIE) ──
+{
+    clearUndo();
+    const fx = makeMapRetypeFixture(
+        [
+            { id: 1, type: "Legacy", inputs: [{ name: "model", type: "MODEL", link: 777 }], outputs: [] },
+        ],
+        [],
+    );
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New" }, {
+        app: fx.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ inputs: [{ name: "model", type: "MODEL" }] }),
+    });
+    assert.strictEqual(res.data.links_reconnected, 0, "entrée pendante 777 NON comptée recâblée");
+    assert.strictEqual(res.data.links_lost, 1, "entrée pendante 777 comptée détachée");
+    assert.strictEqual(fx.root.getNodeById(1).inputs.find((i) => i.name === "model").link, null, "nouvelle node : entrée sans référence pendante");
+    const problems = graphStateProblems(fx.root, 1, { kept: {}, gone: [777] });
+    assert.deepStrictEqual(problems, [], `état de graphe (I8b) : ${problems.join(" | ")}`);
+    clearUndo();
+    ok("(I8b) entrée pendante : jamais recréée ni comptée recâblée (symétrie avec la SORTIE)");
 }
 
 console.log(`\n✅ Partie 1 (pure) : ${n} groupes d'assertions PASS — suite jsdom…`);
