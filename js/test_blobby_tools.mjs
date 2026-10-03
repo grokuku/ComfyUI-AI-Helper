@@ -20,6 +20,12 @@
 //      messages, le parsing texte ([SET…]/[MOVE_TO]/[SHELL]) continue de
 //      marcher, [SET…] en 'read' est refusé SANS muter le workflow ;
 //   7. (g) parité i18n FR/EN des clés bl.* ajoutées.
+//   8. (h) SUBGRAPHS / POSITION / MODES (6bis) : Subgraph Blueprints
+//      (registre root.subgraphs, chemin/instances/ouverture), get_node_position
+//      (scope subgraph + locator uuid:id), set_node_mode (enable/mute/bypass,
+//      lots, groupe, atomicité), resize_node, add/remove DANS un subgraph,
+//      undo complet des mutations internes, refus d'un subgraph non instancié
+//      (undo-safe) et refus des mutations en mode Lecture seule.
 //
 // Usage : node js/test_blobby_tools.mjs
 //   La partie 1 est PURE (node, aucun DOM). La partie 2 (chemin chat) utilise
@@ -142,20 +148,20 @@ const SEED = [
 /* ══════════════════ 1. (a) Filtrage du schéma par mode ═════════════════ */
 console.log("1. Filtrage du schéma par mode (getToolsForMode)");
 
-const READ_EXPECTED = ["describe_workflow", "list_nodes", "get_node_by_id", "get_node_widgets", "get_node_widget", "get_node_connections", "get_object_info", "get_queue_status", "get_execution_status"];
-const ACTIVE_ONLY = ["set_widget_value", "set_node_title", "set_node_color", "move_node", "add_node", "remove_node", "connect_nodes", "disconnect_nodes", "queue_prompt", "interrupt"];
+const READ_EXPECTED = ["describe_workflow", "list_nodes", "get_node_by_id", "get_node_widgets", "get_node_widget", "get_node_connections", "get_object_info", "get_queue_status", "get_execution_status", "get_node_position", "list_subgraphs", "get_subgraph", "list_groups", "open_subgraph", "close_subgraph"];
+const ACTIVE_ONLY = ["set_widget_value", "set_node_title", "set_node_color", "move_node", "resize_node", "set_node_mode", "add_node", "remove_node", "connect_nodes", "disconnect_nodes", "queue_prompt", "interrupt"];
 
 const readTools = getToolsForMode("read");
 const readNames = readTools.map((x) => x.function.name);
 assert.deepStrictEqual(readNames.sort(), READ_EXPECTED.slice().sort(), "mode read : uniquement les outils de lecture");
 assert.ok(readNames.every((nm) => !ACTIVE_ONLY.includes(nm)), "mode read : AUCUN outil 'active' proposé au LLM");
-ok("mode read : 9 outils de lecture, 0 outil actif");
+ok("mode read : 15 outils de lecture, 0 outil actif");
 
 const activeTools = getToolsForMode("active");
 const activeNames = activeTools.map((x) => x.function.name);
 // Défaut sûr : sans shellAccess, l'outil shell n'est PAS proposé (1ʳᵉ barrière).
 assert.deepStrictEqual(activeNames.sort(), READ_EXPECTED.concat(ACTIVE_ONLY).sort(), "mode active (shell off) : tous les outils SAUF run_shell");
-assert.strictEqual(activeTools.length, listTools().length - 1, "shell off : run_shell retiré (19 des 20 outils du registre)");
+assert.strictEqual(activeTools.length, listTools().length - 1, "shell off : run_shell retiré (27 des 28 outils du registre)");
 ok(`mode active (shell off) : ${activeNames.length} outils (run_shell filtré)`);
 
 const activeShellTools = getToolsForMode("active", { shellAccess: true });
@@ -179,6 +185,15 @@ const setW = activeTools.find((x) => x.function.name === "set_widget_value").fun
 assert.ok(setW.parameters.required.includes("id") && setW.parameters.required.includes("widget") && setW.parameters.required.includes("value"), "set_widget_value: id/widget/value requis");
 const objInfo = activeTools.find((x) => x.function.name === "get_object_info").function;
 assert.ok(objInfo.parameters.properties.class_type && objInfo.parameters.required.length === 0, "get_object_info: class_type optionnel");
+const posFn = readTools.find((x) => x.function.name === "get_node_position").function;
+assert.ok(posFn.parameters.required.includes("id"), "get_node_position: id requis (lecture seule)");
+const subFn = readTools.find((x) => x.function.name === "get_subgraph").function;
+assert.ok(subFn.parameters.required.includes("subgraph"), "get_subgraph: subgraph requis");
+const modeFn = activeTools.find((x) => x.function.name === "set_node_mode").function;
+assert.strictEqual(modeFn.parameters.required.length, 1, "set_node_mode: une seule clé REQUISE (mode)");
+assert.ok(modeFn.parameters.required.includes("mode") && modeFn.parameters.properties.nodes && modeFn.parameters.properties.group, "set_node_mode: mode requis + cibles nodes/group");
+const resizeFn = activeTools.find((x) => x.function.name === "resize_node").function;
+assert.ok(resizeFn.parameters.required.includes("width") && resizeFn.parameters.required.includes("height"), "resize_node: width/height requis");
 ok("schémas JSON-Schema valides (type/properties/required) pour tous les outils");
 
 // Normalisation défensive du mode.
@@ -636,6 +651,363 @@ console.log("6. Mutations restantes + formes défensives API");
     assert.strictEqual(r.code, "shell_forbidden", "code shell_forbidden remonté");
     assert.ok(r.error.includes("serveur"), `message clair : ${r.error}`);
     ok("run_shell : filtré/refusé sans shellAccess, autorisé avec (contrôle négatif in-suite), refus serveur propagé");
+}
+
+/* ══════════════ 6bis. Subgraphs / position / modes de nœud ═══════════ */
+console.log("6bis. Subgraphs (Subgraph Blueprints), position étendue, modes de nœud");
+
+const SG_ID = "11111111-2222-4333-8444-555555555555";
+const SG2_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+function serializeFixtureNode(n) {
+    return {
+        id: n.id, type: n.type, title: n.title,
+        pos: Array.isArray(n.pos) ? n.pos.slice() : null,
+        size: Array.isArray(n.size) ? n.size.slice() : null,
+        mode: n.mode,
+        widgets: Array.isArray(n.widgets) ? n.widgets.map((w) => ({ name: w.name, type: w.type, value: w.value })) : [],
+    };
+}
+
+function applyFixtureSnapshot(node, data) {
+    if (!node || !data) return;
+    if (Array.isArray(data.pos)) node.pos = data.pos.slice();
+    if (Array.isArray(data.size)) node.size = data.size.slice();
+    if (data.mode !== undefined) node.mode = data.mode;
+    if (data.title !== undefined) node.title = data.title;
+    if (Array.isArray(data.widgets)) data.widgets.forEach((wd) => {
+        const w = (node.widgets || []).find((x) => x && String(x.name) === String(wd.name));
+        if (w) w.value = wd.value;
+    });
+}
+
+// Fixture « Subgraph Blueprints » : racine (nœud 1 + instance node 10 du sg)
+// → sg « Upscale Chain » (nœud interne 1 + instance node 20 du sg2)
+//   → sg2 « Nested Blueprint » (nœud interne 7). Registre root.subgraphs = Map.
+function makeSubgraphFixture() {
+    const inner7 = makeNode({ id: 7, type: "ImageScale", title: "Scale", pos: [1, 2] });
+    inner7.size = [140, 80];
+    const sg2 = {
+        id: SG2_ID, name: "Nested Blueprint", description: "sous-subgraph",
+        nodes: [inner7], links: {}, inputs: [], outputs: [],
+        getNodeById(id) { return this.nodes.find((n) => String(n.id) === String(id)) || null; },
+        add(n) { n.graph = this; this.nodes.push(n); return n; },
+        remove(n) { const i = this.nodes.indexOf(n); if (i >= 0) this.nodes.splice(i, 1); },
+        setDirtyCanvas() {},
+    };
+    inner7.graph = sg2;
+    const inner1 = makeNode({ id: 1, type: "KSampler", title: "InnerSampler", pos: [5, 6], mode: 0, widgets: [{ name: "steps", type: "number", value: 10, options: { min: 1, max: 100 } }] });
+    inner1.size = [210, 100];
+    const subNode2 = makeNode({ id: 20, type: SG2_ID, title: "Nested Blueprint", pos: [300, 0] });
+    subNode2.subgraph = sg2;
+    subNode2.isSubgraphNode = function () { return true; };
+    const sg = {
+        id: SG_ID, name: "Upscale Chain", description: "chaîne de test",
+        nodes: [inner1, subNode2], links: {},
+        inputs: [{ name: "image", type: "IMAGE" }],
+        outputs: [{ name: "image", type: "IMAGE" }],
+        getNodeById(id) { return this.nodes.find((n) => String(n.id) === String(id)) || null; },
+        add(n) { n.graph = this; this.nodes.push(n); return n; },
+        remove(n) { const i = this.nodes.indexOf(n); if (i >= 0) this.nodes.splice(i, 1); },
+        setDirtyCanvas() {},
+    };
+    inner1.graph = sg;
+    subNode2.graph = sg;
+    const rootNode1 = makeNode({ id: 1, type: "CheckpointLoaderSimple", title: "Checkpoint", widgets: [{ name: "steps", type: "number", value: 20, options: { min: 1, max: 100 } }] });
+    rootNode1.size = [210, 100];
+    const rootSub = makeNode({ id: 10, type: SG_ID, title: "Upscale Chain", pos: [100, 100], mode: 4 });
+    rootSub.subgraph = sg;
+    rootSub.isSubgraphNode = function () { return true; };
+    const groupSampling = {
+        id: 1, title: "Sampling", color: "#335", pos: [0, 0], size: [400, 300], graph: null,
+        nodes: [rootNode1], recomputeInsideNodes() { /* le fixture garde nodes */ },
+    };
+    const groupEmpty = {
+        id: 2, title: "Empty", color: "#335", pos: [0, 0], size: [100, 80], graph: null,
+        nodes: [], recomputeInsideNodes() {},
+    };
+    const root = {
+        id: "root-graph",
+        nodes: [rootNode1, rootSub],
+        links: {},
+        groups: [groupSampling, groupEmpty],
+        subgraphs: new Map([[SG_ID, sg], [SG2_ID, sg2]]),
+        rootGraph: null,
+        getNodeById(id) { return this.nodes.find((n) => String(n.id) === String(id)) || null; },
+        add(n) { this.nodes.push(n); return n; },
+        remove(n) { const i = this.nodes.indexOf(n); if (i >= 0) this.nodes.splice(i, 1); },
+        setDirtyCanvas() {},
+        serialize() {
+            return {
+                version: 1,
+                nodes: this.nodes.map(serializeFixtureNode),
+                definitions: { subgraphs: [sg, sg2].map((s) => ({ id: s.id, name: s.name, nodes: s.nodes.map(serializeFixtureNode) })) },
+            };
+        },
+        configure(data) { this.lastConfigured = data; },
+        loadGraphData(data) {
+            // Restauration fidèle : racine + definitions.subgraphs (comme le
+            // vrai loadGraphData sur un snapshot racine des Subgraph Blueprints).
+            (data.nodes || []).forEach((d) => applyFixtureSnapshot(this.getNodeById(d.id), d));
+            const defs = data.definitions && Array.isArray(data.definitions.subgraphs) ? data.definitions.subgraphs : [];
+            defs.forEach((sd) => {
+                const s = this.subgraphs.get(sd.id);
+                if (!s) return;
+                (sd.nodes || []).forEach((d) => applyFixtureSnapshot(s.getNodeById(d.id), d));
+            });
+            this.lastRestored = data;
+            return Promise.resolve();
+        },
+    };
+    root.rootGraph = root;
+    sg.rootGraph = root;
+    sg2.rootGraph = root;
+    groupSampling.graph = root;
+    groupEmpty.graph = root;
+    const canvas = {
+        graph: root, subgraph: null,
+        setGraph(g) {
+            this.graph = g;
+            this.subgraph = (g && g.rootGraph && g.rootGraph !== g) ? g : undefined;
+        },
+        setDirtyCanvas() {},
+    };
+    const app = {
+        graph: root, rootGraph: root, canvas: canvas,
+        loadGraphData(data) { return root.loadGraphData(data); },
+    };
+    return { app, root, sg, sg2, canvas, rootNode1, rootSub, inner1, inner7, groupSampling, groupEmpty };
+}
+
+// ── list_subgraphs : registre + chemin + instances + état d'ouverture ──
+{
+    const fx = makeSubgraphFixture();
+    const res = await dispatchToolCall("list_subgraphs", {}, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true, "list_subgraphs OK");
+    assert.strictEqual(res.data.count, 2, "2 subgraphs (sg + imbriqué)");
+    const byId = Object.fromEntries(res.data.subgraphs.map((s) => [s.id, s]));
+    assert.ok(byId[SG_ID] && byId[SG2_ID], "les deux subgraphs listés");
+    assert.deepStrictEqual(byId[SG2_ID].path, [SG_ID, SG2_ID], "chemin d'imbrication");
+    assert.strictEqual(byId[SG2_ID].parent_id, SG_ID, "parent du sous-subgraph");
+    assert.strictEqual(byId[SG_ID].node_count, 2, "node_count du sg");
+    assert.strictEqual(byId[SG_ID].instances[0], 10, "instance racine du sg = nœud 10");
+    assert.strictEqual(byId[SG_ID].open, false, "sg fermé au départ");
+    assert.strictEqual(res.data.active_graph, "root", "graphe actif = racine");
+    assert.strictEqual(res.data.current_subgraph, null, "aucun subgraph ouvert");
+    ok("list_subgraphs : registre + chemin + instances + état d'ouverture");
+}
+
+// ── get_subgraph : id/nom/erreurs + nœuds internes détaillés ──
+{
+    const fx = makeSubgraphFixture();
+    let res = await dispatchToolCall("get_subgraph", { subgraph: SG_ID }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.data.name, "Upscale Chain");
+    assert.strictEqual(res.data.node_count, 2);
+    const inner = res.data.nodes.find((n) => n.id === 1);
+    assert.ok(inner, "nœud interne id 1 présent");
+    assert.strictEqual(inner.mode, 0);
+    assert.strictEqual(inner.mode_name, "enable", "mode_name lisible");
+    assert.deepStrictEqual(inner.pos, [5, 6]);
+    assert.strictEqual(inner.widgets.steps, 10, "widgets internes inclus");
+    assert.deepStrictEqual(res.data.inputs, [{ name: "image", type: "IMAGE" }]);
+    assert.deepStrictEqual(res.data.outputs, [{ name: "image", type: "IMAGE" }]);
+    assert.deepStrictEqual(res.data.nested_subgraphs.map((s) => s.id), [SG2_ID], "sous-subgraph listé");
+    res = await dispatchToolCall("get_subgraph", { subgraph: "Upscale Chain" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true, "résolution par nom exact");
+    res = await dispatchToolCall("get_subgraph", { subgraph: "nope" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "subgraph_not_found", "nom inconnu → erreur structurée");
+    const prevName = fx.sg2.name;
+    fx.sg2.name = fx.sg.name;
+    res = await dispatchToolCall("get_subgraph", { subgraph: "Upscale Chain" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "subgraph_ambiguous", "nom ambigu → erreur structurée");
+    fx.sg2.name = prevName;
+    ok("get_subgraph : id/nom/erreurs, nœuds internes (mode/pos/widgets) et sous-subgraphs");
+}
+
+// ── open/close_subgraph : navigation canvas (aucun snapshot) ──
+{
+    const fx = makeSubgraphFixture();
+    let res = await dispatchToolCall("open_subgraph", { subgraph: SG_ID }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true, "ouverture OK en mode lecture (vue seulement)");
+    assert.strictEqual(fx.canvas.subgraph, fx.sg, "subgraph attaché au canvas");
+    assert.strictEqual(res.snapshotId, null, "navigation : AUCUN snapshot (pas une mutation)");
+    res = await dispatchToolCall("list_subgraphs", {}, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.data.current_subgraph.id, SG_ID, "état d'ouverture reflété");
+    assert.strictEqual(res.data.subgraphs.find((s) => s.id === SG_ID).open, true, "open:true");
+    res = await dispatchToolCall("get_node_position", { id: 1, subgraph: "current" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true, "'current' cible le subgraph ouvert");
+    assert.deepStrictEqual(res.data.pos, [5, 6]);
+    assert.strictEqual(res.data.subgraph.id, SG_ID);
+    res = await dispatchToolCall("close_subgraph", {}, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(fx.canvas.graph, fx.root, "retour racine : canvas.graph = root");
+    assert.ok(!fx.canvas.subgraph, "subgraph détaché (undefined, comme le vrai attachCanvas)");
+    res = await dispatchToolCall("close_subgraph", {}, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.data.already_at_root, true, "déjà racine → no-op signalé");
+    res = await dispatchToolCall("open_subgraph", { subgraph: "unknown" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "subgraph_not_found");
+    res = await dispatchToolCall("get_node_position", { id: 1, subgraph: "current" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "subgraph_not_open", "'current' sans subgraph ouvert → erreur claire");
+    res = await dispatchToolCall("open_subgraph", { subgraph: SG_ID }, { app: { graph: fx.root }, mode: "read" });
+    assert.strictEqual(res.code, "no_canvas", "sans canvas → erreur structurée");
+    res = await dispatchToolCall("list_subgraphs", {}, { mode: "read" });
+    assert.strictEqual(res.code, "no_app", "sans app/graph → erreur structurée");
+    ok("open/close_subgraph : navigation canvas (aucun snapshot), 'current', no-op et erreurs");
+}
+
+// ── get_node_position : scope subgraph + locator uuid:id ──
+{
+    const fx = makeSubgraphFixture();
+    let res = await dispatchToolCall("get_node_position", { id: 7 }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "not_found", "id 7 absent de la racine (défaut = racine)");
+    res = await dispatchToolCall("get_node_position", { id: 7, subgraph: SG_ID }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "not_found", "id 7 n'est pas dans sg");
+    assert.ok(res.error.includes("Upscale Chain"), "message nomme le subgraph");
+    res = await dispatchToolCall("get_node_position", { id: 7, subgraph: SG2_ID }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true);
+    assert.deepStrictEqual(res.data.pos, [1, 2]);
+    assert.strictEqual(res.data.subgraph.name, "Nested Blueprint");
+    res = await dispatchToolCall("get_node_position", { id: SG2_ID + ":7" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.ok, true, "locator uuid:id résolu sans argument subgraph");
+    assert.deepStrictEqual(res.data.pos, [1, 2]);
+    ok("get_node_position : scope subgraph + locator uuid:id + erreurs localisées");
+}
+
+// ── Mutations internes (widget/position) + undo complet ──
+clearUndo();
+{
+    const fx = makeSubgraphFixture();
+    let res = await dispatchToolCall("set_widget_value", { id: 1, widget: "steps", value: 33, subgraph: SG_ID }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.ok, true, "widget interne muté via subgraph");
+    assert.strictEqual(fx.inner1.widgets[0].value, 33);
+    assert.ok(res.snapshotId, "snapshot avant mutation interne");
+    const snapId = res.snapshotId;
+    res = await dispatchToolCall("move_node", { id: 1, x: 50, y: 60, subgraph: SG_ID }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.ok, true);
+    assert.deepStrictEqual(fx.inner1.pos, [50, 60]);
+    assert.deepStrictEqual(res.data.previous, [5, 6], "position précédente rapportée");
+    const undo = await undoSnapshot(snapId, { app: fx.app });
+    assert.strictEqual(undo.ok, true, "undo via loadGraphData racine");
+    assert.strictEqual(fx.inner1.widgets[0].value, 10, "undo restaure le widget interne");
+    assert.deepStrictEqual(fx.inner1.pos, [5, 6], "snapshot COMPLET : position d'avant aussi restaurée");
+    clearUndo();
+    ok("mutations internes (widget/position) : snapshot racine + undo restaure le subgraph");
+}
+
+// ── set_node_mode : enable/mute/bypass, read refusé, erreurs, atomicité ──
+clearUndo();
+{
+    const fx = makeSubgraphFixture();
+    let res = await dispatchToolCall("set_node_mode", { id: 1, mode: "mute" }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "mode_forbidden", "mutation interdite en read");
+    assert.strictEqual(fx.rootNode1.mode, 0, "mode intact en read");
+    assert.strictEqual(canUndo(), false, "aucun snapshot poussé en read");
+    res = await dispatchToolCall("set_node_mode", { id: 1, mode: "mute" }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.ok, true, "contrôle négatif in-suite : active passe");
+    assert.strictEqual(fx.rootNode1.mode, 2, "mute appliqué (NEVER=2)");
+    assert.strictEqual(res.data.mode_name, "mute");
+    assert.ok(res.snapshotId, "snapshot pour le changement de mode");
+    const undo = await undoSnapshot(res.snapshotId, { app: fx.app });
+    assert.strictEqual(undo.ok, true);
+    assert.strictEqual(fx.rootNode1.mode, 0, "undo restaure enable (0)");
+    res = await dispatchToolCall("set_node_mode", { id: 1, mode: "bypass", subgraph: SG_ID }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(fx.inner1.mode, 4, "bypass interne (BYPASS=4)");
+    res = await dispatchToolCall("set_node_mode", { id: 10, mode: 2 }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(fx.rootSub.mode, 2, "mode numérique accepté");
+    res = await dispatchToolCall("set_node_mode", { id: 1, mode: "pizza" }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.code, "invalid_value", "mode inconnu → erreur");
+    assert.ok(res.error.includes("enable/mute/bypass"), "message liste les modes attendus");
+    res = await dispatchToolCall("set_node_mode", { mode: "mute" }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.code, "invalid_args", "cible manquante → erreur");
+    res = await dispatchToolCall("set_node_mode", { mode: "mute", id: 1, nodes: [10] }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.code, "invalid_args", "deux cibles → refus");
+    res = await dispatchToolCall("set_node_mode", { mode: "mute", nodes: [1, 999] }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.code, "not_found");
+    assert.strictEqual(fx.rootNode1.mode, 0, "atomicité : aucun nœud muté quand un id du lot est invalide");
+    clearUndo();
+    ok("set_node_mode : enable/mute/bypass (+0/2/4), refus read, erreurs, atomicité du lot");
+}
+
+// ── set_node_mode sur un GROUPE + list_groups ──
+clearUndo();
+{
+    const fx = makeSubgraphFixture();
+    const listed = await dispatchToolCall("list_groups", {}, { app: fx.app, mode: "read" });
+    assert.strictEqual(listed.ok, true);
+    assert.strictEqual(listed.data.count, 2, "2 groupes listés");
+    const sampling = listed.data.groups.find((g) => g.title === "Sampling");
+    assert.deepStrictEqual(sampling.node_ids, [1], "node_ids du groupe");
+    assert.strictEqual(sampling.color, "#335");
+    let res = await dispatchToolCall("set_node_mode", { mode: "mute", group: "Sampling" }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.data.applied, 1, "1 nœud appliqué");
+    assert.strictEqual(fx.rootNode1.mode, 2);
+    assert.strictEqual(res.data.nodes[0].previous_name, "enable");
+    assert.ok(res.snapshotId, "snapshot pour le groupe");
+    await undoSnapshot(res.snapshotId, { app: fx.app });
+    assert.strictEqual(fx.rootNode1.mode, 0, "undo restaure le mode du groupe");
+    res = await dispatchToolCall("set_node_mode", { mode: "mute", group: "Empty" }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.code, "group_empty", "groupe vide → erreur structurée");
+    res = await dispatchToolCall("set_node_mode", { mode: "mute", group: "Nope" }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.code, "group_not_found", "groupe inconnu → erreur structurée");
+    clearUndo();
+    ok("list_groups + set_node_mode sur un GROUPE : node_ids, undo, erreurs vide/inconnu");
+}
+
+// ── resize_node : read refusé, bornes, snapshot + undo ──
+clearUndo();
+{
+    const fx = makeSubgraphFixture();
+    let res = await dispatchToolCall("resize_node", { id: 1, width: 300, height: 150 }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "mode_forbidden", "redimensionner interdit en read");
+    res = await dispatchToolCall("resize_node", { id: 1, width: 0, height: 10 }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.code, "invalid_value", "taille nulle → erreur");
+    res = await dispatchToolCall("resize_node", { id: 1, width: 300, height: 150 }, { app: fx.app, mode: "active" });
+    assert.strictEqual(res.ok, true);
+    assert.deepStrictEqual(fx.rootNode1.size, [300, 150]);
+    assert.deepStrictEqual(res.data.previous, [210, 100]);
+    assert.ok(res.snapshotId, "snapshot pour le resize");
+    await undoSnapshot(res.snapshotId, { app: fx.app });
+    assert.deepStrictEqual(fx.rootNode1.size, [210, 100], "undo restaure la taille");
+    clearUndo();
+    ok("resize_node : read refusé, bornes > 0, snapshot + undo restaure la taille");
+}
+
+// ── add_node / remove_node dans un subgraph ──
+{
+    const fxAdd = makeSubgraphFixture();
+    let res = await dispatchToolCall("add_node", { class_type: "Note", x: 1, y: 2, subgraph: SG_ID }, {
+        app: fxAdd.app, mode: "active",
+        createNodeImpl: (cls) => ({ id: 99, type: cls, title: cls, pos: [0, 0], size: [100, 60], widgets: [], mode: 0 }),
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(fxAdd.sg.nodes.length, 3, "nœud ajouté DANS le subgraph");
+    assert.strictEqual(fxAdd.root.nodes.length, 2, "racine inchangée");
+    assert.strictEqual(res.data.subgraph.id, SG_ID, "scope rapporté au LLM");
+    const fxDel = makeSubgraphFixture();
+    res = await dispatchToolCall("remove_node", { id: 1, subgraph: SG_ID }, { app: fxDel.app, mode: "active" });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(fxDel.sg.nodes.length, 1, "nœud retiré du subgraph propriétaire");
+    ok("add_node/remove_node : scope subgraph (dans le subgraph, racine intacte)");
+}
+
+// ── Subgraph non instancié : liste reachable:false + actions refusées ──
+{
+    const fx = makeSubgraphFixture();
+    const orphan = { id: "99999999-9999-4999-8999-999999999999", name: "Orphan", nodes: [makeNode({ id: 1, type: "X" })], links: {}, inputs: [], outputs: [] };
+    fx.root.subgraphs.set(orphan.id, orphan);
+    let res = await dispatchToolCall("list_subgraphs", {}, { app: fx.app, mode: "read" });
+    const entry = res.data.subgraphs.find((s) => s.id === orphan.id);
+    assert.ok(entry, "subgraph du registre listé");
+    assert.strictEqual(entry.reachable, false, "non instancié → reachable:false");
+    res = await dispatchToolCall("get_node_position", { id: 1, subgraph: orphan.id }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "subgraph_unreachable", "action sur subgraph non instancié refusée (undo-safe)");
+    res = await dispatchToolCall("open_subgraph", { subgraph: orphan.id }, { app: fx.app, mode: "read" });
+    assert.strictEqual(res.code, "subgraph_unreachable", "ouverture refusée aussi");
+    ok("subgraph non instancié : listé reachable:false, actions refusées (pas de couverture undo)");
 }
 
 console.log(`\n✅ Partie 1 (pure) : ${n} groupes d'assertions PASS — suite jsdom…`);

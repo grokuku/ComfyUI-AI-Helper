@@ -22,6 +22,13 @@
  * route serveur POST /aih/blobby/exec tant que l'état persisté ne l'autorise
  * pas (3ᵉ). Défaut = désactivé (fail-safe : absent/faux ⇒ refus).
  *
+ * SUBGRAPHS (frontend « Subgraph Blueprints », root.subgraphs = Map<UUID,
+ * Subgraph>) : les outils peuvent cibler un nœud INTERNE en passant
+ * `subgraph` (UUID, nom, ou 'current'). Résolution/refus détaillés dans la
+ * section dédiée plus bas. Les mutations internes passent par le MÊME
+ * snapshot (serialize() racine embarque definitions.subgraphs pour tous les
+ * subgraphs instanciés) — un subgraph non instancié est refusé (undo-safe).
+ *
  * Contrat backend (étape 1) : POST /api/keywords/llm-process accepte
  * `tools`, `tool_choice` et `messages` (liste complète, remplace la
  * construction system+user) ; la réponse contient `tool_calls` en forme
@@ -119,18 +126,12 @@ function label(ctx, key, params, fallbackFr) {
 // ─── Résolution défensive des nœuds / widgets ────────────────────────────────
 
 /**
- * Retrouve un nœud par id. graph.nodes peut être un ARRAY (LiteGraph
- * historique) ou un MAP (formes défensives) ; getNodeById existe selon les
- * versions. Retourne { node } ou { error, code }.
+ * Recherche locale d'un nœud dans UN graphe (LGraph ou Subgraph).
+ * graph.nodes peut être un ARRAY (LiteGraph historique) ou un MAP (formes
+ * défensives) ; getNodeById existe selon les versions.
  */
-function findNode(ctx, id) {
-    if (id === undefined || id === null || id === "") {
-        return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "id manquant" }, "arguments invalides : {detail}"), code: "invalid_args" };
-    }
-    const graph = getGraph(ctx);
-    if (!graph) {
-        return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
-    }
+function findNodeInGraph(graph, id) {
+    if (!graph) return null;
     let node = null;
     try {
         if (typeof graph.getNodeById === "function") node = graph.getNodeById(id) || null;
@@ -138,13 +139,68 @@ function findNode(ctx, id) {
     if (!node && Array.isArray(graph.nodes)) {
         node = graph.nodes.find((n) => n && String(n.id) === String(id)) || null;
     }
-    if (!node && graph.nodes && typeof graph.nodes === "object") {
+    if (!node && graph.nodes && typeof graph.nodes === "object" && !Array.isArray(graph.nodes)) {
         node = graph.nodes[String(id)] || graph.nodes[Number(id)] || null;
     }
+    return node;
+}
+
+/**
+ * Retrouve un nœud par id. Par défaut : graphe RACINE (comportement
+ * historique). `opts.subgraph` (UUID, nom exact, ou "current") cible un
+ * subgraph — l'id est alors l'id LOCAL dans ce subgraph. Un id au format
+ * locator `"<uuid-subgraph>:<id-local>"` (frontend Subgraph Blueprints) est
+ * aussi accepté. Retourne { node, subgraph, entry } ou { error, code }.
+ */
+function findNode(ctx, id, opts) {
+    if (id === undefined || id === null || id === "") {
+        return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "id manquant" }, "arguments invalides : {detail}"), code: "invalid_args" };
+    }
+    const graph = getGraph(ctx);
+    if (!graph) {
+        return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+    }
+    const ref = opts && opts.subgraph !== undefined && opts.subgraph !== null ? String(opts.subgraph).trim() : "";
+    let scope = null;
+    let entry = null;
+    let localId = id;
+    if (ref) {
+        const rs = resolveSubgraphRef(ctx, ref);
+        if (rs.error) return rs;
+        scope = rs.subgraph;
+        entry = rs.entry;
+    } else if (typeof id === "string") {
+        // Locator `"<uuid-subgraph>:<id-local>"` : l'id local est cherché dans
+        // ce subgraph (format du frontend, les ids de nœuds ne contiennent
+        // jamais ':' — parseNodeId l'interdit).
+        const i = id.indexOf(":");
+        if (i > 0 && UUID_RE.test(id.slice(0, i))) {
+            const rs = resolveSubgraphRef(ctx, id.slice(0, i));
+            if (rs.error) return rs;
+            scope = rs.subgraph;
+            entry = rs.entry;
+            localId = id.slice(i + 1);
+        }
+    }
+    const node = findNodeInGraph(scope || graph, localId);
     if (!node) {
+        if (scope) {
+            return {
+                error: label(ctx, "bl.toolErr.nodeNotFoundInSubgraph", { id: String(localId), name: String(scope.name || "?"), sg: String(scope.id) }, "nœud #{id} introuvable dans le subgraph « {name} » (#{sg})"),
+                code: "not_found",
+            };
+        }
         return { error: label(ctx, "bl.toolErr.nodeNotFound", { id: String(id) }, "nœud #{id} introuvable"), code: "not_found" };
     }
-    return { node };
+    if (entry && !entry.reachable) {
+        // Pas d'instance dans le workflow ⇒ absent du serialize() racine ⇒
+        // aucune action sans possibilité d'annulation (règle undo-safe).
+        return {
+            error: label(ctx, "bl.toolErr.subgraphUnreachable", { ref: entry.id }, "subgraph '{ref}' non instancié dans le workflow (aucun nœud SubgraphNode) — action impossible : il n'est pas couvert par l'annulation"),
+            code: "subgraph_unreachable",
+        };
+    }
+    return { node: node, subgraph: scope, entry: entry };
 }
 
 /** Widget par nom (exact d'abord, puis inclusion — tolérant aux approximations LLM). */
@@ -159,6 +215,250 @@ function findWidget(node, name) {
 
 function nodeTitle(node) {
     return (node && (node.title || node.comfyClass || node.type)) || "?";
+}
+
+// ─── Subgraphs (frontend « Subgraph Blueprints ») ────────────────────────────
+// API réellement disponible (frontend ComfyUI récent — vérifié sur la source
+// 1.47.11 de référence du pack) :
+//   - `app.rootGraph.subgraphs` : Map<UUID, Subgraph> (registre central) ;
+//   - `Subgraph extends LGraph` → `.nodes`, `.id`, `.name`, `.inputs`,
+//     `.outputs`, `.rootGraph` ;
+//   - un nœud instance expose `.isSubgraphNode()` + `.subgraph` ;
+//   - navigation : `app.canvas.subgraph` (subgraph ouvert) + `canvas.setGraph
+//     (g)` / `canvas.openSubgraph(sg, fromNode)` ; retour : `setGraph(root)`.
+//   - sérialisation : le serialize() RACINE embarque `definitions.subgraphs`
+//     pour tous les subgraphs UTILISÉS (instanciés) ⇒ le snapshot undo les
+//     couvre ; un subgraph du registre sans nœud instance n'est pas sérialisé
+//     et toute action de nœud le ciblant est refusée (pas d'undo ⇒ pas de
+//     mutation) — `list_subgraphs` le signale `reachable:false`.
+
+const SUBGRAPH_CURRENT_ALIASES = ["current", "open", "active", "this", "courant"];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Canvas ComfyUI (ctx.canvas prioritaire, puis app.canvas). */
+function resolveCanvas(ctx) {
+    if (ctx && ctx.canvas) return ctx.canvas;
+    const app = resolveApp(ctx);
+    return (app && app.canvas) || null;
+}
+
+/** Subgraph actuellement ouvert dans le canvas (null si graphe racine). */
+function activeSubgraph(ctx) {
+    const canvas = resolveCanvas(ctx);
+    if (!canvas) return null;
+    if (canvas.subgraph) return canvas.subgraph;
+    // Forme défensive : certains frontends posent canvas.graph = subgraph.
+    const g = canvas.graph;
+    if (g && g.rootGraph && g.rootGraph !== g && Array.isArray(g.nodes)) return g;
+    return null;
+}
+
+/** Subgraph référencé par un nœud instance (isSubgraphNode()/.subgraph). */
+function subgraphIdOf(node) {
+    if (!node || typeof node !== "object") return null;
+    try {
+        if (typeof node.isSubgraphNode === "function" && node.isSubgraphNode() && node.subgraph) return node.subgraph;
+    } catch { /* API capricieuse → forme suivante */ }
+    if (node.subgraph && typeof node.subgraph === "object") return node.subgraph;
+    return null;
+}
+
+/**
+ * Parcourt la hiérarchie depuis le graphe racine : Map id → { subgraph, path,
+ * parent_id, instances, reachable:true } pour chaque subgraph INSTANCIÉ.
+ */
+function collectSubgraphs(ctx) {
+    const out = new Map();
+    const root = getGraph(ctx);
+    if (!root) return out;
+    const visit = (graph, path, parentId) => {
+        const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
+        for (const n of nodes) {
+            const sg = subgraphIdOf(n);
+            if (!sg || sg.id === undefined || sg.id === null) continue;
+            const sid = String(sg.id);
+            let entry = out.get(sid);
+            if (!entry) {
+                entry = { id: sid, subgraph: sg, path: path.concat(sid), parent_id: parentId, instances: [], reachable: true };
+                out.set(sid, entry);
+            }
+            if (n.id !== undefined) entry.instances.push(n.id);
+            visit(sg, path.concat(sid), sid);
+        }
+    };
+    visit(root, [], null);
+    return out;
+}
+
+/** Registre central root.subgraphs (Map) quand la version l'expose. */
+function registrySubgraphs(ctx) {
+    const root = getGraph(ctx);
+    try {
+        if (root && root.subgraphs && typeof root.subgraphs.get === "function") return root.subgraphs;
+    } catch { /* registre capricieux → walk seul */ }
+    return null;
+}
+
+/** Liste fusionnée (instanciés + registre seul), triée par chemin. */
+function listSubgraphEntries(ctx) {
+    const out = collectSubgraphs(ctx);
+    const reg = registrySubgraphs(ctx);
+    if (reg) {
+        try {
+            reg.forEach((sg, id) => {
+                if (!sg) return;
+                const sid = String(sg.id !== undefined && sg.id !== null ? sg.id : id);
+                if (!out.has(sid)) {
+                    out.set(sid, { id: sid, subgraph: sg, path: [sid], parent_id: null, instances: [], reachable: false });
+                }
+            });
+        } catch { /* Map exotique → walk seul */ }
+    }
+    return [...out.values()].sort((a, b) => (a.path.join("/") < b.path.join("/") ? -1 : 1));
+}
+
+/**
+ * Résout une référence de subgraph : id UUID, nom exact (insensible à la
+ * casse), ou alias "current"/"open" (= subgraph ouvert dans le canvas).
+ * Retourne { subgraph, entry } ou { error, code }.
+ */
+function resolveSubgraphRef(ctx, ref) {
+    if (!getGraph(ctx)) {
+        return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+    }
+    const raw = String(ref === undefined || ref === null ? "" : ref).trim();
+    if (!raw) {
+        return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "subgraph manquant (id UUID ou nom)" }, "arguments invalides : {detail}"), code: "invalid_args" };
+    }
+    const lower = raw.toLowerCase();
+    if (SUBGRAPH_CURRENT_ALIASES.indexOf(lower) >= 0) {
+        const sg = activeSubgraph(ctx);
+        if (!sg) {
+            return { error: label(ctx, "bl.toolErr.subgraphNotOpen", {}, "aucun subgraph n'est ouvert dans le canvas (précise un id ou un nom)"), code: "subgraph_not_open" };
+        }
+        const sid = String(sg.id);
+        const entries = listSubgraphEntries(ctx);
+        const entry = entries.find((e) => e.id === sid) || { id: sid, subgraph: sg, path: [sid], parent_id: null, instances: [], reachable: true };
+        return { subgraph: sg, entry: entry };
+    }
+    const entries = listSubgraphEntries(ctx);
+    let entry = entries.find((e) => e.id === raw) || null;
+    if (!entry) {
+        const byName = entries.filter((e) => e.subgraph && String(e.subgraph.name || "").toLowerCase() === lower);
+        if (byName.length > 1) {
+            return {
+                error: label(ctx, "bl.toolErr.subgraphAmbiguous", { ref: raw, ids: byName.map((e) => e.id).join(", ") }, "subgraph '{ref}' ambigu — plusieurs correspondances : {ids} (précise l'UUID)"),
+                code: "subgraph_ambiguous",
+            };
+        }
+        if (byName.length === 1) entry = byName[0];
+    }
+    if (!entry) {
+        return { error: label(ctx, "bl.toolErr.subgraphNotFound", { ref: raw }, "subgraph '{ref}' introuvable (utilise list_subgraphs pour voir les subgraphs disponibles)"), code: "subgraph_not_found" };
+    }
+    return { subgraph: entry.subgraph, entry: entry };
+}
+
+/** Refus si le subgraph n'est pas instancié (pas de couverture undo). */
+function requireReachableSubgraph(ctx, rs) {
+    if (rs.error) return rs;
+    if (rs.entry && !rs.entry.reachable) {
+        return {
+            error: label(ctx, "bl.toolErr.subgraphUnreachable", { ref: rs.entry.id }, "subgraph '{ref}' non instancié dans le workflow (aucun nœud SubgraphNode) — action impossible : il n'est pas couvert par l'annulation"),
+            code: "subgraph_unreachable",
+        };
+    }
+    return rs;
+}
+
+/** Forme courte passée au LLM pour situer un nœud. */
+function subgraphScopeInfo(sg) {
+    return sg ? { id: sg.id, name: sg.name || null } : null;
+}
+
+/** Propriété de schéma « subgraph » (id UUID, nom exact, ou "current"). */
+function subgraphProp() {
+    return {
+        type: "string",
+        description: "Subgraph cible : UUID, nom exact, ou 'current' = subgraph ouvert dans le canvas. Optionnel : sans lui, le nœud est cherché dans le graphe racine.",
+    };
+}
+
+// ─── Groupes (cadres) ────────────────────────────────────────────────────────
+
+function graphGroups(graph) {
+    if (!graph) return [];
+    if (Array.isArray(graph.groups)) return graph.groups;
+    if (Array.isArray(graph._groups)) return graph._groups;
+    return [];
+}
+
+function findGroup(graph, ref) {
+    const raw = String(ref === undefined || ref === null ? "" : ref).trim();
+    if (!raw) return null;
+    const groups = graphGroups(graph);
+    const lower = raw.toLowerCase();
+    return groups.find((g) => g && String(g.id) === raw)
+        || groups.find((g) => g && String(g.title || "").toLowerCase() === lower)
+        || null;
+}
+
+/** Nœuds d'un groupe (recompute LiteGraph best-effort, liste courante sinon). */
+function recomputeGroupNodes(group) {
+    let nodes = Array.isArray(group && group.nodes) ? group.nodes : [];
+    try {
+        if (group && group.graph && typeof group.recomputeInsideNodes === "function") {
+            group.recomputeInsideNodes();
+            if (Array.isArray(group.nodes)) nodes = group.nodes;
+        }
+    } catch { /* calcul défensif : liste courante conservée */ }
+    return nodes;
+}
+
+/** Premier nœud instance d'un subgraph (pour canvas.openSubgraph). */
+function findSubgraphInstanceNode(ctx, subgraphId) {
+    const root = getGraph(ctx);
+    if (!root) return null;
+    const stack = [root];
+    const seen = new Set();
+    while (stack.length) {
+        const g = stack.pop();
+        if (!g || seen.has(g)) continue;
+        seen.add(g);
+        const nodes = Array.isArray(g.nodes) ? g.nodes : [];
+        for (const n of nodes) {
+            const sg = subgraphIdOf(n);
+            if (!sg) continue;
+            if (String(sg.id) === String(subgraphId)) return n;
+            stack.push(sg);
+        }
+    }
+    return null;
+}
+
+// ─── Modes de nœud (convention ComfyUI/LiteGraph) ────────────────────────────
+// LGraphEventMode : ALWAYS=0, ON_EVENT=1, NEVER=2 (mute), ON_TRIGGER=3,
+// BYPASS=4. Exposés : enable (0), mute (2), bypass (4) — les valeurs 1/3 ne
+// sont pas proposées (usage interne au moteur).
+
+const NODE_MODE_VALUES = {
+    enable: 0, enabled: 0, always: 0, active: 0, on: 0, normal: 0,
+    mute: 2, muted: 2, never: 2, off: 2, disable: 2, disabled: 2, skip: 2,
+    bypass: 4, bypassed: 4,
+    "0": 0, "2": 2, "4": 4,
+};
+const NODE_MODE_NAMES = { 0: "enable", 1: "on_event", 2: "mute", 3: "on_trigger", 4: "bypass" };
+
+function nodeModeName(mode) {
+    const k = Number(mode);
+    return NODE_MODE_NAMES[k] !== undefined ? NODE_MODE_NAMES[k] : String(mode);
+}
+
+/** normalizeNodeModeValue('bypass'|'mute'|'enable'|0|2|4) → 0/2/4, sinon null. */
+function normalizeNodeModeValue(v) {
+    if (typeof v === "number") return v === 0 || v === 2 || v === 4 ? v : null;
+    const key = String(v === undefined || v === null ? "" : v).trim().toLowerCase();
+    return Object.prototype.hasOwnProperty.call(NODE_MODE_VALUES, key) ? NODE_MODE_VALUES[key] : null;
 }
 
 // ─── Snapshot / UNDO (pile bornée, snapshot = workflow COMPLET) ──────────────
@@ -413,18 +713,19 @@ registerTool({
     description: "Détail complet d'un nœud : type, titre, mode, position, taille, properties, widgets (nom/type/valeur), entrées et sorties.",
     schema: {
         type: "object",
-        properties: { id: { type: ["number", "string"], description: "Identifiant du nœud (vu dans describe_workflow / list_nodes)." } },
+        properties: { id: { type: ["number", "string"], description: "Identifiant du nœud (vu dans describe_workflow / list_nodes)." }, subgraph: subgraphProp() },
         required: ["id"],
     },
     mode: "read",
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
         const n = r.node;
         return {
             data: {
                 id: n.id, type: n.type, title: n.title || n.comfyClass || n.type,
-                mode: n.mode, pos: Array.isArray(n.pos) ? n.pos : null, size: n.size || null,
+                mode: n.mode, mode_name: nodeModeName(n.mode), pos: Array.isArray(n.pos) ? n.pos : null, size: n.size || null,
+                subgraph: subgraphScopeInfo(r.subgraph),
                 properties: n.properties || {},
                 widgets: Array.isArray(n.widgets)
                     ? n.widgets.filter((w) => w && w.name !== undefined).map((w) => ({ name: w.name, type: w.type, value: w.value }))
@@ -441,12 +742,12 @@ registerTool({
     description: "Tous les widgets d'un nœud : nom, type, valeur courante et valeurs possibles (combo).",
     schema: {
         type: "object",
-        properties: { id: { type: ["number", "string"], description: "Identifiant du nœud." } },
+        properties: { id: { type: ["number", "string"], description: "Identifiant du nœud." }, subgraph: subgraphProp() },
         required: ["id"],
     },
     mode: "read",
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
         const n = r.node;
         const widgets = Array.isArray(n.widgets)
@@ -456,7 +757,7 @@ registerTool({
                 return out;
             })
             : [];
-        return { data: { id: n.id, widget_count: widgets.length, widgets: widgets } };
+        return { data: { id: n.id, subgraph: subgraphScopeInfo(r.subgraph), widget_count: widgets.length, widgets: widgets } };
     },
 });
 
@@ -468,12 +769,13 @@ registerTool({
         properties: {
             id: { type: ["number", "string"], description: "Identifiant du nœud." },
             widget: { type: "string", description: "Nom du widget (ex. 'steps', 'ckpt_name')." },
+            subgraph: subgraphProp(),
         },
         required: ["id", "widget"],
     },
     mode: "read",
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
         const w = findWidget(r.node, args.widget);
         if (!w) {
@@ -482,7 +784,7 @@ registerTool({
                 code: "widget_not_found",
             };
         }
-        const out = { id: r.node.id, name: w.name, type: w.type, value: w.value };
+        const out = { id: r.node.id, subgraph: subgraphScopeInfo(r.subgraph), name: w.name, type: w.type, value: w.value };
         if (w.options && Array.isArray(w.options.values)) out.options = { values: w.options.values };
         return { data: out };
     },
@@ -493,14 +795,14 @@ registerTool({
     description: "Connexions d'un nœud : entrées (nom/type + nœud source) et sorties (nom/type + nœuds cibles).",
     schema: {
         type: "object",
-        properties: { id: { type: ["number", "string"], description: "Identifiant du nœud." } },
+        properties: { id: { type: ["number", "string"], description: "Identifiant du nœud." }, subgraph: subgraphProp() },
         required: ["id"],
     },
     mode: "read",
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
-        const graph = getGraph(ctx);
+        const graph = r.subgraph || getGraph(ctx);
         const n = r.node;
         const resolveLink = (linkId) => {
             try {
@@ -514,22 +816,31 @@ registerTool({
                 const l = resolveLink(i.link);
                 return {
                     name: i.name, type: i.type, link: i.link === undefined ? null : i.link,
-                    source: l ? { id: l.from.id, slot: l.from.slot, title: nodeTitle(getNodeSafe(ctx, l.from.id)) } : null,
+                    source: l ? { id: l.from.id, slot: l.from.slot, title: nodeTitle(getNodeSafe(ctx, l.from.id, args)) } : null,
                 };
             })
             : [];
         const outputs = Array.isArray(n.outputs)
             ? n.outputs.map((o) => ({
                 name: o.name, type: o.type,
-                targets: (o.links || []).map(resolveLink).filter(Boolean).map((l) => ({ id: l.to.id, slot: l.to.slot, title: nodeTitle(getNodeSafe(ctx, l.to.id)) })),
+                targets: (o.links || []).map(resolveLink).filter(Boolean).map((l) => ({ id: l.to.id, slot: l.to.slot, title: nodeTitle(getNodeSafe(ctx, l.to.id, args)) })),
             }))
             : [];
-        return { data: { id: n.id, inputs: inputs, outputs: outputs } };
+        return { data: { id: n.id, subgraph: subgraphScopeInfo(r.subgraph), inputs: inputs, outputs: outputs } };
     },
 });
 
-function getNodeSafe(ctx, id) {
-    try { const r = findNode(ctx, id); return r.node || null; } catch { return null; }
+function getNodeSafe(ctx, id, opts) {
+    try {
+        const r = findNode(ctx, id, opts);
+        if (r.node) return r.node;
+        // Liens trans-frontières : cible hors du scope → repli sur la racine.
+        if (opts && opts.subgraph) {
+            const rr = findNode(ctx, id, {});
+            return rr.node || null;
+        }
+        return null;
+    } catch { return null; }
 }
 
 registerTool({
@@ -618,24 +929,251 @@ registerTool({
     },
 });
 
+registerTool({
+    name: "get_node_position",
+    description: "Position et taille d'un nœud sur le canvas : pos [x,y] et size [largeur,hauteur] en unités du graphe. Lecture seule — pour DÉPLACER un nœud utilise move_node, pour le redimensionner utilise resize_node. Pour un nœud dans un subgraph, fournis subgraph (UUID, nom, ou 'current').",
+    schema: {
+        type: "object",
+        properties: {
+            id: { type: ["number", "string"], description: "Identifiant du nœud." },
+            subgraph: subgraphProp(),
+        },
+        required: ["id"],
+    },
+    mode: "read",
+    async exec(args, ctx) {
+        const r = findNode(ctx, args.id, args);
+        if (r.error) return r;
+        const n = r.node;
+        return {
+            data: {
+                id: n.id, type: n.type, title: nodeTitle(n),
+                pos: Array.isArray(n.pos) ? [n.pos[0], n.pos[1]] : null,
+                size: Array.isArray(n.size) ? [n.size[0], n.size[1]] : null,
+                subgraph: subgraphScopeInfo(r.subgraph),
+            },
+        };
+    },
+});
+
+registerTool({
+    name: "list_subgraphs",
+    description: "Liste les Subgraphs (blueprints) du workflow ouvert : id (UUID), nom, nombre de nœuds, chemin d'imbrication, celui qui est OUVERT dans le canvas et ceux non instanciés (reachable:false). Point d'entrée pour l'inspection : détail avec get_subgraph, ouverture avec open_subgraph ; les outils de mutation acceptent subgraph='<UUID ou nom>' pour agir sur un nœud interne.",
+    schema: { type: "object", properties: {}, required: [] },
+    mode: "read",
+    async exec(_args, ctx) {
+        if (!getGraph(ctx)) {
+            return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        }
+        const entries = listSubgraphEntries(ctx);
+        const cur = activeSubgraph(ctx);
+        const curId = cur ? String(cur.id) : null;
+        return {
+            data: {
+                count: entries.length,
+                active_graph: cur ? "subgraph" : "root",
+                current_subgraph: cur ? { id: curId, name: cur.name || null } : null,
+                subgraphs: entries.map((e) => ({
+                    id: e.id,
+                    name: e.subgraph.name || null,
+                    description: e.subgraph.description || null,
+                    path: e.path,
+                    depth: e.path.length,
+                    parent_id: e.parent_id,
+                    node_count: Array.isArray(e.subgraph.nodes) ? e.subgraph.nodes.length : null,
+                    instances: e.instances,
+                    open: curId !== null && curId === e.id,
+                    reachable: e.reachable,
+                })),
+            },
+        };
+    },
+});
+
+registerTool({
+    name: "get_subgraph",
+    description: "Inspecte UN subgraph en détail (par UUID ou nom exact) : nœuds internes (id LOCAL dans le subgraph, type, titre, mode, mode_name, position, taille, widgets), entrées/sorties et sous-subgraphs. Pour MODIFIER un nœud interne, repasse son id local avec subgraph à set_widget_value / set_node_title / move_node / resize_node / set_node_mode / connect_nodes / remove_node…",
+    schema: {
+        type: "object",
+        properties: { subgraph: { type: "string", description: "UUID ou nom exact du subgraph (vu dans list_subgraphs)." } },
+        required: ["subgraph"],
+    },
+    mode: "read",
+    async exec(args, ctx) {
+        const rs = resolveSubgraphRef(ctx, args.subgraph);
+        if (rs.error) return rs;
+        const sg = rs.subgraph;
+        const cur = activeSubgraph(ctx);
+        const nodes = (Array.isArray(sg.nodes) ? sg.nodes : []).map((n) => {
+            const widgets = {};
+            if (Array.isArray(n.widgets)) n.widgets.forEach((w) => { if (w && w.name !== undefined) widgets[w.name] = w.value; });
+            return {
+                id: n.id, type: n.type, title: nodeTitle(n),
+                mode: n.mode, mode_name: nodeModeName(n.mode),
+                pos: Array.isArray(n.pos) ? [n.pos[0], n.pos[1]] : null,
+                size: Array.isArray(n.size) ? [n.size[0], n.size[1]] : null,
+                is_subgraph: !!subgraphIdOf(n),
+                widgets: widgets,
+            };
+        });
+        const nested = listSubgraphEntries(ctx).filter((e) => e.parent_id === String(sg.id));
+        return {
+            data: {
+                id: sg.id, name: sg.name || null, description: sg.description || null,
+                path: rs.entry ? rs.entry.path : [String(sg.id)],
+                parent_id: rs.entry ? rs.entry.parent_id : null,
+                open: cur !== null && String(cur.id) === String(sg.id),
+                reachable: rs.entry ? rs.entry.reachable : true,
+                instances: rs.entry ? rs.entry.instances : [],
+                node_count: nodes.length,
+                nodes: nodes,
+                inputs: (Array.isArray(sg.inputs) ? sg.inputs : []).map((i) => ({ name: i && i.name, type: i && i.type })),
+                outputs: (Array.isArray(sg.outputs) ? sg.outputs : []).map((o) => ({ name: o && o.name, type: o && o.type })),
+                nested_subgraphs: nested.map((e) => ({
+                    id: e.id, name: e.subgraph.name || null,
+                    node_count: Array.isArray(e.subgraph.nodes) ? e.subgraph.nodes.length : null,
+                })),
+            },
+        };
+    },
+});
+
+registerTool({
+    name: "list_groups",
+    description: "Liste les groupes (cadres) du graphe : titre, id, couleur, position/taille et ids des nœuds contenus. Cible ensuite un groupe entier avec set_node_mode (argument group). Pour les groupes d'un subgraph, fournis subgraph.",
+    schema: { type: "object", properties: { subgraph: subgraphProp() }, required: [] },
+    mode: "read",
+    async exec(args, ctx) {
+        let graph = getGraph(ctx);
+        let scope = null;
+        if (args.subgraph !== undefined && args.subgraph !== null && String(args.subgraph).trim() !== "") {
+            const rs = resolveSubgraphRef(ctx, args.subgraph);
+            if (rs.error) return rs;
+            graph = rs.subgraph;
+            scope = rs.subgraph;
+        }
+        if (!graph) {
+            return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        }
+        const groups = graphGroups(graph).map((g) => {
+            const nodes = recomputeGroupNodes(g);
+            return {
+                id: g.id, title: g.title || null, color: g.color || null,
+                pos: Array.isArray(g.pos) ? [g.pos[0], g.pos[1]] : null,
+                size: Array.isArray(g.size) ? [g.size[0], g.size[1]] : null,
+                node_count: nodes.length,
+                node_ids: nodes.map((n) => n && n.id),
+            };
+        });
+        return { data: { subgraph: subgraphScopeInfo(scope), count: groups.length, groups: groups } };
+    },
+});
+
+registerTool({
+    name: "open_subgraph",
+    description: "Ouvre un subgraph dans le canvas (action de VUE : ne modifie PAS le workflow, aucun snapshot). Par UUID ou nom exact. Une fois ouvert, subgraph:'current' cible ce subgraph dans les autres outils. Retour au graphe racine : close_subgraph.",
+    schema: {
+        type: "object",
+        properties: { subgraph: { type: "string", description: "UUID ou nom exact du subgraph à ouvrir (vu dans list_subgraphs)." } },
+        required: ["subgraph"],
+    },
+    mode: "read",
+    async exec(args, ctx) {
+        const rs = requireReachableSubgraph(ctx, resolveSubgraphRef(ctx, args.subgraph));
+        if (rs.error) return rs;
+        const canvas = resolveCanvas(ctx);
+        if (!canvas) {
+            return { error: label(ctx, "bl.toolErr.noCanvas", {}, "canvas ComfyUI indisponible (app.canvas introuvable)"), code: "no_canvas" };
+        }
+        const sg = rs.subgraph;
+        const already = activeSubgraph(ctx);
+        if (already && String(already.id) === String(sg.id)) {
+            return {
+                data: { opened: true, already_open: true, subgraph: subgraphScopeInfo(sg) },
+                action: label(ctx, "bl.toolAct.openSubgraph", { name: String(sg.name || sg.id) }, "📂 Subgraph « {name} » ouvert"),
+            };
+        }
+        const openFail = (detail) => ({
+            error: label(ctx, "bl.toolErr.subgraphOpenFailed", { error: detail }, "ouverture du subgraph impossible : {error}"),
+            code: "subgraph_open_failed",
+        });
+        try {
+            // openSubgraph respecte l'événement annulable 'subgraph-opening' ;
+            // setGraph est le repli des versions qui ne l'exposent pas.
+            if (typeof canvas.openSubgraph === "function") canvas.openSubgraph(sg, findSubgraphInstanceNode(ctx, sg.id));
+            else if (typeof canvas.setGraph === "function") canvas.setGraph(sg);
+            else return openFail("aucune API canvas (openSubgraph/setGraph)");
+        } catch (e) {
+            return openFail((e && e.message) || String(e));
+        }
+        const now = activeSubgraph(ctx);
+        if (!now || String(now.id) !== String(sg.id)) {
+            return openFail("le canvas n'a pas changé (événement 'subgraph-opening' annulé par une extension ?)");
+        }
+        dirtyCanvas(ctx);
+        return {
+            data: { opened: true, subgraph: subgraphScopeInfo(sg) },
+            action: label(ctx, "bl.toolAct.openSubgraph", { name: String(sg.name || sg.id) }, "📂 Subgraph « {name} » ouvert"),
+        };
+    },
+});
+
+registerTool({
+    name: "close_subgraph",
+    description: "Revient au graphe racine depuis un subgraph ouvert (action de VUE uniquement, aucun snapshot). Sans subgraph ouvert : no-op signalé (already_at_root).",
+    schema: { type: "object", properties: {}, required: [] },
+    mode: "read",
+    async exec(_args, ctx) {
+        const canvas = resolveCanvas(ctx);
+        if (!canvas) {
+            return { error: label(ctx, "bl.toolErr.noCanvas", {}, "canvas ComfyUI indisponible (app.canvas introuvable)"), code: "no_canvas" };
+        }
+        const root = getGraph(ctx);
+        if (!root) {
+            return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
+        }
+        const cur = activeSubgraph(ctx);
+        if (!cur) {
+            return { data: { closed: false, already_at_root: true, active_graph: "root" } };
+        }
+        const closeFail = (detail) => ({
+            error: label(ctx, "bl.toolErr.subgraphCloseFailed", { error: detail }, "retour au graphe racine impossible : {error}"),
+            code: "subgraph_close_failed",
+        });
+        try {
+            if (typeof canvas.setGraph === "function") canvas.setGraph(root);
+            else return closeFail("aucune API canvas.setGraph");
+        } catch (e) {
+            return closeFail((e && e.message) || String(e));
+        }
+        if (activeSubgraph(ctx)) return closeFail("le canvas est toujours dans un subgraph");
+        dirtyCanvas(ctx);
+        return {
+            data: { closed: true, closed_subgraph: subgraphScopeInfo(cur), active_graph: "root" },
+            action: label(ctx, "bl.toolAct.closeSubgraph", {}, "📂 Retour au graphe racine"),
+        };
+    },
+});
+
 // ─── Mutations ('active', undoable : snapshot avant exec) ────────────────────
 
 registerTool({
     name: "set_widget_value",
-    description: "Change la valeur d'un widget (champ) d'un nœud. Les nombres sont bornés aux min/max du widget, les combos vérifiés contre la liste des valeurs possibles.",
+    description: "Change la valeur d'un widget (champ) d'un nœud. Les nombres sont bornés aux min/max du widget, les combos vérifiés contre la liste des valeurs possibles. Pour un nœud dans un subgraph, fournis subgraph.",
     schema: {
         type: "object",
         properties: {
             id: { type: ["number", "string"], description: "Identifiant du nœud." },
             widget: { type: "string", description: "Nom du widget (ex. 'steps')." },
             value: { description: "Nouvelle valeur (nombre, texte ou booléen selon le widget)." },
+            subgraph: subgraphProp(),
         },
         required: ["id", "widget", "value"],
     },
     mode: "active",
     undoable: true,
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
         const node = r.node;
         const w = findWidget(node, args.widget);
@@ -684,7 +1222,7 @@ registerTool({
         }
         dirtyCanvas(ctx);
         return {
-            data: { node: node.id, widget: w.name, type: w.type, value: v },
+            data: { node: node.id, widget: w.name, type: w.type, value: v, subgraph: subgraphScopeInfo(r.subgraph) },
             action: label(ctx, "bl.toolAct.setWidget", { name: nodeTitle(node), widget: w.name, value: String(v) }, "⚙️ {name} · {widget} = {value}"),
         };
     },
@@ -692,25 +1230,26 @@ registerTool({
 
 registerTool({
     name: "set_node_title",
-    description: "Renomme le titre d'un nœud.",
+    description: "Renomme le titre d'un nœud. Pour un nœud dans un subgraph, fournis subgraph.",
     schema: {
         type: "object",
         properties: {
             id: { type: ["number", "string"], description: "Identifiant du nœud." },
             title: { type: "string", description: "Nouveau titre." },
+            subgraph: subgraphProp(),
         },
         required: ["id", "title"],
     },
     mode: "active",
     undoable: true,
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
         const old = r.node.title;
         r.node.title = String(args.title);
         dirtyCanvas(ctx);
         return {
-            data: { node: r.node.id, title: r.node.title, previous: old },
+            data: { node: r.node.id, title: r.node.title, previous: old, subgraph: subgraphScopeInfo(r.subgraph) },
             action: label(ctx, "bl.toolAct.setTitle", { id: String(r.node.id), title: String(args.title) }, "🏷️ #{id} renommé « {title} »"),
         };
     },
@@ -720,20 +1259,21 @@ const COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
 registerTool({
     name: "set_node_color",
-    description: "Change la couleur d'un nœud (color = cadre, bgcolor = fond). Formats hexadécimaux (#RGB / #RRGGBB / #RRGGBBAA).",
+    description: "Change la couleur d'un nœud (color = cadre, bgcolor = fond). Formats hexadécimaux (#RGB / #RRGGBB / #RRGGBBAA). Pour un nœud dans un subgraph, fournis subgraph.",
     schema: {
         type: "object",
         properties: {
             id: { type: ["number", "string"], description: "Identifiant du nœud." },
             color: { type: "string", description: "Couleur du cadre, ex. '#FF8F00'." },
             bgcolor: { type: "string", description: "Couleur de fond (optionnel)." },
+            subgraph: subgraphProp(),
         },
         required: ["id", "color"],
     },
     mode: "active",
     undoable: true,
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
         const color = String(args.color).trim();
         if (!COLOR_RE.test(color)) {
@@ -749,7 +1289,7 @@ registerTool({
         if (bg !== undefined) node.bgcolor = bg;
         dirtyCanvas(ctx);
         return {
-            data: { node: node.id, color: color, bgcolor: bg !== undefined ? bg : node.bgcolor, previous: previous },
+            data: { node: node.id, color: color, bgcolor: bg !== undefined ? bg : node.bgcolor, previous: previous, subgraph: subgraphScopeInfo(r.subgraph) },
             action: label(ctx, "bl.toolAct.setColor", { name: nodeTitle(node), color: color }, "🎨 {name} recoloré ({color})"),
         };
     },
@@ -757,20 +1297,21 @@ registerTool({
 
 registerTool({
     name: "move_node",
-    description: "Déplace un nœud sur le canvas (coordonnées du graphe).",
+    description: "Déplace un nœud sur le canvas (coordonnées du graphe). Pour le redimensionner, utilise resize_node. Pour un nœud dans un subgraph, fournis subgraph (UUID, nom, ou 'current').",
     schema: {
         type: "object",
         properties: {
             id: { type: ["number", "string"], description: "Identifiant du nœud." },
             x: { type: "number", description: "Position X." },
             y: { type: "number", description: "Position Y." },
+            subgraph: subgraphProp(),
         },
         required: ["id", "x", "y"],
     },
     mode: "active",
     undoable: true,
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
         const x = Number(args.x);
         const y = Number(args.y);
@@ -782,15 +1323,145 @@ registerTool({
         node.pos = [x, y];
         dirtyCanvas(ctx);
         return {
-            data: { node: node.id, pos: [x, y], previous: previous },
+            data: { node: node.id, pos: [x, y], previous: previous, subgraph: subgraphScopeInfo(r.subgraph) },
             action: label(ctx, "bl.toolAct.moveNode", { name: nodeTitle(node), x: String(x), y: String(y) }, "↔️ {name} déplacé ({x}, {y})"),
         };
     },
 });
 
 registerTool({
+    name: "resize_node",
+    description: "Redimensionne un nœud (width/height en unités du graphe ; LiteGraph applique ses tailles minimales — la taille réellement appliquée est renvoyée). Pour un nœud dans un subgraph, fournis subgraph.",
+    schema: {
+        type: "object",
+        properties: {
+            id: { type: ["number", "string"], description: "Identifiant du nœud." },
+            width: { type: "number", description: "Largeur souhaitée (> 0)." },
+            height: { type: "number", description: "Hauteur souhaitée (> 0)." },
+            subgraph: subgraphProp(),
+        },
+        required: ["id", "width", "height"],
+    },
+    mode: "active",
+    undoable: true,
+    async exec(args, ctx) {
+        const r = findNode(ctx, args.id, args);
+        if (r.error) return r;
+        const w = Number(args.width);
+        const h = Number(args.height);
+        if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
+            return { error: label(ctx, "bl.toolErr.invalidValue", { detail: "width/height doivent être des nombres > 0" }, "valeur invalide : {detail}"), code: "invalid_value" };
+        }
+        const node = r.node;
+        const previous = Array.isArray(node.size) ? node.size.slice() : null;
+        try {
+            if (typeof node.setSize === "function") node.setSize([w, h]);
+            else node.size = [w, h];
+        } catch (e) {
+            return { error: label(ctx, "bl.toolErr.exec", { error: (e && e.message) || String(e) }, "échec de l'outil : {error}"), code: "exec_error" };
+        }
+        const size = Array.isArray(node.size) ? [node.size[0], node.size[1]] : [w, h];
+        dirtyCanvas(ctx);
+        return {
+            data: { node: node.id, title: nodeTitle(node), size: size, previous: previous, subgraph: subgraphScopeInfo(r.subgraph) },
+            action: label(ctx, "bl.toolAct.resizeNode", { name: nodeTitle(node), w: String(size[0]), h: String(size[1]) }, "📐 {name} redimensionné ({w}×{h})"),
+        };
+    },
+});
+
+registerTool({
+    name: "set_node_mode",
+    description: "Change le mode d'exécution d'un ou plusieurs nœuds : 'enable' (ALWAYS=0, exécution normale), 'mute' (NEVER=2, nœud ignoré : sa sortie est coupée), 'bypass' (BYPASS=4, nœud court-circuité : ses entrées traversent vers la sortie compatible). Cible EXACTEMENT UNE forme : id (un nœud), nodes ([ids]) ou group (titre/id d'un groupe vu dans list_groups). mode accepte aussi 0/2/4. Pour des nœuds dans un subgraph, fournis subgraph.",
+    schema: {
+        type: "object",
+        properties: {
+            mode: { type: ["string", "number"], description: "'enable' | 'mute' | 'bypass' (ou 0/2/4)." },
+            id: { type: ["number", "string"], description: "Nœud cible (alternative à nodes/group)." },
+            nodes: { type: "array", items: { type: ["number", "string"] }, description: "Liste d'ids de nœuds cibles (alternative à id/group)." },
+            group: { type: ["string", "number"], description: "Titre ou id d'un groupe : applique le mode à TOUS ses nœuds (alternative à id/nodes)." },
+            subgraph: subgraphProp(),
+        },
+        required: ["mode"],
+    },
+    mode: "active",
+    undoable: true,
+    async exec(args, ctx) {
+        const m = normalizeNodeModeValue(args.mode);
+        if (m === null) {
+            return { error: label(ctx, "bl.toolErr.invalidMode", { detail: String(args.mode === undefined || args.mode === null ? "mode manquant" : args.mode) }, "mode invalide : {detail} — attendu enable/mute/bypass (ou 0/2/4)"), code: "invalid_value" };
+        }
+        const hasId = args.id !== undefined && args.id !== null && args.id !== "";
+        const hasNodes = Array.isArray(args.nodes);
+        const hasGroup = args.group !== undefined && args.group !== null && String(args.group).trim() !== "";
+        if ((hasId ? 1 : 0) + (hasNodes ? 1 : 0) + (hasGroup ? 1 : 0) !== 1) {
+            return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "fournir UNE cible exactement : id, nodes ou group" }, "arguments invalides : {detail}"), code: "invalid_args" };
+        }
+        // Scope éventuel (subgraph) : résolu UNE fois pour tout le lot.
+        let scope = null;
+        if (args.subgraph !== undefined && args.subgraph !== null && String(args.subgraph).trim() !== "") {
+            const rs = requireReachableSubgraph(ctx, resolveSubgraphRef(ctx, args.subgraph));
+            if (rs.error) return rs;
+            scope = rs.subgraph;
+        }
+        const targets = [];
+        const seen = new Set();
+        const pushNode = (node) => { if (node && !seen.has(node)) { seen.add(node); targets.push(node); } };
+        if (hasId) {
+            const r = findNode(ctx, args.id, args);
+            if (r.error) return r;
+            pushNode(r.node);
+        } else if (hasNodes) {
+            if (args.nodes.length === 0 || args.nodes.length > 500) {
+                return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "nodes doit contenir 1 à 500 ids" }, "arguments invalides : {detail}"), code: "invalid_args" };
+            }
+            for (const oneId of args.nodes) {
+                const r = findNode(ctx, oneId, args);
+                if (r.error) return r; // erreur atomique : aucun nœud muté avant la validation complète
+                pushNode(r.node);
+            }
+        } else {
+            const graph = scope || getGraph(ctx);
+            const group = findGroup(graph, args.group);
+            if (!group) {
+                return { error: label(ctx, "bl.toolErr.groupNotFound", { ref: String(args.group) }, "groupe '{ref}' introuvable (utilise list_groups)"), code: "group_not_found" };
+            }
+            const groupNodes = recomputeGroupNodes(group);
+            if (!groupNodes.length) {
+                return { error: label(ctx, "bl.toolErr.groupEmpty", { ref: String(group.title || args.group) }, "groupe '{ref}' sans nœud à modifier"), code: "group_empty" };
+            }
+            if (groupNodes.length > 500) {
+                return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "groupe > 500 nœuds" }, "arguments invalides : {detail}"), code: "invalid_args" };
+            }
+            groupNodes.forEach(pushNode);
+        }
+        if (!targets.length) {
+            return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "aucun nœud cible" }, "arguments invalides : {detail}"), code: "invalid_args" };
+        }
+        const results = targets.map((node) => {
+            const previous = node.mode;
+            node.mode = m;
+            try { if (typeof node.updateComputedDisabled === "function") node.updateComputedDisabled(); } catch { /* best-effort */ }
+            return { id: node.id, title: nodeTitle(node), previous: previous, previous_name: nodeModeName(previous) };
+        });
+        // Marque le graphe modifié (même comportement que le menu natif de
+        // groupe ComfyUI), sans casser sur les formes qui ne l'exposent pas.
+        const scopeGraph = scope || getGraph(ctx);
+        try { if (scopeGraph && typeof scopeGraph.change === "function") scopeGraph.change(); } catch { /* best-effort */ }
+        dirtyCanvas(ctx);
+        return {
+            data: {
+                mode: m, mode_name: nodeModeName(m), applied: results.length,
+                nodes: results.slice(0, 100), results_truncated: results.length > 100,
+                subgraph: subgraphScopeInfo(scope),
+            },
+            action: label(ctx, "bl.toolAct.setNodeMode", { count: String(results.length), mode: nodeModeName(m) }, "⚡ {count} nœud(s) → {mode}"),
+        };
+    },
+});
+
+registerTool({
     name: "add_node",
-    description: "Ajoute un nœud du type ComfyUI donné au workflow. Si le type est inconnu, l'erreur invite à vérifier avec get_object_info.",
+    description: "Ajoute un nœud du type ComfyUI donné au workflow (racine, ou DANS un subgraph avec subgraph). Si le type est inconnu, l'erreur invite à vérifier avec get_object_info.",
     schema: {
         type: "object",
         properties: {
@@ -798,6 +1469,7 @@ registerTool({
             x: { type: "number", description: "Position X (optionnel, défaut 0)." },
             y: { type: "number", description: "Position Y (optionnel, défaut 0)." },
             title: { type: "string", description: "Titre personnalisé (optionnel)." },
+            subgraph: subgraphProp(),
         },
         required: ["class_type"],
     },
@@ -812,13 +1484,22 @@ registerTool({
         if (!graph) {
             return { error: label(ctx, "bl.toolErr.noApp", {}, "workflow ComfyUI indisponible (app/graph introuvable)"), code: "no_app" };
         }
+        // Cible : racine par défaut, ou subgraph (id/nom/'current').
+        let targetGraph = graph;
+        let scope = null;
+        if (args.subgraph !== undefined && args.subgraph !== null && String(args.subgraph).trim() !== "") {
+            const rs = requireReachableSubgraph(ctx, resolveSubgraphRef(ctx, args.subgraph));
+            if (rs.error) return rs;
+            targetGraph = rs.subgraph;
+            scope = rs.subgraph;
+        }
         // Forme défensive de création (selon la version LiteGraph/ComfyUI) :
         // hook de test → window.LiteGraph.createNode → graph.createNode.
         let node = null;
         try {
             if (ctx && typeof ctx.createNodeImpl === "function") node = ctx.createNodeImpl(classType, ctx);
             else if (typeof window !== "undefined" && window.LiteGraph && typeof window.LiteGraph.createNode === "function") node = window.LiteGraph.createNode(classType);
-            else if (typeof graph.createNode === "function") node = graph.createNode(classType);
+            else if (typeof targetGraph.createNode === "function") node = targetGraph.createNode(classType);
         } catch { node = null; }
         if (!node) {
             // createNode renvoie null pour un type inconnu ET si l'API n'est
@@ -833,16 +1514,16 @@ registerTool({
         try { node.pos = [Number.isFinite(x) ? x : 0, Number.isFinite(y) ? y : 0]; } catch { /* pos immuable ? tant pis */ }
         if (args.title !== undefined && args.title !== null) { try { node.title = String(args.title); } catch { /* ignore */ } }
         let added = false;
-        try { if (typeof graph.add === "function") { graph.add(node); added = true; } } catch { /* forme inattendue */ }
-        if (!added && Array.isArray(graph.nodes)) {
-            try { graph.nodes.push(node); added = true; } catch { /* ignore */ }
+        try { if (typeof targetGraph.add === "function") { targetGraph.add(node); added = true; } } catch { /* forme inattendue */ }
+        if (!added && Array.isArray(targetGraph.nodes)) {
+            try { targetGraph.nodes.push(node); added = true; } catch { /* ignore */ }
         }
         if (!added) {
             return { error: label(ctx, "bl.toolErr.addFailed", { class: classType }, "création du nœud '{class}' impossible (API LiteGraph indisponible ou type inconnu — vérifie avec get_object_info)"), code: "add_failed" };
         }
         dirtyCanvas(ctx);
         return {
-            data: { id: node.id, type: node.type || classType, title: node.title },
+            data: { id: node.id, type: node.type || classType, title: node.title, subgraph: subgraphScopeInfo(scope) },
             action: label(ctx, "bl.toolAct.addNode", { class: classType, id: String(node.id) }, "➕ {class} ajouté (id {id})"),
         };
     },
@@ -850,27 +1531,32 @@ registerTool({
 
 registerTool({
     name: "remove_node",
-    description: "Supprime un nœud du workflow (les liens connectés sont coupés par l'API du graphe).",
+    description: "Supprime un nœud du workflow (les liens connectés sont coupés par l'API du graphe). Pour un nœud dans un subgraph, fournis subgraph.",
     schema: {
         type: "object",
-        properties: { id: { type: ["number", "string"], description: "Identifiant du nœud à supprimer." } },
+        properties: { id: { type: ["number", "string"], description: "Identifiant du nœud à supprimer." }, subgraph: subgraphProp() },
         required: ["id"],
     },
     mode: "active",
     undoable: true,
     async exec(args, ctx) {
-        const r = findNode(ctx, args.id);
+        const r = findNode(ctx, args.id, args);
         if (r.error) return r;
-        const graph = getGraph(ctx);
+        const rootGraph = getGraph(ctx);
         const node = r.node;
         const title = nodeTitle(node);
+        // Retrait sur le graphe PROPRIÉTAIRE du nœud (racine ou subgraph) :
+        // graph.remove sur la racine avec un nœud de subgraph serait incohérent.
+        const owner = (node && node.graph && typeof node.graph.remove === "function") ? node.graph
+            : (r.subgraph && typeof r.subgraph.remove === "function") ? r.subgraph
+                : rootGraph;
         let removed = false;
         try {
-            if (graph && typeof graph.remove === "function") { graph.remove(node); removed = true; }
+            if (owner && typeof owner.remove === "function") { owner.remove(node); removed = true; }
             else if (node && typeof node.remove === "function") { node.remove(); removed = true; }
-            else if (graph && Array.isArray(graph.nodes)) {
-                const i = graph.nodes.indexOf(node);
-                if (i >= 0) { graph.nodes.splice(i, 1); removed = true; }
+            else if (owner && Array.isArray(owner.nodes)) {
+                const i = owner.nodes.indexOf(node);
+                if (i >= 0) { owner.nodes.splice(i, 1); removed = true; }
             }
         } catch (e) {
             return { error: label(ctx, "bl.toolErr.removeFailed", { error: (e && e.message) || String(e) }, "suppression impossible : {error}"), code: "remove_failed" };
@@ -880,7 +1566,7 @@ registerTool({
         }
         dirtyCanvas(ctx);
         return {
-            data: { removed: node.id, title: title },
+            data: { removed: node.id, title: title, subgraph: subgraphScopeInfo(r.subgraph) },
             action: label(ctx, "bl.toolAct.removeNode", { name: title }, "🗑️ {name} supprimé"),
         };
     },
@@ -888,7 +1574,7 @@ registerTool({
 
 registerTool({
     name: "connect_nodes",
-    description: "Connecte la sortie from_slot du nœud from_id à l'entrée to_input du nœud to_id (to_input = nom d'entrée ou index).",
+    description: "Connecte la sortie from_slot du nœud from_id à l'entrée to_input du nœud to_id (to_input = nom d'entrée ou index). Les DEUX nœuds doivent être dans le même graphe (même subgraph le cas échéant, via subgraph).",
     schema: {
         type: "object",
         properties: {
@@ -896,15 +1582,16 @@ registerTool({
             from_slot: { type: "number", description: "Index de la sortie du nœud source." },
             to_id: { type: ["number", "string"], description: "Nœud cible." },
             to_input: { type: ["number", "string"], description: "Nom (ex. 'model') ou index de l'entrée du nœud cible." },
+            subgraph: subgraphProp(),
         },
         required: ["from_id", "from_slot", "to_id", "to_input"],
     },
     mode: "active",
     undoable: true,
     async exec(args, ctx) {
-        const rFrom = findNode(ctx, args.from_id);
+        const rFrom = findNode(ctx, args.from_id, args);
         if (rFrom.error) return rFrom;
-        const rTo = findNode(ctx, args.to_id);
+        const rTo = findNode(ctx, args.to_id, args);
         if (rTo.error) return rTo;
         const nodeOut = rFrom.node;
         const nodeIn = rTo.node;
@@ -937,6 +1624,7 @@ registerTool({
                 connected: true, link: link === undefined ? null : link,
                 from: { id: nodeOut.id, slot: fromSlot, title: nodeTitle(nodeOut) },
                 to: { id: nodeIn.id, input: typeof args.to_input === "string" ? args.to_input : toInput, title: nodeTitle(nodeIn) },
+                subgraph: subgraphScopeInfo(rFrom.subgraph),
             },
             action: label(ctx, "bl.toolAct.connect", { from: nodeTitle(nodeOut), to: nodeTitle(nodeIn) }, "🔗 {from} → {to}"),
         };
@@ -945,7 +1633,7 @@ registerTool({
 
 registerTool({
     name: "disconnect_nodes",
-    description: "Déconnecte : (from_id + from_slot [+ to_id]) coupe sur la sortie donnée, sinon (to_id + to_input) coupe l'entrée donnée du nœud cible.",
+    description: "Déconnecte : (from_id + from_slot [+ to_id]) coupe sur la sortie donnée, sinon (to_id + to_input) coupe l'entrée donnée du nœud cible. Pour des nœuds dans un subgraph, fournis subgraph.",
     schema: {
         type: "object",
         properties: {
@@ -953,6 +1641,7 @@ registerTool({
             from_slot: { type: "number", description: "Index de sortie du nœud source." },
             to_id: { type: ["number", "string"], description: "Nœud cible." },
             to_input: { type: ["number", "string"], description: "Nom ou index de l'entrée à couper sur le nœud cible." },
+            subgraph: subgraphProp(),
         },
         required: [],
     },
@@ -966,7 +1655,7 @@ registerTool({
         }
         let disconnected = 0;
         if (hasFrom) {
-            const rFrom = findNode(ctx, args.from_id);
+            const rFrom = findNode(ctx, args.from_id, args);
             if (rFrom.error) return rFrom;
             const nodeOut = rFrom.node;
             const slot = Number(args.from_slot);
@@ -974,7 +1663,7 @@ registerTool({
                 return { error: label(ctx, "bl.toolErr.invalidArgs", { detail: "sortie " + String(args.from_slot) + " inexistante sur #" + String(nodeOut.id) }, "arguments invalides : {detail}"), code: "invalid_args" };
             }
             if (hasTo) {
-                const rTo = findNode(ctx, args.to_id);
+                const rTo = findNode(ctx, args.to_id, args);
                 if (rTo.error) return rTo;
                 try { if (nodeOut.disconnectOutput(slot, rTo.node)) disconnected++; }
                 catch (e) { return { error: label(ctx, "bl.toolErr.disconnectFailed", { error: (e && e.message) || String(e) }, "déconnexion impossible : {error}"), code: "disconnect_failed" }; }
@@ -984,7 +1673,7 @@ registerTool({
                 catch (e) { return { error: label(ctx, "bl.toolErr.disconnectFailed", { error: (e && e.message) || String(e) }, "déconnexion impossible : {error}"), code: "disconnect_failed" }; }
             }
         } else {
-            const rTo = findNode(ctx, args.to_id);
+            const rTo = findNode(ctx, args.to_id, args);
             if (rTo.error) return rTo;
             const nodeIn = rTo.node;
             let toInput = args.to_input;
@@ -1009,7 +1698,7 @@ registerTool({
         dirtyCanvas(ctx);
         return {
             data: { disconnected: disconnected },
-            action: label(ctx, "bl.toolAct.disconnect", { from: nodeTitle(getNodeSafe(ctx, args.from_id)), to: nodeTitle(getNodeSafe(ctx, args.to_id)) }, "✂️ {from} ✕ {to}"),
+            action: label(ctx, "bl.toolAct.disconnect", { from: nodeTitle(getNodeSafe(ctx, args.from_id, args)), to: nodeTitle(getNodeSafe(ctx, args.to_id, args)) }, "✂️ {from} ✕ {to}"),
         };
     },
 });

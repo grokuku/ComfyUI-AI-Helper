@@ -2965,17 +2965,19 @@ const Blobby = {
             msgs.pop();
         }
         var shellOn = this.getShellAccess();
+        // Liste DYNAMIQUE des outils réellement envoyés (p.tools = schémas déjà
+        // filtrés par mode + accès shell) : plus de liste codée en dur à
+        // maintenir quand le registre blobby_tools.js évolue (subgraphs, modes…).
+        var toolNames = (Array.isArray(p.tools) ? p.tools : [])
+            .map(function (tool) { return tool && tool.function ? tool.function.name : null; })
+            .filter(function (name) { return !!name; });
         var instruction = p.character + (p.memoryBlock || '') + '\n\n'
             + 'Humeur actuelle : ' + p.moodDesc + '\n'
             + '(Ton "Blobby" doit refletter cette humeur)\n\n'
             + 'Workflow actuel :\n' + p.workflowDesc + '\n\n'
             + this._modeInstruction() + '\n'
             + 'Tu disposes d\'OUTILS (schémas fournis avec la requête) pour lire,\n'
-            + 'modifier et exécuter le workflow ComfyUI : describe_workflow, list_nodes, get_node_by_id,\n'
-            + 'get_node_widgets, get_node_widget, get_node_connections, get_object_info, get_queue_status,\n'
-            + 'get_execution_status, set_widget_value, set_node_title, set_node_color, move_node, add_node,\n'
-            + 'remove_node, connect_nodes, disconnect_nodes, queue_prompt, interrupt'
-            + (shellOn ? ', run_shell' : '') + '.\n'
+            + 'modifier et exécuter le workflow ComfyUI : ' + toolNames.join(', ') + '.\n'
             + '- Pour agir, ÉMETS un tool_call (ne décris pas l\'action, fais-la).\n'
             + '- Les résultats d\'outils te seront renvoyés : analyse-les, enchaîne si nécessaire, puis\n'
             + '  donne ta réponse finale en Markdown.\n'

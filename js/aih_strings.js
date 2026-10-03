@@ -804,6 +804,23 @@ import "./aih_i18n.js";
         "bl.toolErr.shellUnreachable": "exécution shell impossible : {error}",
         "bl.toolAct.runShell": "🖥️ {command}",
 
+        /* Subgraphs / position / modes (outils Blobby — Subgraph Blueprints) */
+        "bl.toolErr.noCanvas": "canvas ComfyUI indisponible (app.canvas introuvable)",
+        "bl.toolErr.subgraphNotFound": "subgraph '{ref}' introuvable (utilise list_subgraphs pour voir les subgraphs disponibles)",
+        "bl.toolErr.subgraphAmbiguous": "subgraph '{ref}' ambigu — plusieurs correspondances : {ids} (précise l'UUID)",
+        "bl.toolErr.subgraphNotOpen": "aucun subgraph n'est ouvert dans le canvas (précise un id ou un nom)",
+        "bl.toolErr.subgraphUnreachable": "subgraph '{ref}' non instancié dans le workflow (aucun nœud SubgraphNode) — action impossible : il n'est pas couvert par l'annulation",
+        "bl.toolErr.subgraphOpenFailed": "ouverture du subgraph impossible : {error}",
+        "bl.toolErr.subgraphCloseFailed": "retour au graphe racine impossible : {error}",
+        "bl.toolErr.nodeNotFoundInSubgraph": "nœud #{id} introuvable dans le subgraph « {name} » (#{sg})",
+        "bl.toolErr.groupNotFound": "groupe '{ref}' introuvable (utilise list_groups)",
+        "bl.toolErr.groupEmpty": "groupe '{ref}' sans nœud à modifier",
+        "bl.toolErr.invalidMode": "mode invalide : {detail} — attendu enable/mute/bypass (ou 0/2/4)",
+        "bl.toolAct.setNodeMode": "⚡ {count} nœud(s) → {mode}",
+        "bl.toolAct.resizeNode": "📐 {name} redimensionné ({w}×{h})",
+        "bl.toolAct.openSubgraph": "📂 Subgraph « {name} » ouvert",
+        "bl.toolAct.closeSubgraph": "📂 Retour au graphe racine",
+
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
         "iv.operationProcessed": "Opération traitée.",
         "iv.fsClose": "Fermer (Échap)",
@@ -2076,6 +2093,23 @@ import "./aih_i18n.js";
         "bl.toolErr.shellFailed": "shell command failed: {detail}",
         "bl.toolErr.shellUnreachable": "shell execution impossible: {error}",
         "bl.toolAct.runShell": "🖥️ {command}",
+
+        /* Subgraphs / position / modes (Blobby tools — Subgraph Blueprints) */
+        "bl.toolErr.noCanvas": "ComfyUI canvas unavailable (app.canvas not found)",
+        "bl.toolErr.subgraphNotFound": "subgraph '{ref}' not found (use list_subgraphs to list available subgraphs)",
+        "bl.toolErr.subgraphAmbiguous": "subgraph '{ref}' is ambiguous — multiple matches: {ids} (provide the UUID)",
+        "bl.toolErr.subgraphNotOpen": "no subgraph is open in the canvas (provide an id or name)",
+        "bl.toolErr.subgraphUnreachable": "subgraph '{ref}' is not instantiated in the workflow (no SubgraphNode) — action refused: it is not covered by undo",
+        "bl.toolErr.subgraphOpenFailed": "opening the subgraph failed: {error}",
+        "bl.toolErr.subgraphCloseFailed": "returning to the root graph failed: {error}",
+        "bl.toolErr.nodeNotFoundInSubgraph": "node #{id} not found in subgraph \"{name}\" (#{sg})",
+        "bl.toolErr.groupNotFound": "group '{ref}' not found (use list_groups)",
+        "bl.toolErr.groupEmpty": "group '{ref}' has no node to change",
+        "bl.toolErr.invalidMode": "invalid mode: {detail} — expected enable/mute/bypass (or 0/2/4)",
+        "bl.toolAct.setNodeMode": "⚡ {count} node(s) → {mode}",
+        "bl.toolAct.resizeNode": "📐 {name} resized ({w}×{h})",
+        "bl.toolAct.openSubgraph": "📂 Subgraph \"{name}\" opened",
+        "bl.toolAct.closeSubgraph": "📂 Back to the root graph",
 
         /* Image Viewer (holaf_image_viewer.js + image_viewer/*) */
         "iv.operationProcessed": "Operation processed.",
