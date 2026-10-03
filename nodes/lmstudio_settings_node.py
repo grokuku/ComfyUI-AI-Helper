@@ -51,16 +51,15 @@ class AIHLMStudioSettingsNode:
 
 # === ComfyUI node registration =============================================
 # Per-file registry read by the extension's dynamic loader. Canonical key
-# follows the AIH naming convention (AIH<PascalCase>, no Node suffix);
-# the legacy pre-fusion key stays as an alias pointing to the SAME class so
-# existing workflows keep loading. Legacy aliases are never purged.
+# follows the AIH naming convention (AIH<PascalCase>, no Node suffix).
+# Legacy alias keys were removed (user decision): /api/object_info exposes
+# one entry PER KEY, so a second alias key made every node appear TWICE in
+# the Add Node search. Old workflows referencing the removed keys must be
+# redone.
 NODE_CLASS_MAPPINGS = {
     "AIHLMStudioSettings": AIHLMStudioSettingsNode,
-    # Legacy alias - never purge.
-    "AIHLMStudioSettingsNode": AIHLMStudioSettingsNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AIHLMStudioSettings": "AIH LMStudio Settings",
-    "AIHLMStudioSettingsNode": "AIH LMStudio Settings",
 }

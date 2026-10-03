@@ -22,11 +22,11 @@ const t = (key, params) => {
  *   - Textarea resultat
  */
 (function() {
-    // Accepted ComfyUI class keys for this node: canonical post-rename key plus
-    // the legacy pre-rename alias. The Python side registers BOTH (legacy alias
-    // kept so old workflows — node.type = "AIHEnhanceNode" — still load), and
-    // beforeRegisterNodeDef fires once per definition, so both must match.
-    const NODE_TYPES = ["AIHPromptEnhancer", "AIHEnhanceNode"];
+    // ComfyUI class key of this node. The legacy pre-rename alias was removed
+    // from the Python registry (user decision): one key per node, so the
+    // Add Node search lists it once. Old workflows referencing it must be
+    // redone.
+    const NODE_TYPES = ["AIHPromptEnhancer"];
 
     function aihBoot() {
         // Les fichiers d'extension ComfyUI ne sont pas chargés dans un ordre

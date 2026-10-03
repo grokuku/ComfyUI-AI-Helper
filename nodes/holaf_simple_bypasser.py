@@ -16,7 +16,7 @@
 """
 HolafSimpleBypasser — Reactive bypasser node.
 
-Unlike HolafRemote (which *initiates* group synchronization), this node is a
+Unlike AIH Remote (which *initiates* group synchronization), this node is a
 *reactive* bypasser: it listens for group state changes pushed by the JS layer
 via the ``syncGroupState`` mechanism and never initiates synchronization itself.
 
@@ -78,17 +78,16 @@ class HolafSimpleBypasser:
         return {}
 
 # === ComfyUI node registration =============================================
-# Per-file registry read by the extension's dynamic loader. Canonical keys
-# follow the AIH naming convention (AIH<PascalCase>, no Node suffix);
-# legacy pre-fusion keys stay as aliases pointing to the SAME class so
-# existing workflows keep loading. Legacy aliases are never purged.
+# Per-file registry read by the extension's dynamic loader. Canonical key
+# follows the AIH naming convention (AIH<PascalCase>, no Node suffix).
+# Legacy alias keys were removed (user decision): /api/object_info exposes
+# one entry PER KEY, so a second alias key made every node appear TWICE in
+# the Add Node search. Old workflows referencing the removed keys must be
+# redone.
 NODE_CLASS_MAPPINGS = {
     "AIHSimpleBypasser": HolafSimpleBypasser,
-    # Legacy alias - never purge.
-    "HolafSimpleBypasser": HolafSimpleBypasser,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AIHSimpleBypasser": "AIH Simple Bypasser",
-    "HolafSimpleBypasser": "AIH Simple Bypasser",
 }

@@ -144,11 +144,10 @@ function debounce(fn, delay) {
 // Enregistrement du widget
 // ========================
 
-// Accepted ComfyUI class keys for this node: canonical post-rename key plus
-// the legacy pre-rename alias. The Python side registers BOTH (legacy alias
-// kept so old workflows — node.type = "AIHKeywordsNode" — still load), and
-// beforeRegisterNodeDef fires once per definition, so both must match.
-const NODE_TYPES = ["AIHKeywords", "AIHKeywordsNode"];
+// ComfyUI class key of this node. The legacy pre-rename alias was removed
+// from the Python registry (user decision): one key per node, so the Add Node
+// search lists it once. Old workflows referencing it must be redone.
+const NODE_TYPES = ["AIHKeywords"];
 
 // Polling auto-contenu pour attendre window.app (évite la dépendance
 // à AIH.waitForApp qui peut charger après ce fichier)

@@ -7,8 +7,9 @@
 //   2. parité i18n FR/EN des clés `sm.*` (dont `sm.saveToServer`) ;
 //   3. widget js/aih_save_media_widget.js : renommage du label via i18n,
 //      grisage de `base_path` quand le toggle est ON, réactivation sinon ;
-//   4. hooks : les deux clés node (AIHSaveMedia + alias HolafSaveMedia) sont
-//      branchées ; un node non-AIH n'est PAS modifié (contrôle négatif).
+//   4. hook : la clé canonique AIHSaveMedia est branchée ; un node non-AIH
+//      n'est PAS modifié (contrôle négatif), l'ancien alias retiré n'est plus
+//      branché.
 //
 // Usage : node js/test_aih_save_media.mjs
 // Code de sortie : 0 = PASS, 1 = FAIL (aucune dépendance jsdom requise).
@@ -146,11 +147,11 @@ await capturedExt.beforeRegisterNodeDef(nodeType, { name: "AIHSaveMedia" });
 assert.strictEqual(typeof nodeType.prototype.onNodeCreated, "function", "AIHSaveMedia branché");
 ok("AIHSaveMedia branché");
 
-// Alias hérité.
-const legacyType = { prototype: {} };
-await capturedExt.beforeRegisterNodeDef(legacyType, { name: "HolafSaveMedia" });
-assert.strictEqual(typeof legacyType.prototype.onNodeCreated, "function", "HolafSaveMedia branché");
-ok("HolafSaveMedia (alias) branché");
+// Contrôle négatif : l'ancien alias retiré (HolafSaveMedia) n'est plus branché.
+const removedAliasType = { prototype: {} };
+await capturedExt.beforeRegisterNodeDef(removedAliasType, { name: "HolafSaveMedia" });
+assert.strictEqual(removedAliasType.prototype.onNodeCreated, undefined, "ancien alias HolafSaveMedia NON branché (retiré)");
+ok("ancien alias HolafSaveMedia non branché (retiré)");
 
 // Contrôle négatif : node étranger NON modifié.
 const otherType = { prototype: {} };

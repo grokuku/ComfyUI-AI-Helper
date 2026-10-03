@@ -1,8 +1,7 @@
 /*
  * Copyright (C) 2025 Holaf
- * Compact custom UI for the AIH Resolution Preset v2 node (ComfyUI keys:
- * canonical "AIHResolutionPresetV2" + legacy pre-rename alias
- * "HolafResolutionPresetV2", see NODE_TYPES).
+ * Compact custom UI for the AIH Resolution Preset v2 node (ComfyUI key:
+ * "AIHResolutionPresetV2", see NODE_TYPES).
  *
  * The 7 real Python widgets stay in this.widgets (never destroyed): they
  * carry the workflow serialization. A single DOM widget (serialize:false)
@@ -12,10 +11,10 @@
 
 import { app } from "../../scripts/app.js";
 
-// Accepted ComfyUI class keys for this node: canonical post-rename key plus
-// legacy pre-rename alias. The Python side registers BOTH so old workflows
-// keep loading; beforeRegisterNodeDef fires once per definition.
-const NODE_TYPES = ["AIHResolutionPresetV2", "HolafResolutionPresetV2"];
+// ComfyUI class key of this node. The legacy pre-rename alias was removed
+// from the Python registry (user decision): one key per node — old workflows
+// referencing it must be redone.
+const NODE_TYPES = ["AIHResolutionPresetV2"];
 
 // Options mirrored from the Python INPUT_TYPES.
 const MODEL_OPTIONS = ["SD1.5", "SDXL", "FLUX", "Z-Image", "Ideogram4", "Krea2 Turbo", "Nucleus-Image", "Qwen", "Megapixels"];

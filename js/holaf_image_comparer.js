@@ -672,16 +672,15 @@ class HolafImageComparer extends HolafBaseServerNode {
 }
 // Display title aligned with the Python NODE_DISPLAY_NAME_MAPPINGS.
 HolafImageComparer.title = "AIH Image Comparer";
-// Canonical post-rename ComfyUI key. NOTE: the Python side ALSO registers the
-// legacy pre-rename key ("HolafImageComparer") so existing workflows — which
-// serialize node.type = "HolafImageComparer" — keep loading. Both server
-// definitions must be hooked: see IMAGE_COMPARER_TYPES below.
+// ComfyUI class key of this node. The legacy pre-rename key was removed from
+// the Python registry (user decision): one key per node. Old workflows
+// serializing the removed key must be redone.
 HolafImageComparer.type = "AIHImageComparer";
 HolafImageComparer.comfyClass = "AIHImageComparer";
 HolafImageComparer["@comparer_mode"] = { type: "combo", values: ["Slide", "Click"] };
 
-// Accepted ComfyUI class keys for this node: canonical "AIH*" + legacy "Holaf*".
-const IMAGE_COMPARER_TYPES = ["AIHImageComparer", "HolafImageComparer"];
+// ComfyUI class key of this node.
+const IMAGE_COMPARER_TYPE = "AIHImageComparer";
 
 
 // --- ComfyUI Integration ---
@@ -713,16 +712,11 @@ app.registerExtension(holaf);
 logger.log(LogLevel.INFO, "Holaf extension registered.");
 
 
-// Register the specific override for the HolafImageComparer node.
+// Register the specific override for the AIH Image Comparer node.
 app.registerExtension({
     name: "AIH.ImageComparer.Override",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        // Match BOTH the canonical key ("AIHImageComparer") and the legacy
-        // pre-rename key ("HolafImageComparer"): beforeRegisterNodeDef fires
-        // once per server definition, and hooking both registrations is what
-        // lets old workflows (node.type = "HolafImageComparer") still get the
-        // comparer widget instead of the default ComfyUI implementation.
-        if (IMAGE_COMPARER_TYPES.includes(nodeData.name)) {
+        if (nodeData.name === IMAGE_COMPARER_TYPE) {
             HolafImageComparer.setUp(nodeType, nodeData);
         }
     },

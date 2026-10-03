@@ -279,12 +279,16 @@ class HolafRemoteComparerNode:
 
         return {"ui": {"holaf_payload": [payload]}, "result": (input_1, input_2)}
 
+# === ComfyUI node registration =============================================
+# Per-file registry read by the extension's dynamic loader. Canonical key
+# follows the AIH naming convention (AIH<PascalCase>, no Node suffix).
+# Legacy alias keys were removed (user decision): /api/object_info exposes
+# one entry PER KEY, so a second alias key made every node appear TWICE in
+# the Add Node search. Old workflows referencing the removed keys must be
+# redone.
 NODE_CLASS_MAPPINGS = {
     "AIHRemoteComparer": HolafRemoteComparerNode,
-    # Legacy alias - never purge.
-    "HolafRemoteComparer": HolafRemoteComparerNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AIHRemoteComparer": "AIH Remote Comparer",
-    "HolafRemoteComparer": "AIH Remote Comparer",
 }

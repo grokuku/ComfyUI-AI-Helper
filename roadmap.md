@@ -54,7 +54,7 @@ App Android connectée à un serveur externe relais permettant de :
 
 ### Module 3 — Comparer remote
 
-* Reprise de la node comparer existante (`HolafRemoteComparer`), adaptée mobile :
+* Reprise de la node comparer existante (`AIHRemoteComparer`), adaptée mobile :
   * comparaison A/B par geste slide/swipe,
   * mise à jour temps réel quand une nouvelle génération arrive.
 

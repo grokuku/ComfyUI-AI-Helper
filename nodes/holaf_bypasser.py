@@ -49,17 +49,16 @@ class HolafBypasser:
             return (alternative,)
 
 # === ComfyUI node registration =============================================
-# Per-file registry read by the extension's dynamic loader. Canonical keys
-# follow the AIH naming convention (AIH<PascalCase>, no Node suffix);
-# legacy pre-fusion keys stay as aliases pointing to the SAME class so
-# existing workflows keep loading. Legacy aliases are never purged.
+# Per-file registry read by the extension's dynamic loader. Canonical key
+# follows the AIH naming convention (AIH<PascalCase>, no Node suffix).
+# Legacy alias keys were removed (user decision): /api/object_info exposes
+# one entry PER KEY, so a second alias key made every node appear TWICE in
+# the Add Node search. Old workflows referencing the removed keys must be
+# redone.
 NODE_CLASS_MAPPINGS = {
     "AIHBypasser": HolafBypasser,
-    # Legacy alias - never purge.
-    "HolafBypasser": HolafBypasser,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AIHBypasser": "AIH Bypasser",
-    "HolafBypasser": "AIH Bypasser",
 }

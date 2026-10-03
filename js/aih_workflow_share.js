@@ -564,10 +564,8 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     // Upscale
     "UpscaleModelLoader":      { idx: 0, cat: "upscale" },
     "ImageUpscaleWithModel":   { idx: 0, cat: "upscale" },
-    // Holaf/AIH upscale node: canonical post-rename key + legacy pre-rename
-    // alias (Python registers BOTH so old workflows keep loading).
+    // AIH upscale node (canonical key; the legacy alias was removed).
     "AIHUpscale":              { idx: 0, cat: "upscale" },
-    "UpscaleImageHolaf":      { idx: 0, cat: "upscale" },
     // GLIGEN
     "GLIGENLoader":            { idx: 0, cat: "gligen" },
     // Hypernetwork

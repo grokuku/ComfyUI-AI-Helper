@@ -1,10 +1,10 @@
 import { app } from "../../scripts/app.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
 
-// Accepted ComfyUI class keys for this node: canonical post-rename key plus
-// legacy pre-rename alias (the Python side registers BOTH so old workflows
-// keep loading). beforeRegisterNodeDef fires once per definition.
-const NODE_TYPES = ["AIHToText", "HolafToText"];
+// ComfyUI class key of this node. The legacy pre-rename alias was removed
+// from the Python registry (user decision): one key per node, so the Add Node
+// search lists it once. Old workflows referencing it must be redone.
+const NODE_TYPES = ["AIHToText"];
 
 app.registerExtension({
     name: "AIH.ToText",

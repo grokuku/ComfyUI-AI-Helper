@@ -22,9 +22,11 @@ import "./aih_strings.js";
 
     const AIH = (window.AIH = window.AIH || {});
 
-    // Clés ComfyUI acceptées : clé canonique post-rename + alias hérité.
-    // Les deux sont enregistrées côté Python, donc les deux doivent matcher.
-    const NODE_TYPES = ["AIHSaveMedia", "HolafSaveMedia"];
+    // Clé ComfyUI du node. L'alias hérité a été retiré de l'enregistrement
+    // Python (décision utilisateur) : une seule clé par node, donc une seule
+    // entrée « Add Node ». Les vieux workflows référençant l'ancienne clé
+    // sont à refaire.
+    const NODE_TYPES = ["AIHSaveMedia"];
     const TOGGLE_NAME = "save_to_server";
     const BASE_PATH_NAME = "base_path";
 

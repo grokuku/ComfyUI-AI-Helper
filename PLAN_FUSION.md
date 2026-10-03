@@ -113,7 +113,7 @@ Zéro collision de noms constatée lors de l'analyse préalable (préfixes `Hola
 | 3.4 | **Enregistrement des nodes CUI-Holaf** | Utils charge dynamiquement chaque fichier de `nodes/` en lisant `module.NODE_CLASS_MAPPINGS` par fichier, alors que CUI-Holaf utilise un registre central dans son `__init__.py`. Deux options au choix de l'implémenteur : (a) adapter les 24 fichiers pour exposer chacun leur propre `NODE_CLASS_MAPPINGS`, ou (b) conserver/intégrer leur registre central. **Le choix retenu devra être documenté dans le code ou dans ce document.** |
 | 3.5 | **`__init__.py` racine AIH (~1812 lignes)** | **Refactoring obligatoire** : suppression du chargement exotique via `sys.modules` pré-enregistrés (~35 routes HTTP inline), standardisation des imports, conservation du préfixe `/aih/*` des routes. |
 | 3.6 | **Routes HTTP** | Disjointes après vérification : `/holaf/*` (Utils/CUI-Holaf) vs `/aih/*` (AIH). Aucun changement de namespace requis. |
-| 3.7 | **Normalisation des noms de nodes** | Marque unique **AIH** : clés de mapping `AIH<PascalCase>`, labels préfixés « AIH », arbre de catégories racine `AIH/`, alias legacy obligatoires — détail complet ci-dessous. |
+| 3.7 | **Normalisation des noms de nodes** | Marque unique **AIH** : clés de mapping `AIH<PascalCase>`, labels préfixés « AIH », arbre de catégories racine `AIH/`. Alias legacy d'abord conservés puis **retirés** (décision utilisateur — détail ci-dessous). |
 | 3.8 | **Dossiers web JS** | Différents entre les deux sources (aucun conflit). Utils hardcode `/extensions/ComfyUI-Holaf-Utilities/` dans son JS : valide uniquement tant que le dé-hardcodage (§3.11) n'est pas réalisé ; après dé-hardcodage, ces chemins deviennent dynamiques (dérivés de l'URL du script chargé) et survivent au renommage du dossier. |
 | 3.9 | **Chemins de persistance** | Sans collision : `user/default/aih/` (AIH) vs `.cache/` (Utils). Aucune migration nécessaire. **Précision post-chantier A (Phase 2)** : après fusion, le pack écrit donc dans DEUX racines utilisateur distinctes — `user/default/aih/` pour tout le socle AIH (credentials.json, openai_keys.json, aih_elements_presets.json, data/aihelper.db — conservé tel quel pour compatibilité des données AI-Helper existantes, cf. `aih/store.py` / `aih/credentials.py`) et `user/default/AI-Helper/` pour les sous-systèmes Holaf (`holaf_user_data_manager`, ROOT_NAME="AI-Helper"). Noms distincts, aucune collision même sur filesystem insensible à la casse. ⚠️ Anomalie historique préservée : les refs music3 mirroirées par `sync_engine.sync_music3_local()` vivent sous `user/default/aihelper/data/music3/` (héritage de l'ancien layout pré-`aih/` d'AI-Helper), PAS sous `user/default/aih/` — ne pas « corriger » sans migration des données utilisateurs. Une unification éventuelle des deux racines est différée. |
 | 3.10 | **Double installation** | Vérifier qu'après migration, aucun ancien repo (CUI-Holaf ou l'extension ComfyUI de l'ancien monorepo AI-Helper copiée séparément) ne reste installé en parallèle dans `custom_nodes/` → risque de double enregistrement des nodes/routes. |
@@ -194,11 +194,23 @@ Nodes ex-AIH :
 | `AIHOpenAISettingsNode` | `AIHOpenAISettings` |
 | `AIHMusicNode` | `AIHMusic` |
 
-#### Mécanisme d'alias legacy (obligatoire)
+#### Mécanisme d'alias legacy — RETIRÉ (décision utilisateur, 2026)
 
-- Chaque ancienne clé doit **continuer d'exister dans `NODE_CLASS_MAPPINGS`** et pointer vers la **même classe** que sa nouvelle clé : les vieux workflows restent compatibles indéfiniment.
-- La table d'alias **n'est jamais purgée**.
-- Les nouveaux workflows sauvegardent les nouvelles clés.
+- **MISE À JOUR** : les 34 clés d'alias legacy listées dans les deux tables
+  ci-dessus ont été **supprimées** de `NODE_CLASS_MAPPINGS` /
+  `NODE_DISPLAY_NAME_MAPPINGS` (une seule clé par node, la canonique `AIH…`).
+- Raison : `/api/object_info` expose une entrée PAR CLÉ ; deux clés partageant
+  le même `display_name` faisaient apparaître chaque node **DEUX FOIS** dans la
+  recherche « Add Node » (mêmes nom, catégorie et badge de source).
+- Décision utilisateur : la compatibilité de chargement des anciens workflows
+  (qui référencent les clés supprimées) n'est **pas** conservée — ils sont à
+  refaire. Les tables de renommage ci-dessus restent comme trace historique ;
+  le mécanisme d'alias décrit dans les versions antérieures de ce document
+  n'est plus d'actualité.
+- Garde-fou : `tests/test_node_registration_unique.py` (une clé par fichier de
+  node, aucun `display_name` partagé par deux clés, aucune des 34 clés d'alias
+  ne peut réapparaître, zéro référence entre guillemets dans le JS de
+  production) + contrôles négatifs par mutation.
 
 #### Protections anti-casse
 

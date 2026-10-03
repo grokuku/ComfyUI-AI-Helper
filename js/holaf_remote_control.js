@@ -12,38 +12,35 @@ const MODE_MUTE = 2;
 const MODE_BYPASS = 4;
 
 // ---------------------------------------------------------------------------
-// Node-type keys — canonical "AIH*" forms + legacy "Holaf*" aliases.
+// Node-type keys — canonical "AIH*" forms only.
 //
-// Since the AIH rename, the Python side registers every node of this family
-// TWICE: under its new canonical key (e.g. "AIHBypasser") and under its old
-// pre-rename key (e.g. "HolafBypasser") so that existing workflows — which
-// serialize the OLD key into node.type — keep loading. Consequently BOTH
-// definitions reach beforeRegisterNodeDef, and every type check below (on
-// nodeData.name or node.type) MUST accept both spellings. Always go through
-// isFamilyType()/ALL_FAMILY_TYPES instead of comparing raw strings.
-const NODE_TYPE_ALIASES = {
-    bypasser:       ["AIHBypasser",       "HolafBypasser"],
-    groupBypasser:  ["AIHGroupBypasser",  "HolafGroupBypasser"],
-    remote:         ["AIHRemote",         "HolafRemote"],
-    remoteSelector: ["AIHRemoteSelector", "HolafRemoteSelector"],
-    simpleBypasser: ["AIHSimpleBypasser", "HolafSimpleBypasser"],
+// The legacy pre-rename "Holaf*" aliases were removed from the Python
+// registry (user decision): /api/object_info exposes one entry PER KEY, so a
+// second alias key made every node appear TWICE in the Add Node search. Old
+// workflows that serialize the removed keys must be redone. All type checks
+// below (on nodeData.name or node.type) go through isFamilyType().
+const FAMILY_TYPES_BY_GROUP = {
+    bypasser:       "AIHBypasser",
+    groupBypasser:  "AIHGroupBypasser",
+    remote:         "AIHRemote",
+    remoteSelector: "AIHRemoteSelector",
+    simpleBypasser: "AIHSimpleBypasser",
 };
 
-/** Every accepted ComfyUI class key of the family, canonical + legacy. */
-const ALL_FAMILY_TYPES = Object.values(NODE_TYPE_ALIASES).flat();
+/** Every ComfyUI class key of the family. */
+const ALL_FAMILY_TYPES = Object.values(FAMILY_TYPES_BY_GROUP);
 
 /** Family groups that REACT to syncGroupState (the Selector drives others but is not driven). */
 const SYNC_GROUPS = ["bypasser", "remote", "groupBypasser", "simpleBypasser"];
 
 /**
- * True if `t` is one of the family's ComfyUI class keys, accepting both the
- * canonical "AIH*" form and the legacy "Holaf*" form.
+ * True if `t` is one of the family's ComfyUI class keys.
  * @param {string} t value of nodeData.name or node.type to test
- * @param {string} [group] optional family group (NODE_TYPE_ALIASES key) to restrict the match
+ * @param {string} [group] optional family group (FAMILY_TYPES_BY_GROUP key) to restrict the match
  */
 function isFamilyType(t, group) {
-    const aliases = group ? NODE_TYPE_ALIASES[group] : null;
-    return Array.isArray(aliases) ? aliases.includes(t) : ALL_FAMILY_TYPES.includes(t);
+    const expected = group ? FAMILY_TYPES_BY_GROUP[group] : null;
+    return expected ? t === expected : ALL_FAMILY_TYPES.includes(t);
 }
 
 // IS_SYNCING prevents recursive group state synchronization.
@@ -55,7 +52,7 @@ app.registerExtension({
     name: "AIH.RemoteControl",
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        // Canonical + legacy keys both arrive here (see NODE_TYPE_ALIASES).
+        // Family keys only (see FAMILY_TYPES_BY_GROUP).
         if (isFamilyType(nodeData.name)) {
 
             // --- 1. SETUP ON CREATION ---
@@ -483,7 +480,7 @@ function holafHandlePromotedChange(subgraphNode, widgetName, newValue) {
     const subgraph = subgraphNode.subgraph;
     if (!subgraph) return;
 
-    // Canonical + legacy keys (see NODE_TYPE_ALIASES).
+    // Family keys only (see FAMILY_TYPES_BY_GROUP).
 
     // Each promoted input keeps a reference to its SubgraphInput slot, whose
     // linkIds point at interior links inside the subgraph. Resolve them to
