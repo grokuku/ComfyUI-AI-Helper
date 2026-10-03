@@ -217,17 +217,26 @@ function _blobbyEnsureChatCSS() {
         '.blobby-action-row > .blobby-msg[data-role="action"] {',
         '  align-self: auto; margin: 0; min-width: 0; max-width: 100%;',
         '}',
-        // Indicateur d'ACTIVITÉ du tour : barre HORS de la zone de défilement
-        // (le texte streame PENDANT que l'indicateur reste visible). Animé par
-        // 3 points qui pulsent ; visible tant qu'un tour est actif (classe .on).
+        // Barre d'ACTIVITÉ + COMPTEUR DE TOKENS : TOUJOURS affichée, HORS de la
+        // zone de défilement des messages (le texte streame PENDANT que la
+        // barre reste visible). Elle porte UNE seule ligne : à GAUCHE les 3
+        // points animés + le libellé d'activité (visibles seulement pendant un
+        // tour, classe .on) ; à DROITE le compteur de tokens (#blobby-chat-ctx),
+        // aligné à droite par marginLeft:auto. Le compteur reste donc lisible au
+        // repos COMME pendant un tour, sans jamais recouvrir les messages.
         '.blobby-chat-activity {',
-        '  display: none; align-items: center; gap: 8px;',
+        '  display: flex; align-items: center; gap: 8px;',
         '  padding: 4px 12px; font-size: 11px; color: #f59e0b;',
         '  background: #242428; flex-shrink: 0; user-select: none;',
-        '  border-top: 1px solid #2a2a2e;',
+        '  border-top: 1px solid #2a2a2e; min-width: 0;',
         '}',
-        '.blobby-chat-activity.on { display: flex; }',
-        '.blobby-activity-dots { display: inline-flex; gap: 3px; }',
+        // Points + libellé d'activité : affichés UNIQUEMENT pendant un tour
+        // (.on). Le libellé peut être tronqué (ellipsis) pour ne jamais pousser
+        // le compteur hors de la ligne sur petit écran.
+        '.blobby-activity-dots { display: none; gap: 3px; flex-shrink: 0; }',
+        '.blobby-chat-activity.on .blobby-activity-dots { display: inline-flex; }',
+        '.blobby-activity-label { display: none; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+        '.blobby-chat-activity.on .blobby-activity-label { display: block; }',
         '.blobby-activity-dots i {',
         '  width: 5px; height: 5px; border-radius: 50%;',
         '  background: #f59e0b; opacity: .35;',
@@ -609,8 +618,6 @@ function _blobbyActivityEl(container, create) {
     if (!el && create) {
         el = document.createElement('div');
         el.className = 'blobby-chat-activity';
-        el.setAttribute('role', 'status');
-        el.setAttribute('aria-live', 'polite');
         var dot = document.createElement('span');
         dot.className = 'blobby-activity-dots';
         dot.appendChild(document.createElement('i'));
@@ -618,6 +625,9 @@ function _blobbyActivityEl(container, create) {
         dot.appendChild(document.createElement('i'));
         var label = document.createElement('span');
         label.className = 'blobby-activity-label';
+        label.setAttribute('role', 'status');
+        label.setAttribute('aria-live', 'polite');
+        label.setAttribute('aria-hidden', 'true');
         el.appendChild(dot);
         el.appendChild(label);
         if (container && container.parentNode) container.parentNode.insertBefore(el, container.nextSibling);
@@ -633,15 +643,16 @@ function _blobbySetActivity(container, text) {
     if (!el) return;
     var label = el.querySelector('.blobby-activity-label');
     if (text == null) {
+        // La barre RESTE affichée au repos : elle porte le compteur de tokens à
+        // droite. Seuls les points + libellé d'activité se masquent (cf. CSS
+        // .on) ; le compteur, lui, reste lisible (visuellement ET a11y).
         el.classList.remove('on');
-        el.style.display = 'none';
-        if (label) label.textContent = '';
-        el.setAttribute('aria-hidden', 'true');
+        el.style.display = 'flex';
+        if (label) { label.textContent = ''; label.setAttribute('aria-hidden', 'true'); }
     } else {
-        if (label) label.textContent = text;
+        if (label) { label.textContent = text; label.removeAttribute('aria-hidden'); }
         el.classList.add('on');
         el.style.display = 'flex';
-        el.removeAttribute('aria-hidden');
     }
 }
 
@@ -2506,13 +2517,17 @@ const Blobby = {
         }
         messages.scrollTop = messages.scrollHeight;
 
-        // Contexte (en bas de la zone de messages)
+        // Compteur de tokens : élément #blobby-chat-ctx, monté plus bas DANS la
+        // barre d'activité (même ligne que l'indicateur), aligné à droite.
         var ctxBar = document.createElement('div');
         ctxBar.id = 'blobby-chat-ctx';
+        // Compteur de tokens : vit DANS la barre d'activité (appendChild plus
+        // bas), poussé à DROITE (marginLeft:auto) face au libellé à gauche.
+        // Aucun borderTop ici : la barre porte déjà sa bordure supérieure.
         Object.assign(ctxBar.style, {
-            padding: '3px 12px', fontSize: '10px', color: '#555',
-            textAlign: 'right', borderTop: '1px solid #2a2a2e', flexShrink: '0',
-            userSelect: 'none',
+            padding: '0 0 0 8px', fontSize: '10px', color: '#555',
+            textAlign: 'right', flexShrink: '0', userSelect: 'none',
+            marginLeft: 'auto', whiteSpace: 'nowrap',
         });
         // Valeur + source initiales : celles du preset sélectionné (GET
         // /api/presets), sinon inconnues → « ? max ». Jamais de repli chiffré.
@@ -2606,14 +2621,13 @@ const Blobby = {
         inputArea.appendChild(input);
         inputArea.appendChild(sendBtn);
 
-        // Indicateur d'ACTIVITÉ (hors zone de défilement) : visible pendant TOUT
-        // le tour, animé, toujours masqué à la fin (cf. _blobbySetActivity).
+        // Barre d'ACTIVITÉ + COMPTEUR (hors zone de défilement) : TOUJOURS
+        // affichée. À gauche les points + libellé d'activité (visibles pendant
+        // un tour) ; à droite le compteur de tokens. La zone live (role=status)
+        // ne porte QUE le libellé d'activité pour ne pas annoncer le compteur.
         var activityBar = document.createElement('div');
         activityBar.id = 'blobby-chat-activity';
         activityBar.className = 'blobby-chat-activity';
-        activityBar.setAttribute('role', 'status');
-        activityBar.setAttribute('aria-live', 'polite');
-        activityBar.setAttribute('aria-hidden', 'true');
         var actDots = document.createElement('span');
         actDots.className = 'blobby-activity-dots';
         actDots.appendChild(document.createElement('i'));
@@ -2621,12 +2635,18 @@ const Blobby = {
         actDots.appendChild(document.createElement('i'));
         var actLabel = document.createElement('span');
         actLabel.className = 'blobby-activity-label';
+        actLabel.setAttribute('role', 'status');
+        actLabel.setAttribute('aria-live', 'polite');
+        actLabel.setAttribute('aria-hidden', 'true');
         activityBar.appendChild(actDots);
         activityBar.appendChild(actLabel);
+        // Le compteur de tokens rejoint la MÊME ligne (à droite) : il ne vit
+        // plus dans/à côté du conteneur des messages et ne peut donc plus le
+        // recouvrir. Il reste visible au repos comme pendant un tour.
+        activityBar.appendChild(ctxBar);
 
         bodyWrapper.appendChild(modeBar);
         bodyWrapper.appendChild(messages);
-        bodyWrapper.appendChild(ctxBar);
         bodyWrapper.appendChild(activityBar);
         bodyWrapper.appendChild(inputArea);
 
