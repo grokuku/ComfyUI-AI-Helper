@@ -33,7 +33,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
   //   - est comparée au fichier RÉELLEMENT servi (fetch cache: no-store) pour
   //     afficher un bandeau rouge « version obsolète — Ctrl+Shift+R ».
   // ⚠️ Incrémenter à CHAQUE livraison de ce fichier.
-  var AIH_WF_SHARE_BUILD = "wf-share-2026-09-30-r5";
+  var AIH_WF_SHARE_BUILD = "wf-share-2026-10-04-r6";
 
   var AIH_WF_SHARE_BUILD_RX = /AIH_WF_SHARE_BUILD\s*=\s*["']([^"']+)["']/;
 
@@ -83,6 +83,9 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
       stale: null,
       servedBuild: null,
       check: checkServedBuildFreshness,
+      // Analyse de dépendances exposée (DevTools + tests) : une fonction
+      // déclarée est hissée, donc disponible ici malgré sa définition plus bas.
+      detectDeps: detectDependencies,
     };
   }
   try {
@@ -163,6 +166,43 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     s = s.split("/").pop() || s;
     s = s.replace(/^comfyui[-_]/, "");
     return s.replace(/[^a-z0-9]/g, "");
+  }
+
+  // ── Références résiduelles à l'ANCIEN pack (noms historiques) ──
+  // Le pack s'appelait avant « ComfyUI-Holaf-Utilities ». Un workflow sauvegardé
+  // avant le renommage peut encore porter des `properties.cnr_id` / `aux_id`
+  // désignant l'ancien pack (résidus). L'analyse de dépendances NE DOIT PAS le
+  // déclarer requis : l'installer re-clonerait la vieille copie (un dossier
+  // legacy qui écrasait l'UI). Ces références sont IGNORÉES et SIGNALÉES à
+  // l'utilisateur (jamais embarquées silencieusement). Miroir de
+  // aih/repair_workflow.py (LEGACY_PACK_TOKENS / LEGACY_WIDGET_PREFIX).
+  var LEGACY_PACK_TOKENS = ["holafutilities", "holafutils", "holaf"];
+  var LEGACY_WIDGET_PREFIX = "holaf_";
+  // Widgets EXTENSION encore fournis par le pack COURANT (DOM/custom) : une
+  // référence vers eux est LÉGITIME et n'est jamais signalée.
+  var CURRENT_EXTENSION_WIDGETS = [
+    "holaf_comparer", "holaf_media_loader", "holaf_v2_ui",
+    "aih_enhance", "elements_ui", "keywords_ui",
+  ];
+
+  function normalizePackToken(value) {
+    var s = String(value == null ? "" : value).trim().toLowerCase();
+    if (!s) return "";
+    s = s.replace(/\.git/g, "").replace(/\/+$/, "");
+    s = s.split("/").pop() || s;
+    s = s.replace(/^comfyui[-_]/, "");
+    return s.replace(/[^a-z0-9]/g, "");
+  }
+
+  function isLegacyPackReference(value) {
+    var token = normalizePackToken(value);
+    return !!token && LEGACY_PACK_TOKENS.indexOf(token) >= 0;
+  }
+
+  function isLegacyWidgetReference(name) {
+    var raw = String(name == null ? "" : name).trim().toLowerCase();
+    if (!raw || raw.indexOf(LEGACY_WIDGET_PREFIX) !== 0) return false;
+    return CURRENT_EXTENSION_WIDGETS.indexOf(raw) < 0;
   }
 
   // ── Check d'existence serveur AVANT upload ──
@@ -734,8 +774,10 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
       return allNodes;
     }
     var nodes = _collectAllNodes(workflowJSON);
-    var deps = { nodes: [], models: [], loras: [] };
+    var deps = { nodes: [], models: [], loras: [], ignoredLegacy: [] };
     var seen = { nodes: {}, models: {}, loras: {} };
+    var ignoredLegacy = {};   // token normalisé -> {name, url, count, kind}
+    var orphanWidgets = {};   // nom de widget -> count
 
     // Recuperer les fichiers locaux pour determiner le vrai dossier de chaque model
     var localModelFiles = await getLocalModelFiles();
@@ -802,6 +844,19 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
       var auxId = props.aux_id || "";
       var cnrId = props.cnr_id || "";
 
+      // Références de slot à un widget du pack historique supprimé : inertes
+      // (ignorées à l'exécution) — on les SIGNALE, jamais une dépendance.
+      var nodeSlots = [nodes[i].inputs, nodes[i].outputs];
+      for (var sl = 0; sl < nodeSlots.length; sl++) {
+        var slotList = nodeSlots[sl] || [];
+        for (var si2 = 0; si2 < slotList.length; si2++) {
+          var wname = slotList[si2] && slotList[si2].widget && slotList[si2].widget.name;
+          if (wname && isLegacyWidgetReference(wname)) {
+            orphanWidgets[wname] = (orphanWidgets[wname] || 0) + 1;
+          }
+        }
+      }
+
       // Determiner le pack : aux_id (owner/repo) ou cnr_id (registry ID)
       var packId = auxId || cnrId || "";
       if (!packId || packId === "comfy-core") {
@@ -809,21 +864,32 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
       } else {
         // Extraire le nom du pack (derniere partie apres /)
         var packName = packId.indexOf("/") >= 0 ? packId.split("/").pop() : packId;
-        var packKey = packId;  // cle unique = ID complet
-        if (!packMap[packKey]) {
-          // Chercher le git URL dans les packs installes
-          var gitUrl = "";
-          var installed = installedByName[packName];
-          if (installed && installed.git_url) {
-            gitUrl = installed.git_url;
-          } else if (auxId.indexOf("/") >= 0) {
-            // Construire l'URL GitHub depuis aux_id (owner/repo)
-            gitUrl = "https://github.com/" + auxId;
+        if (isLegacyPackReference(packId) || isLegacyPackReference(packName)) {
+          // RÉSIDU de l'ancien pack : JAMAIS déclaré comme dépendance (l'installer
+          // pourrait re-cloner la vieille copie et écraser l'UI). IGNORÉ mais
+          // SIGNALÉ à l'utilisateur.
+          var lkey = normalizePackToken(packName || packId);
+          if (!ignoredLegacy[lkey]) {
+            ignoredLegacy[lkey] = { name: packName, url: "", count: 0, kind: "pack" };
           }
-          packMap[packKey] = { name: packName, url: gitUrl, node_types: [] };
-        }
-        if (type && type.indexOf("-") < 0 && packMap[packKey].node_types.indexOf(type) < 0) {
-          packMap[packKey].node_types.push(type);
+          ignoredLegacy[lkey].count++;
+        } else {
+          var packKey = packId;  // cle unique = ID complet
+          if (!packMap[packKey]) {
+            // Chercher le git URL dans les packs installes
+            var gitUrl = "";
+            var installed = installedByName[packName];
+            if (installed && installed.git_url) {
+              gitUrl = installed.git_url;
+            } else if (auxId.indexOf("/") >= 0) {
+              // Construire l'URL GitHub depuis aux_id (owner/repo)
+              gitUrl = "https://github.com/" + auxId;
+            }
+            packMap[packKey] = { name: packName, url: gitUrl, node_types: [] };
+          }
+          if (type && type.indexOf("-") < 0 && packMap[packKey].node_types.indexOf(type) < 0) {
+            packMap[packKey].node_types.push(type);
+          }
         }
       }
 
@@ -856,6 +922,14 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
     }
 
     deps.nodes = Object.keys(packMap).map(function(k) { return packMap[k]; });
+
+    // Résidus de l'ancien pack IGNORÉS (pack + widgets de slot disparus) :
+    // signalés à l'utilisateur, JAMAIS déclarés comme dépendances.
+    var ignoredList = Object.keys(ignoredLegacy).map(function(k) { return ignoredLegacy[k]; });
+    for (var ow in orphanWidgets) {
+      ignoredList.push({ name: ow, url: "", count: orphanWidgets[ow], kind: "widget" });
+    }
+    deps.ignoredLegacy = ignoredList;
 
     return deps;
   }
@@ -1209,6 +1283,19 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
           }
           depsHtml += '</div>';
         }
+      }
+      // RÉSIDUS de l'ancien pack : IGNORÉS comme dépendances mais SIGNALÉS
+      // (jamais embarqués silencieusement : l'utilisateur reste maître).
+      if (deps.ignoredLegacy && deps.ignoredLegacy.length) {
+        var ignoredTotal = deps.ignoredLegacy.reduce(function(a, x) { return a + (x.count || 0); }, 0);
+        depsHtml += '<div style="margin-bottom:4px;margin-top:6px;"><span style="color:#f59e0b;">' +
+          esc(t('wf.legacyRefsIgnored', { count: ignoredTotal })) + '</span>';
+        for (var gi = 0; gi < deps.ignoredLegacy.length; gi++) {
+          var gl = deps.ignoredLegacy[gi];
+          depsHtml += '<div style="margin-left:12px;color:#f59e0b;font-size:10px;">· ' +
+            esc(t('wf.legacyRefItem', { name: gl.name, count: gl.count })) + '</div>';
+        }
+        depsHtml += '</div>';
       }
       container.querySelector("#wf-deps").innerHTML = depsHtml;
 

@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -140,6 +141,96 @@ CORE_NODE_TYPES = frozenset({
     "subgraph/input",
     "subgraph/output",
 })
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RÉFÉRENCES RÉSIDUELLES À L'ANCIEN PACK (détection + nettoyage)
+# ══════════════════════════════════════════════════════════════════════════
+# Le pack s'appelait avant « ComfyUI-Holaf-Utilities » (noms historiques :
+# « ComfyUI-Holaf-Utilities » / « ComfyUI-Holaf-Utils » / « ComfyUI-Holaf »,
+# cf. holaf_startup_checks.py). Ces noms ne sont PLUS son identité. Un workflow
+# sauvegardé AVANT le renommage peut conserver des résidus :
+#
+#   1. ``nodes[].properties.cnr_id`` / ``properties.aux_id`` pointant sur
+#      l'ancien pack. C'est CE que lit l'analyse de dépendances du Workflow
+#      Share (js/aih_workflow_share.js:801-806) — il déclarait donc à tort
+#      l'ancien pack comme dépendance, ce qui pouvait re-cloner la vieille copie
+#      et écraser l'UI.
+#   2. ``nodes[].inputs[].widget`` / ``nodes[].outputs[].widget`` =
+#      ``{name: "holaf_…"}`` : références de slot vers des widgets du pack
+#      historique SUPPRIMÉS (ex. ``holaf_terminal_widget`` — le node Terminal
+#      est passé en fenêtre flottante ; les widgets DOM d'une valeur de
+#      sérialisation portent leur NOM dans le slot, cf.
+#      comfyui-frontend-src/src/lib/litegraph/src/node/slotUtils.ts:50-70 et
+#      types/serialisation.ts:74/81). Inertes à l'exécution mais présentes.
+#
+# Décision utilisateur (2026) : nettoyer CES RÉSIDUS (jamais une vraie
+# référence au pack courant ni un widget encore défini).
+LEGACY_PACK_TOKENS = frozenset({
+    "holafutilities",   # ComfyUI-Holaf-Utilities
+    "holafutils",       # ComfyUI-Holaf-Utils
+    "holaf",            # ComfyUI-Holaf
+})
+
+# Préfixe des widgets du pack historique. Un nom de widget de slot commençant
+# par ce préfixe ET absent de la liste des widgets ENCORE fournis par le pack
+# courant est un résidu (jamais nettoyé sinon : on ne casse pas une référence
+# valide).
+LEGACY_WIDGET_PREFIX = "holaf_"
+
+# Widgets EXTENSION du pack courant (DOM/« custom », donc HORS INPUT_TYPES) :
+# une référence de slot vers eux est VALIDE (à NE PAS nettoyer). Source de
+# vérité : js/*.js (addDOMWidget / addCustomWidget).
+CURRENT_EXTENSION_WIDGETS = frozenset({
+    "holaf_comparer",       # js/holaf_image_comparer.js
+    "holaf_media_loader",   # js/holaf_load_image_video.js
+    "holaf_v2_ui",          # js/holaf_resolution_preset_v2.js
+    "AIH_Enhance",          # js/aih_enhance_widget.js
+    "elements_ui",          # js/aih_elements_widget.js
+    "keywords_ui",          # js/aih_keywords_widget.js
+})
+
+_NON_ALNUM_RX = re.compile(r"[^a-z0-9]")
+
+
+def normalize_pack_token(value: Any) -> str:
+    """Réduit un identifiant de pack (cnr_id/aux_id/URL) à un jeton comparable.
+
+    ``grokuku/ComfyUI-Holaf-Utilities`` , ``ComfyUI-Holaf-Utilities.git`` ,
+    ``https://github.com/grokuku/ComfyUI-Holaf-Utilities`` et
+    ``comfyui-holaf-utilities`` → tous ``holafutilities``. Le dernier segment de
+    chemin est retenu, le préfixe ``comfyui[-_]`` et tout non-alphanumérique
+    sont retirés (même convention que normalizeRepoName côté JS).
+    """
+    s = str(value if value is not None else "").strip().lower()
+    if not s:
+        return ""
+    s = s.replace(".git", "")
+    s = s.rstrip("/")
+    s = s.split("/")[-1]
+    if s.startswith("comfyui-"):
+        s = s[len("comfyui-"):]
+    elif s.startswith("comfyui_"):
+        s = s[len("comfyui_"):]
+    return _NON_ALNUM_RX.sub("", s)
+
+
+def is_legacy_pack_reference(value: Any) -> bool:
+    """True si l'identifiant référence l'ANCIEN pack (nom historique)."""
+    token = normalize_pack_token(value)
+    return bool(token) and token in LEGACY_PACK_TOKENS
+
+
+def is_legacy_widget_reference(name: Any) -> bool:
+    """True si le nom de widget de slot est un résidu du pack historique.
+
+    Un widget ENCORE fourni par le pack courant (``holaf_media_loader`` …) n'est
+    JAMAIS signalé : on ne retire pas une référence valide.
+    """
+    raw = str(name if name is not None else "").strip()
+    if not raw or not raw.lower().startswith(LEGACY_WIDGET_PREFIX):
+        return False
+    return raw.lower() not in {w.lower() for w in CURRENT_EXTENSION_WIDGETS}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -456,11 +547,128 @@ def detect_missing_node_types(ctx: AnalyzeContext) -> Iterator[dict]:
             }
 
 
+def detect_legacy_references(ctx: AnalyzeContext) -> Iterator[dict]:
+    """Occurrences de RÉSIDUS de l'ancien pack (pack obsolète / widget disparu).
+
+    Deux familles, regroupées séparément par ``(kind, key)`` :
+      - ``legacy_pack_reference``   : ``properties.cnr_id``/``aux_id`` désignant
+        l'ancien pack → à RETIRER (sinon le Workflow Share le déclare requis) ;
+      - ``legacy_widget_reference`` : slot ``{widget: {name: "holaf_…"}}`` vers
+        un widget du pack historique supprimé → référence INERTE à RETIRER.
+
+    Chaque occurrence porte l'emplacement exact (scope, node_id, slot/index ou
+    property) pour la réparation ciblée. Le nettoyage n'affecte rien d'autre :
+    aucune règle de validation ne s'applique à ces champs.
+    """
+    for scope, graph in ctx.graphs:
+        nodes = graph.get("nodes")
+        for node in (nodes if isinstance(nodes, list) else []):
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get("id")
+
+            # (1) Propriétés de pack obsolète.
+            props = node.get("properties")
+            if isinstance(props, dict):
+                for prop_key in ("cnr_id", "aux_id"):
+                    value = props.get(prop_key)
+                    if not is_legacy_pack_reference(value):
+                        continue
+                    yield {
+                        "kind": "legacy_pack_reference",
+                        "key": ("pack", prop_key, normalize_pack_token(value)),
+                        "old_type": value,
+                        "new_type": None,
+                        "checkable": True,
+                        "action": {
+                            "type": "remove_legacy_reference",
+                            "target": "property",
+                            "property": prop_key,
+                            "value": value,
+                        },
+                        "occurrence": {
+                            "scope": scope,
+                            "node_id": node_id,
+                            "title": node.get("title"),
+                            "property": prop_key,
+                            "value": value,
+                        },
+                    }
+
+            # (2) Références de slot vers un widget historique supprimé.
+            for slot_key, slot_dir in (("inputs", "input"), ("outputs", "output")):
+                slots = node.get(slot_key)
+                if not isinstance(slots, list):
+                    continue
+                for index, slot in enumerate(slots):
+                    if not isinstance(slot, dict):
+                        continue
+                    widget = slot.get("widget")
+                    name = widget.get("name") if isinstance(widget, dict) else None
+                    if not is_legacy_widget_reference(name):
+                        continue
+                    yield {
+                        "kind": "legacy_widget_reference",
+                        "key": ("widget", slot_dir, str(name)),
+                        "old_type": name,
+                        "new_type": None,
+                        "checkable": True,
+                        "action": {
+                            "type": "remove_legacy_reference",
+                            "target": "slot_widget",
+                            "slot": slot_key,
+                            "widget": name,
+                        },
+                        "occurrence": {
+                            "scope": scope,
+                            "node_id": node_id,
+                            "title": node.get("title"),
+                            "slot": slot_dir,
+                            "index": index,
+                            "widget": name,
+                        },
+                    }
+
+        # (3) Widgets EXPOSÉS au niveau d'un subgraph : ``definitions.subgraphs[].
+        # widgets`` = ``[{id: nodeId, name: "holaf_…"}]`` (cf. ExposedWidget,
+        # comfyui-frontend-src/src/lib/litegraph/src/types/serialisation.ts:181).
+        # Retirer l'entrée n'affecte AUCUN lien (simple mapping d'affichage).
+        exposed = graph.get("widgets")
+        if isinstance(exposed, list):
+            for index, exp in enumerate(exposed):
+                if not isinstance(exp, dict):
+                    continue
+                name = exp.get("name")
+                if not is_legacy_widget_reference(name):
+                    continue
+                source_id = exp.get("id")
+                yield {
+                    "kind": "legacy_widget_reference",
+                    "key": ("exposed_widget", str(name), _id_key(source_id)),
+                    "old_type": name,
+                    "new_type": None,
+                    "checkable": True,
+                    "action": {
+                        "type": "remove_legacy_reference",
+                        "target": "exposed_widget",
+                        "widget": name,
+                    },
+                    "occurrence": {
+                        "scope": scope,
+                        "node_id": source_id,
+                        "widget": name,
+                        "index": index,
+                        "source_id": source_id,
+                    },
+                }
+
+
 # Registre des détecteurs : POINT D'EXTENSION. Ajouter une fonction pour couvrir
 # un nouveau type de problème (liens pendants, valeurs de widgets inconnues,
 # nodes dépréciées…). Le regroupement, la validation et le rapport sont génériques.
 DETECTORS = (
     detect_missing_node_types,
+    detect_legacy_references,
 )
 
 
@@ -523,9 +731,14 @@ def _context_stats(ctx: AnalyzeContext, problems: List[dict]) -> dict:
         if isinstance(nodes, list):
             node_count += sum(1 for n in nodes if isinstance(n, dict))
     missing_count = sum(p["count"] for p in problems if p["kind"] == "missing_node_type")
+    legacy_count = sum(
+        p["count"] for p in problems
+        if p["kind"] in ("legacy_pack_reference", "legacy_widget_reference")
+    )
     return {
         "node_count": node_count,
         "missing_count": missing_count,
+        "legacy_reference_count": legacy_count,
         "known_types_available": bool(ctx.class_defs),
         "subgraph_count": len(ctx.subgraph_ids),
     }
@@ -807,6 +1020,85 @@ def apply_type_replacement(node: dict, new_type: Any, old_type: Any,
     }
 
 
+def remove_legacy_property(node: dict, property_key: Any, expected_value: Any = None) -> int:
+    """Retire une propriété de pack obsolète d'un node (``cnr_id``/``aux_id``).
+
+    Garde-fou : si ``expected_value`` est fourni, la propriété n'est retirée que
+    si sa valeur correspond EXACTEMENT — la réparation reste ciblée sur le résidu
+    analysé (jamais une propriété qui aurait changé entre analyse et application).
+    Retourne 1 si retirée, 0 sinon. Ne touche à AUCUN autre champ.
+    """
+    props = node.get("properties")
+    if not isinstance(props, dict):
+        return 0
+    key = str(property_key)
+    if key not in props:
+        return 0
+    if expected_value is not None and props.get(key) != expected_value:
+        return 0
+    del props[key]
+    return 1
+
+
+def remove_slot_widget_reference(node: dict, slot_key: Any, widget_name: Any,
+                                 slot_index: Any = None) -> int:
+    """Retire une référence de slot ``{widget: {name: …}}`` d'un node.
+
+    Cible l'index EXACT quand il est connu (repli sur le nom si l'index a bougé),
+    et ne retire QUE la clé ``widget`` du slot concerné (le slot, son nom, son
+    type et son lien sont intacts). Retourne le nombre de références retirées.
+    """
+    slots = node.get(slot_key) if slot_key in ("inputs", "outputs") else None
+    if not isinstance(slots, list):
+        return 0
+    target_name = str(widget_name if widget_name is not None else "")
+    if isinstance(slot_index, int) and 0 <= slot_index < len(slots):
+        candidates = [slots[slot_index]]
+    else:
+        candidates = list(slots)
+    removed = 0
+    for slot in candidates:
+        if not isinstance(slot, dict):
+            continue
+        widget = slot.get("widget")
+        if not isinstance(widget, dict):
+            continue
+        if str(widget.get("name")) != target_name:
+            continue
+        del slot["widget"]
+        removed += 1
+    return removed
+
+
+def remove_exposed_widget_reference(graph: dict, widget_name: Any, source_id: Any = None) -> int:
+    """Retire une entrée ``widgets[]`` d'un subgraph (widget exposé résiduel).
+
+    Ne filtre que les entrées dont le ``name`` correspond (ET, si fourni, l'``id``
+    du node source). Ne touche à AUCUN lien : c'est un simple mapping d'affichage.
+    Retourne le nombre d'entrées retirées.
+    """
+    if not isinstance(graph, dict):
+        return 0
+    widgets = graph.get("widgets")
+    if not isinstance(widgets, list):
+        return 0
+    target_name = str(widget_name if widget_name is not None else "")
+    src_key = _id_key(source_id) if source_id is not None else None
+    removed = 0
+    kept: List[Any] = []
+    for exp in widgets:
+        match = isinstance(exp, dict) and str(exp.get("name")) == target_name
+        if match and src_key is not None:
+            match = _id_key(exp.get("id")) == src_key
+        if match:
+            removed += 1
+        else:
+            kept.append(exp)
+    if removed:
+        graph["widgets"] = kept
+    return removed
+
+
 def apply_repairs(
     workflow: Any,
     selected_ids: Iterable[str],
@@ -831,6 +1123,7 @@ def apply_repairs(
     applied: List[dict] = []
     widget_report: List[dict] = []
     unmapped_report: List[dict] = []
+    legacy_report: List[dict] = []
     unknown_selected: List[str] = []
 
     for pid in selected:
@@ -839,9 +1132,53 @@ def apply_repairs(
             unknown_selected.append(pid)
             continue
         action = problem.get("action")
-        if not action or action.get("type") != "replace_node_type":
+        if not action:
             # Problème sans action (type inconnu sans proposition) : rien à faire.
             continue
+        action_type = action.get("type")
+
+        if action_type == "remove_legacy_reference":
+            # Nettoyage d'un RÉSIDU de l'ancien pack : propriété cnr_id/aux_id
+            # ou référence de slot vers un widget historique supprimé.
+            removed = 0
+            target = action.get("target")
+            for occ in problem["occurrences"]:
+                graph = graphs.get(occ["scope"])
+                if target == "exposed_widget":
+                    # L'entrée visée est dans `graph["widgets"]`, pas dans un node :
+                    # on opère directement sur le graphe (scope).
+                    if graph is not None:
+                        removed += remove_exposed_widget_reference(
+                            graph, action.get("widget"), occ.get("source_id"))
+                    continue
+                node = _find_node(graph, occ["node_id"]) if graph is not None else None
+                if node is None:
+                    continue
+                if target == "property":
+                    removed += remove_legacy_property(
+                        node, action.get("property"), action.get("value"))
+                elif target == "slot_widget":
+                    removed += remove_slot_widget_reference(
+                        node, action.get("slot"), action.get("widget"), occ.get("index"))
+            applied.append({
+                "problem_id": pid,
+                "kind": problem["kind"],
+                "from": problem.get("old_type"),
+                "to": None,
+                "removed": removed,
+            })
+            legacy_report.append({
+                "problem_id": pid,
+                "kind": problem["kind"],
+                "target": target,
+                "reference": problem.get("old_type"),
+                "removed": removed,
+            })
+            continue
+
+        if action_type != "replace_node_type":
+            continue
+
         old_type = action.get("from")
         new_type = action.get("to")
         renamed = 0
@@ -893,6 +1230,7 @@ def apply_repairs(
         "applied": applied,
         "widgets": widget_report,
         "unmapped_widgets": unmapped_report,
+        "legacy_references": legacy_report,
         "validation_before": before_errors,
         "validation_after": after_errors,
         "new_validation_errors": new_errors,
@@ -903,28 +1241,48 @@ def apply_repairs(
 
 def repair_summary(report: dict) -> dict:
     """Résumé compact (compteurs) du rapport de réparation."""
+    legacy_removed = sum(a.get("removed", 0) for a in report.get("applied", []))
     return {
         "nodes_renamed": sum(a.get("nodes_renamed", 0) for a in report.get("applied", [])),
         "widgets_remapped": sum(
             1 for w in report.get("widgets", []) if w.get("remapped")
         ),
         "widgets_unmapped": len(report.get("unmapped_widgets", [])),
+        "legacy_references_removed": legacy_removed,
         "problems_applied": len(report.get("applied", [])),
         "new_validation_errors": len(report.get("new_validation_errors", [])),
         "pre_existing_validation_errors": len(report.get("validation_before", [])),
     }
 
 
+def _slot_widget_name(node: dict, slot_key: str, index: int) -> Optional[str]:
+    """Nom du widget référencé par un slot sérialisé (ou None)."""
+    slots = node.get(slot_key)
+    if not isinstance(slots, list) or index >= len(slots):
+        return None
+    slot = slots[index]
+    if not isinstance(slot, dict):
+        return None
+    widget = slot.get("widget")
+    if isinstance(widget, dict) and widget.get("name") is not None:
+        return str(widget.get("name"))
+    return None
+
+
 def diff_workflows(before: Any, after: Any) -> List[dict]:
     """Diff minimal (lisible) entre workflow original et réparé.
 
-    Une entrée par node dont le ``type`` ou les ``widgets_values`` changent.
+    Une entrée par changement : ``type`` d'un node, ``widgets_values``, propriété
+    retirée (``properties``) ou référence de slot à un widget retirée
+    (``input_widget``/``output_widget``). Utile pour montrer EXACTEMENT ce qui a
+    été nettoyé (résidus de l'ancien pack) comme pour un renommage d'alias.
     """
     index_before = {}
     for scope, graph in iter_graphs(before):
         for node in graph.get("nodes") or []:
             if isinstance(node, dict):
                 index_before[(scope, _id_key(node.get("id")))] = node
+    graphs_before = {scope: graph for scope, graph in iter_graphs(before)}
 
     changes: List[dict] = []
     for scope, graph in iter_graphs(after):
@@ -951,6 +1309,49 @@ def diff_workflows(before: Any, after: Any) -> List[dict]:
                     "before": old.get("widgets_values"),
                     "after": node.get("widgets_values"),
                 })
+            # Propriétés retirées (cnr_id / aux_id d'un pack obsolète…).
+            old_props = old.get("properties") if isinstance(old.get("properties"), dict) else {}
+            new_props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+            for prop_key in sorted(set(old_props) | set(new_props)):
+                if old_props.get(prop_key) != new_props.get(prop_key):
+                    changes.append({
+                        "scope": scope,
+                        "node_id": node.get("id"),
+                        "field": "properties",
+                        "property": prop_key,
+                        "before": old_props.get(prop_key),
+                        "after": new_props.get(prop_key),
+                    })
+            # Références de slot à un widget retirées.
+            for slot_key in ("inputs", "outputs"):
+                old_slots = old.get(slot_key) if isinstance(old.get(slot_key), list) else []
+                new_slots = node.get(slot_key) if isinstance(node.get(slot_key), list) else []
+                for index in range(max(len(old_slots), len(new_slots))):
+                    old_name = _slot_widget_name(old, slot_key, index)
+                    new_name = _slot_widget_name(node, slot_key, index)
+                    if old_name != new_name:
+                        changes.append({
+                            "scope": scope,
+                            "node_id": node.get("id"),
+                            "field": "input_widget" if slot_key == "inputs" else "output_widget",
+                            "slot": index,
+                            "before": old_name,
+                            "after": new_name,
+                        })
+        # Widgets exposés au niveau d'un subgraph (liste racine du graphe).
+        old_graph = graphs_before.get(scope)
+        old_widgets = old_graph.get("widgets") if isinstance(old_graph, dict) and isinstance(old_graph.get("widgets"), list) else []
+        new_widgets = graph.get("widgets") if isinstance(graph.get("widgets"), list) else []
+        old_names = [w.get("name") for w in old_widgets if isinstance(w, dict)]
+        new_names = [w.get("name") for w in new_widgets if isinstance(w, dict)]
+        if old_names != new_names:
+            changes.append({
+                "scope": scope,
+                "node_id": None,
+                "field": "exposed_widget",
+                "before": old_names,
+                "after": new_names,
+            })
     return changes
 
 

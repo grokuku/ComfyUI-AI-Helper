@@ -497,6 +497,237 @@ def test_mutation_no_widget_remap_is_red():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 6bis. RÉSIDUS DE L'ANCIEN PACK (pack obsolète + widgets orphelins)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Constat utilisateur : un workflow ancien garde des références à l'ancien
+# pack (avant le renommage « ComfyUI-Holaf-Utilities ») :
+#   * `properties.cnr_id` / `aux_id` sur l'ancien pack — ce que lit l'analyse
+#     de dépendances du Workflow Share, qui déclarait donc à tort l'ancien pack
+#     comme requis (risque de re-cloner la vieille copie) ;
+#   * des « widgets orphelins » nommés `holaf_…` : références de slot
+#     `inputs[].widget = {name: …}` vers un widget du pack historique supprimé
+#     (ex. holaf_terminal_widget), inertes à l'exécution.
+# Le détecteur les GROUPE par type de référence (une ligne + compte) et la
+# réparation les RETIRE proprement, sans toucher au reste.
+
+def build_legacy_workflow():
+    """Workflow avec RÉSIDUS de l'ancien pack + références LÉGITIMES (courant)."""
+    return {
+        "id": "root",
+        "version": 1,
+        "nodes": [
+            {
+                "id": 1, "type": "AIHRemoteComparer",
+                "inputs": [
+                    {"name": "in", "type": "*", "link": None},
+                    {"name": "holaf_terminal_widget", "type": "*", "link": None,
+                     "widget": {"name": "holaf_terminal_widget"}},
+                ],
+                "outputs": [],
+                "properties": {
+                    "Node name for S&R": "AIHRemoteComparer",
+                    "cnr_id": "comfyui-holaf-utilities",
+                    "ver": "1.0.0",
+                },
+                "widgets_values": ["Cmp", "fast"],
+            },
+            {
+                "id": 2, "type": "AIHRemoteComparer",
+                "inputs": [{"name": "x", "type": "*", "link": None,
+                             "widget": {"name": "holaf_terminal_widget"}}],
+                "outputs": [],
+                "properties": {"aux_id": "grokuku/ComfyUI-Holaf-Utilities"},
+            },
+            {
+                "id": 3, "type": "AIHImageComparer",
+                "inputs": [{"name": "holaf_comparer", "type": "*", "link": None,
+                             "widget": {"name": "holaf_comparer"}}],
+                "outputs": [],
+                "properties": {"cnr_id": "Holaf/ComfyUI-AI-Helper"},
+            },
+        ],
+        "links": [],
+        "groups": [],
+        "extra": {},
+        "definitions": {"subgraphs": []},
+    }
+
+
+def _problems_by_kind(analysis):
+    by_kind = {}
+    for p in analysis["problems"]:
+        by_kind.setdefault(p["kind"], []).append(p)
+    return by_kind
+
+
+def _legacy_widget_refs(wf, name="holaf_terminal_widget"):
+    """Toutes les références de slot `{widget: {name}}` vers un widget donné."""
+    refs = []
+    for _scope, graph in rw.iter_graphs(wf):
+        for nd in graph.get("nodes") or []:
+            if not isinstance(nd, dict):
+                continue
+            for key in ("inputs", "outputs"):
+                for slot in nd.get(key) or []:
+                    if not isinstance(slot, dict):
+                        continue
+                    w = slot.get("widget")
+                    if isinstance(w, dict) and w.get("name") == name:
+                        refs.append((nd.get("id"), key))
+    return refs
+
+
+def _legacy_props(wf):
+    """Valeurs cnr_id/aux_id résiduelles (ancien pack) encore présentes."""
+    found = []
+    for _scope, graph in rw.iter_graphs(wf):
+        for nd in graph.get("nodes") or []:
+            props = nd.get("properties") if isinstance(nd, dict) else None
+            if not isinstance(props, dict):
+                continue
+            for k in ("cnr_id", "aux_id"):
+                if rw.is_legacy_pack_reference(props.get(k)):
+                    found.append((nd.get("id"), k, props.get(k)))
+    return found
+
+
+def test_normalize_and_legacy_classifiers():
+    assert rw.normalize_pack_token("grokuku/ComfyUI-Holaf-Utilities") == "holafutilities"
+    assert rw.normalize_pack_token("comfyui-holaf-utils.git") == "holafutils"
+    assert rw.is_legacy_pack_reference("grokuku/ComfyUI-Holaf-Utilities")
+    assert rw.is_legacy_pack_reference("comfyui-holaf-utilities")
+    assert rw.is_legacy_pack_reference("https://github.com/grokuku/ComfyUI-Holaf-Utils")
+    assert rw.is_legacy_pack_reference("Holaf/ComfyUI-Holaf")
+    # Le pack COURANT et un pack quelconque ne sont JAMAIS des résidus.
+    assert not rw.is_legacy_pack_reference("Holaf/ComfyUI-AI-Helper")
+    assert not rw.is_legacy_pack_reference("some/Real-Pack")
+    assert not rw.is_legacy_pack_reference("comfy-core")
+    assert not rw.is_legacy_pack_reference("")
+    # Widget orphelin vs widget ENCORE fourni par le pack courant.
+    assert rw.is_legacy_widget_reference("holaf_terminal_widget")
+    assert not rw.is_legacy_widget_reference("holaf_comparer")
+    assert not rw.is_legacy_widget_reference("holaf_media_loader")
+    assert not rw.is_legacy_widget_reference("holaf_v2_ui")
+    assert not rw.is_legacy_widget_reference("seed")
+
+
+def test_legacy_references_are_grouped_and_counted():
+    analysis = rw.analyze(build_legacy_workflow(), class_defs=CLASS_DEFS)
+    by_kind = _problems_by_kind(analysis)
+    packs = by_kind.get("legacy_pack_reference", [])
+    widgets = by_kind.get("legacy_widget_reference", [])
+    # Une ligne PAR (propriété, valeur) : cnr_id puis aux_id = 2 lignes.
+    assert len(packs) == 2, packs
+    assert sum(p["count"] for p in packs) == 2
+    assert all(p["checkable"] and p["action"]["type"] == "remove_legacy_reference" for p in packs)
+    # UNE seule ligne pour le widget orphelin, comptant ses 2 occurrences.
+    assert len(widgets) == 1, widgets
+    assert widgets[0]["old_type"] == "holaf_terminal_widget"
+    assert widgets[0]["count"] == 2
+    assert widgets[0]["action"]["target"] == "slot_widget"
+    # Compteur global du rapport.
+    assert analysis["stats"]["legacy_reference_count"] == 4
+    # Jamais une ligne par occurrence.
+    assert len(packs) + len(widgets) == 3
+
+
+def test_current_widget_and_current_pack_are_not_flagged():
+    analysis = rw.analyze(build_legacy_workflow(), class_defs=CLASS_DEFS)
+    refs = [p["old_type"] for p in analysis["problems"]
+            if p["kind"] in ("legacy_pack_reference", "legacy_widget_reference")]
+    assert "holaf_comparer" not in refs, "un widget ENCORE fourni ne doit pas être signalé"
+    assert "Holaf/ComfyUI-AI-Helper" not in refs, "le pack courant ne doit pas être signalé"
+
+
+def test_repair_removes_legacy_references_only():
+    wf = build_legacy_workflow()
+    analysis = rw.analyze(wf, class_defs=CLASS_DEFS)
+    selected = [p["id"] for p in analysis["problems"] if p["kind"].startswith("legacy_")]
+    repaired, report = rw.apply_repairs(wf, selected, class_defs=CLASS_DEFS)
+    blob = rw.dumps(repaired)
+    low = blob.lower()
+    # Les RÉSIDUS ont DISPARU : aucune propriété de pack obsolète, aucune
+    # référence de slot vers le widget orphelin.
+    assert "holaf-utilities" not in low
+    assert _legacy_props(repaired) == []
+    assert _legacy_widget_refs(repaired) == []
+    # Le reste est INTACT : référence au pack courant + widget courant + valeurs.
+    assert "Holaf/ComfyUI-AI-Helper" in blob
+    assert "holaf_comparer" in blob
+    assert '"widgets_values"' in blob and 'Cmp' in blob
+    # Le slot lui-même N'EST PAS supprimé (retirer un slot décalerait les
+    # indices et casserait des liens ciblant les slots suivants).
+    assert len(repaired["nodes"][0]["inputs"]) == 2
+    # Validation OK, aucune nouvelle incohérence.
+    assert report["new_validation_errors"] == []
+    assert rw.validate_workflow(repaired) == []
+    # L'original n'est JAMAIS modifié.
+    assert wf["nodes"][0]["properties"]["cnr_id"] == "comfyui-holaf-utilities"
+    assert wf["nodes"][1]["inputs"][0]["widget"] == {"name": "holaf_terminal_widget"}
+    # Résumé + diff lisibles.
+    assert rw.repair_summary(report)["legacy_references_removed"] == 4
+    diff = rw.diff_workflows(wf, repaired)
+    assert any(d["field"] == "properties" and d["property"] == "cnr_id" for d in diff)
+    assert any(d["field"] == "input_widget" and d["before"] == "holaf_terminal_widget" for d in diff)
+
+
+def test_mutation_not_cleaning_leaves_residues_red():
+    """Contrôle négatif : sans sélection, les résidus RESTENT (le test mord)."""
+    wf = build_legacy_workflow()
+    repaired, report = rw.apply_repairs(wf, [], class_defs=CLASS_DEFS)
+    assert _legacy_props(repaired) != [], "sans nettoyage, le résidu de pack subsiste"
+    assert _legacy_widget_refs(repaired) != [], "sans nettoyage, le widget orphelin subsiste"
+    assert report["applied"] == []
+    assert rw.repair_summary(report)["legacy_references_removed"] == 0
+
+
+def test_mutation_removing_a_legit_reference_is_detected():
+    """Contrôle négatif : retirer une référence LÉGITIME doit être évité (helper ciblé)."""
+    node = build_legacy_workflow()["nodes"][2]
+    # Le helper ne retire QUE le nom demandé : un widget courant n'est pas touché.
+    assert rw.remove_slot_widget_reference(node, "inputs", "holaf_terminal_widget", 0) == 0
+    assert node["inputs"][0]["widget"] == {"name": "holaf_comparer"}
+    # Retirer un widget orphelin fonctionne, index exact.
+    node2 = build_legacy_workflow()["nodes"][0]
+    assert rw.remove_slot_widget_reference(node2, "inputs", "holaf_terminal_widget", 1) == 1
+    assert "widget" not in node2["inputs"][1]
+
+
+def build_exposed_widget_workflow():
+    """Subgraph avec un widget EXPOSÉ résiduel (``subgraph.widgets[].name``)."""
+    return {
+        "id": "root", "version": 1, "nodes": [], "links": [], "extra": {},
+        "definitions": {"subgraphs": [{
+            "id": "sub-uuid", "name": "Sub A",
+            "nodes": [{"id": 10, "type": "AIHRemoteComparer", "inputs": [], "outputs": []}],
+            "links": [], "groups": [],
+            "widgets": [
+                {"id": 10, "name": "holaf_terminal_widget"},
+                {"id": 10, "name": "holaf_comparer"},  # courant : à conserver
+            ],
+            "definitions": {"subgraphs": []},
+        }]},
+    }
+
+
+def test_legacy_exposed_widget_in_subgraph_detected_and_removed():
+    wf = build_exposed_widget_workflow()
+    analysis = rw.analyze(wf, class_defs=CLASS_DEFS)
+    widgets = [p for p in analysis["problems"] if p["kind"] == "legacy_widget_reference"]
+    assert len(widgets) == 1
+    assert widgets[0]["old_type"] == "holaf_terminal_widget"
+    assert widgets[0]["count"] == 1
+    repaired, report = rw.apply_repairs(wf, [widgets[0]["id"]], class_defs=CLASS_DEFS)
+    sub = repaired["definitions"]["subgraphs"][0]
+    assert [w["name"] for w in sub["widgets"]] == ["holaf_comparer"]
+    assert rw.repair_summary(report)["legacy_references_removed"] == 1
+    assert rw.validate_workflow(repaired) == []
+    diff = rw.diff_workflows(wf, repaired)
+    assert any(d["field"] == "exposed_widget" for d in diff)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 7. Routes /aih/repair/* (analyse, aperçu, écrasement avec sauvegarde, save-as)
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -740,6 +971,37 @@ def test_route_apply_refuses_invalid_destination(repair_env):
     entry = data["results"][0]
     assert entry["written"] is False
     assert entry["error"] == "invalid_path"
+
+
+def test_route_apply_removes_legacy_references_with_backup(repair_env):
+    """Écrasement réel : résidus retirés, .bak = original, validation OK."""
+    build_app, workflows_dir = repair_env
+    path = _write_workflow(workflows_dir, "legacy.json", build_legacy_workflow())
+    original = path.read_text(encoding="utf-8")
+    _s, analysis = _run(_call(build_app, "POST", "/aih/repair/analyze", {
+        "sources": [{"id": "file:legacy.json", "kind": "file", "path": "legacy.json"}],
+    }))
+    selected = [p["id"] for p in analysis["problems"] if p["kind"].startswith("legacy_")]
+    assert selected, "les résidus doivent être détectés côté route"
+    status, data = _run(_call(build_app, "POST", "/aih/repair/apply", {
+        "sources": [{"id": "file:legacy.json", "kind": "file", "path": "legacy.json"}],
+        "selected": selected,
+        "mode": "overwrite",
+    }))
+    assert status == 200
+    entry = data["results"][0]
+    assert entry["written"] is True
+    assert entry["backup"] == "legacy.json.bak"
+    assert entry["summary"]["legacy_references_removed"] == 4
+    backup = workflows_dir / "legacy.json.bak"
+    assert backup.is_file()
+    assert backup.read_text(encoding="utf-8") == original, "la sauvegarde = l'original"
+    repaired = json.loads(path.read_text(encoding="utf-8"))
+    blob = json.dumps(repaired)
+    assert "holaf-utilities" not in blob.lower()
+    assert _legacy_props(repaired) == []
+    assert _legacy_widget_refs(repaired) == []
+    assert rw.validate_workflow(repaired) == []
 
 
 def test_path_resolution_blocks_traversal():
