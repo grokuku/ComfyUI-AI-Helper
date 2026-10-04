@@ -5,6 +5,7 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { onCanvasDraw, setWidgetHidden } from "./holaf_nodes2_compat.js";
 
 // Constants
 const MODE_ALWAYS = 0;
@@ -257,8 +258,11 @@ app.registerExtension({
                 const groupWidget = this.widgets.find(w => w.name === "group_name");
                 const activeWidget = this.widgets.find(w => w.name === "active");
                 const invertWidget = this.widgets.find(w => w.name === "invert");
-                // Cacher le widget "active" — piloté par syncGroupState, pas par l'utilisateur
-                if (activeWidget) activeWidget.hidden = true;
+                // Cacher le widget "active" — piloté par syncGroupState, pas par l'utilisateur.
+                // setWidgetHidden pose hidden (canvas) ET options.hidden (Vue) : le
+                // renderer classique lit widget.hidden, le renderer Nodes 2.0 lit
+                // options.hidden — sans les deux, le widget reste visible en Vue.
+                if (activeWidget) setWidgetHidden(activeWidget, true);
                 if (!invertWidget) return;
                 // Callback sur "invert" : re-évaluer le bypass avec la valeur active courante. LOCAL, pas de syncGroupState.
                 const originalInvertCallback = invertWidget.callback;
@@ -287,10 +291,27 @@ app.registerExtension({
                 // Refresh immediately
                 refreshGroups();
 
-                // Refresh on interaction
+                // Refresh on interaction (renderer classique : hook node-level).
                 this.onMouseEnter = function (e) {
                     refreshGroups();
                 };
+
+                // Nodes 2.0 (Vue) : le hook node-level onMouseEnter n'est JAMAIS
+                // appelé (LGraphCanvas.processMouseMove met node=null en
+                // vueNodesMode). On rafraîchit donc aussi le combo depuis le hook
+                // canvas-level (survivant), STRICTEMENT en vueNodesMode : en mode
+                // classique le callback n'est jamais exécuté (no-op total).
+                if (!this._holafGroupRefreshOff) {
+                    this._holafGroupRefreshOff = onCanvasDraw(refreshGroups);
+                    const prevRemoved = this.onRemoved;
+                    this.onRemoved = function () {
+                        if (prevRemoved) prevRemoved.apply(this, arguments);
+                        if (this._holafGroupRefreshOff) {
+                            this._holafGroupRefreshOff();
+                            this._holafGroupRefreshOff = null;
+                        }
+                    };
+                }
             };
 
 

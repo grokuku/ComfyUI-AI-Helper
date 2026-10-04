@@ -305,6 +305,134 @@ function clearLinkRefs(graph, linkId, excludeNode) {
 }
 
 /**
+ * Écrit un lien dans le registre du graphe. Le frontend récent expose
+ * `graph.links` comme un Proxy Map+Record (méthodes Map `.set`/`.get`/`.delete`
+ * PLUS accès indexé) ; on privilégie `.set()` puis l'affectation indexée (Map
+ * ou objet historique). `p.ref` (objet lien DÉJÀ en vie) est ré-écrit tel quel
+ * pour préserver son prototype (LLink.serialize/disconnect) — jamais un objet
+ * nu qui casserait une resérialisation ultérieure. Retourne 1 si écrit.
+ */
+function writeGraphLink(graph, p) {
+    if (!graph || !graph.links || !p) return 0;
+    const entry = p.ref || ({
+        id: p.id, origin_id: p.origin_id, origin_slot: p.origin_slot,
+        target_id: p.target_id, target_slot: p.target_slot, type: p.type,
+    });
+    try { if (typeof graph.links["set"] === "function") graph.links.set(p.id, entry); } catch { /* forme suivante */ }
+    if (getLinkById(graph, p.id)) return 1;
+    try { graph.links[p.id] = entry; } catch { /* ignore */ }
+    if (getLinkById(graph, p.id)) return 1;
+    return 0;
+}
+
+/** id de slot d'I/O de subgraph (négatifs, hors `graph.nodes`). */
+function isSubgraphIoId(id) {
+    const n = Number(id);
+    return Number.isFinite(n) && n < 0;
+}
+
+/** Le registre d'I/O d'un subgraph (`graph.inputs`/`outputs`) référence-t-il ce lien ? */
+function subgraphIoHasLink(graph, listName, linkId) {
+    const list = graph && graph[listName];
+    if (!Array.isArray(list)) return true; // pas de registre d'I/O → non vérifiable, on ne crie pas au loup
+    const target = String(linkId);
+    for (const slot of list) {
+        if (slot && Array.isArray(slot.linkIds) && slot.linkIds.some((id) => String(id) === target)) return true;
+    }
+    return false;
+}
+
+/**
+ * RÉPARE l'extrémité d'I/O d'un subgraph (nœud de frontière hors `graph.nodes`) :
+ * garantit que le slot (retrouvé par son INDEX `slotIndex`, à défaut par
+ * recherche) référence `linkId` dans son `linkIds`. Cette réparation est le
+ * SYMÉTRIQUE de `clearLinkRefs` (qui, lui, RETIRE la référence quand le lien est
+ * détaché) : un hook post-swap peut avoir vidé les `linkIds` des I/O, on les
+ * RECONSTRUIT depuis le lien VIVANT (le registre, lui, n'est pas modifié).
+ * Retourne false si le slot est introuvable (vérification impossible, pas de
+ * faux « conservé »).
+ */
+function repairSubgraphIoLink(graph, listName, slotIndex, linkId) {
+    const list = graph && graph[listName];
+    if (!Array.isArray(list)) return true; // pas de registre d'I/O → non vérifiable, on ne crie pas au loup
+    const target = String(linkId);
+    let slot = (slotIndex >= 0 && slotIndex < list.length) ? list[slotIndex] : null;
+    if (!slot || !Array.isArray(slot.linkIds)) {
+        slot = list.find((s) => s && Array.isArray(s.linkIds) && s.linkIds.some((id) => String(id) === target)) || null;
+    }
+    if (!slot || !Array.isArray(slot.linkIds)) return false;
+    if (!slot.linkIds.some((id) => String(id) === target)) slot.linkIds.push(linkId);
+    return subgraphIoHasLink(graph, listName, linkId);
+}
+
+/**
+ * Ré-applique et VÉRIFIE les DEUX extrémités d'un lien : le slot d'entrée doit
+ * porter `link`, le slot de sortie doit contenir `link` dans `links`. Ré-applique
+ * si un hook post-swap les a écrasés. Les extrémités d'I/O de subgraph (hors
+ * `nodes`) sont RÉPARÉES puis vérifiées via `linkIds` (slot retrouvé par index) :
+ * un hook destructeur qui vide les `linkIds` de frontière est ainsi corrigé au
+ * lieu de faire perdre à tort le lien. Retourne false si l'extrémité n'est pas
+ * vérifiable (slot absent).
+ */
+function repairAndCheckLinkEnds(graph, link) {
+    const id = link.id;
+    // Extrémité CIBLE (côté entrée).
+    const tgt = findNodeInGraph(graph, link.target_id);
+    if (tgt) {
+        const s = Array.isArray(tgt.inputs) ? tgt.inputs[link.target_slot] : null;
+        if (!s) return false;
+        if (String(s.link) !== String(id)) s.link = id;
+        if (String(s.link) !== String(id)) return false;
+    } else if (isSubgraphIoId(link.target_id)) {
+        if (!repairSubgraphIoLink(graph, "outputs", link.target_slot, id)) return false;
+    }
+    // Extrémité ORIGINE (côté sortie).
+    const org = findNodeInGraph(graph, link.origin_id);
+    if (org) {
+        const s = Array.isArray(org.outputs) ? org.outputs[link.origin_slot] : null;
+        if (!s) return false;
+        if (!Array.isArray(s.links)) s.links = [];
+        if (!s.links.some((x) => String(x) === String(id))) s.links.push(id);
+        if (!s.links.some((x) => String(x) === String(id))) return false;
+    } else if (isSubgraphIoId(link.origin_id)) {
+        if (!repairSubgraphIoLink(graph, "inputs", link.origin_slot, id)) return false;
+    }
+    return true;
+}
+
+/**
+ * RE-LECTURE + RÉ-VÉRIFICATION, APRÈS le swap et ses hooks post-swap
+ * (onNodeAdded/updateExecutionOrder/change/onRemoved) : un de ces hooks (ou une
+ * resynchronisation de slots façon ComfyUI) peut avoir écrasé les liens
+ * recâblés. Chaque lien du plan est : (1) ré-écrit dans le registre s'il a
+ * disparu ; (2) re-pointé (origine/cible + slots) ; (3) re-représenté dans les
+ * slots des DEUX extrémités ; (4) VÉRIFIÉ. Un lien NON prouvé n'est JAMAIS
+ * compté « conservé » — le compte rendu ne peut pas mentir.
+ * Retourne { kept, relinked, keptIds, lostIds }.
+ */
+function reconcileAndVerifyLinks(graph, plan) {
+    let relinked = 0;
+    const keptIds = [];
+    const lostIds = [];
+    if (!Array.isArray(plan)) return { kept: 0, relinked: 0, keptIds: keptIds, lostIds: lostIds };
+    for (const p of plan) {
+        if (!p || p.id === undefined || p.id === null) continue;
+        let link = getLinkById(graph, p.id);
+        if (!link) { relinked += writeGraphLink(graph, p); link = getLinkById(graph, p.id); }
+        if (link) {
+            try {
+                link.origin_id = p.origin_id; link.origin_slot = p.origin_slot;
+                link.target_id = p.target_id; link.target_slot = p.target_slot;
+                if (p.type !== undefined && link.type === undefined) link.type = p.type;
+            } catch { /* ignore */ }
+        }
+        if (link && repairAndCheckLinkEnds(graph, link)) keptIds.push(p.id);
+        else lostIds.push(p.id);
+    }
+    return { kept: keptIds.length, relinked: relinked, keptIds: keptIds, lostIds: lostIds };
+}
+
+/**
  * Index du slot de `newSlots` correspondant à `oldSlot` : d'abord par NOM
  * (exact, insensible à la casse), sinon par TYPE de données. `used` (Set
  * d'index déjà pris) évite de réutiliser un slot. -1 si aucun équivalent.
@@ -2138,10 +2266,18 @@ registerTool({
         const newOutputs = Array.isArray(newNode.outputs) ? newNode.outputs : [];
         const usedIn = new Set();
         const usedOut = new Set();
-        let reconnected = 0;
         let linksLost = 0;
         const lostInputs = [];
         const lostOutputs = [];
+        // Plan des liens que l'on PRÉTEND conserver (id + extrémités + réf vivante)
+        // et ensemble des liens DÉFINITIVEMENT perdus (détachés) — pour re-vérifier
+        // l'état réel APRÈS le swap (le registre peut avoir été écrasé par un hook).
+        const keptPlan = [];
+        const hardLost = new Set();
+        const planOf = (link) => ({
+            id: link.id, origin_id: link.origin_id, origin_slot: link.origin_slot,
+            target_id: link.target_id, target_slot: link.target_slot, type: link.type, ref: link,
+        });
         const slotLabel = (slot, idx) => (slot && slot.name !== undefined && slot.name !== null ? slot.name : idx);
 
         for (let oi = 0; oi < oldInputs.length; oi++) {
@@ -2154,6 +2290,7 @@ registerTool({
                 if (oldIn.link !== undefined && oldIn.link !== null) {
                     const lostLinkId = oldIn.link;
                     linksLost++;
+                    hardLost.add(String(lostLinkId));
                     clearLinkRefs(owner, lostLinkId, newNode);
                     removeGraphLink(owner, lostLinkId);
                     try { oldIn.link = null; } catch { /* ignore */ }
@@ -2169,7 +2306,7 @@ registerTool({
                     newInputs[ni].link = linkId;
                     oldIn.link = null;
                     usedIn.add(ni);
-                    reconnected++;
+                    keptPlan.push(planOf(link));
                 } else {
                     // Lien absent du registre (référence pendante PRÉEXISTANTE) :
                     // on ne RECRÉE pas la référence sur la nouvelle node et on ne
@@ -2183,12 +2320,14 @@ registerTool({
                     oldIn.link = null;
                     usedIn.add(ni);
                     linksLost++;
+                    hardLost.add(String(linkId));
                     clearLinkRefs(owner, linkId, newNode);
                     removeGraphLink(owner, linkId);
                 }
             } catch {
                 lostInputs.push(slotLabel(oldIn, oi));
                 linksLost++;
+                hardLost.add(String(linkId));
                 clearLinkRefs(owner, linkId, newNode);
                 removeGraphLink(owner, linkId);
                 try { oldIn.link = null; } catch { /* ignore */ }
@@ -2203,7 +2342,7 @@ registerTool({
             if (no < 0) {
                 lostOutputs.push(slotLabel(oldOut, oo));
                 linksLost += outLinks.length;
-                for (const lid of outLinks) { clearLinkRefs(owner, lid, newNode); removeGraphLink(owner, lid); }
+                for (const lid of outLinks) { hardLost.add(String(lid)); clearLinkRefs(owner, lid, newNode); removeGraphLink(owner, lid); }
                 try { oldOut.links = []; } catch { /* ignore */ }
                 continue;
             }
@@ -2215,16 +2354,17 @@ registerTool({
                     if (link) {
                         link.origin_id = newNode.id; link.origin_slot = no;
                         newOutputs[no].links.push(lid);
-                        reconnected++;
+                        keptPlan.push(planOf(link));
                     } else {
                         // Lien absent du registre (référence pendante préexistante) :
                         // on ne RECRÉE pas la référence — on la nettoie partout
                         // (jamais de lien pendant, pas de faux « recâblé »).
                         linksLost++;
+                        hardLost.add(String(lid));
                         clearLinkRefs(owner, lid, newNode);
                         removeGraphLink(owner, lid);
                     }
-                } catch { linksLost++; clearLinkRefs(owner, lid, newNode); removeGraphLink(owner, lid); }
+                } catch { linksLost++; hardLost.add(String(lid)); clearLinkRefs(owner, lid, newNode); removeGraphLink(owner, lid); }
             }
             try { oldOut.links = []; } catch { /* ignore */ }
         }
@@ -2245,15 +2385,34 @@ registerTool({
         try { if (typeof oldNode.onRemoved === "function") oldNode.onRemoved(); } catch { /* ignore */ }
         dirtyCanvas(ctx);
 
-        // Message NON ALARMANT pour Blobby/l'utilisateur : distinguer explicitement
-        // les connexions CONSERVÉES des liens sans équivalent DÉTACHÉS proprement,
-        // pour ne pas présenter un détachement légitime comme « les connexions
-        // sont cassées ». `notice` est le champ lu par le LLM (renderToolContent).
-        const notice = linksLost > 0
-            ? label(ctx, "bl.toolRes.changeNodeTypeKeptLost", { kept: String(reconnected), lost: String(linksLost) },
-                "{kept} connexion(s) conservée(s) ; {lost} détachée(s) proprement (aucun slot équivalent dans la nouvelle classe — normal lors d'un changement de classe)")
-            : label(ctx, "bl.toolRes.changeNodeTypeAllKept", { kept: String(reconnected) },
-                "{kept} connexion(s) conservée(s) (tous les slots ont un équivalent dans la nouvelle classe)");
+        // 6bis) RE-LECTURE + RÉ-VÉRIFICATION après les hooks post-swap : un de ces
+        // hooks (resync de slots façon ComfyUI, reconfigure, change…) peut avoir
+        // ÉCRASÉ les liens recâblés. On ré-applique une fois depuis le plan, puis
+        // on VÉRIFIE lien par lien (registre + refs des DEUX extrémités + slots).
+        // Un lien annoncé « conservé » mais non prouvé est recompté PERDU : le
+        // compte rendu ne peut PAS mentir sur l'état réel du graphe.
+        const intendedPlan = keptPlan.filter((p) => !hardLost.has(String(p.id)));
+        const verify = reconcileAndVerifyLinks(owner, intendedPlan);
+        const finalKept = verify.kept;
+        const unverified = Math.max(0, intendedPlan.length - verify.kept);
+        const finalLost = linksLost + unverified;
+
+        // Message HONNÊTE pour Blobby/l'utilisateur : les connexions CONSERVÉES
+        // sont VÉRIFIÉES dans l'état réel (jamais un simple compteur optimiste) ;
+        // les liens sans équivalent sont DÉTACHÉS proprement et comptés ; tout
+        // lien non prouvé est signalé comme perdu (avec renvoi vers Annuler).
+        // `notice` est le champ lu par le LLM (renderToolContent).
+        let notice;
+        if (unverified > 0) {
+            notice = label(ctx, "bl.toolRes.changeNodeTypeUnverified", { kept: String(finalKept), lost: String(finalLost), unverified: String(unverified) },
+                "{kept} connexion(s) conservée(s) ; {lost} détachée(s). ⚠️ {unverified} lien(s) recâblé(s) n'ont PAS survécu à la vérification (état du graphe re-lu) — utilise Annuler, puis reconnecte-les manuellement.");
+        } else if (finalLost > 0) {
+            notice = label(ctx, "bl.toolRes.changeNodeTypeKeptLost", { kept: String(finalKept), lost: String(finalLost) },
+                "{kept} connexion(s) conservée(s) ; {lost} détachée(s) proprement (aucun slot équivalent dans la nouvelle classe — normal lors d'un changement de classe)");
+        } else {
+            notice = label(ctx, "bl.toolRes.changeNodeTypeAllKept", { kept: String(finalKept) },
+                "{kept} connexion(s) conservée(s) — vérifiées lien par lien dans l'état réel du graphe (registre + refs des deux extrémités)");
+        }
 
         return {
             data: {
@@ -2272,10 +2431,20 @@ registerTool({
                 widgets_copied: widgetsCopied,
                 lost_widgets: lostWidgets,
                 new_widgets: newOnlyWidgets,
-                links_reconnected: reconnected,
-                links_lost: linksLost,
+                links_reconnected: finalKept,
+                links_lost: finalLost,
                 lost_inputs: lostInputs,
                 lost_outputs: lostOutputs,
+                // Preuve de vérification : ces compteurs sont issus d'une RE-LECTURE
+                // de l'état réel (pas du compteur optimiste). `verified:false` ⇒ au
+                // moins un lien annoncé conservé ne l'était plus.
+                link_verification: {
+                    verified: unverified === 0,
+                    intended_kept: intendedPlan.length,
+                    actually_kept: finalKept,
+                    relinked: verify.relinked,
+                    lost_links: verify.lostIds,
+                },
                 subgraph: subgraphScopeInfo(r.subgraph),
             },
             action: label(ctx, "bl.toolAct.changeNodeType", { name: nodeTitle(oldNode), from: oldType || "?", to: newType }, "🔁 {name} : {from} → {to}"),

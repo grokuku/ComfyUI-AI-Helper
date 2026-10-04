@@ -1,0 +1,184 @@
+/*
+ * Copyright (C) 2026 Holaf
+ * CSS — outil « Réparer un workflow » (js/aih_repair_workflow.js)
+ * ----------------------------------------------------------------------------
+ * Feuille dédiée au contenu de la fenêtre (le chrome vient de aih_dialog.css).
+ * Utilise les variables de thème centralisées --aih-* pour rester cohérent
+ * (mode clair/sombre, accent, etc.). Injectée par le module via holafExtUrl.
+ */
+
+.rw-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--aih-border);
+    border-radius: var(--aih-radius);
+    background: var(--aih-bg-secondary);
+    margin-bottom: 10px;
+}
+
+.rw-section-title {
+    font-weight: 600;
+    color: var(--aih-text);
+    font-size: var(--aih-title-size);
+}
+
+.rw-subsection-title {
+    font-weight: 600;
+    color: var(--aih-text-secondary);
+    font-size: 12px;
+    margin-top: 4px;
+}
+
+.rw-hint {
+    font-size: 11px;
+    color: var(--aih-text-secondary);
+    line-height: 1.4;
+}
+
+.rw-error { color: var(--aih-danger); }
+.rw-ok { color: var(--aih-success); }
+
+.rw-saved-list {
+    max-height: 140px;
+    overflow-y: auto;
+    border: 1px solid var(--aih-border);
+    border-radius: 6px;
+    background: var(--aih-bg-input);
+    padding: 4px;
+}
+
+.rw-saved-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.rw-saved-row:hover { background: var(--aih-bg-hover); }
+.rw-saved-name { font-size: 12px; color: var(--aih-text); }
+
+.rw-saved-count { font-size: 11px; color: var(--aih-text-secondary); }
+
+.rw-paste {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--aih-text);
+    background: var(--aih-bg-input);
+    border: 1px solid var(--aih-border);
+    border-radius: 6px;
+    padding: 8px;
+}
+
+.rw-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+.rw-btn {
+    background: var(--aih-btn-bg);
+    color: var(--aih-text);
+    border: 1px solid var(--aih-btn-border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.rw-btn:hover { background: var(--aih-btn-bg-hover); }
+.rw-btn:disabled { opacity: 0.6; cursor: default; }
+
+.rw-btn-primary {
+    background: var(--aih-accent);
+    color: var(--aih-accent-text);
+    border-color: var(--aih-accent);
+}
+
+.rw-btn-primary:hover { background: var(--aih-accent-hover); }
+
+.rw-btn-danger {
+    background: var(--aih-danger);
+    color: var(--aih-danger-text);
+    border-color: var(--aih-danger);
+}
+
+.rw-summary {
+    font-size: 12px;
+    color: var(--aih-text-secondary);
+    margin-bottom: 6px;
+}
+
+.rw-problems {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.rw-problem {
+    border: 1px solid var(--aih-border);
+    border-radius: 6px;
+    background: var(--aih-bg-input);
+    padding: 6px 8px;
+}
+
+.rw-problem-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.rw-problem-label {
+    flex: 1;
+    font-size: 12px;
+    color: var(--aih-text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    word-break: break-all;
+}
+
+.rw-problem-count {
+    font-size: 11px;
+    color: var(--aih-text-secondary);
+    white-space: nowrap;
+}
+
+.rw-problem-toggle {
+    background: transparent;
+    border: none;
+    color: var(--aih-text-secondary);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 0 4px;
+}
+
+.rw-problem-details {
+    margin-top: 6px;
+    padding-left: 22px;
+    border-top: 1px dashed var(--aih-border);
+    padding-top: 6px;
+}
+
+.rw-detail-title {
+    font-size: 11px;
+    color: var(--aih-text-secondary);
+    margin-bottom: 4px;
+}
+
+.rw-detail-list {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 11px;
+    color: var(--aih-text-secondary);
+    max-height: 160px;
+    overflow-y: auto;
+}
+
+.rw-problem-unmapped .rw-problem-label { color: var(--aih-text-secondary); }

@@ -2280,6 +2280,229 @@ function realLinks(g) { return [...g._links.values()].map((l) => `${l.id}:${l.or
     ok("(I8b) entrée pendante : jamais recréée ni comptée recâblée (symétrie avec la SORTIE)");
 }
 
+// ── (I6s) hook POST-SWAP destructeur DANS UN SUBGRAPH : I/O de frontière RÉPARÉES ──
+// Comme J2 en contexte RACINE, mais dans un SUBGRAPH et avec un hook qui vide
+// AUSSI les `linkIds` des I/O de frontière (hors `graph.nodes`). Le correctif
+// doit RÉPARER les deux extrémités (slots de node + linkIds de frontière) :
+// un `linkIds` vidé laissait auparavant le lien de frontière « perdu » à tort.
+{
+    clearUndo();
+    const w = makeRealSubgraphWorld();
+    // Hook destructeur (resynchronisation de slots façon ComfyUI via change()).
+    w.sg.change = function () {
+        const nn = this.getNodeById(1);
+        if (nn) { nn.inputs.forEach((i) => { i.link = null; }); nn.outputs.forEach((o) => { o.links = []; }); }
+        this.inputs[0].linkIds.length = 0;
+        this.outputs[0].linkIds.length = 0;
+    };
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New", subgraph: SG_ID }, {
+        app: w.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ id: 59, inputs: [{ name: "model", type: "MODEL" }, { name: "image", type: "IMAGE" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true, "retype interne OK malgré le hook destructeur");
+    assert.strictEqual(res.data.links_lost, 0, "hook destructeur subgraph : liens RÉPARÉS (aucun perdu)");
+    assert.strictEqual(res.data.links_reconnected, 4, "4 liens vivants après réparation");
+    assert.strictEqual(res.data.link_verification.verified, true, "liens VÉRIFIÉS en subgraph");
+    assert.deepStrictEqual(w.sg.inputs[0].linkIds, [200], "linkIds d'ENTRÉE de frontière RÉPARÉS");
+    assert.deepStrictEqual(w.sg.outputs[0].linkIds, [203], "linkIds de SORTIE de frontière RÉPARÉS");
+    assert.strictEqual(w.sg.getNodeById(1).inputs[1].link, 200, "frontière entrante ré-posée sur la nouvelle node");
+    assert.strictEqual(w.sg.getNodeById(1).outputs[0].links.includes(203), true, "frontière sortante ré-posée");
+    assert.strictEqual(noticeKeptCount(res.data.notice), 4, "le notice ne ment pas (4 conservées)");
+    const problems = graphStateProblems(w.sg, 1, {
+        kept: {
+            200: { target: "new", target_slot: 1 },
+            201: { origin: "other", origin_id: 30, target: "new", target_slot: 0 },
+            202: { origin: "new", origin_slot: 0, target: "other", target_id: 31 },
+            203: { origin: "new", origin_slot: 0 },
+        },
+    });
+    assert.deepStrictEqual(problems, [], `état après hook destructeur subgraph (I6s) : ${problems.join(" | ")}`);
+    clearUndo();
+    ok("(I6s) hook post-swap destructeur DANS UN SUBGRAPH : I/O de frontière RÉPARÉES (linkIds) + notice honnête");
+}
+
+console.log("\n6septies. change_node_type : RÉGRESSION « liens détruits + notice mensonger » (hooks post-swap)");
+
+// Reproduction fidèle du scénario réel signalé : un hook POST-SWAP destructeur
+// (resynchronisation de slots façon ComfyUI via graph.change()/configure, ou
+// changement qui ré-écrit inputs/outputs) ÉCRASE les liens recâblés. L'ANCIEN
+// code comptait ces liens « conservés » (compteur OPTIMISTE) → comportement
+// cassé ET message MENSONGER (« N connexion(s) conservée(s) » alors que tout
+// est à null). Le correctif RE-LIT l'état réel APRÈS les hooks, ré-applique une
+// fois, puis VÉRIFIE chaque lien (registre + refs des deux extrémités + slots).
+
+/** Registre de liens FIDÈLE au Proxy Map+Record du frontend récent : méthodes
+ *  Map (.get/.set/.delete/.values…) ET accès indexé (links[id]) fonctionnent. */
+function makeProxyLinks(map) {
+    const backing = map instanceof Map ? map : new Map();
+    return new Proxy(backing, {
+        get(t, p) {
+            if (typeof p === "symbol") return Reflect.get(t, p, t);
+            if (typeof t[p] === "function") return t[p].bind(t);
+            if (p in t) return t[p];
+            const k = Number(p);
+            return Number.isNaN(k) ? undefined : t.get(k);
+        },
+        set(t, p, v) {
+            if (typeof p === "symbol") { t[p] = v; return true; }
+            const k = Number(p);
+            if (Number.isNaN(k)) { t[p] = v; return true; }
+            t.set(k, v); return true;
+        },
+        deleteProperty(t, p) {
+            const k = Number(p);
+            return Number.isNaN(k) ? delete t[p] : t.delete(k);
+        },
+        has(t, p) { const k = Number(p); return Number.isNaN(k) ? (p in t) : t.has(k); },
+    });
+}
+
+/** Compte, en RE-LISANT l'état réel, les liens qui traversent `nodeId` ET dont
+ *  les DEUX extrémités (slots) concordent — indépendant des compteurs du code. */
+function countLiveLinksThrough(g, nodeId) {
+    const links = g.links && typeof g.links.values === "function" ? [...g.links.values()] : [];
+    let count = 0;
+    for (const link of links) {
+        if (!link || (String(link.origin_id) !== String(nodeId) && String(link.target_id) !== String(nodeId))) continue;
+        const org = g.getNodeById(link.origin_id);
+        const tgt = g.getNodeById(link.target_id);
+        const orgSlot = org && Array.isArray(org.outputs) ? org.outputs[link.origin_slot] : null;
+        const tgtSlot = tgt && Array.isArray(tgt.inputs) ? tgt.inputs[link.target_slot] : null;
+        const orgOk = !org || (!!orgSlot && Array.isArray(orgSlot.links) && orgSlot.links.some((x) => String(x) === String(link.id)));
+        const tgtOk = !tgt || (!!tgtSlot && String(tgtSlot.link) === String(link.id));
+        if (orgOk && tgtOk) count++;
+    }
+    return count;
+}
+
+/** L'invariant « le notice ne ment pas » : le nombre annoncé « conservé » DOIT
+ *  égaler le nombre de liens réellement vivants (re-lus), sinon on a menti. */
+function noticeKeptCount(notice) {
+    const m = String(notice || "").match(/(\d+)\s+connexion/i);
+    return m ? Number(m[1]) : null;
+}
+function assertNoticeHonest(res, g, nodeId, ctxLabel) {
+    const announced = res.data.links_reconnected;
+    const live = countLiveLinksThrough(g, nodeId);
+    assert.strictEqual(announced, live, `${ctxLabel} : compte rendu HONNÊTE (annoncé ${announced} === vivants ${live})`);
+    assert.strictEqual(noticeKeptCount(res.data.notice), announced, `${ctxLabel} : le notice annonce exactement ${announced}`);
+    assert.ok(res.data.link_verification && res.data.link_verification.verified === true, `${ctxLabel} : liens VÉRIFIÉS`);
+}
+
+// ── (J1) BATcH 17 nodes en chaîne : liens entre nodes retypés tous conservés ──
+{
+    clearUndo();
+    const defs = [];
+    const links = [];
+    defs.push({ id: 1, type: "Legacy", outputs: [{ name: "MODEL", type: "MODEL", links: [100] }] });
+    for (let i = 2; i <= 18; i++) {
+        defs.push({ id: i, type: "Legacy",
+            inputs: [{ name: "MODEL", type: "MODEL", link: 100 + (i - 2) }],
+            outputs: [{ name: "MODEL", type: "MODEL", links: i <= 17 ? [100 + (i - 1)] : [] }] });
+    }
+    for (let i = 0; i < 17; i++) links.push({ id: 100 + i, origin_id: 1 + i, origin_slot: 0, target_id: 2 + i, target_slot: 0, type: "MODEL" });
+    const fx = makeMapRetypeFixture(defs, links);
+    fx.root.links = makeProxyLinks(fx.root.links);
+    const ids = defs.map((d) => d.id);
+    for (const id of ids) {
+        const res = await dispatchToolCall("change_node_type", { id, type: "New" }, {
+            app: fx.app, mode: "active",
+            createNodeImpl: () => makeNewNodeOf({ inputs: [{ name: "MODEL", type: "MODEL" }], outputs: [{ name: "MODEL", type: "MODEL" }] }),
+        });
+        assert.strictEqual(res.ok, true, `retype #${id} OK`);
+        assert.strictEqual(res.data.links_lost, 0, `retype #${id} : aucun lien perdu`);
+        assertNoticeHonest(res, fx.root, id, `(J1#${id})`);
+    }
+    const problems = graphStateProblems(fx.root, 1, {
+        kept: { 100: { origin: "new", origin_slot: 0, target: "other", target_id: 2 } },
+    });
+    assert.deepStrictEqual(problems, [], `état après lot 17 (J1) : ${problems.join(" | ")}`);
+    assert.strictEqual(fx.root.links.size, 17, "les 17 liens sont intacts dans le registre");
+    clearUndo();
+    ok("(J1) lot 17 nodes (registre Proxy Map+Record) : liens entre nodes retypés conservés ET VÉRIFIÉS (notice honnête)");
+}
+
+// ── (J2) hook POST-SWAP destructeur réparé (réconciliation) ──
+{
+    clearUndo();
+    const fx = makeMapRetypeFixture(
+        [
+            { id: 10, type: "Loader", outputs: [{ name: "MODEL", type: "MODEL", links: [101] }] },
+            { id: 1, type: "Legacy", inputs: [{ name: "model", type: "MODEL", link: 101 }], outputs: [{ name: "IMAGE", type: "IMAGE", links: [102] }] },
+            { id: 20, type: "Saver", inputs: [{ name: "x", type: "IMAGE", link: 102 }] },
+        ],
+        [
+            { id: 101, origin_id: 10, origin_slot: 0, target_id: 1, target_slot: 0, type: "MODEL" },
+            { id: 102, origin_id: 1, origin_slot: 0, target_id: 20, target_slot: 0, type: "IMAGE" },
+        ],
+    );
+    fx.root.links = makeProxyLinks(fx.root.links);
+    // Hook post-swap destructeur : vide les slots du nœud remplacé (simule la
+    // resynchronisation de slots d'un `graph.change()`/reconfigure réel).
+    fx.root.change = function () {
+        const nn = this.getNodeById(1);
+        if (nn) { nn.inputs.forEach((i) => { i.link = null; }); nn.outputs.forEach((o) => { o.links = []; }); }
+    };
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New" }, {
+        app: fx.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ inputs: [{ name: "model", type: "MODEL" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.data.links_lost, 0, "liens RÉPARÉS (ré-appliqués) : aucun perdu");
+    assertNoticeHonest(res, fx.root, 1, "(J2)");
+    const problems = graphStateProblems(fx.root, 1, {
+        kept: {
+            101: { origin: "other", origin_id: 10, target: "new", target_slot: 0 },
+            102: { origin: "new", origin_slot: 0, target: "other", target_id: 20 },
+        },
+    });
+    assert.deepStrictEqual(problems, [], `état après hook destructeur (J2) : ${problems.join(" | ")}`);
+    clearUndo();
+    ok("(J2) hook post-swap destructeur : liens RÉ-APPLIQUÉS puis VÉRIFIÉS (le compte rendu ne ment pas)");
+}
+
+// ── (J3) perte IRRÉCUPÉRABLE : le notice NE prétend PAS conserver ──
+{
+    clearUndo();
+    const fx = makeMapRetypeFixture(
+        [
+            { id: 10, type: "Loader", outputs: [{ name: "MODEL", type: "MODEL", links: [101] }] },
+            { id: 1, type: "Legacy", inputs: [{ name: "model", type: "MODEL", link: 101 }], outputs: [{ name: "IMAGE", type: "IMAGE", links: [102] }] },
+            { id: 20, type: "Saver", inputs: [{ name: "x", type: "IMAGE", link: 102 }] },
+        ],
+        [
+            { id: 101, origin_id: 10, origin_slot: 0, target_id: 1, target_slot: 0, type: "MODEL" },
+            { id: 102, origin_id: 1, origin_slot: 0, target_id: 20, target_slot: 0, type: "IMAGE" },
+        ],
+    );
+    const backing = fx.root.links;
+    fx.root.links = makeProxyLinks(backing);
+    // Hook post-swap qui DÉTRUIT les liens ET rend le registre non inscriptible
+    // (réconciliation impossible) — cas extrême = « les liens sont bien détruits ».
+    fx.root.change = function () {
+        const nn = this.getNodeById(1);
+        if (nn) {
+            const ids = [...nn.inputs.map((i) => i.link), ...nn.outputs.flatMap((o) => o.links || [])].filter((v) => v !== null && v !== undefined);
+            for (const id of ids) backing.delete(id);
+            nn.inputs.forEach((i) => { i.link = null; }); nn.outputs.forEach((o) => { o.links = []; });
+        }
+        backing.set = function () { return this; }; // inscriptible = non
+    };
+    const res = await dispatchToolCall("change_node_type", { id: 1, type: "New" }, {
+        app: fx.app, mode: "active",
+        createNodeImpl: () => makeNewNodeOf({ inputs: [{ name: "model", type: "MODEL" }], outputs: [{ name: "IMAGE", type: "IMAGE" }] }),
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.data.links_reconnected, 0, "aucune connexion annoncée conservée (état re-vérifié)");
+    assert.strictEqual(res.data.link_verification.verified, false, "vérification : NON (les liens ont bien été détruits)");
+    assert.ok(/PAS survécu|détach/.test(res.data.notice), `le notice signale la perte : ${res.data.notice}`);
+    // L'invariant « le notice ne ment pas » : annoncé === vivants (0).
+    assert.strictEqual(noticeKeptCount(res.data.notice), 0, "le notice annonce 0 conservé (jamais 2)");
+    assert.strictEqual(countLiveLinksThrough(fx.root, 1), 0, "état réel : aucun lien vivant (cohérent avec le notice)");
+    clearUndo();
+    ok("(J3) perte irrécupérable : le compte rendu SIGNALE les liens perdus (jamais de « conservé » mensonger)");
+}
+
 console.log(`\n✅ Partie 1 (pure) : ${n} groupes d'assertions PASS — suite jsdom…`);
 
 /* ════════════════════════════════════════════════════════════════════════

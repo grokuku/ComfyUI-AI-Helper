@@ -175,6 +175,131 @@ def _get_presets_path():
     return os.path.join(_get_aih_user_dir(), "aih_elements_presets.json")
 
 
+# ── Workflows sauvegardés (outil « Réparer un workflow ») ──────────────
+# Le frontend ComfyUI lit/écrit les workflows via /api/userdata sur le
+# préfixe « workflows/ » (cf. comfyui-frontend-src : src/scripts/api.ts
+# getUserData/storeUserData/listUserDataFullInfo + comfyWorkflow.basePath).
+# Côté disque cela correspond à <ComfyUI>/user/default/workflows/ — on cible
+# le MÊME dossier pour garantir en Python la sauvegarde .bak et la validation
+# AVANT écriture (ce que /api/userdata ne fait pas).
+
+def _get_workflows_dir():
+    """Dossier user/default/workflows des workflows sauvegardés."""
+    try:
+        import folder_paths
+        user_dir = folder_paths.get_user_directory()
+        if user_dir:
+            return os.path.join(user_dir, "default", "workflows")
+    except Exception:
+        pass
+    try:
+        import folder_paths
+        base = getattr(folder_paths, "base_path", None)
+        if base:
+            return os.path.join(base, "user", "default", "workflows")
+    except Exception:
+        pass
+    return os.path.join(_PACK_ROOT, "user_data", "workflows")
+
+
+def _resolve_workflow_path(workflows_dir, rel_path):
+    """Résout un chemin relatif de workflow sous ``workflows_dir``.
+
+    Accepte le préfixe frontend « workflows/ ». REFUSE toute évasion (segment
+    « .. », chemin absolu, commonpath hors base) et tout fichier non .json.
+    Retourne le chemin absolu, ou None si le chemin est invalide.
+    """
+    if not rel_path or not isinstance(rel_path, str):
+        return None
+    rel = rel_path.replace("\\", "/").lstrip("/")
+    if rel.startswith("workflows/"):
+        rel = rel[len("workflows/"):]
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    if not parts[-1].lower().endswith(".json"):
+        return None
+    base = os.path.abspath(workflows_dir)
+    target = os.path.abspath(os.path.join(base, *parts))
+    try:
+        if os.path.commonpath([base, target]) != base:
+            return None
+    except ValueError:
+        return None
+    return target
+
+
+def _list_workflow_files(workflows_dir):
+    """Liste les fichiers .json sous ``workflows_dir`` (récursif, trié)."""
+    items = []
+    if not os.path.isdir(workflows_dir):
+        return items
+    for dirpath, _dirs, files in os.walk(workflows_dir):
+        for filename in files:
+            if not filename.lower().endswith(".json"):
+                continue
+            full = os.path.join(dirpath, filename)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            rel = os.path.relpath(full, workflows_dir).replace(os.sep, "/")
+            items.append({
+                "path": rel,
+                "name": filename,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            })
+    items.sort(key=lambda x: x["path"].lower())
+    return items
+
+
+def _parse_workflow_payload(content):
+    """Parse le contenu d'un workflow (dict déjà parsé, ou texte JSON).
+
+    Retourne (workflow_dict|None, error_message|None).
+    """
+    if isinstance(content, dict):
+        return content, None
+    if not isinstance(content, str):
+        return None, "contenu de workflow invalide (ni objet ni texte JSON)"
+    try:
+        parsed = json.loads(content)
+    except Exception as e:
+        return None, "JSON invalide : %s" % e
+    if not isinstance(parsed, dict):
+        return None, "le workflow doit être un objet JSON (racine {…})"
+    return parsed, None
+
+
+def _atomic_write_json(path, data, make_backup=True):
+    """Écrit ``data`` en JSON de façon atomique ; sauvegarde .bak si écrasement.
+
+    Retourne le chemin de la sauvegarde créée (ou None). L'écriture passe par
+    un fichier temporaire puis os.replace : jamais de fichier à moitié écrit.
+    """
+    import shutil
+    import tempfile
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    backup_path = None
+    if make_backup and os.path.isfile(path):
+        backup_path = path + ".bak"
+        shutil.copy2(path, backup_path)
+    fd, tmp = tempfile.mkstemp(prefix=".aih-repair-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return backup_path
+
+
 class _RecordingRoutes:
     """Proxy mince autour de l'objet ``routes`` du PromptServer.
 
@@ -624,6 +749,228 @@ def _register_blobby_group(r):
                 status=500,
             )
 
+
+
+# GROUPE 4bis — Repair Workflow (analyse & réparation JSON, déterministe)
+
+def _register_repair_group(r):
+    """Routes de l'outil « Réparer un workflow » (cœur métier en Python).
+
+    - GET  /aih/repair/workflows : liste les workflows sauvegardés
+      (user/default/workflows, même arborescence que /api/userdata).
+    - POST /aih/repair/analyze   : analyse GROUPÉE (une entrée par type de
+      problème) de sources collées (JSON) et/ou de fichiers sélectionnés ;
+      gère la racine ET les subgraphs, les deux formats de ``links``.
+    - POST /aih/repair/apply     : applique UNIQUEMENT les problèmes cochés.
+      ``mode=preview`` renvoie le JSON réparé (pour Copier / Enregistrer sous),
+      ``mode=overwrite`` écrase le fichier d'origine (sauvegarde .bak) et
+      ``mode=save_as`` écrit une copie. L'écriture est REFUSÉE si la validation
+      détecte de NOUVELLES incohérences (liens pendants / slots inexistants).
+
+    Aucune authentification applicative (décision produit) : la protection est
+    assurée par le reverse-proxy devant ComfyUI.
+    """
+    from aih import repair_workflow as _rw
+
+    def _known_class_defs():
+        """Définitions de classes depuis les nodes enregistrés (ou {} hors runtime)."""
+        try:
+            return _rw.build_class_defs_from_nodes() or None
+        except Exception:
+            return None
+
+    def _collect_sources(body, workflows_dir):
+        """Normalise le corps de requête en sources chargeables.
+
+        Accepte ``sources`` (liste) et/ou les raccourcis ``workflow`` (collé)
+        et ``paths`` (fichiers). Retourne (sources, erreurs) où chaque source
+        = {id, kind, path, name, workflow, valid, validation_errors}.
+        """
+        sources = []
+        errors = []
+        raw_sources = body.get("sources")
+        if not isinstance(raw_sources, list):
+            raw_sources = []
+            if "workflow" in body or "content" in body:
+                raw_sources.append({"id": "pasted", "kind": "pasted",
+                                    "content": body.get("workflow", body.get("content"))})
+            for p in (body.get("paths") or []):
+                raw_sources.append({"id": "file:%s" % p, "kind": "file", "path": p})
+
+        for src in raw_sources:
+            if not isinstance(src, dict):
+                continue
+            kind = src.get("kind") or ("file" if src.get("path") else "pasted")
+            sid = src.get("id") or (("file:%s" % src.get("path")) if src.get("path") else "pasted")
+            name = src.get("name")
+            path_label = None
+            content = src.get("content", src.get("workflow"))
+            if kind == "file":
+                resolved = _resolve_workflow_path(workflows_dir, src.get("path"))
+                if resolved is None:
+                    errors.append({"id": sid, "error": "invalid_path",
+                                   "message": "chemin de workflow refusé : %s" % src.get("path")})
+                    continue
+                if not os.path.isfile(resolved):
+                    errors.append({"id": sid, "error": "not_found",
+                                   "message": "workflow introuvable : %s" % src.get("path")})
+                    continue
+                try:
+                    with open(resolved, "r", encoding="utf-8") as f:
+                        content = f.read()
+                except Exception as e:
+                    errors.append({"id": sid, "error": "read_failed",
+                                   "message": "lecture impossible : %s" % e})
+                    continue
+                if not name:
+                    name = os.path.basename(resolved)
+                path_label = src.get("path")
+            workflow, parse_err = _parse_workflow_payload(content)
+            if parse_err:
+                errors.append({"id": sid, "error": "invalid_json", "message": parse_err})
+                continue
+            sources.append({
+                "id": sid,
+                "kind": kind,
+                "path": path_label,
+                "name": name or ("JSON collé" if kind == "pasted" else sid),
+                "workflow": workflow,
+            })
+        return sources, errors
+
+    @r.get("/aih/repair/workflows")
+    async def aih_repair_list_workflows_route(request):
+        try:
+            return web.json_response({"workflows": _list_workflow_files(_get_workflows_dir())})
+        except Exception as e:
+            logging.error(f"[Repair] list workflows error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    @r.post("/aih/repair/analyze")
+    async def aih_repair_analyze_route(request):
+        try:
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "corps JSON requis"}, status=400)
+            sources, errors = _collect_sources(body, _get_workflows_dir())
+            class_defs = _known_class_defs()
+
+            def _analyze_sync():
+                loaded = []
+                for src in sources:
+                    validation = _rw.validate_workflow(src["workflow"])
+                    loaded.append({**src, "valid": not validation,
+                                   "validation_errors": validation})
+                analysis = _rw.analyze_sources(loaded, class_defs=class_defs)
+                analysis["errors"] = errors
+                return analysis
+
+            # Analyse CPU/I-O offloadée dans un thread : ne bloque pas l'UI.
+            import asyncio
+            analysis = await asyncio.get_running_loop().run_in_executor(None, _analyze_sync)
+            return web.json_response(analysis)
+        except Exception as e:
+            logging.error(f"[Repair] analyze error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    @r.post("/aih/repair/apply")
+    async def aih_repair_apply_route(request):
+        try:
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "corps JSON requis"}, status=400)
+            sources, errors = _collect_sources(body, _get_workflows_dir())
+            selected = body.get("selected") or []
+            if not isinstance(selected, list):
+                return web.json_response({"error": "selected doit être une liste"}, status=400)
+            mode = body.get("mode") or "preview"
+            if mode not in ("preview", "overwrite", "save_as"):
+                return web.json_response({"error": "mode inconnu : %s" % mode}, status=400)
+            save_as = body.get("save_as")
+            class_defs = _known_class_defs()
+            workflows_dir = _get_workflows_dir()
+
+            def _apply_sync():
+                results = []
+                for src in sources:
+                    repaired, report = _rw.apply_repairs(
+                        src["workflow"], selected, class_defs=class_defs
+                    )
+                    entry = {
+                        "id": src["id"],
+                        "kind": src["kind"],
+                        "name": src["name"],
+                        "path": src["path"],
+                        "summary": _rw.repair_summary(report),
+                        "report": report,
+                        "diff": _rw.diff_workflows(src["workflow"], repaired),
+                        "valid": not report["new_validation_errors"],
+                        "validation_errors": report["validation_after"],
+                    }
+                    if mode == "preview":
+                        entry["repaired"] = repaired
+                        results.append(entry)
+                        continue
+
+                    # Écriture : JAMAIS si la validation échoue sur une NOUVELLE erreur.
+                    if report["new_validation_errors"]:
+                        entry["written"] = False
+                        entry["error"] = "validation_failed"
+                        entry["message"] = (
+                            "Réparation refusée : la validation a détecté %d nouvelle(s) "
+                            "incohérence(s) — le fichier n'a PAS été modifié."
+                            % len(report["new_validation_errors"])
+                        )
+                        results.append(entry)
+                        continue
+
+                    if mode == "overwrite":
+                        if not src.get("path"):
+                            entry["written"] = False
+                            entry["error"] = "not_a_file"
+                            entry["message"] = "Écraser n'est possible que pour un workflow sauvegardé."
+                            results.append(entry)
+                            continue
+                        dest = _resolve_workflow_path(workflows_dir, src["path"])
+                    else:  # save_as
+                        target_name = src.get("save_as") or save_as
+                        if not target_name:
+                            entry["written"] = False
+                            entry["error"] = "missing_name"
+                            entry["message"] = "Nom de fichier manquant pour « Enregistrer sous »."
+                            results.append(entry)
+                            continue
+                        dest = _resolve_workflow_path(workflows_dir, target_name)
+                    if dest is None:
+                        entry["written"] = False
+                        entry["error"] = "invalid_path"
+                        entry["message"] = "Destination invalide (doit être un .json sous workflows/)."
+                        results.append(entry)
+                        continue
+                    backup = _atomic_write_json(dest, repaired, make_backup=True)
+                    entry["written"] = True
+                    entry["dest"] = os.path.relpath(dest, workflows_dir).replace(os.sep, "/")
+                    entry["backup"] = (
+                        os.path.relpath(backup, workflows_dir).replace(os.sep, "/")
+                        if backup else None
+                    )
+                    results.append(entry)
+                return results
+
+            # Réparation + écritures offloadées dans un thread : ne bloque pas l'UI.
+            import asyncio
+            results = await asyncio.get_running_loop().run_in_executor(None, _apply_sync)
+            return web.json_response({
+                "mode": mode,
+                "selected": selected,
+                "results": results,
+                "errors": errors,
+            })
+        except Exception as e:
+            logging.error(f"[Repair] apply error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
 
 
 # GROUPE 4 — Models SFTP chunked + fingerprint & Custom Nodes
@@ -1885,6 +2232,7 @@ def register(server_routes):
     _safe("credentials", _register_credentials_group, r)
     _safe("update", _register_update_group, r)
     _safe("blobby", _register_blobby_group, r)
+    _safe("repair", _register_repair_group, r)
     _safe("models", _register_models_group, r)
     if _safe("local", _register_local_group, r):
         # Comportement d'origine de la source : le moteur de synchronisation

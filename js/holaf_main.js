@@ -219,6 +219,7 @@ const HolafUtilitiesMenu = {
             { label: t("menu.modelManager"), handlerName: "holafModelManager", wipFeature: 'model_manager' },
             { label: t("menu.nodesManager"), handlerName: "holafNodesManager", wipFeature: 'custom_nodes_manager' },
             { label: t("menu.workflowProfiler"), special: "profiler_standalone", wipFeature: 'workflow_profiler' },
+            { label: t("menu.repairWorkflow"), special: "aih_repair_workflow" },
             { special: 'aih_blobby_toggle', wipFeature: 'blobby' },
             { label: t("menu.chat"), special: 'aih_chat', wipFeature: 'chat' },
 
@@ -404,6 +405,16 @@ const HolafUtilitiesMenu = {
                         window.AIHMenu.openUpdate();
                     } else {
                         this.checkForAIHUpdate();
+                    }
+                }
+                else if (itemInfo.special === 'aih_repair_workflow') {
+                    // Réparation de workflows au niveau JSON (outil du pack :
+                    // js/aih_repair_workflow.js). Le cœur métier est en Python
+                    // (aih/repair_workflow.py, routes /aih/repair/*).
+                    if (window.AIHRepairWorkflow && typeof window.AIHRepairWorkflow.open === "function") {
+                        window.AIHRepairWorkflow.open();
+                    } else {
+                        AIH.ask({ title: t("main.notImplemented"), message: t("rw.menuUnavailable"), buttons: [{ text: t("dialog.ok"), value: true }] });
                     }
                 }
                 else if (itemInfo.special && itemInfo.special.startsWith('aih_')) {

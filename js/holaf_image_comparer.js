@@ -19,6 +19,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
+import { isVueNodesMode } from "./holaf_nodes2_compat.js";
 
 // --- Utility to safely define or redefine object properties ---
 function defineProperty(instance, property, desc) {
@@ -649,6 +650,22 @@ class HolafImageComparer extends HolafBaseServerNode {
         this.canvasWidget = this.addCustomWidget(new HolafImageComparerWidget("holaf_comparer", this));
         this.setSize(this.computeSize());
         this.setDirtyCanvas(true, true);
+        // Nodes 2.0 (rendu Vue) : le widget canvas custom S'AFFICHE (monté par
+        // WidgetLegacy), mais ses interactions Slide/Click (survol A/B, split au
+        // curseur) reposent sur des hooks node-level onMouse* que le renderer Vue
+        // N'APPELLE PAS (LGraphCanvas.processMouseMove met node=null). On le
+        // signale explicitement plutôt que de laisser une dégradation silencieuse.
+        // (Mode classique : aucun changement.)
+        // NODES2_INCOMPATIBLE: AIHImageComparer — interaction onMouse* node-level +
+        // addCustomWidget non portables tels quels en Vue ; signal runtime ci-dessous.
+        if (isVueNodesMode()) {
+            console.warn(
+                "[Holaf] AIHImageComparer : mode Nodes 2.0 (Vue) — l'interaction " +
+                "Slide/Click (survol A/B) est dégradée car les hooks onMouse* " +
+                "node-level ne sont pas appelés par le renderer Vue. " +
+                "Repasser en rendu classique ou voir docs/NODES2_COMPAT.md."
+            );
+        }
     }
 
     setIsPointerDown(down = this.isPointerDown) {

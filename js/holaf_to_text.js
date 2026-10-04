@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
+import { onCanvasDraw } from "./holaf_nodes2_compat.js";
 
 // ComfyUI class key of this node. The legacy pre-rename alias was removed
 // from the Python registry (user decision): one key per node, so the Add Node
@@ -161,24 +162,39 @@ app.registerExtension({
                 ComfyWidgets.STRING(this, "display_text", ["STRING", { multiline: true }], app);
                 this.custom_widget_el = null; 
                 this.last_display_mode = "Plain";
+                // Nodes 2.0 : node.onDrawForeground n'est jamais appelé (le rendu
+                // Vue saute le dessin canvas du node). On entretient donc le rendu
+                // riche via le hook canvas-level (Vue uniquement ; strictement
+                // inactif en mode classique).
+                if (!this._holafToTextOff) {
+                    this._holafToTextOff = onCanvasDraw(() => ensureToTextRenderer(this));
+                    const prevRemoved = this.onRemoved;
+                    this.onRemoved = function () {
+                        if (prevRemoved) prevRemoved.apply(this, arguments);
+                        if (this._holafToTextOff) { this._holafToTextOff(); this._holafToTextOff = null; }
+                    };
+                }
                 return r;
             };
 
             // --- 4. DOM INJECTION (Lazy Swap) ---
-            const onDrawForeground = nodeType.prototype.onDrawForeground;
-            nodeType.prototype.onDrawForeground = function (ctx) {
-                onDrawForeground?.apply(this, arguments);
-
-                const widget = this.widgets?.find((w) => w.name === "display_text");
-                if (!widget || !widget.inputEl || !widget.inputEl.parentNode) return;
+            // Le rendu riche du ToText (Markdown/JSON) est un <div> DOM injecté à
+            // côté du textarea de `display_text` (lui-même un DOM widget). Cette
+            // injection était déclenchée depuis node.onDrawForeground — hook SAUTÉ
+            // en Nodes 2.0. On l'extrait dans une fonction idempotente appelée
+            // depuis les DEUX chemins : onDrawForeground (classique, inchangé) et
+            // onCanvasDraw (canvas-level, Vue uniquement).
+            const ensureToTextRenderer = (node) => {
+                const widget = node.widgets?.find((w) => w.name === "display_text");
+                if (!widget || !widget.inputEl || !widget.inputEl.parentNode) return false;
 
                 if (widget.inputEl.holaf_patched) {
                     // Update height on every draw if node was resized
-                    if (this.custom_widget_el && this.custom_widget_el.isConnected) {
-                        const targetH = computeDivHeight(this, widget);
-                        this.custom_widget_el.style.height = targetH + "px";
+                    if (node.custom_widget_el && node.custom_widget_el.isConnected) {
+                        const targetH = computeDivHeight(node, widget);
+                        node.custom_widget_el.style.height = targetH + "px";
                     }
-                    return;
+                    return true;
                 }
 
                 // Hide original widget
@@ -206,14 +222,21 @@ app.registerExtension({
                 });
 
                 // Set initial height
-                const initialH = computeDivHeight(this, widget);
+                const initialH = computeDivHeight(node, widget);
                 myDiv.style.height = initialH + "px";
 
                 widget.inputEl.parentNode.appendChild(myDiv);
-                this.custom_widget_el = myDiv;
+                node.custom_widget_el = myDiv;
                 widget.inputEl.holaf_patched = true; 
                 
-                updateWidgetVisuals(myDiv, widget.value || "", this.last_display_mode);
+                updateWidgetVisuals(myDiv, widget.value || "", node.last_display_mode);
+                return true;
+            };
+
+            const onDrawForeground = nodeType.prototype.onDrawForeground;
+            nodeType.prototype.onDrawForeground = function (ctx) {
+                onDrawForeground?.apply(this, arguments);
+                ensureToTextRenderer(this);
             };
 
             // --- 5. DATA UPDATE ---
