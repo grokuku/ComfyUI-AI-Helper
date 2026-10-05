@@ -32,6 +32,17 @@ async def update_comparer_settings(request):
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)})
 
+
+@PromptServer.instance.routes.get("/holaf/comparer/file")
+async def serve_comparer_media_file(request):
+    """Serve a local media file AS-IS (Range + MIME) — no re-encode, no copy.
+
+    Used when A/B receive a string that resolves to an existing file (e.g. a
+    saved video the user does not want to re-encode). See holaf_comparer_paths.
+    """
+    return await serve_comparer_file(request)
+
+
 # --- 2. UNIVERSAL TYPE DEFINITION ---
 # AnyType is shared pack-wide via nodes/holaf_node_helpers.py since the fusion
 # (the former local duplicate class was removed; see PLAN_FUSION.md §3.1).
@@ -45,6 +56,11 @@ if _NODE_DIR not in _sys.path:
     _sys.path.insert(0, _NODE_DIR)
 
 from holaf_node_helpers import ANY_TYPE as ANY  # noqa: E402  (requires _NODE_DIR above)
+from holaf_comparer_paths import (  # noqa: E402  (requires _NODE_DIR above)
+    analyze_input_string,
+    build_direct_media_meta,
+    serve_comparer_file,
+)
 
 # --- 3. FFMPEG CACHE ---
 def get_ffmpeg_encoder():
@@ -83,6 +99,9 @@ class HolafRemoteComparerNode:
 
     def compare(self, comparison_name="Comparison 1", input_1=None, input_2=None):
         media_list = []
+        # Collected by process_input when a STRING pretends to be a path but is
+        # not a servable file (explicit message surfaced to the comparer UI).
+        errors = []
         
         def save_passthrough(file_path, prefix, media_type):
             """Directly copies existing files (Audio/Video/Images) without re-encoding."""
@@ -257,12 +276,19 @@ class HolafRemoteComparerNode:
                     m_type = "video" if ext.endswith(('.mp4', '.webm', '.mkv', '.avi', '.mov')) else "audio" if ext.endswith(('.wav', '.mp3', '.flac', '.ogg')) else "image"
                     return save_passthrough(file_path, prefix, m_type)
 
-            # CASE E: PASSTHROUGH STRING (Direct file path)
-            elif isinstance(data, str) and os.path.exists(data):
-                ext = data.lower()
-                m_type = "video" if ext.endswith(('.mp4', '.webm', '.mkv', '.avi', '.mov')) else "audio" if ext.endswith(('.wav', '.mp3', '.flac', '.ogg')) else "image"
-                return save_passthrough(data, prefix, m_type)
-            
+            # CASE E: STRING (generic single added branch)
+            # A string that resolves to an EXISTING local FILE is displayed
+            # directly (no copy, no re-encode). Any string that is not a path
+            # is IGNORED as before; a string that looks like a path but is not
+            # servable yields an explicit error. Every OTHER type has already
+            # been handled above and is unchanged.
+            elif isinstance(data, str):
+                kind, info = analyze_input_string(data)
+                if kind == "media":
+                    return build_direct_media_meta(info)
+                if kind == "error":
+                    errors.append(info)
+
             return None
 
         m1 = process_input(input_1, "A")
@@ -276,6 +302,8 @@ class HolafRemoteComparerNode:
             "comparison_name": comparison_name,
             "media": media_list
         }
+        if errors:
+            payload["errors"] = errors
 
         return {"ui": {"holaf_payload": [payload]}, "result": (input_1, input_2)}
 

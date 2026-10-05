@@ -90,6 +90,40 @@
     z-index: 10;
 }
 
+/* Message d'erreur explicite (fichier absent/illisible/chemin refusé) */
+#holaf-remote-comparer-root .holaf-rc-status-text.holaf-rc-status-error {
+    color: var(--holaf-danger-color, #ff6b6b);
+    font-weight: bold;
+    text-align: center;
+    padding: 0 16px;
+}
+
+/* Étiquette « ce qui est affiché » (fichiers directs A/B) */
+#holaf-remote-comparer-root .holaf-rc-media-label {
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--holaf-text-primary, #EEEEEE);
+    background-color: color-mix(in srgb, var(--holaf-background-primary) 70%, transparent);
+    border: 1px solid var(--holaf-border-color, #444444);
+    border-radius: 4px;
+    padding: 4px 8px;
+    pointer-events: auto;
+}
+
+#holaf-remote-comparer-root .holaf-rc-media-label a {
+    color: var(--holaf-accent-color, #00a8ff);
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+#holaf-remote-comparer-root .holaf-rc-media-label-item {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: inline-block;
+    max-width: 100%;
+}
+
 /* Sidebar history list items */
 #holaf-remote-comparer-root .holaf-rc-history-item {
     padding: 10px 12px;

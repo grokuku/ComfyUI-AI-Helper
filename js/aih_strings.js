@@ -1348,6 +1348,12 @@ import "./aih_i18n.js";
         "rc.latest": "Dernier",
         "rc.unknownTrack": "Piste inconnue",
         "rc.audio": "AUDIO",
+        "rc.notPreviewable": "Non prévisualisable",
+        "rc.download": "Télécharger",
+        "rc.errLoad": "Lecture impossible : {name}",
+        "rc.errNotFound": "Fichier introuvable : {name}",
+        "rc.errNotAFile": "Ce n'est pas un fichier : {name}",
+        "rc.errInvalidPath": "Chemin invalide : {name}",
 
         /* Shortcuts (holaf_shortcuts.js) */
         "sc.title": "Raccourcis",
@@ -2744,6 +2750,12 @@ import "./aih_i18n.js";
         "rc.latest": "Latest",
         "rc.unknownTrack": "Unknown Track",
         "rc.audio": "AUDIO",
+        "rc.notPreviewable": "Not previewable",
+        "rc.download": "Download",
+        "rc.errLoad": "Cannot load: {name}",
+        "rc.errNotFound": "File not found: {name}",
+        "rc.errNotAFile": "Not a file: {name}",
+        "rc.errInvalidPath": "Invalid path: {name}",
 
         /* Shortcuts (holaf_shortcuts.js) */
         "sc.title": "Shortcuts",

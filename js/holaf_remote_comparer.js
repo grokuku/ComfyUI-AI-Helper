@@ -51,6 +51,7 @@ const HolafRemoteComparer = {
     floatingSidebarBtn: null,
     floatingPopoutBtn: null,
     floatingPopinBtn: null,
+    mediaLabelEl: null,
 
     // UI Control Elements
     uiControls: {
@@ -116,12 +117,19 @@ const HolafRemoteComparer = {
                 if (type === 'COMPARER_PAYLOAD') {
                     const compName = payload.comparison_name || t("rc.unnamed");
                     const mediaMeta = payload.media || [];
-                    if (mediaMeta.length === 0) return;
+                    const payloadErrors = payload.errors || [];
+                    if (payloadErrors.length) {
+                        this._showError(payloadErrors.map(this._formatError).join("  •  "));
+                    }
+                    if (mediaMeta.length === 0) {
+                        if (payloadErrors.length && !this.isOpen) this.show();
+                        return;
+                    }
                     this.latestImagesMeta = mediaMeta;
                     this.history = this.history.filter(h => h.name !== compName);
                     this.history.unshift({ name: compName, imagesMeta: mediaMeta });
                     this.renderSidebarHistory();
-                    this.statusTextEl.style.display = "none";
+                    this._hideError();
                     if (!this.isOpen) this.show();
                     this.resetZoom();
                     this.loadMedia(mediaMeta).then(() => this.draw());
@@ -349,6 +357,14 @@ const HolafRemoteComparer = {
         });
         this.statusTextEl.innerText = t("rc.waiting");
 
+        // Étiquette « ce qui est affiché » (fichiers directs uniquement).
+        this.mediaLabelEl = document.createElement("div");
+        this.mediaLabelEl.className = "holaf-rc-media-label";
+        Object.assign(this.mediaLabelEl.style, {
+            position: "absolute", left: "10px", bottom: "10px", zIndex: "10",
+            display: "none", maxWidth: "70%", pointerEvents: "auto"
+        });
+
         this.canvasEl = document.createElement("canvas");
         Object.assign(this.canvasEl.style, {
             display: "block", cursor: "crosshair", width: "100%", height: "100%", transformOrigin: "0 0"
@@ -360,6 +376,7 @@ const HolafRemoteComparer = {
         this.contentElement.appendChild(this.floatingPopinBtn);
         this.contentElement.appendChild(this.statusTextEl);
         this.contentElement.appendChild(this.canvasEl);
+        this.contentElement.appendChild(this.mediaLabelEl);
 
         this.mainContainer.appendChild(this.sidebarElement);
         this.mainContainer.appendChild(this.contentElement);
@@ -704,8 +721,21 @@ const HolafRemoteComparer = {
         const payload = payloads[0];
         const compName = payload.comparison_name || t("rc.unnamed");
         const mediaMeta = payload.media || [];
+        const payloadErrors = payload.errors || [];
 
-        if (mediaMeta.length === 0) return;
+        if (payloadErrors.length) {
+            this._showError(payloadErrors.map(this._formatError).join("  •  "));
+        }
+
+        if (mediaMeta.length === 0) {
+            // Une chaîne-chemin invalide doit être signalée même s'il n'y a aucun
+            // média à charger (jamais un écran vide ni un échec silencieux).
+            if (payloadErrors.length && !this.isOpen && !this.isComparerDetached()) {
+                this.show();
+                this.saveState();
+            }
+            return;
+        }
 
         // Relay to standalone comparer tab if detached (popped out or standalone open)
         if (this.isComparerDetached()) {
@@ -723,7 +753,7 @@ const HolafRemoteComparer = {
         this.renderSidebarHistory();
 
         if (shouldReload) {
-            this.statusTextEl.style.display = "none";
+            this._hideError();
             if (!this.isOpen && !this.isComparerDetached()) {
                 this.show();
                 this.saveState();
@@ -782,19 +812,48 @@ const HolafRemoteComparer = {
                         }
                         this.checkAndStartAnimation();
                         this.updateVolumes();
+                        this.renderMediaLabel();
                         resolve();
                     }
                 };
 
                 const onMediaError = () => {
                     console.error("[Holaf Remote Comparer] Failed to load media:", meta.filename);
+                    // Message EXPLICITE (jamais un écran vide ni un échec silencieux).
+                    this._showError(t("rc.errLoad", { name: meta.filename || "?" }));
                     loadedCount++;
                     if (loadedCount === targetCount) {
                         if (hasTimelineMedia) this.uiControls.container.style.display = "flex";
                         this.checkAndStartAnimation();
+                        this.renderMediaLabel();
                         resolve();
                     }
                 };
+
+                // Genre "other" : fichier existant non prévisualisable -> on pose
+                // un placeholder étiqueté (AUCUN élément média). Le repli explicite
+                // s'affiche (nom + « non prévisualisable » + lien de téléchargement),
+                // jamais un faux média ni une case vide.
+                if (meta.direct && meta.format === 'other') {
+                    const placeholder = {
+                        _holafGenre: 'other',
+                        _holafFormat: 'other',
+                        _holafName: meta.filename,
+                        _holafDirect: true,
+                        _holafPath: meta.path || null,
+                    };
+                    if (i === 0) this.setViewportImageSize(placeholder);
+                    this.images.push(placeholder);
+                    loadedCount++;
+                    if (loadedCount === targetCount) {
+                        if (hasTimelineMedia) this.uiControls.container.style.display = "flex";
+                        this.checkAndStartAnimation();
+                        this.updateVolumes();
+                        this.renderMediaLabel();
+                        resolve();
+                    }
+                    continue;
+                }
 
                 if (meta.format === 'video' || meta.format === 'audio') {
                     hasTimelineMedia = true;
@@ -827,18 +886,25 @@ const HolafRemoteComparer = {
                     mediaEl.onerror = onMediaError;
                 }
 
-                const params = new URLSearchParams({ filename: meta.filename, type: meta.type, subfolder: meta.subfolder || "" });
-                // VAGUE 10 : cache-buster (_t) pour ne jamais servir une version
-                // périmée en cache quand le même fichier est régénéré (ex. après
-                // un crop qui réécrit le même nom de sortie).
-                params.set("_t", String(Date.now()));
-                // Use api.apiURL if available, otherwise fallback to a direct URL
-                const viewUrl = api.apiURL ? api.apiURL(`/view?${params.toString()}`) : `/view?${params.toString()}`;
+                // Chemin direct : servi TEL QUEL par la route du pack (Range + MIME,
+                // jamais ré-encodé ni copié). Sinon : route /view habituelle.
+                let viewUrl;
+                if (meta.direct && meta.path) {
+                    viewUrl = this._buildDirectUrl(meta.path);
+                } else {
+                    const params = new URLSearchParams({ filename: meta.filename, type: meta.type, subfolder: meta.subfolder || "" });
+                    // VAGUE 10 : cache-buster (_t) pour ne jamais servir une version
+                    // périmée en cache quand le même fichier est régénéré.
+                    params.set("_t", String(Date.now()));
+                    viewUrl = api.apiURL ? api.apiURL(`/view?${params.toString()}`) : `/view?${params.toString()}`;
+                }
                 mediaEl.src = viewUrl;
 
                 // Tag the element for rendering logic
                 mediaEl._holafFormat = meta.format;
                 mediaEl._holafName = meta.filename;
+                mediaEl._holafDirect = !!meta.direct;
+                mediaEl._holafPath = meta.path || null;
                 
                 this.images.push(mediaEl);
             }
@@ -848,6 +914,19 @@ const HolafRemoteComparer = {
     // --- RENDER ENGINE ---
 
     drawMediaItem(ctx, media, x, y, w, h, isA) {
+        // Repli explicite pour un fichier non prévisualisable (jamais un faux média).
+        if (media._holafGenre === "other") {
+            ctx.fillStyle = "#101418";
+            ctx.fillRect(x, y, w, h);
+            ctx.fillStyle = isA ? "#ff8c00" : "#00a8ff";
+            ctx.font = "bold 28px sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText(t("rc.notPreviewable"), x + w / 2, y + h / 2 - 10);
+            ctx.fillStyle = "#bbbbbb";
+            ctx.font = "16px sans-serif";
+            ctx.fillText(media._holafName || "", x + w / 2, y + h / 2 + 24);
+            return;
+        }
         if (media instanceof HTMLImageElement || media instanceof HTMLVideoElement) {
             ctx.drawImage(media, x, y, w, h);
         } else if (media instanceof window.HTMLAudioElement) {
@@ -1001,6 +1080,7 @@ const HolafRemoteComparer = {
     // --- UTILS & BOILERPLATE ---
     
     getMediaSize(media) {
+        if (media && media._holafGenre === "other") return { width: 1280, height: 720 };
         if (media instanceof HTMLVideoElement) return { width: media.videoWidth || 0, height: media.videoHeight || 0 };
         if (media instanceof HTMLImageElement) return { width: media.naturalWidth || 0, height: media.naturalHeight || 0 };
         return { width: 0, height: 0 }; // Audio
@@ -1031,6 +1111,7 @@ const HolafRemoteComparer = {
 
     isMediaReady(media) {
         if (!media) return false;
+        if (media._holafGenre === "other") return true; // placeholder étiqueté
         if (media instanceof HTMLMediaElement) return media.readyState >= 1; // Metadata loaded is enough
         return media.complete && media.naturalWidth > 0;
     },
@@ -1059,6 +1140,73 @@ const HolafRemoteComparer = {
     resetZoom() {
         if (this.vp) this.vp.fit();
         this.draw();
+    },
+
+    // --- DIRECT FILE (path) HELPERS ---
+
+    // URL de service d'un fichier direct : route du pack, TEL QUEL (Range +
+    // MIME), avec cache-buster. Réutilise api.apiURL si présent (base ComfyUI).
+    _buildDirectUrl(path) {
+        const params = new URLSearchParams({ path: path, _t: String(Date.now()) });
+        const route = `/holaf/comparer/file?${params.toString()}`;
+        return api.apiURL ? api.apiURL(route) : route;
+    },
+
+    _esc(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+        }[c]));
+    },
+
+    // Traduit un code d'erreur backend en message explicite (i18n FR/EN).
+    _formatError(err) {
+        const detail = (err && err.detail) || "";
+        switch (err && err.code) {
+            case "not_found": return t("rc.errNotFound", { name: detail });
+            case "not_a_file": return t("rc.errNotAFile", { name: detail });
+            default: return t("rc.errInvalidPath", { name: detail });
+        }
+    },
+
+    _showError(message) {
+        if (!this.statusTextEl) return;
+        this.statusTextEl.classList.add("holaf-rc-status-error");
+        this.statusTextEl.style.display = "block";
+        this.statusTextEl.innerText = message;
+    },
+
+    _hideError() {
+        if (!this.statusTextEl) return;
+        this.statusTextEl.classList.remove("holaf-rc-status-error");
+        this.statusTextEl.style.display = "none";
+        this.statusTextEl.innerText = t("rc.waiting");
+    },
+
+    // Indique CE QUI EST AFFICHÉ (fichiers directs A/B), avec repli explicite et
+    // lien de téléchargement pour les fichiers non prévisualisables.
+    renderMediaLabel() {
+        if (!this.mediaLabelEl) return;
+        const parts = [];
+        this.images.forEach((m, i) => {
+            if (!m || !m._holafDirect) return;
+            const side = i === 0 ? "A" : "B";
+            const name = this._esc(m._holafName || "?");
+            if (m._holafGenre === "other") {
+                const link = m._holafPath
+                    ? ` (<a href="${this._esc(this._buildDirectUrl(m._holafPath))}" download="${name}">${this._esc(t("rc.download"))}</a>)`
+                    : "";
+                parts.push(`<span class="holaf-rc-media-label-item">${side}: ${name} — ${this._esc(t("rc.notPreviewable"))}${link}</span>`);
+            } else {
+                parts.push(`<span class="holaf-rc-media-label-item">${side}: ${name}</span>`);
+            }
+        });
+        if (parts.length) {
+            this.mediaLabelEl.innerHTML = parts.join("<br>");
+            this.mediaLabelEl.style.display = "block";
+        } else {
+            this.mediaLabelEl.innerHTML = "";
+            this.mediaLabelEl.style.display = "none";
+        }
     },
 
     updatePlaybackUI(isPlaying) {
@@ -1115,7 +1263,7 @@ const HolafRemoteComparer = {
         let targetMeta = nameId === "latest" ? this.latestImagesMeta : (this.history.find(h => h.name === nameId)?.imagesMeta || []);
 
         if (targetMeta.length > 0) {
-            this.statusTextEl.style.display = "none";
+            this._hideError();
             this.resetZoom();
             await this.loadMedia(targetMeta);
             this.draw();
