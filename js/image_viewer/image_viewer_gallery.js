@@ -42,6 +42,9 @@ import { HolafGrid } from "../vendor/holaf/holaf-virtual-grid.js";
 import { showToast } from "../aih_toast_bridge.js";
 import { showFullscreenView, getFullImageUrl } from './image_viewer_navigation.js';
 import { GallerySource } from './image_viewer_source.js';
+// Restauration de l'état de travail mémorisé (défilement + élément actif) de la
+// source active, à la demande de l'hôte (ouverture du panneau / bascule).
+import { restoreGalleryView } from './image_viewer_persist.js';
 import {
     PAGE_SIZE, getWindowStart, isWindowLoaded, isWindowLoading,
     getLoadingPromise, registerLoading, unregisterLoading,
@@ -262,8 +265,7 @@ function cleanupCell(el) {
     }
     const oldImg = el.querySelector('img');
     if (oldImg) oldImg.remove();
-    const oldVideo = el.querySelector('video.holaf-hover-preview');
-    if (oldVideo) { oldVideo.pause(); oldVideo.src = ""; oldVideo.remove(); }
+    releaseHoverPreview(el);
     const oldError = el.querySelector('.holaf-viewer-error-overlay');
     if (oldError) oldError.remove();
     const oldFsIcon = el.querySelector('.holaf-viewer-fullscreen-icon');
@@ -285,11 +287,10 @@ function updateCell(el, image, ctx) {
         actionIcon.innerHTML = '🎥';
         actionIcon.title = t('iv.playVideo');
         if (image.has_edit_file) actionIcon.classList.add('active');
-        // Aperçu au survol = édition/serveur de fichiers locaux (loadEdits +
-        // « full »). La source serveur (étape 2 = vignettes seulement) ne le
-        // supporte pas (capabilities.edit === false) : pas d'aperçu, seule la
-        // vignette est affichée (lecture vidéo = étape 4).
-        if (GallerySource.active().capabilities.edit) {
+        // Aperçu au survol = source capable de résoudre une URL d'aperçu
+        // (local : URL same-origin ; serveur : blob Bearer + cache local).
+        // `capabilities.videoPreview` porte cette règle pour les deux sources.
+        if (GallerySource.active().capabilities.videoPreview) {
             el._hoverCleanup = attachVideoHoverListeners(el, image);
         }
     } else if (isAudio) {
@@ -567,6 +568,35 @@ async function fetchWindow(start) {
 }
 
 // --- Video Hover Preview (extracted for reuse with pooled placeholders) ---
+//
+// PRINCIPE (partagé par toutes les sources) : au survol d'une cellule VIDÉO,
+// on superpose un `<video>` muet, en boucle et en lecture automatique sur la
+// vignette statique ; au `mouseleave` (ou au recyclage de la cellule) on
+// l'arrête et le retire. C'est le comportement historique de la galerie LOCALE ;
+// il est désormais appliqué aussi à la source SERVEUR via le même code — seul
+// le TRANSPORT de l'URL change (local : URL same-origin cachée par le
+// navigateur ; serveur : blob Bearer + cache local borné).
+
+/** Arrête/retire l'aperçu vidéo d'une cellule et libère ses ressources. */
+function releaseHoverPreview(placeholder) {
+    if (!placeholder) return;
+    if (placeholder._hoverAbort) {
+        try { placeholder._hoverAbort.abort(); } catch (e) { /* ignore */ }
+        placeholder._hoverAbort = null;
+    }
+    if (placeholder._hoverRevoke) {
+        try { placeholder._hoverRevoke(); } catch (e) { /* ignore */ }
+        placeholder._hoverRevoke = null;
+    }
+    const vid = placeholder.querySelector('video.holaf-hover-preview');
+    if (vid) {
+        try { vid.pause(); } catch (e) { /* ignore */ }
+        vid.removeAttribute('src');
+        if (typeof vid.load === 'function') { try { vid.load(); } catch (e) { /* ignore */ } }
+        vid.remove();
+    }
+}
+
 function attachVideoHoverListeners(placeholder, image) {
     const mouseenterHandler = async () => {
         const generation = (placeholder._hoverGeneration || 0) + 1;
@@ -592,17 +622,51 @@ function attachVideoHoverListeners(placeholder, image) {
 
         if (!placeholder.isConnected || placeholder._hoverGeneration !== generation) return;
 
-        const timeoutId = setTimeout(() => {
+        const timeoutId = setTimeout(async () => {
             hoverTimeouts.delete(image.path_canon);
             if (!placeholder.isConnected || placeholder._hoverGeneration !== generation) return;
 
             const existingVideo = placeholder.querySelector('video.holaf-hover-preview');
             if (existingVideo) return;
 
-            const videoUrl = getFullImageUrl(image);
+            // Résolution de l'URL d'aperçu : sync (chaîne) en local, async
+            // ({ url, revoke }) en serveur. On annule via signal si le pointeur
+            // quitte la cellule pendant le téléchargement (aperçu serveur).
+            const provider = GallerySource.active();
+            const abortController = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+            // Stocké AVANT l'await : un mouseleave pendant le téléchargement
+            // (aperçu serveur) doit pouvoir l'annuler via releaseHoverPreview.
+            placeholder._hoverAbort = abortController;
+            let previewUrl = null;
+            let revoke = null;
+            try {
+                if (typeof provider.resolvePreviewMediaUrl === 'function') {
+                    const resolved = await provider.resolvePreviewMediaUrl(
+                        image, { signal: abortController ? abortController.signal : undefined });
+                    if (resolved && typeof resolved === 'object' && resolved.url) {
+                        previewUrl = resolved.url;
+                        revoke = resolved.revoke || null;
+                    } else {
+                        previewUrl = resolved;
+                    }
+                } else {
+                    previewUrl = getFullImageUrl(image);
+                }
+            } catch (e) {
+                if (revoke) { try { revoke(); } catch (err) { /* ignore */ } }
+                return;
+            }
+            if (!placeholder.isConnected || placeholder._hoverGeneration !== generation) {
+                if (revoke) { try { revoke(); } catch (e) { /* ignore */ } }
+                return;
+            }
+            if (!previewUrl) return;
+
+            placeholder._hoverRevoke = revoke;
+
             const vid = document.createElement('video');
             vid.className = 'holaf-hover-preview';
-            vid.src = videoUrl;
+            vid.src = previewUrl;
             vid.muted = true;
             vid.loop = true;
             vid.autoplay = true;
@@ -632,7 +696,9 @@ function attachVideoHoverListeners(placeholder, image) {
                 filter: ${filterStr};
             `;
 
-            vid.onerror = () => { vid.remove(); };
+            // Flux illisible (format non décodable par le navigateur) : retirer
+            // l'aperçu et relâcher l'objectURL éventuel (vignette statique gardée).
+            vid.onerror = () => { releaseHoverPreview(placeholder); };
             placeholder.appendChild(vid);
         }, HOVER_DELAY_MS);
 
@@ -645,12 +711,7 @@ function attachVideoHoverListeners(placeholder, image) {
             clearTimeout(hoverTimeouts.get(image.path_canon));
             hoverTimeouts.delete(image.path_canon);
         }
-        const vid = placeholder.querySelector('video.holaf-hover-preview');
-        if (vid) {
-            vid.pause();
-            vid.src = "";
-            vid.remove();
-        }
+        releaseHoverPreview(placeholder);
     };
 
     placeholder.addEventListener('mouseenter', mouseenterHandler);
@@ -660,6 +721,7 @@ function attachVideoHoverListeners(placeholder, image) {
     return () => {
         placeholder.removeEventListener('mouseenter', mouseenterHandler);
         placeholder.removeEventListener('mouseleave', mouseleaveHandler);
+        releaseHoverPreview(placeholder);
     };
 }
 
@@ -724,6 +786,15 @@ function initGallery(viewer) {
         ensureImageLoaded,
         selection: grid.selection,
     };
+}
+
+// Consomme la demande de restauration de vue posée par l'hôte (ouverture du
+// panneau, bascule de source) : restaure défilement + élément actif de la
+// source active, une seule fois, APRÈS le rendu (le sizer connaît le total).
+function applyPendingViewRestore() {
+    if (!viewerInstance || !viewerInstance._restoreGalleryViewOnNextSync) return;
+    viewerInstance._restoreGalleryViewOnNextSync = false;
+    restoreGalleryView();
 }
 
 // Ré-affiche la fenêtre visible de la grille. Re-synchronise la sélection de la
@@ -807,6 +878,7 @@ function syncGallery(viewer, images) {
         const emptyMsg = grid.surface.querySelector('.holaf-viewer-empty-message');
         if (emptyMsg) emptyMsg.remove();
         grid.relayout();
+        applyPendingViewRestore();
         applyActiveClass();
         return;
     }
@@ -824,6 +896,7 @@ function syncGallery(viewer, images) {
     if (images && images.length > 0) {
         galleryEl.scrollTop = 0;
         grid.render(true);
+        applyPendingViewRestore();
         applyActiveClass();
     } else {
         grid.render(true);

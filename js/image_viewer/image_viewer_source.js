@@ -198,6 +198,9 @@ const localSource = {
         pollDelta: true,
         mediaPlayback: true,    // vidéo/audio lus depuis l'URL /holaf/images/full
         preloadFull: true,      // plein média = URL directe (préchargeable)
+        // Aperçu VIDÉO au survol (animation de la vignette) : le principe
+        // historique de la galerie locale, partagé avec la source serveur.
+        videoPreview: true,
     }),
     pageSize: LOCAL_PAGE_SIZE,
     mode: 'window',
@@ -304,6 +307,15 @@ const localSource = {
 
     // — Média / infos (métier) —
     resolveMediaUrl(image /*, { signal } */) {
+        return _buildFullImageUrl(image);
+    },
+
+    // — Aperçu vidéo au survol —
+    // MÊME transport que le plein média local : une URL same-origin
+    // (`/holaf/images/full`) que le navigateur streame et CACHE (cache-buster
+    // mtime) — aucun blob, aucune révocation. Renvoie une chaîne (le hover
+    // gère indifféremment chaîne et { url, revoke }).
+    resolvePreviewMediaUrl(image /*, { signal } */) {
         return _buildFullImageUrl(image);
     },
 

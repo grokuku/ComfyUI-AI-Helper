@@ -199,6 +199,21 @@ const REMOTE_THUMB_TIMEOUT_MS = 30000;
 const REMOTE_THUMB_RETRY = Object.freeze({ max: 2, delayMs: 3000 });
 const REMOTE_THUMB_CONCURRENCY = 6;
 
+// Cache LOCAL des APERÇUS VIDÉO (blob → objectURL) de la source serveur.
+//
+// La galerie LOCALE n'a pas besoin de cache pour l'aperçu au survol : son URL
+// (`/holaf/images/full?...mtime=`) est same-origin et le NAVIGATEUR la cache.
+// La source serveur, elle, exige un Bearer (impossible sur un `<video src>`),
+// donc l'aperçu passe par un blob téléchargé via le bridge : sans cache, chaque
+// survol re-téléchargerait le média. Ce cache LRU borné (nombre d'entrées ET
+// budget d'octets) sert exactement ce mécanisme : un second survol du même
+// média réutilise l'objectURL au lieu de re-télécharger. Il est vidé à la
+// bascule de source (pour ne pas garder en mémoire des blobs inutiles).
+// Les entrées plus grosses que le budget NE sont PAS cachées (l'objectURL est
+// alors révoqué par l'hôte à la fin du survol).
+const REMOTE_PREVIEW_CACHE_MAX_ITEMS = 8;
+const REMOTE_PREVIEW_CACHE_MAX_BYTES = 48 * 1024 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS PURS (exportés pour les tests)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -476,6 +491,38 @@ export function buildMediaListQuery(filters) {
 // PROVIDER
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Télécharge le binaire ORIGINAL d'un média via le bridge (Bearer) et renvoie
+ * le Blob. Gère l'annulation (signal → AbortError) et les erreurs typées.
+ * Partagé par resolveMediaUrl (plein média image) et resolvePreviewMediaUrl
+ * (aperçu vidéo/audio au survol).
+ */
+async function _downloadOriginalBlob(image, { signal = undefined } = {}) {
+    const id = (image && image.server_id != null) ? image.server_id : serverIdFromPath(image && image.path_canon);
+    if (id == null) throw _mediaError(404);
+    if (signal && signal.aborted) throw _abortError();
+
+    let resp;
+    try {
+        resp = await remoteGet(REMOTE_ENDPOINTS.download(id), { raw: true, signal });
+    } catch (err) {
+        if (signal && signal.aborted) throw _abortError();
+        throw err;
+    }
+    if (signal && signal.aborted) throw _abortError();
+    if (!resp || resp.ok === false) throw _mediaError(resp ? resp.status : 0);
+
+    let blob;
+    try {
+        blob = await resp.blob();
+    } catch (err) {
+        if (signal && signal.aborted) throw _abortError();
+        throw _mediaError(0);
+    }
+    if (signal && signal.aborted) throw _abortError();
+    return blob;
+}
+
 /** Taille d'affichage de vignette courante (state.ui.thumbnail_size). */
 function currentThumbSize() {
     try {
@@ -508,6 +555,41 @@ export function createRemoteSource(overrides = {}) {
         return currentThumbSize();
     }
 
+    // Cache LOCAL borné des aperçus vidéo/audio (blob → objectURL). LRU par
+    // ordre d'insertion + budget d'octets. Voir REMOTE_PREVIEW_CACHE_*.
+    const _previewCache = new Map(); // key -> { url, size }
+    function _previewCacheBytes() {
+        let total = 0;
+        for (const e of _previewCache.values()) total += (e.size || 0);
+        return total;
+    }
+    function _previewCacheGet(key) {
+        if (!_previewCache.has(key)) return null;
+        const entry = _previewCache.get(key);
+        _previewCache.delete(key);
+        _previewCache.set(key, entry); // touch LRU
+        return entry;
+    }
+    function _previewCachePut(key, entry) {
+        if (_previewCache.has(key)) _previewCache.delete(key);
+        _previewCache.set(key, entry);
+        while (_previewCache.size > REMOTE_PREVIEW_CACHE_MAX_ITEMS
+            || _previewCacheBytes() > REMOTE_PREVIEW_CACHE_MAX_BYTES) {
+            const oldestKey = _previewCache.keys().next().value;
+            if (oldestKey === undefined) break;
+            const old = _previewCache.get(oldestKey);
+            _previewCache.delete(oldestKey);
+            try { URL.revokeObjectURL(old.url); } catch (e) { /* ignore */ }
+            if (_previewCache.size === 0) break;
+        }
+    }
+    function _previewCacheClear() {
+        for (const e of _previewCache.values()) {
+            try { URL.revokeObjectURL(e.url); } catch (err) { /* ignore */ }
+        }
+        _previewCache.clear();
+    }
+
     const provider = {
         id: REMOTE_SOURCE_ID,
         label: 'Server',
@@ -523,6 +605,10 @@ export function createRemoteSource(overrides = {}) {
             // seulement. L'hôte n'appelle jamais resolveMediaUrl pour du
             // vidéo/audio et affiche un message (cf. navigation.js).
             mediaPlayback: false,
+            // Aperçu VIDÉO au survol (MÊME principe que la galerie locale) :
+            // le transport diffère (Bearer → blob téléchargé puis objectURL),
+            // cf. resolvePreviewMediaUrl + cache local borné.
+            videoPreview: true,
             // Préchargement du plein média via <img src> impossible : le Bearer
             // ne peut pas être porté par un élément. L'hôte saute le preload
             // plein (le plein écran passe par le bridge + objectURL).
@@ -799,36 +885,46 @@ export function createRemoteSource(overrides = {}) {
          * @returns {Promise<{url: string, revoke: Function}>}
          */
         async resolveMediaUrl(image, { signal = undefined } = {}) {
-            const id = (image && image.server_id != null) ? image.server_id : serverIdFromPath(image && image.path_canon);
-            if (id == null) throw _mediaError(404);
             if (!isPlayableImage(image)) {
-                // Vidéo/audio : AUCUN téléchargement du binaire complet.
+                // Vidéo/audio : AUCUN téléchargement du binaire complet (plein écran).
                 throw new HolafFetchError('lecture vidéo/audio indisponible en mode serveur', { status: -1 });
             }
-            if (signal && signal.aborted) throw _abortError();
-
-            let resp;
-            try {
-                resp = await remoteGet(REMOTE_ENDPOINTS.download(id), { raw: true, signal });
-            } catch (err) {
-                if (signal && signal.aborted) throw _abortError();
-                throw err;
-            }
-            if (signal && signal.aborted) throw _abortError();
-            if (!resp || resp.ok === false) throw _mediaError(resp ? resp.status : 0);
-
-            let blob;
-            try {
-                blob = await resp.blob();
-            } catch (err) {
-                if (signal && signal.aborted) throw _abortError();
-                throw _mediaError(0);
-            }
-            if (signal && signal.aborted) throw _abortError();
-
+            const blob = await _downloadOriginalBlob(image, { signal });
             const url = URL.createObjectURL(blob);
             return { url, revoke: () => { try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ } } };
         },
+
+        /**
+         * Aperçu VIDÉO/AUDIO au survol — MÊME principe que la galerie LOCALE
+         * (`<video>` muet en boucle superposé à la vignette). Transport serveur :
+         * blob téléchargé via le bridge (Bearer) → objectURL, avec un CACHE LOCAL
+         * borné (REMOTE_PREVIEW_CACHE_*) pour ne pas re-télécharger le média à
+         * chaque survol. Pour une IMAGE, on retombe sur resolveMediaUrl.
+         *
+         * `revoke()` : no-op pour une entrée CACHÉE (le cache possède
+         * l'objectURL et le libère à l'éviction / au vidage) ; réel si le média
+         * dépasse le budget (l'hôte libère alors l'objectURL en fin de survol).
+         * @returns {Promise<{url:string, revoke:Function}>}
+         */
+        async resolvePreviewMediaUrl(image, { signal = undefined } = {}) {
+            if (isPlayableImage(image)) return provider.resolveMediaUrl(image, { signal });
+            const key = provider.itemKey(image);
+            if (key) {
+                const hit = _previewCacheGet(key);
+                if (hit) return { url: hit.url, revoke: () => {} };
+            }
+            const blob = await _downloadOriginalBlob(image, { signal });
+            const url = URL.createObjectURL(blob);
+            const size = (blob && typeof blob.size === 'number') ? blob.size : 0;
+            if (key && size <= REMOTE_PREVIEW_CACHE_MAX_BYTES) {
+                _previewCachePut(key, { url, size });
+                return { url, revoke: () => {} };
+            }
+            return { url, revoke: () => { try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ } } };
+        },
+
+        /** Vide le cache local des aperçus (toutes les entrées révoquées). */
+        clearPreviewCache() { _previewCacheClear(); return provider; },
 
         /**
          * Métadonnées détaillées pour le panneau d'infos : GET

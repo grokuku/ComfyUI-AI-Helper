@@ -40,6 +40,10 @@ import * as InfoPane from './image_viewer/image_viewer_infopane.js';
 import * as Navigation from './image_viewer/image_viewer_navigation.js';
 import { ImageEditor } from './image_viewer/image_viewer_editor.js';
 import { imageViewerState } from './image_viewer/image_viewer_state.js';
+// Persistance LOCALE (localStorage) de l'état de TRAVAIL de la galerie
+// (défilement + élément actif), PAR source — non couvert par les settings
+// backend (qui portent déjà source/filtres/tri/taille/thème).
+import { captureGalleryView } from './image_viewer/image_viewer_persist.js';
 
 const STATS_REFRESH_INTERVAL_MS = 2000;
 const DOWNLOAD_CHUNK_SIZE = 5 * 1024 * 1024;
@@ -117,6 +121,14 @@ const holafImageViewer = {
         // standalone — plus besoin du polyfill inline.
 
         document.addEventListener("keydown", (e) => this._handleKeyDown(e));
+        // État de travail (défilement + élément actif) : capture à la
+        // fermeture/au rechargement de la page. Best-effort, jamais bloquant.
+        if (!this._persistCaptureBound) {
+            this._persistCaptureBound = true;
+            const capture = () => captureGalleryView();
+            window.addEventListener('pagehide', capture);
+            window.addEventListener('beforeunload', capture);
+        }
         const cssId = "holaf-image-viewer-css";
         if (!document.getElementById(cssId)) {
             const link = document.createElement("link");
@@ -163,6 +175,9 @@ const holafImageViewer = {
             if (!optionsLoaded) await this._refreshRemoteFilterCountsIfOpen();
 
             // Immediate load on show, no debounce needed here
+            // À l'OUVERTURE, on restaure la vue mémorisée (défilement + élément
+            // actif) de la source active dès que la grille est re-rendue.
+            this._restoreGalleryViewOnNextSync = true;
             this.triggerFilterChange(true); 
 
             // Le poll suit la source ACTIVE : local = intervalle 2 s historique
@@ -192,7 +207,12 @@ const holafImageViewer = {
                 galleryEl.addEventListener('scroll', () => {
                     this._isGalleryScrolling = true;
                     clearTimeout(scrollStopTimer);
-                    scrollStopTimer = setTimeout(() => { this._isGalleryScrolling = false; }, 500);
+                    scrollStopTimer = setTimeout(() => {
+                        this._isGalleryScrolling = false;
+                        // Mémorise la position de défilement de la source active
+                        // (débouncé : une seule écriture après la fin du scroll).
+                        captureGalleryView();
+                    }, 500);
                 }, { passive: true });
             }
 
@@ -207,6 +227,9 @@ const holafImageViewer = {
     },
 
     hide() {
+        // Mémorise l'état de travail (défilement + élément actif) AVANT de
+        // masquer : rouvrir la galerie doit retrouver le contexte.
+        captureGalleryView();
         if (this.panelElements?.panelEl) {
             this.panelElements.panelEl.style.display = "none";
             if (this.statsRefreshIntervalId) {

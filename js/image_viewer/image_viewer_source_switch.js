@@ -62,6 +62,9 @@ import { GallerySource } from './image_viewer_source.js';
 import { imageViewerState } from './image_viewer_state.js';
 import { resetWindowCache, rebindSourceCollection } from './image_viewer_data.js';
 import { getRemoteConfig } from '../aih_fetch_bridge.js';
+// Capture de la vue de travail (défilement + élément actif) de la source
+// SORTANTE avant le swap : elle sera restaurée si l'on revient sur cette source.
+import { captureGalleryView } from './image_viewer_persist.js';
 // Le provider distant est enregistré à la demande (idempotent) : une config
 // validée après le démarrage doit s'appliquer sans redémarrer ComfyUI.
 import { ensureRemoteSourceRegistered } from './image_viewer_source_remote.js';
@@ -238,6 +241,14 @@ export async function applySourceSwitch(viewer, targetId) {
     }
 
     const previousId = GallerySource.activeId();
+    // Mémorise la vue de travail de la source quittée (défilement + actif).
+    captureGalleryView();
+    // La source quittée peut avoir un cache local d'APERÇUS VIDÉO (blobs) : on
+    // le vide pour ne pas conserver en mémoire des vidéos inutiles.
+    try {
+        const leaving = GallerySource.active();
+        if (leaving && typeof leaving.clearPreviewCache === 'function') leaving.clearPreviewCache();
+    } catch (e) { /* ignore */ }
     _stopViewerActivity(viewer);
     // Vide le cache de fenêtres de la collection SORTANTE avant le swap.
     resetWindowCache();
@@ -266,6 +277,11 @@ export async function applySourceSwitch(viewer, targetId) {
     // serveur → poll de tête 10 s (le poll de la source quittée vient d'être
     // arrêté par _stopViewerActivity).
     if (typeof viewer._syncSourcePolling === 'function') viewer._syncSourcePolling();
+
+    // La source active ayant changé, la grille va se re-rendre : on demande la
+    // restauration de la vue MÉMORISÉE de la NOUVELLE source (jamais celle de
+    // l'ancienne). Consommée par syncGallery dès qu'il re-rend la grille.
+    if (viewer) viewer._restoreGalleryViewOnNextSync = true;
 
     if (viewer && typeof viewer.saveSettings === 'function') {
         viewer.saveSettings({ gallery_source: decision.id });
