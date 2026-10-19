@@ -9,6 +9,7 @@ import { imageViewerState } from './image_viewer_state.js';
 import * as Navigation from './image_viewer_navigation.js';
 import { HolafFetch } from '../vendor/holaf/holaf-fetch.js';
 import { showToast as bridgeShowToast } from '../aih_toast_bridge.js';
+import { aihIconSvg } from '../aih_icons.js';
 import {
     SOURCE_LOCAL,
     SOURCE_REMOTE,
@@ -330,10 +331,10 @@ class ImageViewerUI {
                 <div id="holaf-processing-overlay" style="display:none; position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); background:rgba(0,0,0,0.6); color:white; padding:15px 25px; border-radius:8px; z-index:101; pointer-events:none; font-weight:bold; backdrop-filter:blur(2px);">
                     ${t('iv.processingVideo')}
                 </div>
-                <button class="holaf-viewer-zoom-close" title="${t('iv.zoomCloseTitle')}">✖</button>
+                <button class="holaf-viewer-zoom-close" title="${t('iv.zoomCloseTitle')}" style="display:inline-flex;align-items:center;justify-content:center;">${aihIconSvg('x', { size: 18 })}</button>
                 <img src="" draggable="false" />
                 <video controls loop id="holaf-viewer-zoom-video" style="display: none; width: 100%; height: 100%; object-fit: contain;"></video>
-                <button class="holaf-viewer-zoom-fullscreen-icon" title="${t('iv.enterFullscreen')}">⛶</button>
+                <button class="holaf-viewer-zoom-fullscreen-icon" title="${t('iv.enterFullscreen')}" style="display:inline-flex;align-items:center;justify-content:center;">${aihIconSvg('maximize', { size: 18 })}</button>
             </div>
         `;
         return pane;

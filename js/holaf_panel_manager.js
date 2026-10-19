@@ -13,6 +13,7 @@
  */
 
 import { HOLAF_THEMES } from "./holaf_themes.js";
+import { aihIconSvg } from "./aih_icons.js";
 import "./aih_strings.js";
 import { makeDraggable, makeResizable, makeContentZoomable, applyContentZoom, loadZoomLevel, saveZoomLevel, aihWindowManager } from "./holaf_window_utils.js";
 
@@ -113,8 +114,13 @@ export const HolafPanelManager = {
 
         const closeButton = document.createElement("button");
         closeButton.className = "holaf-utility-close-button";
-        closeButton.textContent = "✕";
+        // Icône « x » de la brique (trait, stroke=currentColor → la couleur reste
+        // celle de `.holaf-utility-close-button` / son :hover). Nom accessible porté
+        // par `title` → icône décorative.
+        closeButton.innerHTML = aihIconSvg("x", { size: 14 });
         closeButton.title = t("dialog.close");
+        closeButton.style.display = "inline-flex";
+        closeButton.style.alignItems = "center";
         closeButton.style.marginLeft = "auto";
         if (options.headerContent) {
             closeButton.style.marginLeft = "10px";

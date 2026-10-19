@@ -2,6 +2,16 @@ import "./aih_dialog.js";
 import "./aih_strings.js";
 import { showToast as bridgeShowToast } from "./aih_toast_bridge.js";
 import { remoteRequest, HolafFetch, normalizeServerUrl } from "./aih_fetch_bridge.js";
+// Seed PAR ÉLÉMENT : sémantique des 3 modes + contrôle de ligne (source unique,
+// miroir de nodes/elements_node.py — voir js/aih_elements_seed.js).
+import {
+    SEED_MODE_FIXED,
+    normalizeSeedMode,
+    elementSeedFields,
+    effectiveElementSeed,
+    resolveBraceBlocks,
+    createSeedControl,
+} from "./aih_elements_seed.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -207,13 +217,17 @@ function _parseConceptSyntax(text, defaultCount) {
                     w.value = JSON.stringify({
                         elements: node._aihElements.map(e => {
                             const base = { visible: e.visible !== false };
+                            // Seed par élément : `elementSeedFields` ne renvoie
+                            // RIEN pour le mode hérité (défaut) → les workflows et
+                            // presets existants sont réécrits au format d'origine,
+                            // sans champ parasite.
                             if (e.type === "filter") {
-                                return { ...base, type: "filter", id: e.id, name: e.name || "", author: e.author || "", is_public: !!e.is_public, hint: e.hint || "" };
+                                return { ...base, ...elementSeedFields(e), type: "filter", id: e.id, name: e.name || "", author: e.author || "", is_public: !!e.is_public, hint: e.hint || "" };
                             }
                             if (e.type === "text") {
                                 // "raw" est le format attendu par le backend /api/generate.
                                 // hint = préfixe de résolution optionnel (texte brut si vide).
-                                return { ...base, type: "raw", text: e.text, hint: e.hint || "" };
+                                return { ...base, ...elementSeedFields(e), type: "raw", text: e.text, hint: e.hint || "" };
                             }
                             return { ...base, ...e };
                         }),
@@ -435,18 +449,23 @@ function _parseConceptSyntax(text, defaultCount) {
                         if (data.elements && Array.isArray(data.elements)) {
                             node._aihElements = data.elements.map(e => {
                                 const visible = e.visible !== false;
+                                // Seed par élément : les anciens éléments (sans
+                                // seed_mode) sont normalisés en mode hérité et ne
+                                // reçoivent AUCUN champ (pas de valeur parasite).
+                                const seed = elementSeedFields(e);
                                 if (e.type === "filter") {
                                     return {
                                         type: "filter", id: e.id, name: e.name || t("el.filterLabel", { id: e.id }),
                                         author: e.author || "?", is_public: !!e.is_public, hint: e.hint || "", visible,
+                                        ...seed,
                                     };
                                 }
                                 if (e.type === "text" || e.type === "raw") {
                                     // hint conservé explicitement (sinon perte silencieuse
                                     // au rechargement d'un preset).
-                                    return { type: "text", text: e.text || "", hint: e.hint || "", visible };
+                                    return { type: "text", text: e.text || "", hint: e.hint || "", visible, ...seed };
                                 }
-                                return { ...e, visible };
+                                return { ...e, visible, ...seed };
                             });
                         }
                         // Restaurer random checkboxes
@@ -786,6 +805,29 @@ function _parseConceptSyntax(text, defaultCount) {
                         };
 
                         row.appendChild(grip);
+
+                        // ---- Seed par élément (3 états : hérité / random / fixe) ----
+                        // Colonne de contrôle compacte placée AVANT les autres
+                        // boutons de ligne (la poignée de drag reste en tête).
+                        // `kind === "mode"` → la ligne est re-rendue (le champ de
+                        // valeur apparaît/disparaît) ; `kind === "value"` → simple
+                        // synchronisation pour ne PAS voler le focus du champ.
+                        const seedCtl = createSeedControl({
+                            doc: document,
+                            element: item,
+                            t: t,
+                            onChange: (mode, value, kind) => {
+                                item.seed_mode = mode;
+                                if (mode === SEED_MODE_FIXED && value !== undefined) {
+                                    item.seed_value = value;
+                                }
+                                markDirty();
+                                if (kind === "mode") renderList();
+                                syncElementsWidget(true);
+                            },
+                        });
+                        if (seedCtl) row.appendChild(seedCtl);
+
                         row.appendChild(eyeBtn);
 
                         // Icône cerveau (toggle LLM intelligent par liste)
@@ -1317,6 +1359,11 @@ function _parseConceptSyntax(text, defaultCount) {
                     var brainToggles = allElements.map(e => !!e.brain);
                     var context = [];
 
+                    // Seed courant de la node, lu AVANT la boucle : le seed par
+                    // élément (mode fixe) en a besoin pour l'aperçu.
+                    var _seedWidget = n.widgets?.find(w => w.name === "seed");
+                    var nodeSeed = _seedWidget ? (parseInt(_seedWidget.value) || 0) : 0;
+
                     // Indiquer que la génération est en cours
                     var originalBtnText = genBtn.textContent;
                     genBtn.textContent = t("el.generating");
@@ -1391,10 +1438,20 @@ function _parseConceptSyntax(text, defaultCount) {
 
                         // Résolution normale des blocs {} (sans LLM)
                         if (el.type !== "filter" && rawText.indexOf("{") >= 0) {
-                            el.text = rawText.replace(/\{([^}]+)\}/g, function(match) {
-                                var choices = match.replace(/[{}]/g, "").split("::").map(function(s) { return s.trim(); }).filter(Boolean);
-                                return choices.length > 0 ? choices[Math.floor(Math.random() * choices.length)] : match;
-                            });
+                            // Mode « fixe » : l'aperçu utilise EXACTEMENT le hash du Run
+                            // Python (resolveBraceBlocks, miroir de _resolve_braces) → ce
+                            // que l'utilisateur voit est ce qui sera produit, y compris
+                            // pour la valeur 0 (seed dérivé du texte).
+                            // Les modes hérité/random gardent l'aperçu aléatoire historique
+                            // (aucun changement de comportement pour l'existant).
+                            if (normalizeSeedMode(el.seed_mode) === SEED_MODE_FIXED) {
+                                el.text = resolveBraceBlocks(rawText, effectiveElementSeed(el, nodeSeed), i);
+                            } else {
+                                el.text = rawText.replace(/\{([^}]+)\}/g, function(match) {
+                                    var choices = match.replace(/[{}]/g, "").split("::").map(function(s) { return s.trim(); }).filter(Boolean);
+                                    return choices.length > 0 ? choices[Math.floor(Math.random() * choices.length)] : match;
+                                });
+                            }
                         }
 
                         // Ajouter au contexte
@@ -1407,9 +1464,10 @@ function _parseConceptSyntax(text, defaultCount) {
                     }
 
                     // 3. Envoyer à /api/generate
-                    // Lire le seed depuis le widget ComfyUI
-                    const sw = n.widgets?.find(w => w.name === "seed");
-                    const seed = sw ? parseInt(sw.value) || 0 : 0;
+                    // Seed de la node (déjà lu avant la boucle) : INCHANGÉ, et seul
+                    // envoyé s'il est > 0 — le seed par élément ne concerne que la
+                    // résolution locale, pas le payload serveur.
+                    const seed = nodeSeed;
 
                     var payload = {
                         elements: elements.map(function(e) {
@@ -1551,6 +1609,9 @@ function _parseConceptSyntax(text, defaultCount) {
                         if (data.elements && Array.isArray(data.elements) && data.elements.length > 0 && n._aihElements.length === 0) {
                             n._aihElements = data.elements.map(e => {
                                 const visible = e.visible !== false;
+                                // Seed par élément : normalisation ascendante (ancien
+                                // élément → mode hérité, aucun champ ajouté).
+                                const seed = elementSeedFields(e);
                                 if (e.type === "filter") {
                                     return {
                                         type: "filter",
@@ -1560,15 +1621,16 @@ function _parseConceptSyntax(text, defaultCount) {
                                         is_public: !!e.is_public,
                                         hint: e.hint || "",
                                         visible,
+                                        ...seed,
                                     };
                                 }
                                 if (e.type === "text" || e.type === "raw") {
                                     // Format interne = "text" pour l'affichage.
                                     // hint conservé explicitement (sinon perte silencieuse
                                     // au rechargement d'un workflow).
-                                    return { type: "text", text: e.text || "", hint: e.hint || "", visible };
+                                    return { type: "text", text: e.text || "", hint: e.hint || "", visible, ...seed };
                                 }
-                                return { ...e, visible };
+                                return { ...e, visible, ...seed };
                             });
                             renderList();
                         }

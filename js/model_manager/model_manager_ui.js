@@ -7,6 +7,7 @@
 import "../aih_strings.js";
 import { HolafPanelManager } from "../holaf_panel_manager.js";
 import { HOLAF_THEMES } from "../holaf_themes.js";
+import { aihIconSvg } from "../aih_icons.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -193,7 +194,7 @@ export function createUploadDialog(manager) {
 
     const header = document.createElement("div");
     header.className = "holaf-utility-header";
-    header.innerHTML = `<span>${t("mmu.uploadDialogTitle")}</span><button class="holaf-utility-close-button" style="margin-left:auto;">✖</button>`;
+    header.innerHTML = `<span>${t("mmu.uploadDialogTitle")}</span><button class="holaf-utility-close-button" title="${t("dialog.close")}" style="margin-left:auto; display:inline-flex; align-items:center;">${aihIconSvg("x", { size: 14 })}</button>`;
     header.querySelector('.holaf-utility-close-button').onclick = () => {
         dialogEl.style.display = 'none';
         HolafPanelManager.unregister(dialogEl);

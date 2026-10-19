@@ -22,6 +22,7 @@ import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { holafBridge } from "./holaf_comfy_bridge.js";
 import { HolafFetchError } from "./vendor/holaf/holaf-fetch.js";
 import { holafExtUrl } from './holaf_ext_base.js';
+import { aihIconSvg } from './aih_icons.js';
 import * as Settings from './image_viewer/image_viewer_settings.js';
 import { GallerySource } from './image_viewer/image_viewer_source.js';
 // Effet de bord : enregistre la source 'remote' SI le serveur AIH est configuré
@@ -290,7 +291,7 @@ const holafImageViewer = {
         overlay.id = 'holaf-viewer-fullscreen-overlay';
         overlay.style.display = 'none';
         overlay.innerHTML = `
-            <button id="holaf-viewer-fs-close" class="holaf-viewer-fs-close" title="${t('iv.fsClose')}">✖</button>
+            <button id="holaf-viewer-fs-close" class="holaf-viewer-fs-close" title="${t('iv.fsClose')}" style="display:inline-flex;align-items:center;justify-content:center;">${aihIconSvg('x', { size: 22 })}</button>
             <button id="holaf-viewer-fs-prev" class="holaf-viewer-fs-nav" title="${t('iv.fsPrev')}">‹</button>
             <img src="" draggable="false" />
             <video controls loop id="holaf-viewer-fs-video" style="display: none;"></video>

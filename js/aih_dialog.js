@@ -26,6 +26,7 @@
 import "./aih_i18n.js";
 import { makeDraggable, makeResizable, saveWindowRect, loadWindowRect, makeContentZoomable, applyContentZoom, loadZoomLevel, saveZoomLevel, aihWindowManager, AIH_MODAL_Z } from "./holaf_window_utils.js";
 import { holafExtUrl } from "./holaf_ext_base.js";
+import { aihIconSvg } from "./aih_icons.js";
 import {
     AIH_MODES,
     AIH_ACCENTS,
@@ -513,11 +514,17 @@ import {
 
         const closeBtn = document.createElement("button");
         closeBtn.className = "aih-dialog-close";
-        closeBtn.textContent = "✕";
+        // Icône « x » de la brique (trait, stroke=currentColor) au lieu du glyphe
+        // texte de fermeture : rendu identique partout, couleur héritée du bouton
+        // (--aih-close-color / :hover). Le bouton porte déjà son nom accessible
+        // via `title` → l'icône est DÉCORATIVE.
+        closeBtn.innerHTML = aihIconSvg("x", { size: 14 });
         closeBtn.title = L("dialog.close", null, "Close");
-        closeBtn.style.display = busy ? "none" : "";
+        // `inline-flex` centre l'icône dans la boîte du bouton sans CSS global.
+        closeBtn.style.display = busy ? "none" : "inline-flex";
+        closeBtn.style.alignItems = "center";
 
-        // Ordre DOM : [titre (flex:1)] [contrôles à droite : customs, zoom, ✕].
+        // Ordre DOM : [titre (flex:1)] [contrôles à droite : customs, zoom, fermeture].
         // Le groupe `.aih-dialog-header-right` est le point d'extension stable
         // (ex. blobby chat y ajoute ses boutons ⚙️/🧹/…).
         header.appendChild(titleEl);
@@ -853,17 +860,31 @@ import {
     AIH.Dialog = { open: open };
 
     // ─── Helper : alert ──────────────────────────────────────────────────────
+    // Taille de l'icône du TYPE d'alerte : identique à l'ancien glyphe emoji
+    // (`.aih-dialog-icon` est stylé en font-size: 24px) → aucun décalage.
+    const ALERT_ICON_SIZE = 24;
+
     function alert(title, message, type) {
         type = type || "info";
-        const icons = {
-            info: "ℹ️",
-            success: "✅",
-            error: "❌",
-            warning: "⚠️",
+        // Noms d'icônes de la brique HolafIcons (trait, stroke=currentColor).
+        // La COULEUR du type n'est PAS codée ici : elle vient du CSS de l'hôte
+        // (.aih-dialog-icon-<type> → color: var(--aih-…)) via currentColor.
+        // La classe `aih-dialog-icon-<type>` (typage d'alerte) est conservée.
+        const ICONS = {
+            info: "info",
+            success: "check-circle",
+            error: "ban",
+            warning: "alert-triangle",
         };
+        // Type inconnu : la CLASSE garde le type demandé (comportement historique :
+        // pas de règle de couleur → couleur héritée) et seule l'ICÔNE retombe sur info.
+        const iconName = ICONS[type] || ICONS.info;
         return new Promise((resolve) => {
             const content = [
-                '<div class="aih-dialog-icon aih-dialog-icon-' + type + '">' + (icons[type] || "ℹ️") + '</div>',
+                // `aria-hidden` : icône DÉCORATIVE (le sens est porté par le titre et
+                // le message) — évite d'annoncer un graphique sans nom.
+                '<div class="aih-dialog-icon aih-dialog-icon-' + escapeHtml(type) + '" aria-hidden="true">' +
+                    aihIconSvg(iconName, { size: ALERT_ICON_SIZE }) + '</div>',
                 '<div class="aih-dialog-message">' + (message || "") + '</div>',
                 '<div class="aih-dialog-actions">',
                 '<button class="aih-dialog-btn aih-dialog-btn-primary" data-aih-ok>' + escapeHtml(L("dialog.ok", null, "OK")) + '</button>',

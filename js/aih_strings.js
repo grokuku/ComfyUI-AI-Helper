@@ -493,6 +493,15 @@ import "./aih_i18n.js";
         "el.by": "par ",
         "el.llmCountTitle": "Nombre par défaut quand on utilise ||concept sans préciser le nombre",
 
+        /* Seed par élément (🔗 chaînon = comme la node · 🎲 dé = random · 🔒 cadenas = fixe) */
+        "el.seedModeNode": "Seed de l'élément : comme la node (suit le seed de la node)",
+        "el.seedModeRandom": "Seed de l'élément : aléatoire (re-tiré à chaque exécution)",
+        "el.seedModeFixed": "Seed de l'élément : fixe {value} (stable, indépendant du seed de la node)",
+        "el.seedCycleHint": "clic : mode suivant",
+        "el.seedFixedTitle": "Seed fixe de l'élément (0 à 18446744073709551615). 0 = dérivé du texte de l'élément (stable).",
+        "el.seedFixedPlaceholder": "seed",
+        "el.seedFixedInvalid": "Seed invalide : entier attendu entre 0 et 18446744073709551615.",
+
         /* Keywords Picker (aih_keywords_widget.js) */
         "kw.sectionPlaceholder": "Section...",
         "kw.subsectionPlaceholder": "Sous-section...",
@@ -1895,6 +1904,15 @@ import "./aih_i18n.js";
         "el.noFilter": "No filter available.",
         "el.by": "by ",
         "el.llmCountTitle": "Default count when using ||concept without specifying the number",
+
+        /* Per-element seed (🔗 link = same as node · 🎲 dice = random · 🔒 lock = fixed) */
+        "el.seedModeNode": "Element seed: same as the node (follows the node seed)",
+        "el.seedModeRandom": "Element seed: random (re-drawn on every run)",
+        "el.seedModeFixed": "Element seed: fixed {value} (stable, independent of the node seed)",
+        "el.seedCycleHint": "click: next mode",
+        "el.seedFixedTitle": "Fixed seed for this element (0 to 18446744073709551615). 0 = derived from the element text (stable).",
+        "el.seedFixedPlaceholder": "seed",
+        "el.seedFixedInvalid": "Invalid seed: integer expected between 0 and 18446744073709551615.",
 
         /* Keywords Picker (aih_keywords_widget.js) */
         "kw.sectionPlaceholder": "Section...",

@@ -12,6 +12,7 @@ import { app, api } from "./holaf_api_compat.js";
 import { makeDraggable, makeResizable, makeContentZoomable, aihWindowManager } from "./holaf_window_utils.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 import { HolafViewport } from "./vendor/holaf/holaf-viewport.js";
+import { aihIconSvg } from "./aih_icons.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -269,9 +270,13 @@ const HolafRemoteComparer = {
         Object.assign(btnContainer.style, { display: "flex", gap: "12px" });
 
         const closeBtn = document.createElement("button");
-        closeBtn.innerText = "✕";
+        // Icône « x » de la brique (trait, stroke=currentColor) — nom accessible
+        // porté par `title`, donc icône décorative.
+        closeBtn.innerHTML = aihIconSvg("x", { size: 14 });
         closeBtn.title = t("dialog.close");
         closeBtn.className = "holaf-utility-close-button";
+        closeBtn.style.display = "inline-flex";
+        closeBtn.style.alignItems = "center";
         // Hover handled by CSS
         closeBtn.onmousedown = (e) => e.stopPropagation();
         closeBtn.onclick = () => this.hide();

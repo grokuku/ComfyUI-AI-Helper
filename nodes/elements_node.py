@@ -25,10 +25,19 @@ Format des listes manuelles :
   - femme de {25::30::35::40} ans → template avec bloc inline
   - {blond::brun} cheveux {long::court} → multiples blocs indépendants
   - Texte hors {} = littéral, retourné tel quel
+
+Seed PAR ÉLÉMENT (réglage optionnel de l'UI, rétro-compatible) :
+  - "node"   (DÉFAUT) : seed de la node, index `i` historique → identique à avant ;
+  - "random" : tirage frais à chaque exécution, propre à l'élément ;
+  - "fixed"  : valeur de l'élément (0 → seed dérivé du texte), stable et
+    indépendante du seed de la node.
+  Voir SEED_MODE_* ci-dessous, IS_CHANGED (cache ComfyUI) et
+  js/aih_elements_seed.js (miroir JS de la sémantique).
 """
 
 import json
 import logging
+import math
 import random
 import re
 
@@ -43,6 +52,95 @@ def _hash32(s):
         h ^= ord(ch)
         h = (h * 0x01000193) & 0xffffffff
     return h
+
+
+# === Seed PAR ÉLÉMENT ======================================================
+# Chaque élément peut choisir son seed parmi trois modes (réglage optionnel
+# porté par l'UI, js/aih_elements_seed.js) :
+#   - "node"   (DÉFAUT, hérité) : le seed de la node, avec l'index i historique
+#     → comportement BIT-À-BIT identique à l'ancienne version (aucun décalage
+#     des tirages existants) ;
+#   - "random" : tirage frais à CHAQUE exécution, indépendant du seed de la
+#     node et indépendant des autres éléments ;
+#   - "fixed"  : valeur propre à l'élément, stable d'une exécution à l'autre et
+#     quel que soit le seed de la node (0 → seed dérivé du texte).
+# Un élément sans ces champs (anciens workflows/presets) est normalisé en mode
+# hérité : rien ne change pour l'existant.
+#
+# MIROIR JS : js/aih_elements_seed.js (normalizeSeedMode / parseSeedDigits /
+# derivedElementSeed / effectiveElementSeed / resolveBraceBlocks). Toute
+# évolution doit être faite DES DEUX CÔTÉS (table de hash vérifiée dans
+# tests/test_elements_seed_modes.py ET js/test_aih_elements_seed.mjs).
+SEED_MODE_NODE = "node"
+SEED_MODE_RANDOM = "random"
+SEED_MODE_FIXED = "fixed"
+SEED_MODES = (SEED_MODE_NODE, SEED_MODE_RANDOM, SEED_MODE_FIXED)
+_MAX_SEED = 0xffffffffffffffff
+
+
+def _normalize_seed_mode(element):
+    """Mode de seed d'un élément ; toute valeur absente/inconnue → "node"."""
+    if not isinstance(element, dict):
+        return SEED_MODE_NODE
+    mode = element.get("seed_mode")
+    mode = mode.strip().lower() if isinstance(mode, str) else ""
+    return mode if mode in (SEED_MODE_RANDOM, SEED_MODE_FIXED) else SEED_MODE_NODE
+
+
+def _coerce_seed_value(value):
+    """Entier dans [0, 0xffffffffffffffff] ; 0 pour toute valeur inexploitable.
+
+    Accepte un int, un float entier, ou une chaîne de chiffres (le JS stocke en
+    chaîne les valeurs au-delà de 2^53, que JSON ne peut pas transporter sans
+    perte). Borné aux mêmes limites que le widget `seed` de ComfyUI.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return 0
+        number = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text.isdigit():
+            return 0
+        number = int(text)
+    else:
+        return 0
+    if number < 0:
+        return 0
+    return min(number, _MAX_SEED)
+
+
+def _derived_element_seed(element):
+    """Seed stable dérivé du TEXTE de l'élément (repli du mode fixe pour 0).
+
+    Jamais 0 → jamais le chemin « aléatoire » des helpers de résolution.
+    """
+    text = ""
+    if isinstance(element, dict):
+        text = str(element.get("text") or "")
+    return _hash32(text) or 1
+
+
+def _resolve_element_seed(element, node_seed):
+    """Seed effectif d'un élément (miroir de effectiveElementSeed() en JS).
+
+    - hérité  : le seed de la node (comportement historique inchangé) ;
+    - fixe    : la valeur de l'élément, ou le seed dérivé du texte si elle vaut 0 ;
+    - random  : tirage frais non nul, propre à l'élément ET à l'exécution.
+    """
+    mode = _normalize_seed_mode(element)
+    if mode == SEED_MODE_FIXED:
+        value = _coerce_seed_value(element.get("seed_value")) if isinstance(element, dict) else 0
+        return value if value > 0 else _derived_element_seed(element)
+    if mode == SEED_MODE_RANDOM:
+        # Tirage indépendant : deux éléments en random ne tirent pas la même
+        # valeur, et chaque exécution en tire une nouvelle.
+        return random.randint(1, _MAX_SEED)
+    return node_seed
 
 
 def _parse_concept_syntax(text, default_count=10):
@@ -273,6 +371,38 @@ class AIHElementsNode:
     RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("elements", "llm_config")
 
+    @classmethod
+    def IS_CHANGED(cls, seed=0, _elements_json="{}", elements_input="", llm_config=None):
+        """Force la ré-exécution UNIQUEMENT si un élément visible est en mode random.
+
+        PIÈGE CACHE COMFYUI : la node n'est ré-exécutée que si une entrée change.
+        Avec `control_after_generate: "randomize"` le seed de la node change
+        après chaque Run, donc le mode random se re-tire naturellement — mais si
+        l'utilisateur passe ce réglage à « fixed », la node serait servie depuis
+        le cache et le mode random ne se re-tirerait JAMAIS.
+
+        On renvoie donc NaN (valeur toujours différente d'elle-même → jamais de
+        cache) SEULEMENT s'il existe au moins un élément visible en mode random.
+        Dans tous les autres cas on renvoie une constante déterministe : le cache
+        actuel est préservé à l'identique (aucune ré-exécution ajoutée).
+        """
+        try:
+            elems_cfg = json.loads(_elements_json) if _elements_json else {}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return ""
+        elements = elems_cfg.get("elements") if isinstance(elems_cfg, dict) else None
+        if not isinstance(elements, list):
+            return ""
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            # Même filtre que generate() : un élément masqué ne s'exécute pas.
+            if element.get("visible") is False:
+                continue
+            if _normalize_seed_mode(element) == SEED_MODE_RANDOM:
+                return float("NaN")
+        return ""
+
     def generate(self, seed, _elements_json="{}", elements_input="", llm_config=None):
         try:
             elems_cfg = json.loads(_elements_json) if _elements_json else {}
@@ -319,6 +449,12 @@ class AIHElementsNode:
             if not raw_text:
                 continue
 
+            # Seed effectif de CET élément (mode hérité = seed de la node, donc
+            # strictement le comportement historique). L'index `i` passé aux
+            # helpers reste INCHANGÉ : c'est lui qui décorelle les tirages et
+            # changer d'index décalerait tous les résultats existants.
+            el_seed = _resolve_element_seed(el, seed)
+
             brain_on = (
                 bool(brain_toggles[i])
                 if isinstance(brain_toggles, list) and i < len(brain_toggles)
@@ -349,7 +485,7 @@ class AIHElementsNode:
 
                 if llm_config:
                     # Config LLM externe (LM Studio ou OpenAI)
-                    output = llm_helper.call_llm(llm_config, instruction, input_text, seed=seed)
+                    output = llm_helper.call_llm(llm_config, instruction, input_text, seed=el_seed)
                     items = _parse_llm_list(output) if output else []
                 else:
                     # Backend existant (comportement actuel)
@@ -358,7 +494,7 @@ class AIHElementsNode:
                     )
                     items = _parse_llm_list(output) if output else []
                 if items:
-                    chosen_keyword = _pick_from_list(items, seed, i, raw_text)
+                    chosen_keyword = _pick_from_list(items, el_seed, i, raw_text)
                     # Le champ « hint » de l'élément est conservé tel quel :
                     # il est forwardé au backend /api/generate qui l'applique
                     # comme préfixe de résolution (aucun « : » si vide).
@@ -385,7 +521,7 @@ class AIHElementsNode:
 
                 if llm_config:
                     # Config LLM externe (LM Studio ou OpenAI)
-                    output = llm_helper.call_llm(llm_config, instruction, input_text, seed=seed)
+                    output = llm_helper.call_llm(llm_config, instruction, input_text, seed=el_seed)
                     filtered = _parse_llm_list(output) if output else []
                 else:
                     # Backend existant (comportement actuel)
@@ -395,7 +531,7 @@ class AIHElementsNode:
                     filtered = _parse_llm_list(output) if output else []
                 if filtered:
                     el["text"] = _resolve_braces_with_filtered(
-                        raw_text, seed, i, filtered
+                        raw_text, el_seed, i, filtered
                     )
                     context.append(el["text"])
                     continue
@@ -405,12 +541,12 @@ class AIHElementsNode:
                         "falling back to random"
                     )
                 # Fallback: random dans les blocs d'origine
-                el["text"] = _resolve_braces(raw_text, seed, i)
+                el["text"] = _resolve_braces(raw_text, el_seed, i)
                 context.append(el["text"])
             else:
                 # Comportement standard (déterministe par seed)
                 # Sans {} → texte littéral retourné tel quel
-                el["text"] = _resolve_braces(raw_text, seed, i)
+                el["text"] = _resolve_braces(raw_text, el_seed, i)
                 if el["text"]:
                     context.append(el["text"])
 
@@ -442,6 +578,12 @@ class AIHElementsNode:
             }
 
         # Construire le payload pour /api/generate
+        # NOTE seed par élément : le seed global reste SEUL dans le payload (et
+        # seulement s'il est > 0), exactement comme avant → comportement par
+        # défaut inchangé. Les seeds par élément ne concernent QUE la résolution
+        # locale (blocs {}, listes ||concept, appels LLM). Les entrées de type
+        # « filter » et le random_count sont résolus côté serveur avec ce seed
+        # global : le réglage par élément n'y a pas d'effet (limite documentée).
         payload = {"elements": elements}
         if seed > 0:
             payload["seed"] = seed

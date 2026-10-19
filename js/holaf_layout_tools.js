@@ -2,6 +2,7 @@
     import { app } from "./holaf_api_compat.js";
     import { makeDraggable, makeContentZoomable, aihWindowManager } from "./holaf_window_utils.js";
     import { showToast } from "./aih_toast_bridge.js";
+    import { aihIconSvg } from "./aih_icons.js";
 
     // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
     const t = (key, params) => {
@@ -106,7 +107,15 @@
             grip.style.padding = "0 4px";
             grip.style.color = "var(--descriptive-text, #888)";
             grip.style.fontSize = "14px";
-            grip.textContent = "⠿";
+            // Poignée de drag : icône « grip-vertical » de la brique (trait,
+            // currentColor → couleur héritée ci-dessus). `display:flex` centre
+            // l'icône sans CSS global ; `touch-action:none` évite que le
+            // navigateur confisque le geste tactile au profit du scroll. Le
+            // drag lui-même reste inchangé (makeDraggable sur `grip`).
+            grip.innerHTML = aihIconSvg("grip-vertical", { size: 14 });
+            grip.style.display = "flex";
+            grip.style.alignItems = "center";
+            grip.style.touchAction = "none";
             this.container.appendChild(grip);
 
             this.coordDisplay = document.createElement("div");
@@ -126,7 +135,12 @@
             // Fermeture discrète en fin de barre
             const closeBtn = document.createElement("button");
             closeBtn.className = "holaf-header-button";
-            closeBtn.textContent = "✕";
+            // Icône « x » de la brique (trait, stroke=currentColor) ; `title` porte
+            // le nom accessible → icône décorative. `display:inline-flex` centre
+            // l'icône sans toucher au CSS partagé.
+            closeBtn.innerHTML = aihIconSvg("x", { size: 14 });
+            closeBtn.style.display = "inline-flex";
+            closeBtn.style.alignItems = "center";
             closeBtn.title = t("dialog.close");
             Object.assign(closeBtn.style, { background: "transparent", border: "none", cursor: "pointer", padding: "2px 6px", color: "var(--fg-color, #ccc)" });
             closeBtn.onmousedown = (e) => e.stopPropagation();
