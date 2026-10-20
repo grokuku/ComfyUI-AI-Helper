@@ -1460,12 +1460,16 @@ def paste_mask(crop_mask, window, width, height):
     # masque mal calé.
     if tuple(fitted.shape) != (win_h, win_w):
         LOGGER.warning(
-            f"{LOG_PREFIX} masque {tuple(fitted.shape)} ≠ fenêtre "
-            f"{(win_h, win_w)} → masque vide (repli)"
+            f"{LOG_PREFIX} masque non recollable : {tuple(fitted.shape)} "
+            f"≠ fenêtre {(win_h, win_w)} → masque vide (repli)"
         )
         return full
     spans = paste_slices(window, win_w, win_h, width, height)
     if spans is None:
+        LOGGER.warning(
+            f"{LOG_PREFIX} masque non recollable : fenêtre {window} hors de "
+            f"l'image {width}×{height} → masque vide (repli)"
+        )
         return full
     dst_x0, dst_y0, dst_x1, dst_y1, src_x0, src_y0, src_x1, src_y1 = spans
     # Même taille des DEUX côtés : sinon torch lèverait (ou diffuserait) et le
@@ -1473,7 +1477,7 @@ def paste_mask(crop_mask, window, width, height):
     if ((dst_y1 - dst_y0, dst_x1 - dst_x0)
             != (src_y1 - src_y0, src_x1 - src_x0)):
         LOGGER.warning(
-            f"{LOG_PREFIX} recollage incohérent "
+            f"{LOG_PREFIX} masque non recollable : recollage incohérent "
             f"(fenêtre {(win_h, win_w)}, masque {tuple(fitted.shape)}) "
             "→ masque vide (repli)"
         )
