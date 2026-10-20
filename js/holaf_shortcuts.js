@@ -1,6 +1,7 @@
 import { app, api } from "./holaf_api_compat.js";
 import { makeDraggable, makeResizable, makeContentZoomable, aihWindowManager } from "./holaf_window_utils.js";
 import { escapeHtml } from "./holaf_dom_utils.js";
+import { aihIconSvg } from "./aih_icons.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -199,8 +200,11 @@ const HolafShortcuts = {
         
         const btn = this.listElement.querySelector(`[data-id="${id}"] .update-btn`);
         if (btn) {
+            // Retour visuel « enregistré » : coche de la brique (stroke=currentColor,
+            // donc la couleur reste celle de `.holaf-shortcut-btn`) puis restauration
+            // du glyphe d'origine (disquette) après 1 s.
             const originalText = btn.innerHTML;
-            btn.innerHTML = "✓";
+            btn.innerHTML = aihIconSvg("check", { size: 12 });
             setTimeout(() => btn.innerHTML = originalText, 1000);
         }
     },
@@ -265,7 +269,13 @@ const HolafShortcuts = {
 
         const closeBtn = document.createElement("button");
         closeBtn.className = "holaf-utility-close-button";
-        closeBtn.textContent = "✕";
+        // Croix de la brique ; `stroke="currentColor"` → la couleur reste celle de
+        // `.holaf-utility-close-button` (et de son :hover). `title` porte le nom
+        // accessible, l'icône est donc décorative. `display:inline-flex` centre
+        // l'icône sans toucher au CSS partagé.
+        closeBtn.innerHTML = aihIconSvg("x", { size: 14 });
+        closeBtn.style.display = "inline-flex";
+        closeBtn.style.alignItems = "center";
         closeBtn.title = t("dialog.close");
         closeBtn.onmousedown = (e) => e.stopPropagation();
         closeBtn.onclick = () => this.hide();
@@ -357,7 +367,11 @@ const HolafShortcuts = {
             updateBtn.onclick = (e) => { e.stopPropagation(); this.updateShortcut(s.id); };
 
             const delBtn = document.createElement("button");
-            delBtn.innerHTML = "✕";
+            // Croix de la brique (décorative) : le nom accessible reste `title`, et
+            // `currentColor` laisse le survol rouge (`onmouseenter` + CSS) intact.
+            delBtn.innerHTML = aihIconSvg("x", { size: 12 });
+            delBtn.style.display = "inline-flex";
+            delBtn.style.alignItems = "center";
             delBtn.title = t("sc.delete");
             delBtn.className = "holaf-shortcut-btn";
             delBtn.onmouseenter = () => delBtn.style.color = "#ff5555";

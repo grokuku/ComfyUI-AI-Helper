@@ -1,5 +1,6 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
+import { aihIconSvg } from "./aih_icons.js";
 import { showToast as bridgeShowToast } from "./aih_toast_bridge.js";
 import { remoteRequest, HolafFetch, normalizeServerUrl } from "./aih_fetch_bridge.js";
 // Seed PAR ÉLÉMENT : sémantique des 3 modes + contrôle de ligne (source unique,
@@ -769,9 +770,13 @@ function _parseConceptSyntax(text, defaultCount) {
                             row.style.border = "1px solid #444";
                         }
 
-                        // Poignée de drag (⠿)
+                        // Poignée de drag : icône « grip-vertical » de la brique
+                        // (décorative ; `title` porte le nom accessible). Les styles
+                        // inline requis par le drag (cursor grab, user-select:none,
+                        // touch-action:none) et le `pointerdown` → startDrag sont
+                        // INCHANGÉS (surtout pas de onclick ici).
                         const grip = document.createElement("span");
-                        grip.textContent = "⠿";
+                        grip.innerHTML = aihIconSvg("grip-vertical", { size: 10 });
                         Object.assign(grip.style, {
                             cursor: "grab", color: "#666", fontSize: "10px", flexShrink: "0",
                             userSelect: "none", marginRight: "2px", touchAction: "none",
@@ -786,10 +791,14 @@ function _parseConceptSyntax(text, defaultCount) {
                         // synthetiser correctement dans le DOM widget ComfyUI.
                         const eyeBtn = document.createElement("button");
                         eyeBtn.type = "button";
-                        eyeBtn.textContent = isHidden ? "🙈" : "👁";
+                        // Icône de la brique : œil barré = entrée masquée, œil = visible.
+                        // Décorative (`title` porte le nom accessible, recalculé à
+                        // chaque rendu) ; couleur via currentColor (style de l'hôte).
+                        eyeBtn.innerHTML = aihIconSvg(isHidden ? "eye-off" : "eye", { size: 12 });
                         Object.assign(eyeBtn.style, {
                             background: "none", border: "none", color: "#ccc",
                             cursor: "pointer", fontSize: "12px", padding: "0 2px", flexShrink: "0",
+                            display: "inline-flex", alignItems: "center",
                         });
                         eyeBtn.title = isHidden ? t("el.eyeShow") : t("el.eyeHide");
                         eyeBtn.onclick = () => {
@@ -945,12 +954,15 @@ function _parseConceptSyntax(text, defaultCount) {
                             }
                         }
 
-                        // Bouton supprimer
+                        // Bouton supprimer : croix de la brique, décorative (le nom
+                        // accessible vient de `title`), couleur via currentColor.
                         const del = document.createElement("button");
-                        del.textContent = "✕";
+                        del.innerHTML = aihIconSvg("x", { size: 11 });
+                        del.title = t("el.removeTitle");
                         Object.assign(del.style, {
                             background: "none", border: "none", color: "#f87171",
                             cursor: "pointer", fontSize: "11px", padding: "0 2px", flexShrink: "0",
+                            display: "inline-flex", alignItems: "center",
                         });
                         del.onclick = () => {
                             items.splice(idx, 1);
@@ -964,7 +976,7 @@ function _parseConceptSyntax(text, defaultCount) {
                 }
 
                 // ---- Drag & drop reorder (pointer events) ----
-                // Le handle ⠿ de chaque ligne declenche un drag fluide :
+                // Le handle (icône grip-vertical) de chaque ligne declenche un drag fluide :
                 // - clone fantome qui suit le curseur, a taille identique aux autres lignes
                 // - placeholder reduit (fine barre) indiquant l'emplacement de drop
                 // - les elements glissent avec une petite animation FLIP quand le

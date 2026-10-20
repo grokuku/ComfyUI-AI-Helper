@@ -37,6 +37,7 @@
 
 import "../aih_strings.js";
 import { imageViewerState } from "./image_viewer_state.js";
+import { aihIconSvg } from "../aih_icons.js";
 import { HolafThumbCache } from "../vendor/holaf/holaf-thumbcache.js";
 import { HolafGrid } from "../vendor/holaf/holaf-virtual-grid.js";
 import { showToast } from "../aih_toast_bridge.js";
@@ -408,7 +409,11 @@ function addFullscreenIcon(placeholder, image) {
         const fsIcon = document.createElement('div');
         fsIcon.className = 'holaf-viewer-fullscreen-icon';
         fsIcon.setAttribute('data-holaf-action', 'fullscreen');
-        fsIcon.innerHTML = '⛶';
+        // Icône « maximize » de la brique : le badge ouvre la vue plein écran
+        // dédiée (bloc sans état, refermé par sa propre croix). `size: 16` = la
+        // taille de texte du badge ; la couleur vient de `currentColor` (blanc
+        // posé par `.holaf-viewer-fullscreen-icon`).
+        fsIcon.innerHTML = aihIconSvg('maximize', { size: 16 });
         fsIcon.title = t('iv.viewFullscreen');
         // Click handled via delegation on the grid surface
         placeholder.appendChild(fsIcon);

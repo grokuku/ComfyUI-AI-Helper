@@ -7,45 +7,85 @@
  * faut une garde qui empêche la consommation de DÉBORDER du lot en cours (c'est
  * la seule garantie mécanique que le périmètre annoncé est respecté). La liste
  * des fichiers autorisés vit ici, et nulle part ailleurs : les tests
- * (test_aih_icons.mjs pour le socle, test_aih_icons_phase2a.mjs pour le lot)
- * interrogent les MÊMES constantes.
+ * (test_aih_icons.mjs pour le socle, test_aih_icons_phase2a.mjs et
+ * test_aih_icons_phase2b.mjs pour les lots) interrogent les MÊMES constantes.
+ *
+ * Structure PAR PHASE : `PHASES` associe un numéro de lot à la liste des
+ * fichiers d'UI qu'il a migrés. Le périmètre AUTORISÉ est l'UNION de toutes les
+ * phases déjà livrées (`ALLOWED_CONSUMERS`) ; `CURRENT_PHASE` désigne le lot en
+ * cours (celui dont on exige que les fichiers consomment RÉELLEMENT la façade).
+ * Ajouter une phase = ajouter une clé, jamais élargir une liste existante.
  *
  * Convention : un fichier « consomme » la façade s'il la mentionne (import ou
  * appel `aihIconSvg` / `aihIconEl` / `aihIconNames` / `AIH_ICON_DEFAULT_SIZE`).
  *
  * Usage :
- *   import { checkIconPerimeter } from "./test_helpers/icon_perimeter.mjs";
- *   const r = checkIconPerimetre(PACKAGE_DIR);
+ *   import { checkIconPerimetre, PHASES } from "./test_helpers/icon_perimeter.mjs";
+ *   const r = checkIconPerimetre(PACKAGE_DIR);            // phase courante
+ *   const r2a = checkIconPerimetre(PACKAGE_DIR, "2a");    // lot 2a seulement
  *   assert.deepStrictEqual(r.horsListe, [], "…");
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
 /**
- * Fichiers d'UI AUTORISÉS à consommer la façade au terme de la PHASE 2a
- * (dialogues, boutons « fermer », plein écran, poignée de drag).
+ * Phases de la migration, chacune avec les fichiers d'UI qu'elle a migrés.
  * Chemins relatifs à la racine du pack, séparateur « / ».
  * Ajouter un fichier ici = étendre explicitement le périmètre du lot.
  */
-export const PHASE_2A_CONSUMERS = Object.freeze([
-    "js/aih_dialog.js",                       // alertes (info/success/error/warning) + fermeture
-    "js/holaf_panel_manager.js",              // fermeture des panneaux
-    "js/holaf_remote_comparer.js",            // fermeture du comparer
-    "js/holaf_layout_tools.js",               // poignée de drag + fermeture
-    "js/holaf_image_viewer.js",               // fermeture du plein écran
-    "js/image_viewer/image_viewer_ui.js",     // fermeture du zoom + plein écran
-    "js/model_manager/model_manager_ui.js",   // fermeture de la modale d'upload
-]);
+export const PHASES = Object.freeze({
+    /**
+     * PHASE 2a — dialogues, boutons « fermer », plein écran, poignée de drag.
+     */
+    "2a": Object.freeze([
+        "js/aih_dialog.js",                       // alertes (info/success/error/warning) + fermeture
+        "js/holaf_panel_manager.js",              // fermeture des panneaux
+        "js/holaf_remote_comparer.js",            // fermeture du comparer
+        "js/holaf_layout_tools.js",               // poignée de drag + fermeture
+        "js/holaf_image_viewer.js",               // fermeture du plein écran
+        "js/image_viewer/image_viewer_ui.js",     // fermeture du zoom + plein écran
+        "js/model_manager/model_manager_ui.js",   // fermeture de la modale d'upload
+    ]),
+    /**
+     * PHASE 2b — même famille (fermer / cocher / plein écran / supprimer une
+     * ligne) : raccourcis, badge plein écran de la galerie, suppression d'un
+     * contrôle de l'éditeur, suppression d'un modèle distant, et la ligne du
+     * widget Elements (poignée + œil + suppression).
+     */
+    "2b": Object.freeze([
+        "js/holaf_shortcuts.js",                  // coche « enregistré » + fermeture + suppression d'un raccourci
+        "js/image_viewer/image_viewer_gallery.js",// badge plein écran d'une vignette de la grille
+        "js/image_viewer/image_viewer_editor.js", // suppression d'un contrôle (ligne de la liste)
+        "js/02_aih_model_browser.js",             // suppression d'un modèle distant (admin, par ligne)
+        "js/aih_elements_widget.js",              // poignée de drag + œil (visibilité) + suppression d'une ligne
+    ]),
+});
+
+/** Lot en cours (celui dont les fichiers doivent consommer réellement). */
+export const CURRENT_PHASE = "2b";
+
+/** Alias historique : la phase 2a reste adressable sous son ancien nom. */
+export const PHASE_2A_CONSUMERS = PHASES["2a"];
+
+/** Alias explicite de la phase 2b. */
+export const PHASE_2B_CONSUMERS = PHASES["2b"];
+
+/** Union de TOUS les fichiers autorisés (toutes phases livrées confondues). */
+export const ALLOWED_CONSUMERS = Object.freeze(
+    [...new Set(Object.values(PHASES).flat())].sort()
+);
 
 /**
  * Fichiers d'UI qui ne doivent JAMAIS consommer la façade — soit parce qu'ils
  * appartiennent à un lot ULTÉRIEUR (dont les emoji sont assertés par des tests
  * existants qu'il faut adapter en même temps), soit parce que leurs emoji sont
  * SÉMANTIQUES (jamais remplaçables par une icône).
+ *
+ * ⚠️ `js/holaf_shortcuts.js` a QUITTÉ cette liste en PHASE 2b : il est désormais
+ * un consommateur autorisé (et son test de confirmation destructive a été
+ * réécrit en assertions structurelles). Ceux qui restent sont SÉMANTIQUES.
  */
 export const FORBIDDEN_CONSUMERS = Object.freeze([
-    // Lot suivant : la croix de suppression est assertée par test_shortcuts_delete_confirm.mjs.
-    "js/holaf_shortcuts.js",
     // Emoji de protocole/sentinelle assertés (éclair de puce, sablier de placeholder, ⏹/➤).
     "js/blobby_companion.js",
     // Cadenas / lien / dé = clés de mode assertées par les tests de seed.
@@ -106,18 +146,50 @@ export function scanIconConsumers(packageDir) {
  * Vérifie le périmètre et renvoie le détail (aucune assertion ici : les tests
  * choisissent quelles listes doivent être vides, pour des messages parlants).
  * @param {string} packageDir racine du pack.
- * @returns {{offenders: string[], horsListe: string[], interdits: string[], manquants: string[]}}
+ * @param {string} [phase] lot dont on exige la consommation effective
+ *   (défaut : `CURRENT_PHASE`).
+ * @returns {{phase: string, offenders: string[], horsListe: string[], interdits: string[],
+ *            manquants: string[], manquantsToutesPhases: string[], autorises: string[], attendus: string[]}}
  */
-export function checkIconPerimetre(packageDir) {
+export function checkIconPerimetre(packageDir, phase = CURRENT_PHASE) {
     const offenders = scanIconConsumers(packageDir);
+    const lot = PHASES[phase] || [];
     return {
+        phase,
         offenders,
         // Consommateurs hors liste blanche → débordement de périmètre.
-        horsListe: offenders.filter((f) => !PHASE_2A_CONSUMERS.includes(f)),
+        // (La liste blanche est CUMULATIVE : toutes les phases livrées.)
+        horsListe: offenders.filter((f) => !ALLOWED_CONSUMERS.includes(f)),
         // Consommateurs explicitement interdits → la faute la plus grave.
         interdits: offenders.filter((f) => FORBIDDEN_CONSUMERS.includes(f)),
-        // Fichiers du lot qui ne consomment plus rien → la liste blanche serait
-        // vide de sens (garde vacante) : on exige que le lot soit réellement branché.
-        manquants: PHASE_2A_CONSUMERS.filter((f) => !offenders.includes(f)),
+        // Fichiers du lot demandé qui ne consomment plus rien → la liste blanche
+        // serait vide de sens (garde vacante) : on exige que le lot soit
+        // réellement branché.
+        manquants: lot.filter((f) => !offenders.includes(f)),
+        // Idem, mais sur TOUTES les phases (aucune phase ne doit se dé-brancher).
+        manquantsToutesPhases: ALLOWED_CONSUMERS.filter((f) => !offenders.includes(f)),
+        // Rappel des listes pour les messages d'erreur.
+        autorises: ALLOWED_CONSUMERS.slice(),
+        attendus: lot.slice(),
     };
+}
+
+/**
+ * Cohérence des listes elles-mêmes (indépendante du disque) :
+ *   - aucune liste de phase ne recoupe `FORBIDDEN_CONSUMERS` ;
+ *   - aucun fichier n'apparaît dans deux phases (un fichier = un lot).
+ * @returns {{croisements: string[], doublonsPhases: string[]}}
+ */
+export function checkPhaseDisjointness() {
+    const croisements = [];
+    const doublonsPhases = [];
+    const vus = new Map();
+    for (const [phase, files] of Object.entries(PHASES)) {
+        for (const f of files) {
+            if (FORBIDDEN_CONSUMERS.includes(f)) croisements.push(`${phase}:${f}`);
+            if (vus.has(f)) doublonsPhases.push(`${f} (${vus.get(f)} + ${phase})`);
+            else vus.set(f, phase);
+        }
+    }
+    return { croisements, doublonsPhases };
 }

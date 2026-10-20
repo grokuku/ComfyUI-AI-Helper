@@ -25,13 +25,13 @@
 //      en Node ; `aihIconEl` y échoue avec un message clair (jamais un
 //      ReferenceError opaque).
 //   7. PÉRIMÈTRE DE CONSOMMATION : la façade n'est branchée QUE dans les
-//      fichiers explicitement autorisés (liste blanche de
+//      fichiers explicitement autorisés (liste blanche PAR PHASE de
 //      test_helpers/icon_perimeter.mjs). Toute consommation hors liste — et
 //      plus encore dans un fichier INTERDIT (blobby_companion, elements_seed,
-//      keywords_widget, holaf_shortcuts) — est ROUGE. ⚠️ Ce garde-fou a été
-//      introduit en PHASE 1 (liste vide) puis élargi en PHASE 2a aux 7
-//      fichiers du lot : c'est son rôle, et il se met à jour EN MÊME TEMPS que
-//      le branchement, jamais après.
+//      keywords_widget) — est ROUGE. ⚠️ Ce garde-fou a été introduit en
+//      PHASE 1 (liste vide), élargi en PHASE 2a (7 fichiers), puis en PHASE 2b
+//      (5 fichiers) : c'est son rôle, et il se met à jour EN MÊME TEMPS que le
+//      branchement, jamais après.
 //   8. CONTRÔLES NÉGATIFS PAR MUTATION (le vérificateur n'est pas vacant) :
 //      wrapper cassé → ROUGE, attribut aria inversé → ROUGE, throw non rattrapé
 //      → ROUGE, cache retiré → ROUGE, consommateur hors liste → ROUGE. Les
@@ -47,9 +47,12 @@ import { dirname, join, resolve } from "node:path";
 
 import { loadJsdomOrSkip } from "./test_helpers/jsdom_loader.mjs";
 import {
+    PHASES,
     PHASE_2A_CONSUMERS,
+    ALLOWED_CONSUMERS,
     FORBIDDEN_CONSUMERS,
     checkIconPerimetre,
+    checkPhaseDisjointness,
 } from "./test_helpers/icon_perimeter.mjs";
 import { HolafIcons } from "./vendor/holaf/holaf-icons.js";
 
@@ -319,7 +322,7 @@ console.log("6. import ESM sans DOM (Node) : chaînes OK, aihIconEl échoue clai
 }
 
 /* ══ 7. Périmètre : la façade n'est consommée QUE là où c'est décidé ═════ */
-console.log("7. périmètre de consommation (phase 2a) : liste blanche stricte");
+console.log("7. périmètre de consommation (phases 2a + 2b) : liste blanche stricte");
 {
     const r = checkIconPerimetre(PACKAGE_DIR);
 
@@ -328,22 +331,35 @@ console.log("7. périmètre de consommation (phase 2a) : liste blanche stricte")
     assert.deepStrictEqual(r.interdits, [],
         "fichier(s) INTERDIT(S) consommant la façade : " + r.interdits.join(", "));
 
-    // (b) Aucune consommation hors de la liste blanche du lot en cours.
+    // (b) Aucune consommation hors de la liste blanche CUMULATIVE (toutes phases).
     assert.deepStrictEqual(r.horsListe, [],
-        "consommateur(s) hors périmètre (phase 2a) : " + r.horsListe.join(", "));
+        "consommateur(s) hors périmètre (phases livrées) : " + r.horsListe.join(", "));
 
     // (c) Les fichiers du lot consomment RÉELLEMENT la façade (sinon la liste
     //     blanche ne prouverait rien : une garde vide est une garde vacante).
     assert.deepStrictEqual(r.manquants, [],
-        "fichier(s) du lot ne consommant pas la façade : " + r.manquants.join(", "));
+        "fichier(s) du lot en cours ne consommant pas la façade : " + r.manquants.join(", "));
+    assert.deepStrictEqual(r.manquantsToutesPhases, [],
+        "fichier(s) d'une phase livrée ne consommant plus la façade : " +
+        r.manquantsToutesPhases.join(", "));
 
-    // (d) La liste blanche et la liste interdite ne se recoupent pas.
+    // (d) La liste blanche et la liste interdite ne se recoupent pas, et aucun
+    //     fichier n'appartient à deux phases (un fichier = un lot).
     const recoupement = PHASE_2A_CONSUMERS.filter((f) => FORBIDDEN_CONSUMERS.includes(f));
     assert.deepStrictEqual(recoupement, [],
         "fichier(s) à la fois autorisés et interdits : " + recoupement.join(", "));
+    const disjoint = checkPhaseDisjointness();
+    assert.deepStrictEqual(disjoint.croisements, [],
+        "fichier(s) à la fois dans une phase et interdits : " + disjoint.croisements.join(", "));
+    assert.deepStrictEqual(disjoint.doublonsPhases, [],
+        "fichier(s) présents dans deux phases : " + disjoint.doublonsPhases.join(", "));
 
-    ok(`périmètre respecté : ${r.offenders.length} consommateur(s) = les ${PHASE_2A_CONSUMERS.length} du lot, ` +
-        `aucun interdit (${FORBIDDEN_CONSUMERS.length} surveillés)`);
+    const totalPhases = Object.values(PHASES).reduce((acc, files) => acc + files.length, 0);
+    assert.strictEqual(ALLOWED_CONSUMERS.length, totalPhases,
+        "l'union des phases doit contenir tous les fichiers (aucun doublon)");
+
+    ok(`périmètre respecté : ${r.offenders.length} consommateur(s) = les ${ALLOWED_CONSUMERS.length} ` +
+        `des ${Object.keys(PHASES).length} phases (2a+2b), aucun interdit (${FORBIDDEN_CONSUMERS.length} surveillés)`);
     assert.ok(readFileSync(join(HERE, "aih_icons.js"), "utf8").length > 0, "façade lisible");
 }
 

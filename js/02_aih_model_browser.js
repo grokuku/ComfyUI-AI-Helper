@@ -21,6 +21,7 @@
 import "./aih_dialog.js";
 import "./aih_download_window.js";
 import "./aih_strings.js";
+import { aihIconSvg } from "./aih_icons.js";
 import { remoteRequest, normalizeServerUrl } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 import {
@@ -1987,7 +1988,12 @@ var WF_REMOTE_MAX_PAGES = 20;
             // ── Bouton supprimer (admin seulement) ──
             if (m._currentUser && m._currentUser.role === 'admin') {
                 var delBtn = document.createElement('button');
-                delBtn.textContent = '🗑';
+                // Corbeille de la brique (décorative : `title` porte le nom
+                // accessible) ; `currentColor` laisse jouer l'opacité/le survol de
+                // `.mb-del-btn`, et `inline-flex` centre l'icône dans le bouton.
+                delBtn.innerHTML = aihIconSvg('trash', { size: 13 });
+                delBtn.style.display = 'inline-flex';
+                delBtn.style.alignItems = 'center';
                 delBtn.className = 'mb-del-btn';
                 delBtn.title = t('mb.deleteModelTitle');
                 delBtn.addEventListener('click', function (e) {

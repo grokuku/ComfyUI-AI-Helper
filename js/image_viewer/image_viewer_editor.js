@@ -8,6 +8,7 @@
  */
 
 import "../aih_strings.js";
+import { aihIconSvg } from "../aih_icons.js";
 import { imageViewerState } from './image_viewer_state.js';
 import { resetTransform, getFullImageUrl } from './image_viewer_navigation.js';
 import { GallerySource } from './image_viewer_source.js';
@@ -916,7 +917,10 @@ export class ImageEditor {
             const def = findControlDef(c.type);
             if (!def) return;
             const expanded = this._expandedCtrlId === c.id;
-            const delBtn = iconBtn(`data-ctrl-id="${c.id}" title="${t('iv.removeCtrlTitle', { label: _controlTypeLabel(c.type) })}"`, '✕', 'color:var(--holaf-error-color,#c44);');
+            // Croix de la brique (décorative : `title` porte le nom accessible) ;
+            // `inline-flex` centre l'icône, la couleur vient de `--holaf-error-color`
+            // (currentColor) → aucune couleur codée en dur dans l'icône.
+            const delBtn = iconBtn(`data-ctrl-id="${c.id}" title="${t('iv.removeCtrlTitle', { label: _controlTypeLabel(c.type) })}"`, aihIconSvg('x', { size: 12 }), 'color:var(--holaf-error-color,#c44);display:inline-flex;align-items:center;justify-content:center;');
             const nameStyle = 'text-align:left;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
 
             if (!expanded) {

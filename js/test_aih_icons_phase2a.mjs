@@ -199,16 +199,24 @@ console.log("1. source : façade appelée, emoji cosmétiques disparus (7 fichie
 
     // La liste blanche du périmètre est bien celle de ce lot (source unique de
     // vérité test_helpers/icon_perimeter.mjs) : aucun fichier interdit ne consomme.
-    const perimeter = checkIconPerimetre(PACKAGE_DIR);
+    // ⚠️ Depuis la PHASE 2b la liste autorisée est CUMULATIVE : on vérifie le lot
+    // 2a (`manquants`) sans exiger qu'il soit l'UNIQUE consommateur du pack.
+    const perimeter = checkIconPerimetre(PACKAGE_DIR, "2a");
     assert.deepStrictEqual(perimeter.interdits, [],
         "fichier(s) interdit(s) consommant la façade : " + perimeter.interdits.join(", "));
     assert.deepStrictEqual(perimeter.horsListe, [],
         "consommateur(s) hors périmètre : " + perimeter.horsListe.join(", "));
     assert.deepStrictEqual(perimeter.manquants, [],
-        "fichier(s) du lot ne consommant pas la façade : " + perimeter.manquants.join(", "));
-    assert.deepStrictEqual(perimeter.offenders, PHASE_2A_CONSUMERS.slice().sort(),
-        "les consommateurs doivent être EXACTEMENT les 7 fichiers du lot");
-    ok(`périmètre : ${perimeter.offenders.length} fichiers, tous dans la liste blanche, aucun interdit`);
+        "fichier(s) du lot 2a ne consommant pas la façade : " + perimeter.manquants.join(", "));
+    assert.deepStrictEqual(perimeter.manquantsToutesPhases, [],
+        "fichier(s) de TOUTES les phases ne consommant pas la façade : " +
+        perimeter.manquantsToutesPhases.join(", "));
+    for (const rel of PHASE_2A_CONSUMERS) {
+        assert.ok(perimeter.offenders.includes(rel),
+            `${rel} : fichier du lot 2a absent des consommateurs détectés`);
+    }
+    ok(`périmètre : ${perimeter.offenders.length} consommateur(s) détecté(s), ` +
+        `les ${PHASE_2A_CONSUMERS.length} du lot 2a présents, aucun interdit`);
 }
 
 /* ══ Modules réels du pack (chargés une seule fois) ══════════════════════ */

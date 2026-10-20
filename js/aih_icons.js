@@ -62,10 +62,18 @@
  * ── État ────────────────────────────────────────────────────────────────────
  * PHASE 1 (socle) : façade disponible, aucun changement visuel.
  * PHASE 2a (lot « dialogues / fermer / plein écran / poignée de drag ») : les
- * emoji cosmétiques de 7 fichiers d'UI sont remplacés par ces icônes. Le
- * périmètre exact est verrouillé par test_helpers/icon_perimeter.mjs et
- * test_aih_icons_phase2a.mjs ; les emoji SÉMANTIQUES et les emoji assertés par
- * un test existant restent en place (voir la liste interdite du helper).
+ * emoji cosmétiques de 7 fichiers d'UI sont remplacés par ces icônes.
+ * PHASE 2b (même famille : fermer / cocher / plein écran / supprimer une ligne)
+ * : 5 fichiers de plus — js/holaf_shortcuts.js (coche « enregistré », croix de
+ * fermeture et de suppression), js/image_viewer/image_viewer_gallery.js (badge
+ * plein écran d'une vignette), js/image_viewer/image_viewer_editor.js
+ * (suppression d'un contrôle), js/02_aih_model_browser.js (suppression d'un
+ * modèle distant) et js/aih_elements_widget.js (poignée de drag, œil de
+ * visibilité, suppression d'une ligne). Le périmètre exact est verrouillé par
+ * test_helpers/icon_perimeter.mjs (structure PAR PHASE : PHASES / CURRENT_PHASE)
+ * et par test_aih_icons_phase2a.mjs / test_aih_icons_phase2b.mjs ; les emoji
+ * SÉMANTIQUES et les emoji assertés par un test existant restent en place (voir
+ * la liste interdite du helper).
  * Une seule voie d'accès : cette façade (jamais la brique vendorisée).
  */
 
