@@ -1,11 +1,26 @@
 import "./aih_dialog.js";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+// Icônes d'UI : UNIQUEMENT via la façade (jamais la brique vendorisée directe).
+import { aihIconSvg } from "./aih_icons.js";
 
 // ComfyUI class key of this node. The legacy pre-rename alias was removed
 // from the Python registry (user decision): one key per node, so the Add Node
 // search lists it once. Old workflows referencing it must be redone.
 const NODE_TYPES = ["AIHLoadImageVideo"];
+
+// ── Libellé du bouton d'upload ──
+// Le glyphe « 📤 » était collé au texte : chaque écriture du libellé devait
+// recomposer la chaîne ENTIÈRE (3 endroits). L'icône a désormais son SLOT
+// (svg décoratif, `aria-hidden` posé par la façade) et le texte est INCHANGÉ :
+// « Upload Image/Video », identique en FR et en EN (aucune clé i18n en jeu).
+// Les deux spans sont collés (aucun espace littéral) : le `textContent` du
+// bouton vaut exactement le libellé.
+const UPLOAD_LABEL = "Upload Image/Video";
+function uploadButtonLabel() {
+    return '<span style="display:inline-flex;align-items:center;margin-right:6px;">' +
+        aihIconSvg("upload", { size: 13 }) + "</span><span>" + UPLOAD_LABEL + "</span>";
+}
 
 // ── Upload helper (used both by file input and clipboard paste) ──
 async function uploadFileAndSetWidget(node, file, uploadButton) {
@@ -15,6 +30,9 @@ async function uploadFileAndSetWidget(node, file, uploadButton) {
     formData.append("image", file);
     formData.append("overwrite", "true");
     try {
+        // État d'attente « ⏳ Uploading... » : glyph de STATUT piloté par le code
+        // (posé ici, restauré dans le `finally`) — laissé en TEXTE, comme les
+        // statuts de l'onglet Workflows : on ne remplace pas un état par une icône.
         if (uploadButton) uploadButton.textContent = "⏳ Uploading...";
         const resp = await api.fetchApi("/upload/image", { method: "POST", body: formData });
         if (resp.status === 200) {
@@ -28,7 +46,7 @@ async function uploadFileAndSetWidget(node, file, uploadButton) {
     } catch (err) {
         await window.AIH.alert("Upload", `Error: ${err.message}`, "error");
     } finally {
-        if (uploadButton) uploadButton.textContent = "📤 Upload Image/Video";
+        if (uploadButton) uploadButton.innerHTML = uploadButtonLabel();
     }
 }
 
@@ -73,7 +91,7 @@ app.registerExtension({
 
                 // 3. Le bouton — pointer-events: auto pour rester cliquable
                 const uploadButton = document.createElement("button");
-                uploadButton.textContent = "📤 Upload Image/Video";
+                uploadButton.innerHTML = uploadButtonLabel();
                 Object.assign(uploadButton.style, {
                     width: "100%",
                     padding: "5px",
@@ -83,7 +101,11 @@ app.registerExtension({
                     border: "1px solid #555",
                     borderRadius: "4px",
                     cursor: "pointer",
-                    pointerEvents: "auto"
+                    pointerEvents: "auto",
+                    // Libellé mêlé : icône + texte centrés sur une même ligne.
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center"
                 });
 
                 // On assemble la structure : Preview en haut, Bouton en bas

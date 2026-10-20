@@ -11,6 +11,8 @@ import { HolafPanelManager } from "./holaf_panel_manager.js";
 import { applyPersistedTheme } from "./holaf_themes.js";
 import { holafComfyHealthCheck } from "./holaf_restart_health.js";
 import { AIH_POPUP_Z } from "./holaf_window_utils.js";
+// Icônes d'UI : UNIQUEMENT via la façade (jamais la brique vendorisée directe).
+import { aihIconSvg } from "./aih_icons.js";
 
 import "./holaf_themes.js";
 import "./aih_dialog.js";
@@ -123,7 +125,10 @@ const HolafUtilitiesMenu = {
                         else if (text.includes("Remote Comparer")) isActive = app.holafRemoteComparer?.isOpen; 
                         else if (text.includes("Compact Menu")) isActive = this.isCompactMode;
 
-                        check.innerHTML = isActive ? "✓" : "";
+                        // La case n'est PAS un contrôle natif : c'est un div dont la
+                        // coche est une icône de la façade (état actif = coche verte
+                        // accentuée par `borderColor`, comportement inchangé).
+                        check.innerHTML = isActive ? aihIconSvg("check", { size: 10 }) : "";
                         check.style.borderColor = isActive ? "var(--holaf-accent-color, #ff8c00)" : "var(--border-color, #888)";
                     }
                 });
@@ -349,7 +354,9 @@ const HolafUtilitiesMenu = {
                 } else if (itemInfo.special === "toggle_compact_menu") {
                     isActive = this.isCompactMode;
                 }
-                checkbox.innerHTML = isActive ? "✓" : "";
+                // Coche = icône de la façade (10 px = `fontSize` de la case) ;
+                // l'état coché/non coché et `borderColor` restent pilotés ici.
+                checkbox.innerHTML = isActive ? aihIconSvg("check", { size: 10 }) : "";
                 checkbox.style.borderColor = isActive ? "var(--holaf-accent-color, #ff8c00)" : "var(--border-color, #888)";
             };
 

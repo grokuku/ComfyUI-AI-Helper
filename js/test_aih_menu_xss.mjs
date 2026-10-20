@@ -193,6 +193,11 @@ doc.body.appendChild(providerContainer);
 await window.AIHMenu.renderProvidersTab(providerContainer);
 
 // 2a. Aucune balise injectée par name / owner_name / model / base_url.
+//     PHASE 2c : l'indicateur « client-side » est désormais une icône de la
+//     FAÇADE (span[role=img] + <svg viewBox="0 0 24 24">), et non plus l'emoji
+//     « 🖥️ ». Les presets ci-dessus ne sont PAS client-side : aucun <svg> ne
+//     doit donc apparaître — et ceux qui apparaîtraient devraient être une
+//     icône de la façade (contrôle positif 2d plus bas).
 assert.strictEqual(providerContainer.querySelectorAll("script, img, svg").length, 0,
     "aucun <script>/<img>/<svg> injecté par les champs de preset");
 
@@ -211,6 +216,44 @@ const modelSpan = presetSpans.find((s) => s.textContent.includes("@"));
 assert.ok(modelSpan, "la ligne model @ base_url est rendue");
 assert.ok(modelSpan.textContent.includes(MALICIOUS_MODEL) && modelSpan.textContent.includes(MALICIOUS_URL),
     "model + base_url malveillants affichés en TEXTE");
+
+// 2d. Indicateur « client-side » (phase 2c) : icône de la FAÇADE, nom accessible,
+//     et le nom du preset reste INERTE (l'icône ne relâche pas l'échappement).
+{
+    PRESETS.push({
+        id: "p-client",
+        name: MALICIOUS_PRESET_NAME,
+        owner_name: MALICIOUS_OWNER,
+        model: MALICIOUS_MODEL,
+        base_url: MALICIOUS_URL,
+        is_global: 0,
+        is_client_side: true,
+    });
+    const clientContainer = doc.createElement("div");
+    doc.body.appendChild(clientContainer);
+    await window.AIHMenu.renderProvidersTab(clientContainer);
+
+    assert.strictEqual(clientContainer.querySelectorAll("script, img").length, 0,
+        "l'indicateur client-side n'ouvre la porte à aucune balise serveur");
+    const badge = clientContainer.querySelector('span[role="img"]');
+    assert.ok(badge, "indicateur client-side : span[role=img] présent (était l'emoji 🖥️)");
+    assert.strictEqual(badge.getAttribute("aria-label"), window.AIH.I18n.t("menu.clientSide"),
+        "l'indicateur porte son nom accessible (clé i18n menu.clientSide)");
+    assert.strictEqual(badge.getAttribute("title"), window.AIH.I18n.t("menu.clientSide"),
+        "infobulle native ajoutée (elle manquait à l'emoji)");
+    assert.ok(!badge.textContent.includes("🖥"), "le glyphe « 🖥️ » a disparu de l'indicateur");
+    const svg = badge.querySelector("svg");
+    assert.ok(svg, "l'indicateur contient le <svg> de la façade");
+    assert.strictEqual(svg.getAttribute("viewBox"), "0 0 24 24", "SVG de la façade (viewBox 24×24)");
+    assert.strictEqual(svg.getAttribute("width"), "12", "taille alignée sur la ligne d'information");
+    assert.strictEqual(svg.getAttribute("aria-hidden"), "true",
+        "l'icône du badge est décorative (le sens est porté par aria-label)");
+    assert.ok(!/#[0-9a-fA-F]{3,8}\b|\brgb\(/.test(svg.outerHTML),
+        "aucune couleur codée en dur dans le SVG (currentColor de l'hôte)");
+    const names = Array.from(clientContainer.querySelectorAll("strong")).map((s) => s.textContent);
+    assert.ok(names.filter((n) => n === MALICIOUS_PRESET_NAME).length === 2,
+        "le nom malveillant reste en TEXTE sur les deux presets (aucune balise)");
+}
 
 // 2c. Confirmation de suppression d'un preset : p.name échappé.
 confirmMessage = null;

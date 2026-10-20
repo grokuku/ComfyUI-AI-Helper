@@ -3,6 +3,8 @@ import "./aih_strings.js";
 import { makeDraggable } from "./holaf_window_utils.js";
 import { showToast as bridgeShowToast, updateToast as bridgeUpdateToast, hideToast as bridgeHideToast } from "./aih_toast_bridge.js";
 import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } from "./aih_fetch_bridge.js";
+// Icônes d'UI : UNIQUEMENT via la façade (jamais la brique vendorisée directe).
+import { aihIconSvg } from "./aih_icons.js";
 
 /**
  * AIH Workflow Manager — Modale unique avec 2 onglets.
@@ -20,6 +22,28 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
   const t = (key, params) => {
     const I = window.AIH && window.AIH.I18n;
     return I && typeof I.t === "function" ? I.t(key, params) : key;
+  };
+
+  // ══════════════════════════════════════════════════════════════════════
+  // Icônes D'ACTION (phase 2c) — les glyphes de STATUT restent en TEXTE :
+  // ⏳ (en cours) ♻️ (écrasé) ✅ (envoyé) ⏭ (ignoré) ❌ (échec) ✓ (lien git)
+  // sont pilotés par le code et assertés par test_aih_workflow_share_preupload
+  // et test_aih_workflow_share_upload_timeout → jamais remplacés par une icône.
+  // ══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Slot d'icône destiné à `innerHTML` : le <svg> (décoratif — la façade pose
+   * `aria-hidden`) est dans son propre span, calé sur la ligne de texte par
+   * `vertical-align` (aucun espace littéral ajouté : le texte reste contigu).
+   * @param {string} name nom d'icône de la brique.
+   * @param {number} size taille en px (alignée sur la taille de texte de l'hôte).
+   * @param {number} [gap] marge droite ; 0 pour un conteneur déjà centré en flex.
+   * @returns {string} HTML du slot.
+   */
+  var iconSlot = function (name, size, gap) {
+    var margin = (gap === 0) ? "" : "margin-right:" + (gap == null ? 3 : gap) + "px;";
+    return '<span style="display:inline-flex;align-items:center;vertical-align:-2px;' + margin +
+      '">' + aihIconSvg(name, { size: size }) + '</span>';
   };
 
   // ── Version du module — VÉRIFIABLE par l'utilisateur ─────────────────────
@@ -1596,19 +1620,19 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
             // workflows (is_mine calculé côté serveur) — le serveur reste la
             // garde finale (403 sur DELETE d'autrui).
             var delHtml = (w.is_mine === true)
-              ? '<button class="wf-del-btn" data-wf-id="' + w.id + '" data-wf-name="' + esc(w.name) + '" onclick="event.stopPropagation();window._wfDeleteWorkflow(this)" style="position:absolute;top:4px;right:4px;width:22px;height:22px;border:1px solid #555;border-radius:4px;background:rgba(60,60,64,0.9);color:#f87171;font-size:11px;cursor:pointer;padding:0;line-height:20px;text-align:center;z-index:2;display:none;">🗑</button>'
+              ? '<button class="wf-del-btn" data-wf-id="' + w.id + '" data-wf-name="' + esc(w.name) + '" onclick="event.stopPropagation();window._wfDeleteWorkflow(this)" style="position:absolute;top:4px;right:4px;width:22px;height:22px;border:1px solid #555;border-radius:4px;background:rgba(60,60,64,0.9);color:#f87171;font-size:11px;cursor:pointer;padding:0;line-height:20px;text-align:center;z-index:2;display:none;">' + iconSlot("trash", 13, 0) + '</button>'
               : '';
             html +=
               '<div class="wf-card" style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid #444;border-radius:6px;margin-bottom:4px;cursor:pointer;background:#3a3a3e;position:relative;"' +
 
               ' onclick="window._wfOpenDetail(' + w.id + ', this)">' +
               delHtml +
-              (w.thumbnail ? '<img src="' + w.thumbnail + '" style="width:48px;height:48px;border-radius:4px;object-fit:cover;flex-shrink:0;">' : '<div style="width:48px;height:48px;border-radius:4px;background:#444;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">📤</div>') +
+              (w.thumbnail ? '<img src="' + w.thumbnail + '" style="width:48px;height:48px;border-radius:4px;object-fit:cover;flex-shrink:0;">' : '<div style="width:48px;height:48px;border-radius:4px;background:#444;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">' + iconSlot("upload", 20, 0) + '</div>') +
               '<div style="flex:1;min-width:0;">' +
               '<div style="font-size:13px;font-weight:600;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(w.name) + '</div>' +
               '<div style="font-size:11px;color:#888;">' + t('wf.by') + esc(author) + (depsCount > 0 ? ' · ' + depsCount + t('wf.depsAbbr') : '') + '</div></div>' +
               '<div style="text-align:right;font-size:11px;color:#888;white-space:nowrap;">' +
-              '❤️ ' + (w.likes || 0) + ' 📥 ' + (w.downloads || 0) + ' <span style="color:#666;">v' + (w.version || 1) + '</span></div></div>';
+              iconSlot("heart", 12) + (w.likes || 0) + ' ' + iconSlot("download", 12) + (w.downloads || 0) + ' <span style="color:#666;">v' + (w.version || 1) + '</span></div></div>';
           }
           listEl.innerHTML = html;
 
@@ -1676,7 +1700,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
             '<div style="margin-bottom:12px;">' +
             '<h2 style="font-size:16px;font-weight:700;color:#e2e8f0;margin:0 0 4px 0;">' + esc(w.name) + '</h2>' +
             '<p style="font-size:12px;color:#888;margin:0;">' + t('wf.by') + esc(w.author || "?") + ' · v' + (w.version || 1) +
-            ' · ❤️ ' + (w.likes || 0) + ' · 📥 ' + (w.downloads || 0) + '</p>' +
+            ' · ' + iconSlot("heart", 12) + (w.likes || 0) + ' · ' + iconSlot("download", 12) + (w.downloads || 0) + '</p>' +
             (w.description ? '<p style="font-size:12px;color:#aaa;margin:8px 0 0 0;">' + esc(w.description) + '</p>' : '') +
             '</div>' +
             '<div id="wf-install-deps" style="margin-bottom:12px;"></div>' +
@@ -1754,7 +1778,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                     (installed ? ' <span style="color:#34d399;">' + t('wf.alreadyInstalledMatch', { reason: reason }) + '</span>' : '') +
                     (!installed && !n.url ? ' <span style="color:#f87171;">' + t('wf.noGitUrl') + '</span>' : '') + '</span>' +
                     (n.url && !installed ? '<button onclick="window._wfInstallNode(\'' + esc(n.url) + '\', \'' + esc(n.name) + '\', this)" style="padding:2px 8px;border:1px solid #555;border-radius:3px;background:#4a4a4e;color:#ccc;font-size:10px;cursor:pointer;">' + t('wf.install') + '</button>' : '') +
-                    (n.url ? '<a href="' + esc(n.url) + '" target="_blank" style="color:var(--aih-accent, #D8700D);text-decoration:none;font-size:11px;" onclick="event.stopPropagation();">🔗</a>' : '') +
+                    (n.url ? '<a href="' + esc(n.url) + '" target="_blank" rel="noopener noreferrer" title="' + esc(t('wf.openNodeRepo')) + '" aria-label="' + esc(t('wf.openNodeRepo')) + '" style="color:var(--aih-accent, #D8700D);text-decoration:none;font-size:11px;display:inline-flex;align-items:center;" onclick="event.stopPropagation();">' + aihIconSvg("link", { size: 12 }) + '</a>' : '') +
                     '</label>';
                 }
               }
@@ -2151,7 +2175,7 @@ import { remoteGet, remotePost, remoteDelete, HolafFetch, normalizeServerUrl } f
                 resizable: false,
                 content: '<div style="font-size:13px;color:#ccc;margin-bottom:8px;">' + t('wf.conflictDesc') + '</div>' +
                   '<div style="background:#1a1a1e;padding:10px;border-radius:6px;margin-bottom:12px;font-size:12px;color:#aaa;font-family:monospace;">' +
-                  '<div>📁 <b style="color:#e2e8f0;">' + esc(fileName) + '</b></div>' +
+                  '<div>' + iconSlot("folder", 13) + '<b style="color:#e2e8f0;">' + esc(fileName) + '</b></div>' +
                   '<div style="margin-top:4px;">Local: ' + (localInfo.size/1048576).toFixed(1) + ' MB (' + (localInfo.path || t('wf.unknownPath')) + ')</div>' +
                   '<div>Server: ' + (remoteInfo.size/1048576).toFixed(1) + ' MB</div></div>' +
                   '<div style="display:flex;flex-direction:column;gap:8px;">' +

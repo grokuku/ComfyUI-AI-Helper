@@ -59,16 +59,34 @@ export const PHASES = Object.freeze({
         "js/02_aih_model_browser.js",             // suppression d'un modèle distant (admin, par ligne)
         "js/aih_elements_widget.js",              // poignée de drag + œil (visibilité) + suppression d'une ligne
     ]),
+    /**
+     * PHASE 2c — MENUS ET BOUTONS D'ACTIONS : les emoji de commande des menus
+     * (supprimer un membre, avatar, indicateur client-side, erreur de mise à
+     * jour), les cases à cocher dessinées du menu principal, les chevrons de
+     * dépliage, les libellés MÊLÉS (icône + texte) et les actions de l'onglet
+     * Workflows. Les glyphes de STATUT restent en TEXTE (voir les tests du lot).
+     */
+    "2c": Object.freeze([
+        "js/aih_menu.js",                         // corbeille d'un membre + avatar + client-side + erreur
+        "js/holaf_main.js",                       // coche ✓ des cases du menu (état actif / inactif)
+        "js/holaf_resolution_preset_v2.js",       // libellé mêlé « 🔗 Use Image Ratio : ON/OFF »
+        "js/holaf_load_image_video.js",           // libellé mêlé « 📤 Upload Image/Video »
+        "js/aih_repair_workflow.js",              // chevrons de dépliage du détail d'un problème
+        "js/aih_workflow_share.js",               // actions seulement (statuts ⏳♻️✅⏭❌ inchangés)
+    ]),
 });
 
 /** Lot en cours (celui dont les fichiers doivent consommer réellement). */
-export const CURRENT_PHASE = "2b";
+export const CURRENT_PHASE = "2c";
 
 /** Alias historique : la phase 2a reste adressable sous son ancien nom. */
 export const PHASE_2A_CONSUMERS = PHASES["2a"];
 
 /** Alias explicite de la phase 2b. */
 export const PHASE_2B_CONSUMERS = PHASES["2b"];
+
+/** Alias explicite de la phase 2c. */
+export const PHASE_2C_CONSUMERS = PHASES["2c"];
 
 /** Union de TOUS les fichiers autorisés (toutes phases livrées confondues). */
 export const ALLOWED_CONSUMERS = Object.freeze(

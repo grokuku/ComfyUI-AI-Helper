@@ -32,6 +32,8 @@
 import "./aih_dialog.js";
 import "./aih_strings.js";
 import { holafExtUrl } from "./holaf_ext_base.js";
+// Icônes d'UI : UNIQUEMENT via la façade (jamais la brique vendorisée directe).
+import { aihIconSvg } from "./aih_icons.js";
 
 (function () {
     "use strict";
@@ -357,7 +359,20 @@ import { holafExtUrl } from "./holaf_ext_base.js";
             });
             const label = el("span", "rw-problem-label", problemLabel(problem));
             const count = el("span", "rw-problem-count", tr("rw.occurrences", { count: problem.count }));
-            const toggle = el("button", "rw-problem-toggle", "▸");
+            // Chevron de dépliage : icône de la façade (avant : « ▸ »/« ▾ » en
+            // texte, dont le seul nom accessible était le glyphe). L'état replié
+            // reste la valeur PAR DÉFAUT et le toggle est le même bouton.
+            const toggle = el("button", "rw-problem-toggle");
+            // État du chevron ET nom accessible dans un seul endroit (le bouton
+            // ne porte plus de texte : `title`/`aria-label` sont obligatoires).
+            const setToggleState = (expanded) => {
+                toggle.innerHTML = aihIconSvg(expanded ? "chevron-down" : "chevron-right", { size: 12 });
+                const name = tr(expanded ? "rw.detail.hide" : "rw.detail.show");
+                toggle.title = name;
+                toggle.setAttribute("aria-label", name);
+                toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+            };
+            setToggleState(false);
 
             head.appendChild(cb);
             head.appendChild(label);
@@ -378,7 +393,7 @@ import { holafExtUrl } from "./holaf_ext_base.js";
             toggle.addEventListener("click", () => {
                 const shown = details.style.display !== "none";
                 details.style.display = shown ? "none" : "block";
-                toggle.textContent = shown ? "▸" : "▾";
+                setToggleState(!shown);
             });
             row.appendChild(details);
 

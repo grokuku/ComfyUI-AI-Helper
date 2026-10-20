@@ -127,7 +127,8 @@ function assertLotSource(reader) {
             must: [
                 [/import\s*\{\s*aihIconSvg\s*\}\s*from\s*["']\.\.\/aih_icons\.js["']/, "import de la façade"],
                 [/aihIconSvg\(\s*['"]maximize['"]\s*,\s*\{\s*size:\s*16\s*\}\s*\)/, "icône plein écran du badge"],
-                [/fsIcon\.title\s*=\s*t\(\s*['"]iv\.viewFullscreen['"]\s*\)/, "nom accessible du badge conservé"],
+                [/const fullscreenLabel = t\(\s*['"]iv\.viewFullscreen['"]\s*\)/, "nom accessible du badge (clé i18n)"],
+                [/fsIcon\.title\s*=\s*fullscreenLabel;/, "nom accessible du badge conservé (title)"],
                 [/fsIcon\.setAttribute\(\s*['"]data-holaf-action['"]\s*,\s*['"]fullscreen['"]\s*\)/,
                     "action déléguée de la grille conservée"],
             ],
@@ -222,8 +223,12 @@ console.log("1. source : façade appelée, glyphes de la famille disparus (5 fic
 /* ══ 2. Périmètre PAR PHASES ═════════════════════════════════════════════ */
 console.log("2. périmètre par phases : lot 2b branché, listes disjointes, interdits préservés");
 {
-    assert.strictEqual(CURRENT_PHASE, "2b", "le lot en cours est bien la phase 2b");
-    assert.deepStrictEqual(Object.keys(PHASES), ["2a", "2b"], "les phases livrées sont 2a et 2b");
+    // Le lot 2b n'est plus le lot COURANT (2c est arrivé) : il reste une phase
+    // LIVÉE et pleinement branchée, ce que vérifient les lignes suivantes.
+    assert.ok(Object.keys(PHASES).includes("2b"), "la phase 2b reste déclarée");
+    assert.notStrictEqual(CURRENT_PHASE, "", "un lot courant est défini");
+    assert.deepStrictEqual(Object.keys(PHASES), ["2a", "2b", "2c"],
+        "les phases livrées sont 2a, 2b et 2c (jamais fusionnées)");
     assert.strictEqual(PHASE_2B_CONSUMERS.length, 5, "la phase 2b couvre 5 fichiers");
     assert.ok(!FORBIDDEN_CONSUMERS.includes("js/holaf_shortcuts.js"),
         "js/holaf_shortcuts.js a QUITTÉ la liste interdite (il est migré en 2b)");
@@ -237,10 +242,10 @@ console.log("2. périmètre par phases : lot 2b branché, listes disjointes, int
         "fichier(s) du lot 2b ne consommant pas la façade : " + r.manquants.join(", "));
     assert.deepStrictEqual(r.manquantsToutesPhases, [],
         "fichier(s) d'une phase livrée ne consommant plus la façade : " + r.manquantsToutesPhases.join(", "));
-    // La liste blanche est CUMULATIVE : 2a ∪ 2b, sans doublon.
+    // La liste blanche est CUMULATIVE : 2a ∪ 2b ∪ … (toutes phases livrées).
     assert.deepStrictEqual(ALLOWED_CONSUMERS,
-        [...new Set([...PHASE_2A_CONSUMERS, ...PHASE_2B_CONSUMERS])].sort(),
-        "ALLOWED_CONSUMERS = union triée de 2a et 2b");
+        [...new Set(Object.values(PHASES).flat())].sort(),
+        "ALLOWED_CONSUMERS = union triée de TOUTES les phases");
     assert.deepStrictEqual(r.offenders, ALLOWED_CONSUMERS,
         "les consommateurs détectés sont EXACTEMENT les fichiers des phases livrées");
 

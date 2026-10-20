@@ -495,6 +495,18 @@ body.holaf-standalone-mode .holaf-utility-panel:not(.holaf-floating-window) {
     opacity: 1;
 }
 
+/* PHASE 2c — le badge plein écran est atteignable au clavier (role="button" +
+   tabindex="0" posés dans image_viewer_gallery.js). Il n'était révélé qu'au
+   SURVOL (opacity: 0) : au clavier il fallait donc le rendre visible ET lui
+   donner un indicateur de focus. Règle SCOPÉE à ce badge (aucun CSS global),
+   même style d'anneau que les autres :focus-visible du pack, couleur de
+   l'accent (jamais une couleur codée en dur). */
+.holaf-viewer-fullscreen-icon:focus-visible {
+    opacity: 1;
+    outline: 2px solid var(--aih-accent-active, currentColor);
+    outline-offset: -2px;
+}
+
 #holaf-viewer-zoom-view {
     position: absolute;
     top: 0;

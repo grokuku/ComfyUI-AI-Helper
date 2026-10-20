@@ -46,6 +46,8 @@ import { showToast } from "./aih_toast_bridge.js";
 import { remoteGet, remoteRequest, normalizeServerUrl, isMaskedApiKey, isUsableApiKey } from "./aih_fetch_bridge.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 import { escapeHtml } from "./holaf_dom_utils.js";
+// Icônes d'UI : UNIQUEMENT via la façade (jamais la brique vendorisée directe).
+import { aihIconSvg } from "./aih_icons.js";
 import {
     formatContextCount,
     contextBadgeKey,
@@ -201,13 +203,15 @@ import {
             // Pas de bouton sur sa propre ligne (le serveur bloque de toute
             // façon « Tu ne peux pas te supprimer ») ni pour un non-admin.
             const showDel = canManage && !(currentUserId && m.id && m.id === currentUserId);
+            // Corbeille : icône de la façade dans le bouton. Le nom accessible est
+            // porté par `title` (déjà présent) → l'icône reste décorative.
             const delCell = showDel
-                ? `<button class="aih-member-del" data-id="${escapeHtml(m.id)}" data-name="${safeName}" title="${t("menu.del")}" style="background:transparent;border:none;cursor:pointer;color:#f87171;font-size:13px;padding:2px 4px;">🗑</button>`
+                ? `<button class="aih-member-del" data-id="${escapeHtml(m.id)}" data-name="${safeName}" title="${t("menu.del")}" style="background:transparent;border:none;cursor:pointer;color:#f87171;font-size:13px;padding:2px 4px;display:inline-flex;align-items:center;justify-content:center;">${aihIconSvg("trash", { size: 13 })}</button>`
                 : "";
 
             html += `<tr style="border-bottom:1px solid #333;">
                 <td style="padding:6px 8px;display:flex;align-items:center;gap:8px;">
-                    ${avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" style="width:24px;height:24px;border-radius:50%;flex-shrink:0;">` : '<span style="width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;background:#444;border-radius:50%;font-size:11px;flex-shrink:0;">👤</span>'}
+                    ${avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" style="width:24px;height:24px;border-radius:50%;flex-shrink:0;">` : `<span style="width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;background:#444;border-radius:50%;font-size:11px;flex-shrink:0;">${aihIconSvg("user", { size: 12 })}</span>`}
                     <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeName}</span>
                 </td>
                 <td style="text-align:center;padding:6px 4px;">${roleBadge}</td>
@@ -716,7 +720,12 @@ import {
                 });
                 const left = document.createElement("div");
                 const scope = p.is_global ? t("menu.scopeGlobal") : (p.owner_name ? `(${p.owner_name})` : t("menu.scopePersonal"));
-                const clientBadge = p.is_client_side ? " <span style='color:#f59e0b;'>🖥️</span>" : "";
+                // Indicateur « client-side » : icône de la façade + nom accessible
+                // (role=img + aria-label + title, clé i18n déjà en parité FR/EN).
+                const clientLabel = t("menu.clientSide");
+                const clientBadge = p.is_client_side
+                    ? ` <span role="img" aria-label="${escapeHtml(clientLabel)}" title="${escapeHtml(clientLabel)}" style='color:#f59e0b;display:inline-flex;align-items:center;vertical-align:-2px;'>${aihIconSvg("monitor", { size: 12 })}</span>`
+                    : "";
                 // Résumé de contexte : valeur + source (manuel/détecté/≈ estimation/? inconnu).
                 // Aucune valeur inventée : sans context_length, « ? contexte inconnu ».
                 const ctxSummary = contextSummaryText(p.context_length, p.context_source, t);
@@ -1177,7 +1186,8 @@ import {
                 const errSection = document.createElement("div");
                 errSection.style.cssText = "margin-top:14px; padding:12px; background:#2e1a1a; border:1px solid #5a2d2d; border-radius:6px; text-align:center;";
                 // data.message est un message du serveur : échappé AVANT innerHTML.
-                errSection.innerHTML = `<p style="color:#f87171; font-size:13px; margin:0 0 8px;">✗ ${data.message ? escapeHtml(data.message) : t("menu.updateError")}</p>`;
+                // La croix est décorative (le paragraphe porte le message texte).
+                errSection.innerHTML = `<p style="color:#f87171; font-size:13px; margin:0 0 8px; display:flex; align-items:center; justify-content:center; gap:5px;">${aihIconSvg("x", { size: 13 })}<span>${data.message ? escapeHtml(data.message) : t("menu.updateError")}</span></p>`;
                 const closeBtn = document.createElement("button");
                 closeBtn.textContent = t("menu.close");
                 Object.assign(closeBtn.style, { padding: "6px 14px", borderRadius: "6px", border: "1px solid #555", background: "transparent", color: "#ccc", cursor: "pointer", fontSize: "12px" });

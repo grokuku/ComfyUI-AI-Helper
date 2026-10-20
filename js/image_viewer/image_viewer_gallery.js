@@ -412,9 +412,25 @@ function addFullscreenIcon(placeholder, image) {
         // Icône « maximize » de la brique : le badge ouvre la vue plein écran
         // dédiée (bloc sans état, refermé par sa propre croix). `size: 16` = la
         // taille de texte du badge ; la couleur vient de `currentColor` (blanc
-        // posé par `.holaf-viewer-fullscreen-icon`).
+        // posé par `.holaf-viewer-fullscreen-icon`). L'icône est DÉCORATIVE
+        // (`aria-hidden` posé par la façade) : le sens est porté par le badge.
         fsIcon.innerHTML = aihIconSvg('maximize', { size: 16 });
-        fsIcon.title = t('iv.viewFullscreen');
+        const fullscreenLabel = t('iv.viewFullscreen');
+        fsIcon.title = fullscreenLabel;
+        // ── Accessibilité du badge (phase 2c) ────────────────────────────────
+        // C'était un <div> cliquable SANS équivalent clavier : il devient un
+        // bouton exposé (role + tabindex + nom accessible) et s'active avec
+        // Entrée et Espace (Espace prévient le défilement de la grille).
+        fsIcon.setAttribute('role', 'button');
+        fsIcon.setAttribute('tabindex', '0');
+        fsIcon.setAttribute('aria-label', fullscreenLabel);
+        fsIcon.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+            if (e.key !== 'Enter') e.preventDefault(); // Espace ≠ scroll
+            // On rejoue un CLIC réel : la délégation de la grille reste l'UNIQUE
+            // chemin d'action (aucun second appel direct à showFullscreenView).
+            fsIcon.click();
+        });
         // Click handled via delegation on the grid surface
         placeholder.appendChild(fsIcon);
     }

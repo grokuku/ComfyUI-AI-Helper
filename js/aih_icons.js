@@ -21,10 +21,12 @@
  *      complète chez les appelants, un seul point à corriger si la brique
  *      change de forme).
  *
- *   3. ACCESSIBILITÉ. Une icône est DÉCORATIVE par défaut : le `<span>` porte
- *      `aria-hidden="true"` et le `<svg>` est toujours `aria-hidden` (il est
- *      décoratif dans les deux cas). Si l'appelant fournit `label`, le sens est
- *      porté par le `<span>` : `role="img"` + `aria-label`, sans aria-hidden.
+ *   3. ACCESSIBILITÉ. Une icône est DÉCORATIVE par défaut : `aihIconSvg`
+ *      marque le `<svg>` `aria-hidden="true"` + `focusable="false"` (une
+ *      chaîne destinée à `innerHTML` ne peut pas porter de nom accessible),
+ *      `aihIconEl` porte `aria-hidden="true"` sur le `<span>` et son `<svg>`.
+ *      Si l'appelant fournit `label`, le sens est porté par le `<span>` :
+ *      `role="img"` + `aria-label`, sans aria-hidden.
  *      `title` ajoute seulement l'infobulle native — il ne rend PAS l'icône
  *      annonçable (utiliser `label` pour cela).
  *
@@ -50,7 +52,8 @@
  *     suit sans modification.
  *
  * ── API ────────────────────────────────────────────────────────────────────
- *   aihIconSvg(name, { size, class })            → string SVG ("" si inconnu)
+ *   aihIconSvg(name, { size, class })            → string SVG ("" si inconnu),
+ *                                                décoratif (aria-hidden)
  *   aihIconEl(name, { size, class, title, label })
  *                                               → <span class="aih-icon">…</span>
  *   aihIconNames()                              → noms disponibles (copie)
@@ -74,6 +77,13 @@
  * et par test_aih_icons_phase2a.mjs / test_aih_icons_phase2b.mjs ; les emoji
  * SÉMANTIQUES et les emoji assertés par un test existant restent en place (voir
  * la liste interdite du helper).
+ * PHASE 2c (menus et boutons d'ACTIONS) : 6 fichiers de plus — js/aih_menu.js
+ * (corbeille d'un membre, avatar, indicateur client-side, marque d'erreur),
+ * js/holaf_main.js (coche des cases du menu), js/holaf_resolution_preset_v2.js
+ * et js/holaf_load_image_video.js (libellés MÊLÉS icône + texte),
+ * js/aih_repair_workflow.js (chevrons de dépliage) et js/aih_workflow_share.js
+ * (actions de l'onglet Workflows SEULEMENT : ses glyphes de STATUT ⏳♻️✅⏭❌
+ * restent du TEXTE, asserté par les tests du module).
  * Une seule voie d'accès : cette façade (jamais la brique vendorisée).
  */
 
@@ -209,6 +219,11 @@ export function aihIconSvg(name, opts) {
     for (const [k, v] of _rootAttrs(entry, _normalizeSize(o.size), cls)) {
         attrs += ` ${k}="${_escapeAttr(v)}"`;
     }
+    // Une chaîne destinée à `innerHTML` ne peut pas porter de nom accessible :
+    // le `<svg>` est donc décoratif par construction (même contrat que le
+    // `<svg>` de `aihIconEl`). `focusable="false"` évite le piège de tabulation
+    // historique des SVG inline hors navigateurs modernes.
+    attrs += ` aria-hidden="true" focusable="false"`;
     return `<svg${attrs}>${entry.body}</svg>`;
 }
 

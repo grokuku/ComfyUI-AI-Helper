@@ -10,6 +10,8 @@
  */
 
 import { app } from "../../scripts/app.js";
+// Icônes d'UI : UNIQUEMENT via la façade (jamais la brique vendorisée directe).
+import { aihIconSvg } from "./aih_icons.js";
 
 // ComfyUI class key of this node. The legacy pre-rename alias was removed
 // from the Python registry (user decision): one key per node — old workflows
@@ -57,6 +59,20 @@ function updateAspectLabels(select, isLandscape) {
         const mapped = isLandscape ? (LANDSCAPE_LABELS[base] || base) : base;
         option.textContent = mapped;
     }
+}
+
+// Libellé MÊLÉ du toggle use_image_ratio : le chaînon était un EMOJI collé au
+// texte (« 🔗 Use Image Ratio : ON »), ce qui obligeait chaque appelant à
+// recomposer la chaîne entière. L'icône a désormais son SLOT (span + <svg>
+// décoratif) et le texte est INCHANGÉ (même en EN : il n'est pas traduit).
+// Le nom accessible du bouton reste le texte visible (aucun aria-label ajouté :
+// le texte est déjà dans le bouton, l'icône ne double pas l'annonce).
+const RATIO_LABELS = Object.freeze({ on: "Use Image Ratio : ON", off: "Use Image Ratio : OFF" });
+function ratioIconLabel(isOn) {
+    const text = isOn ? RATIO_LABELS.on : RATIO_LABELS.off;
+    // Pas d'espace littéral entre les deux spans : textContent === le texte exact.
+    return "<span style=\"display:inline-flex;align-items:center;margin-right:5px;\">" +
+        aihIconSvg("link", { size: 11 }) + "</span><span>" + text + "</span>";
 }
 
 // Masque un widget réel sans le détruire (il reste la source de sérialisation).
@@ -317,8 +333,11 @@ app.registerExtension({
                 const isLandscape = !!widgets.orientation.value;
                 updateAspectLabels(aspectSelect, isLandscape);
 
-                // Ligne 3 — toggle Image Ratio
-                ratioButton.textContent = useImageRatio ? "🔗 Use Image Ratio : ON" : "🔗 Use Image Ratio : OFF";
+                // Ligne 3 — toggle Image Ratio : libellé MÊLÉ (icône + texte).
+                // L'icône est dans son propre slot (aucun texte dans le <svg>) et
+                // le texte reste EXACTEMENT « Use Image Ratio : ON|OFF » (ni
+                // traduit, ni réordonné : il est identique en FR et en EN).
+                ratioButton.innerHTML = ratioIconLabel(useImageRatio);
             };
 
             // Relit les widgets réels (valeurs restaurées au chargement) vers le DOM.

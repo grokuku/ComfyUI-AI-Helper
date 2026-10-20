@@ -150,7 +150,14 @@ console.log("2. aihIconSvg — SVG 24×24 valide, size/class, fidèle à la briq
     assert.strictEqual(root.getAttribute("height"), String(icons.AIH_ICON_DEFAULT_SIZE), "height par défaut");
     assert.strictEqual(icons.AIH_ICON_DEFAULT_SIZE, 16, "taille par défaut = 16 px");
     assert.strictEqual(root.getAttribute("class"), null, "aucune classe si non fournie");
-    ok("SVG valide : 24×24, fill none, stroke currentColor, stroke-width 2, 16 px par défaut");
+    // Décoratif PAR CONSTRUCTION : une chaîne destinée à `innerHTML` ne peut pas
+    // porter de nom accessible → le `<svg>` est `aria-hidden` (même contrat que
+    // le `<svg>` de `aihIconEl`) et hors du parcours de tabulation.
+    assert.strictEqual(root.getAttribute("aria-hidden"), "true",
+        'aihIconSvg : icône décorative (aria-hidden="true")');
+    assert.strictEqual(root.getAttribute("focusable"), "false",
+        'aihIconSvg : focusable="false" (jamais de piège de tabulation)');
+    ok("SVG valide : 24×24, fill none, stroke currentColor, stroke-width 2, 16 px par défaut, décoratif");
 
     // size + class appliqués (class → attribut du <svg>, comme la brique).
     const big = assertValidSvg(icons.aihIconSvg("search", { size: 24, class: "aih-ic aih-ic--lg" }), "size/class");
@@ -166,17 +173,28 @@ console.log("2. aihIconSvg — SVG 24×24 valide, size/class, fidèle à la briq
     }
     ok("size invalide (0, négatif, NaN, texte, Infinity) → repli sur 16");
 
-    // FIDÉLITÉ : mêmes attributs (hors width/height/class) et même corps que la brique.
+    // FIDÉLITÉ : mêmes attributs (hors width/height/class, plus les DEUX attributs
+    // d'accessibilité ajoutés par la façade et vérifiés ci-dessus) et même corps
+    // que la brique — la façade ne réécrit aucun attribut porteur de sens.
     for (const name of ["search", "lock", "recycle", "sparkles"]) {
         const facade = attrMap(assertValidSvg(icons.aihIconSvg(name, { size: 20 }), name));
         const brick = attrMap(assertValidSvg(HolafIcons.render(name, { size: 20 }), name));
-        const strip = (m) => { const c = { ...m }; delete c.width; delete c.height; delete c.class; return c; };
+        const strip = (m) => {
+            const c = { ...m };
+            delete c.width; delete c.height; delete c.class;
+            delete c["aria-hidden"]; delete c.focusable;
+            return c;
+        };
         assert.deepStrictEqual(strip(facade), strip(brick), `attributs divergents pour « ${name} »`);
+        // …et la différence se limite EXACTEMENT à ces deux attributs.
+        const ajoutes = Object.keys(facade).filter((k) => !(k in brick)).sort();
+        assert.deepStrictEqual(ajoutes, ["aria-hidden", "focusable"],
+            `attributs ajoutés inattendus pour « ${name} » : ${ajoutes.join(", ")}`);
         const facadeRoot = parseSvg(icons.aihIconSvg(name, { size: 20 })).documentElement;
         const brickRoot = parseSvg(HolafIcons.render(name, { size: 20 })).documentElement;
         assert.strictEqual(facadeRoot.innerHTML, brickRoot.innerHTML, `tracés divergents pour « ${name} »`);
     }
-    ok("attributs et tracés identiques au rendu de la brique (4 icônes, dont 2 de la vague 0.1.7)");
+    ok("attributs et tracés identiques au rendu de la brique (+ aria-hidden/focusable seulement)");
 }
 
 /* ══ 3. aihIconEl : élément DOM + aria + zéro CSS ════════════════════════ */
@@ -322,7 +340,7 @@ console.log("6. import ESM sans DOM (Node) : chaînes OK, aihIconEl échoue clai
 }
 
 /* ══ 7. Périmètre : la façade n'est consommée QUE là où c'est décidé ═════ */
-console.log("7. périmètre de consommation (phases 2a + 2b) : liste blanche stricte");
+console.log("7. périmètre de consommation (phases 2a + 2b + 2c) : liste blanche stricte");
 {
     const r = checkIconPerimetre(PACKAGE_DIR);
 
@@ -359,7 +377,7 @@ console.log("7. périmètre de consommation (phases 2a + 2b) : liste blanche str
         "l'union des phases doit contenir tous les fichiers (aucun doublon)");
 
     ok(`périmètre respecté : ${r.offenders.length} consommateur(s) = les ${ALLOWED_CONSUMERS.length} ` +
-        `des ${Object.keys(PHASES).length} phases (2a+2b), aucun interdit (${FORBIDDEN_CONSUMERS.length} surveillés)`);
+        `des ${Object.keys(PHASES).length} phases (${Object.keys(PHASES).join("+")}), aucun interdit (${FORBIDDEN_CONSUMERS.length} surveillés)`);
     assert.ok(readFileSync(join(HERE, "aih_icons.js"), "utf8").length > 0, "façade lisible");
 }
 
