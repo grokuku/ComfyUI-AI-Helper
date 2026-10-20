@@ -57,7 +57,7 @@ import { aihIconSvg } from "./aih_icons.js";
   //   - est comparée au fichier RÉELLEMENT servi (fetch cache: no-store) pour
   //     afficher un bandeau rouge « version obsolète — Ctrl+Shift+R ».
   // ⚠️ Incrémenter à CHAQUE livraison de ce fichier.
-  var AIH_WF_SHARE_BUILD = "wf-share-2026-10-04-r6";
+  var AIH_WF_SHARE_BUILD = "wf-share-2026-10-04-r7";
 
   var AIH_WF_SHARE_BUILD_RX = /AIH_WF_SHARE_BUILD\s*=\s*["']([^"']+)["']/;
 
@@ -1173,11 +1173,11 @@ import { aihIconSvg } from "./aih_icons.js";
         '<button id="wf-tab-share" style="flex:1;padding:8px;border:none;border-bottom:2px solid ' +
         (currentTab === "share" ? "var(--aih-accent, #D8700D)" : "transparent") + ';background:transparent;color:' +
         (currentTab === "share" ? "#e2e8f0" : "#888") + ';font-size:13px;font-weight:' +
-        (currentTab === "share" ? "600" : "400") + ';cursor:pointer;">' + t('wf.tabShare') + '</button>' +
+        (currentTab === "share" ? "600" : "400") + ';cursor:pointer;">' + iconSlot("upload", 13) + t('wf.tabShare') + '</button>' +
         '<button id="wf-tab-browse" style="flex:1;padding:8px;border:none;border-bottom:2px solid ' +
         (currentTab === "browse" ? "var(--aih-accent, #D8700D)" : "transparent") + ';background:transparent;color:' +
         (currentTab === "browse" ? "#e2e8f0" : "#888") + ';font-size:13px;font-weight:' +
-        (currentTab === "browse" ? "600" : "400") + ';cursor:pointer;">' + t('wf.tabBrowse') + '</button>' +
+        (currentTab === "browse" ? "600" : "400") + ';cursor:pointer;">' + iconSlot("globe", 13) + t('wf.tabBrowse') + '</button>' +
         '</div>' +
         '<div id="wf-tab-content" style="flex:1;"></div>' +
         // Version VISIBLE : l'utilisateur peut confirmer d'un coup d'œil que le
@@ -1265,7 +1265,7 @@ import { aihIconSvg } from "./aih_icons.js";
         '<div><label style="font-size:11px;color:#888;display:block;margin-bottom:3px;">' + t('wf.labelTags') + '</label>' +
         '<input id="wf-tags" type="text" style="width:100%;padding:6px 8px;border-radius:4px;border:1px solid #555;background:#3a3a3e;color:#ccc;font-size:13px;box-sizing:border-box;"></div>' +
         '<div id="wf-deps" style="font-size:12px;color:#bbb;border-top:1px solid #444;padding-top:8px;"></div>' +
-        '<button id="wf-publish-btn" style="padding:8px;border:none;border-radius:6px;background:var(--aih-accent, #D8700D);color:#fff;font-size:13px;font-weight:600;cursor:pointer;">' + t('wf.publish') + '</button>' +
+        '<button id="wf-publish-btn" style="padding:8px;border:none;border-radius:6px;background:var(--aih-accent, #D8700D);color:#fff;font-size:13px;font-weight:600;cursor:pointer;">' + iconSlot("upload", 13) + t('wf.publish') + '</button>' +
         '<div id="wf-status" style="font-size:11px;color:#888;display:none;"></div>' +
         '</div>';
 
@@ -1276,7 +1276,7 @@ import { aihIconSvg } from "./aih_icons.js";
       } else {
         depsHtml += '<p style="font-size:10px;color:#666;margin:0 0 6px 0;">' + t('wf.checkUpload') + '</p>';
         if (deps.nodes.length) {
-          depsHtml += '<div style="margin-bottom:4px;"><span style="color:#f59e0b;">' + t('wf.customNodes') + ' (' + deps.nodes.length + (deps.nodes.length > 1 ? ' ' + t('wf.packs') : ' ' + t('wf.pack')) + ')</span>';
+          depsHtml += '<div style="margin-bottom:4px;"><span style="color:#f59e0b;">' + iconSlot("package", 12) + t('wf.customNodes') + ' (' + deps.nodes.length + (deps.nodes.length > 1 ? ' ' + t('wf.packs') : ' ' + t('wf.pack')) + ')</span>';
           for (var i = 0; i < deps.nodes.length; i++) {
             var pk = deps.nodes[i];
             var nodeCount = pk.node_types ? pk.node_types.length : 1;
@@ -1298,7 +1298,7 @@ import { aihIconSvg } from "./aih_icons.js";
           depsHtml += '</div>';
         }
         if (deps.loras.length) {
-          depsHtml += '<div style="margin-bottom:4px;"><span style="color:#a78bfa;">' + t('wf.loras') + '</span>';
+          depsHtml += '<div style="margin-bottom:4px;"><span style="color:#a78bfa;">' + iconSlot("palette", 12) + t('wf.loras') + '</span>';
           for (var i = 0; i < deps.loras.length; i++) {
             var l = deps.loras[i];
             depsHtml += '<label style="display:flex;align-items:center;gap:6px;margin-left:12px;color:#ccc;cursor:pointer;font-size:11px;">' +
@@ -1338,13 +1338,16 @@ import { aihIconSvg } from "./aih_icons.js";
               // sinon on publie un NOUVEAU workflow (jamais écraser autrui).
               if (items[i].name.toLowerCase() === name.toLowerCase() && items[i].is_mine === true) {
                 existingId = items[i].id;
-                btn.textContent = t("wf.update", { version: (items[i].version + 1) });
+                // Libellé « icône + texte » : `textContent` reste le texte SEUL
+                // (l'icône vit dans son propre span), donc le libellé se relit
+                // comme avant (tests) tout en gardant l'icône de l'action.
+                btn.innerHTML = iconSlot("refresh", 13) + esc(t("wf.update", { version: (items[i].version + 1) }));
                 btn.style.background = "#f59e0b";
                 return;
               }
             }
             existingId = null;
-            btn.textContent = t("wf.publish");
+            btn.innerHTML = iconSlot("upload", 13) + esc(t("wf.publish"));
             btn.style.background = "var(--aih-accent, #D8700D)";
           })
           .catch(function(){});
@@ -1705,7 +1708,7 @@ import { aihIconSvg } from "./aih_icons.js";
             '</div>' +
             '<div id="wf-install-deps" style="margin-bottom:12px;"></div>' +
             '<div style="display:flex;gap:8px;">' +
-            '<button id="wf-load-btn" style="flex:1;padding:10px;border:none;border-radius:6px;background:var(--aih-accent, #D8700D);color:#fff;font-size:13px;font-weight:600;cursor:pointer;">' + t('wf.loadWorkflow') + '</button>' +
+            '<button id="wf-load-btn" style="flex:1;padding:10px;border:none;border-radius:6px;background:var(--aih-accent, #D8700D);color:#fff;font-size:13px;font-weight:600;cursor:pointer;">' + iconSlot("download", 13) + t('wf.loadWorkflow') + '</button>' +
             '<button id="wf-close-btn" style="padding:10px 16px;border:1px solid #555;border-radius:6px;background:transparent;color:#999;font-size:13px;cursor:pointer;">' + t('dialog.close') + '</button></div>' +
             '<div id="wf-load-status" style="font-size:11px;color:#888;display:none;margin-top:8px;"></div>' +
             '<div id="wf-detail-build" style="font-size:10px;color:#555;text-align:right;margin-top:4px;">' + esc(t('wf.buildLabel', { build: AIH_WF_SHARE_BUILD })) + '</div>';
@@ -1760,7 +1763,7 @@ import { aihIconSvg } from "./aih_icons.js";
                 // Packs déjà installés : comparaison NORMALISÉE (URL git + nom de
                 // dossier + slug) pour reconnaître les alias du même dépôt.
                 var installedIndex = await getInstalledIndex();
-                depHtml += '<div style="background:#3a3a3e;padding:6px 10px;border-bottom:1px solid #444;"><span style="font-size:11px;color:#f59e0b;font-weight:600;">' + t('wf.customNodesHeader') + '</span></div>';
+                depHtml += '<div style="background:#3a3a3e;padding:6px 10px;border-bottom:1px solid #444;"><span style="font-size:11px;color:#f59e0b;font-weight:600;">' + iconSlot("package", 11) + t('wf.customNodesHeader') + '</span></div>';
                 for (var i = 0; i < allDeps.nodes.length; i++) {
                   var n = allDeps.nodes[i];
                   var nodeCount = n.node_types ? n.node_types.length : 1;
@@ -1777,7 +1780,7 @@ import { aihIconSvg } from "./aih_icons.js";
                     (nodeCount > 1 ? ' (' + t('wf.nodeCount', { count: nodeCount }) + ') ' : '') +
                     (installed ? ' <span style="color:#34d399;">' + t('wf.alreadyInstalledMatch', { reason: reason }) + '</span>' : '') +
                     (!installed && !n.url ? ' <span style="color:#f87171;">' + t('wf.noGitUrl') + '</span>' : '') + '</span>' +
-                    (n.url && !installed ? '<button onclick="window._wfInstallNode(\'' + esc(n.url) + '\', \'' + esc(n.name) + '\', this)" style="padding:2px 8px;border:1px solid #555;border-radius:3px;background:#4a4a4e;color:#ccc;font-size:10px;cursor:pointer;">' + t('wf.install') + '</button>' : '') +
+                    (n.url && !installed ? '<button onclick="window._wfInstallNode(\'' + esc(n.url) + '\', \'' + esc(n.name) + '\', this)" style="padding:2px 8px;border:1px solid #555;border-radius:3px;background:#4a4a4e;color:#ccc;font-size:10px;cursor:pointer;">' + iconSlot("download", 11) + t('wf.install') + '</button>' : '') +
                     (n.url ? '<a href="' + esc(n.url) + '" target="_blank" rel="noopener noreferrer" title="' + esc(t('wf.openNodeRepo')) + '" aria-label="' + esc(t('wf.openNodeRepo')) + '" style="color:var(--aih-accent, #D8700D);text-decoration:none;font-size:11px;display:inline-flex;align-items:center;" onclick="event.stopPropagation();">' + aihIconSvg("link", { size: 12 }) + '</a>' : '') +
                     '</label>';
                 }
@@ -2180,8 +2183,8 @@ import { aihIconSvg } from "./aih_icons.js";
                   '<div>Server: ' + (remoteInfo.size/1048576).toFixed(1) + ' MB</div></div>' +
                   '<div style="display:flex;flex-direction:column;gap:8px;">' +
                   '<button id="conflict-overwrite" class="aih-btn-warning" style="padding:10px;border:1px solid #f59e0b;border-radius:6px;background:transparent;color:#f59e0b;font-size:13px;cursor:pointer;">' + t('wf.overwrite') + '</button>' +
-                  '<button id="conflict-suffix" class="aih-btn-primary" style="padding:10px;border:1px solid var(--aih-accent, #D8700D);border-radius:6px;background:transparent;color:var(--aih-accent, #D8700D);font-size:13px;cursor:pointer;">' + t('wf.suffix') + '</button>' +
-                  '<button id="conflict-keep" class="aih-btn-success" style="padding:10px;border:1px solid #34d399;border-radius:6px;background:transparent;color:#34d399;font-size:13px;cursor:pointer;">' + t('wf.keep') + '</button></div>',
+                  '<button id="conflict-suffix" class="aih-btn-primary" style="padding:10px;border:1px solid var(--aih-accent, #D8700D);border-radius:6px;background:transparent;color:var(--aih-accent, #D8700D);font-size:13px;cursor:pointer;">' + iconSlot("plus", 13) + t('wf.suffix') + '</button>' +
+                  '<button id="conflict-keep" class="aih-btn-success" style="padding:10px;border:1px solid #34d399;border-radius:6px;background:transparent;color:#34d399;font-size:13px;cursor:pointer;">' + iconSlot("search", 13) + t('wf.keep') + '</button></div>',
               });
               m.modal.querySelector("#conflict-overwrite").onclick = function() {
                 m.close();

@@ -74,10 +74,24 @@ export const PHASES = Object.freeze({
         "js/aih_repair_workflow.js",              // chevrons de dépliage du détail d'un problème
         "js/aih_workflow_share.js",               // actions seulement (statuts ⏳♻️✅⏭❌ inchangés)
     ]),
+    /**
+     * PHASE 2d — LIBELLÉS i18n CONTENANT UN EMOJI : le dictionnaire porte le
+     * TEXTE SEUL, l'icône est séparée au POINT D'APPEL (slot décoratif à part,
+     * `textContent` du contrôle inchangé).
+     *
+     * ⚠️ Les libellés migrés dans des fichiers DÉJÀ attribués à un lot antérieur
+     * (js/holaf_main.js et js/aih_workflow_share.js en 2c, js/aih_repair_workflow.js
+     * en 2c) restent dans LEUR phase : la règle « un fichier = un lot » (voir
+     * checkPhaseDisjointness) interdit de les réinscrire ici. Cette phase ne
+     * liste donc que les fichiers dont ce lot fait un NOUVEAU consommateur.
+     */
+    "2d": Object.freeze([
+        "js/aih_enhance_widget.js",               // « Test enhance » (clé en.testEnhance)
+    ]),
 });
 
 /** Lot en cours (celui dont les fichiers doivent consommer réellement). */
-export const CURRENT_PHASE = "2c";
+export const CURRENT_PHASE = "2d";
 
 /** Alias historique : la phase 2a reste adressable sous son ancien nom. */
 export const PHASE_2A_CONSUMERS = PHASES["2a"];
@@ -87,6 +101,9 @@ export const PHASE_2B_CONSUMERS = PHASES["2b"];
 
 /** Alias explicite de la phase 2c. */
 export const PHASE_2C_CONSUMERS = PHASES["2c"];
+
+/** Alias explicite de la phase 2d. */
+export const PHASE_2D_CONSUMERS = PHASES["2d"];
 
 /** Union de TOUS les fichiers autorisés (toutes phases livrées confondues). */
 export const ALLOWED_CONSUMERS = Object.freeze(

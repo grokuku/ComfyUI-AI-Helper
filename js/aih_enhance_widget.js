@@ -1,5 +1,7 @@
 import "./aih_strings.js";
 import { remoteGet, remotePost, normalizeServerUrl } from "./aih_fetch_bridge.js";
+// Icônes d'UI : UNIQUEMENT via la façade (jamais la brique vendorisée directe).
+import { aihIconSvg } from "./aih_icons.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -250,12 +252,23 @@ const t = (key, params) => {
                 container.appendChild(presetDiv);
 
                 // ---- Bouton Test Enhance ----
+                // Libellé d'interface : les dictionnaires portent le TEXTE SEUL et
+                // l'icône (action « tester ») est un ÉLÉMENT à part placé AVANT
+                // lui → `textContent` du bouton reste exactement « Test enhance ».
                 const enhanceBtn = document.createElement("button");
-                enhanceBtn.textContent = t("en.testEnhance");
+                const enhanceIcon = document.createElement("span");
+                enhanceIcon.className = "aih-icon";
+                // Chaîne STATIQUE produite par la façade (aucune donnée serveur).
+                enhanceIcon.innerHTML = aihIconSvg("test-tube", { size: 12 });
+                enhanceBtn.appendChild(enhanceIcon);
+                enhanceBtn.appendChild(document.createTextNode(t("en.testEnhance")));
                 Object.assign(enhanceBtn.style, {
                     width: "100%", padding: "6px", borderRadius: "4px",
                     border: "none", background: "var(--holaf-accent-color, #D8700D)", color: "white",
                     fontSize: "11px", fontWeight: "600", cursor: "pointer",
+                    // Icône + libellé sur une ligne, écart par `gap` (le texte
+                    // lui-même ne contient aucun espace ajouté).
+                    display: "inline-flex", alignItems: "center", justifyContent: "center", gap: "6px",
                 });
                 enhanceBtn.onmouseenter = () => enhanceBtn.style.background = "var(--holaf-accent-color, #D8700D)";
                 enhanceBtn.onmouseleave = () => enhanceBtn.style.background = "var(--holaf-accent-color, #D8700D)";

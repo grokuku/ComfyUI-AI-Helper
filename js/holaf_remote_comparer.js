@@ -9,7 +9,7 @@
     */
 
 import { app, api } from "./holaf_api_compat.js";
-import { makeDraggable, makeResizable, makeContentZoomable, aihWindowManager } from "./holaf_window_utils.js";
+import { makeDraggable, makeResizable, clearZoomLevel, aihWindowManager } from "./holaf_window_utils.js";
 import { HolafFetch } from "./vendor/holaf/holaf-fetch.js";
 import { HolafViewport } from "./vendor/holaf/holaf-viewport.js";
 import { aihIconSvg } from "./aih_icons.js";
@@ -292,8 +292,11 @@ const HolafRemoteComparer = {
         });
 
         // Main Container
+        // PAS de classe `holaf-zoom-content` : le comparateur n'a AUCUN zoom de
+        // contenu (voir plus bas, à l'emplacement des anciens boutons) — le seul
+        // zoom est celui de l'afficheur (brique HolafViewport : molette + pan). Un
+        // `zoom` CSS sur ce conteneur déformait l'image sans lui laisser de place.
         this.mainContainer = document.createElement("div");
-        this.mainContainer.classList.add("holaf-zoom-content");
         Object.assign(this.mainContainer.style, {
             flex: "1", display: "flex", flexDirection: "row", overflow: "hidden", width: "100%", height: "100%"
         });
@@ -386,10 +389,20 @@ const HolafRemoteComparer = {
         this.mainContainer.appendChild(this.sidebarElement);
         this.mainContainer.appendChild(this.contentElement);
 
-        // Boutons zoom standard (− / +) : appliqués au contenu (hors header),
-        // persistés sous la clé de fenêtre du comparateur.
-        const zoomGroup = makeContentZoomable(this.mainContainer, { key: this.STORAGE_KEY });
-        header.insertBefore(zoomGroup, btnContainer);
+        // AUCUN bouton de zoom de CONTENU dans la barre de titre : ce comparateur
+        // est un afficheur image/vidéo/audio, son seul zoom est celui de la
+        // brique (molette + pan, cf. HolafViewport.create plus bas + resetZoom).
+        // Le scale CSS (`--aih-zoom-factor` / `.holaf-zoom-content`) perturbait
+        // l'affichage de l'image, d'où le retrait de la fonctionnalité POUR CETTE
+        // FENÊTRE UNIQUEMENT (l'utilitaire partagé makeContentZoomable et son
+        // comportement par défaut restent inchangés pour les autres fenêtres).
+        //
+        // On PURGE l'éventuel niveau persisté de cette fenêtre (store partagé
+        // `aih_zoom_levels`, clé = STORAGE_KEY) : un niveau mémorisé avant ce
+        // retrait ne doit PAS continuer à s'appliquer — sinon l'image reste
+        // agrandie sans aucun bouton visible pour revenir à 100 %. Les entrées
+        // des autres fenêtres sont laissées intactes.
+        clearZoomLevel(this.STORAGE_KEY);
 
         this.createResizeHandles();
         if (this.isStandalone) this.setResizeHandlesVisible(false);

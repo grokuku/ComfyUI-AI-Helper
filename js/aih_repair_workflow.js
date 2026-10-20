@@ -150,6 +150,30 @@ import { aihIconSvg } from "./aih_icons.js";
         apply: (payload) => postJson("/aih/repair/apply", payload),
     };
 
+    /**
+     * Bouton « icône + libellé » : l'icône est un ÉLÉMENT à part
+     * (`span.rw-btn-icon`, contenu décoratif — le `<svg>` de la façade porte
+     * `aria-hidden`), placé AVANT un nœud de TEXTE pur. Conséquence voulue :
+     * `textContent` du bouton reste EXACTEMENT le libellé (aucun caractère ni
+     * espace parasite ajouté — l'écart visuel vient du CSS de la classe).
+     * Les dictionnaires ne portent que le texte, l'icône vient de l'appelant.
+     * @param {Document} doc document de l'appelant (aucun accès au DOM global).
+     * @param {HTMLElement} node bouton hôte.
+     * @param {string} iconName nom d'icône de la brique (via la façade).
+     * @param {string} text libellé (texte seul).
+     * @returns {HTMLElement} le bouton, pour enchaîner.
+     */
+    function setButtonLabelWithIcon(doc, node, iconName, text) {
+        const slot = doc.createElement("span");
+        slot.className = "rw-btn-icon";
+        // Chaîne STATIQUE produite par la façade : aucune donnée serveur ici.
+        slot.innerHTML = aihIconSvg(iconName, { size: 13 });
+        node.textContent = "";
+        node.appendChild(slot);
+        node.appendChild(doc.createTextNode(text === undefined || text === null ? "" : String(text)));
+        return node;
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // Montage de l'UI (deps injectables → testable)
     // ══════════════════════════════════════════════════════════════════════
@@ -251,8 +275,11 @@ import { aihIconSvg } from "./aih_icons.js";
         const outputHint = el("div", "rw-hint", tr("rw.output.hint"));
         const outputSummary = el("div", "rw-summary", "");
         const outputBar = el("div", "rw-actions");
-        const copyBtn = el("button", "rw-btn", tr("rw.copy"));
-        const saveAsBtn = el("button", "rw-btn", tr("rw.saveAs"));
+        // Sortie : libellés d'interface (icône + TEXTE SEUL des dictionnaires).
+        // « Écraser » garde son glyphe ♻️ : c'est un marqueur de STATUT
+        // (remplacement destructif de l'original), pas une décoration.
+        const copyBtn = setButtonLabelWithIcon(doc, el("button", "rw-btn"), "copy", tr("rw.copy"));
+        const saveAsBtn = setButtonLabelWithIcon(doc, el("button", "rw-btn"), "save", tr("rw.saveAs"));
         const overwriteBtn = el("button", "rw-btn rw-btn-danger", tr("rw.overwrite"));
         copyBtn.setAttribute("data-rw-copy", "1");
         saveAsBtn.setAttribute("data-rw-saveas", "1");

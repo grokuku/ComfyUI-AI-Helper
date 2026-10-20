@@ -97,6 +97,16 @@
 .rw-btn:hover { background: var(--aih-btn-bg-hover); }
 .rw-btn:disabled { opacity: 0.6; cursor: default; }
 
+/* Slot d'icône d'un bouton « icône + libellé » : calé sur la ligne de texte
+   (aucun écart ajouté dans la chaîne du libellé, la couleur vient de
+   `currentColor` — aucune couleur codée en dur). */
+.rw-btn-icon {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: -2px;
+    margin-right: 4px;
+}
+
 .rw-btn-primary {
     background: var(--aih-accent);
     color: var(--aih-accent-text);

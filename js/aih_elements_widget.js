@@ -776,6 +776,9 @@ function _parseConceptSyntax(text, defaultCount) {
                         // touch-action:none) et le `pointerdown` → startDrag sont
                         // INCHANGÉS (surtout pas de onclick ici).
                         const grip = document.createElement("span");
+                        // Repère stable de la ligne (l'ordre des contrôles est un
+                        // contrat vérifié par js/test_aih_elements_row_order.mjs).
+                        grip.className = "aih-el-grip";
                         grip.innerHTML = aihIconSvg("grip-vertical", { size: 10 });
                         Object.assign(grip.style, {
                             cursor: "grab", color: "#666", fontSize: "10px", flexShrink: "0",
@@ -791,6 +794,7 @@ function _parseConceptSyntax(text, defaultCount) {
                         // synthetiser correctement dans le DOM widget ComfyUI.
                         const eyeBtn = document.createElement("button");
                         eyeBtn.type = "button";
+                        eyeBtn.className = "aih-el-eye";
                         // Icône de la brique : œil barré = entrée masquée, œil = visible.
                         // Décorative (`title` porte le nom accessible, recalculé à
                         // chaque rendu) ; couleur via currentColor (style de l'hôte).
@@ -813,11 +817,12 @@ function _parseConceptSyntax(text, defaultCount) {
                             syncElementsWidget(true);
                         };
 
-                        row.appendChild(grip);
+                        // (l'ordre d'insertion des contrôles est fixé plus bas,
+                        // après la création du cerveau : voir « Ordre visuel »)
 
                         // ---- Seed par élément (3 états : hérité / random / fixe) ----
-                        // Colonne de contrôle compacte placée AVANT les autres
-                        // boutons de ligne (la poignée de drag reste en tête).
+                        // Colonne de contrôle compacte (🔗/🎲/🔒 + champ de valeur en
+                        // mode fixe), insérée entre le cerveau et le type de ligne.
                         // `kind === "mode"` → la ligne est re-rendue (le champ de
                         // valeur apparaît/disparaît) ; `kind === "value"` → simple
                         // synchronisation pour ne PAS voler le focus du champ.
@@ -835,13 +840,11 @@ function _parseConceptSyntax(text, defaultCount) {
                                 syncElementsWidget(true);
                             },
                         });
-                        if (seedCtl) row.appendChild(seedCtl);
-
-                        row.appendChild(eyeBtn);
 
                         // Icône cerveau (toggle LLM intelligent par liste)
                         const brainBtn = document.createElement("button");
                         brainBtn.type = "button";
+                        brainBtn.className = "aih-el-brain";
                         const brainOn = !!item.brain;
                         brainBtn.textContent = "🧠";
                         Object.assign(brainBtn.style, {
@@ -858,9 +861,23 @@ function _parseConceptSyntax(text, defaultCount) {
                             renderList();
                             syncElementsWidget(true);
                         };
+
+                        // ---- Ordre visuel de la ligne (contrat de rendu) ----
+                        // Les contrôles sont appendés dans l'ordre d'affichage :
+                        //   ⠿ poignée → 👁 œil (on/off) → 🧠 cerveau (LLM)
+                        //   → 🔗🎲🔒 graine → 📝🔽 type → contenu de la ligne
+                        // Déplacement PUR : chaque contrôle est construit ci-dessus
+                        // avec ses propres gestionnaires (drag `pointerdown`, toggles
+                        // `onclick`, cycle/valeur de graine) ; SEUL l'ordre d'insertion
+                        // change. Le type reste juste avant le champ (il identifie la
+                        // ligne) ; la poignée reste le PREMIER enfant de la ligne.
+                        row.appendChild(grip);
+                        row.appendChild(eyeBtn);
                         row.appendChild(brainBtn);
+                        if (seedCtl) row.appendChild(seedCtl);
 
                         const iconSpan = document.createElement("span");
+                        iconSpan.className = "aih-el-type";
                         iconSpan.style.cssText = "flex-shrink:0;";
                         iconSpan.textContent = item.type === "filter" ? "🔽" : "📝";
                         row.appendChild(iconSpan);

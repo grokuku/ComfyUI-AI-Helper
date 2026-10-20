@@ -491,6 +491,28 @@ export function saveZoomLevel(key, level) {
 }
 
 /**
+ * Purge l'entrée de zoom persisté d'UNE fenêtre (les autres entrées du store
+ * sont conservées telles quelles).
+ *
+ * Utile aux fenêtres qui RENONCENT au zoom de contenu (ex. le Remote Comparer,
+ * afficheur image/vidéo/audio où le seul zoom est celui de la brique — molette
+ * + pan) : un niveau mémorisé AVANT ce renoncement ne doit jamais continuer à
+ * s'appliquer, sinon la fenêtre reste agrandie sans aucun contrôle visible pour
+ * revenir à 100 %.
+ *
+ * @param {string} key - id / storageKey de la fenêtre.
+ * @returns {boolean} true si une entrée a été retirée, false sinon.
+ */
+export function clearZoomLevel(key) {
+    if (!key) return false;
+    const store = _readZoomStore();
+    if (!Object.prototype.hasOwnProperty.call(store, key)) return false;
+    delete store[key];
+    _writeZoomStore(store);
+    return true;
+}
+
+/**
  * Clampe un niveau de zoom dans [min, max] et l'arrondit au pas (step).
  * @param {number} level
  * @param {object} [opts]

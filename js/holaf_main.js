@@ -214,19 +214,19 @@ const HolafUtilitiesMenu = {
 
             // Groupe « AIH / Distant »
             { type: 'subtitle', label: t('menu.sectionAIH') },
-            { label: t("menu.openWebpage"), special: 'aih_webpage' },
-            { label: t("menu.workflows"), special: 'aih_workflows' },
-            { label: t("menu.models"), special: 'aih_models' },
-            { label: t("menu.members"), special: 'aih_members' },
+            { label: t("menu.openWebpage"), icon: "globe", special: 'aih_webpage' },
+            { label: t("menu.workflows"), icon: "upload", special: 'aih_workflows' },
+            { label: t("menu.models"), icon: "package", special: 'aih_models' },
+            { label: t("menu.members"), icon: "users", special: 'aih_members' },
 
             // Groupe « Outils & Dev » (items WIP pilotés individuellement)
             { type: 'subtitle', label: t('menu.sectionTools') },
             { label: t("menu.modelManager"), handlerName: "holafModelManager", wipFeature: 'model_manager' },
             { label: t("menu.nodesManager"), handlerName: "holafNodesManager", wipFeature: 'custom_nodes_manager' },
             { label: t("menu.workflowProfiler"), special: "profiler_standalone", wipFeature: 'workflow_profiler' },
-            { label: t("menu.repairWorkflow"), special: "aih_repair_workflow" },
+            { label: t("menu.repairWorkflow"), icon: "wrench", special: "aih_repair_workflow" },
             { special: 'aih_blobby_toggle', wipFeature: 'blobby' },
-            { label: t("menu.chat"), special: 'aih_chat', wipFeature: 'chat' },
+            { label: t("menu.chat"), icon: "message-square", special: 'aih_chat', wipFeature: 'chat' },
 
             // Groupe « Utilitaires »
             { type: 'subtitle', label: t('menu.sectionUtils') },
@@ -239,7 +239,7 @@ const HolafUtilitiesMenu = {
             // Groupe « Système »
             { type: 'subtitle', label: t('menu.sectionSystem') },
             { label: t("menu.settings"), handlerName: "holafSettingsManager" },
-            { label: t("menu.aihUpdate"), special: 'aih_update' },
+            { label: t("menu.aihUpdate"), icon: "refresh", special: 'aih_update' },
             { label: t("menu.restart"), special: 'restart' }
         ];
 
@@ -312,8 +312,28 @@ const HolafUtilitiesMenu = {
             menuItem.style.justifyContent = "space-between";
             menuItem.style.alignItems = "center";
 
+            // Libellé de l'entrée : les dictionnaires portent le TEXTE SEUL.
+            // Quand l'entrée déclare une icône (`itemInfo.icon`), elle est placée
+            // AVANT le texte dans son PROPRE élément → `textContent` de la ligne
+            // reste exactement le libellé (aucun caractère parasite, aucun
+            // espace littéral ajouté : l'écart vient de `gap`). Le slot est
+            // décoratif (aria-hidden posé par la façade) : le texte porte le sens.
             const labelSpan = document.createElement("span");
-            labelSpan.textContent = itemInfo.label;
+            if (itemInfo.icon) {
+                Object.assign(labelSpan.style, {
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                });
+                const iconEl = document.createElement("span");
+                iconEl.className = "aih-icon";
+                // Chaîne STATIQUE produite par la façade (aucune donnée serveur).
+                iconEl.innerHTML = aihIconSvg(itemInfo.icon, { size: 13 });
+                labelSpan.appendChild(iconEl);
+            }
+            labelSpan.appendChild(document.createTextNode(
+                itemInfo.label === undefined || itemInfo.label === null ? "" : String(itemInfo.label)
+            ));
             menuItem.appendChild(labelSpan);
 
             // « 💬 Chat » : identifié pour updateAihDynamicItems (indépendant

@@ -84,6 +84,14 @@
  * js/aih_repair_workflow.js (chevrons de dépliage) et js/aih_workflow_share.js
  * (actions de l'onglet Workflows SEULEMENT : ses glyphes de STATUT ⏳♻️✅⏭❌
  * restent du TEXTE, asserté par les tests du module).
+ * PHASE 2d (libellés i18n contenant un emoji) : le glyphe était dans le
+ * DICTIONNAIRE ; il en est retiré (FR ET EN, parité stricte) et l'icône est
+ * séparée AU POINT D'APPEL — js/holaf_main.js (entrées de menu),
+ * js/aih_workflow_share.js (onglets, boutons et en-têtes de dépendances),
+ * js/aih_repair_workflow.js (Copier / Enregistrer sous) et
+ * js/aih_enhance_widget.js (« Test enhance », nouvel entrant du lot). Les
+ * emoji de STATUT / de MESSAGE et les contextes incapables de porter une
+ * icône (titre de fenêtre, `placeholder`, `<option>`) restent en TEXTE.
  * Une seule voie d'accès : cette façade (jamais la brique vendorisée).
  */
 

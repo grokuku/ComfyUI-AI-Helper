@@ -227,8 +227,8 @@ console.log("2. périmètre par phases : lot 2b branché, listes disjointes, int
     // LIVÉE et pleinement branchée, ce que vérifient les lignes suivantes.
     assert.ok(Object.keys(PHASES).includes("2b"), "la phase 2b reste déclarée");
     assert.notStrictEqual(CURRENT_PHASE, "", "un lot courant est défini");
-    assert.deepStrictEqual(Object.keys(PHASES), ["2a", "2b", "2c"],
-        "les phases livrées sont 2a, 2b et 2c (jamais fusionnées)");
+    assert.deepStrictEqual(Object.keys(PHASES).slice(0, 3), ["2a", "2b", "2c"],
+        "les phases 2a, 2b et 2c restent livrées dans cet ordre (jamais fusionnées)");
     assert.strictEqual(PHASE_2B_CONSUMERS.length, 5, "la phase 2b couvre 5 fichiers");
     assert.ok(!FORBIDDEN_CONSUMERS.includes("js/holaf_shortcuts.js"),
         "js/holaf_shortcuts.js a QUITTÉ la liste interdite (il est migré en 2b)");

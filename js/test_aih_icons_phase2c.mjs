@@ -280,9 +280,15 @@ console.log("1. source : façade appelée, glyphes d'action disparus (6 fichiers
 /* ══ 2. Périmètre PAR PHASES ═════════════════════════════════════════════ */
 console.log("2. périmètre par phases : lot 2c branché, 2a/2b toujours consommateurs, listes disjointes");
 {
-    assert.strictEqual(CURRENT_PHASE, "2c", "le lot en cours est bien la phase 2c");
-    assert.deepStrictEqual(Object.keys(PHASES), ["2a", "2b", "2c"],
-        "les phases livrées sont 2a, 2b et 2c (jamais fusionnées)");
+    // Le lot 2c n'est plus le lot COURANT (2d est arrivé) mais reste une phase
+    // LIVÉE et pleinement branchée. `CURRENT_PHASE` ne doit jamais RECULER : il
+    // désigne toujours le dernier lot livré.
+    assert.deepStrictEqual(Object.keys(PHASES).slice(0, 3), ["2a", "2b", "2c"],
+        "les phases 2a, 2b et 2c restent livrées dans cet ordre (jamais fusionnées)");
+    assert.strictEqual(CURRENT_PHASE, Object.keys(PHASES).slice(-1)[0],
+        "CURRENT_PHASE = dernier lot livré (aucun recul de périmètre)");
+    assert.ok(!PHASE_2C_CONSUMERS.includes("js/aih_enhance_widget.js"),
+        "le fichier du lot 2d n'est PAS inscrit en 2c (un fichier = un lot)");
     assert.strictEqual(PHASE_2C_CONSUMERS.length, 6, "la phase 2c couvre 6 fichiers");
 
     const r = checkIconPerimetre(PACKAGE_DIR, "2c");
