@@ -21,6 +21,9 @@ const t = (key, params) => {
 };
 
 const COMPARER_CHANNEL = 'holaf_comparer_bridge';
+// Valeur de fondu neutre : 50 % de chaque média quand aucune position de
+// pointeur n'est connue (et valeur de départ du mode fondu).
+const FADE_DEFAULT_ALPHA = 0.5;
 const COMPARER_STANDALONE_HEARTBEAT_MS = 2500;
 const COMPARER_STANDALONE_TIMEOUT_MS = 10000;
 const COMPARER_STANDALONE_HEARTBEAT_KEY = 'holaf_comparer_standalone_heartbeat';
@@ -75,6 +78,18 @@ const HolafRemoteComparer = {
     rawMouseX: null,   // Raw canvas mouse X (for audio volume crossfading)
     isMouseOver: false,
     rafId: null,
+
+    // --- Mode d'affichage A/B ---
+    // false = VOLET (comportement historique : ligne de partage qu'on déplace),
+    // true  = FONDU (composition alpha des deux médias, pilotée par la souris).
+    // Réglage de VUE : persisté avec l'état de la fenêtre (STORAGE_KEY) mais
+    // JAMAIS envoyé au backend (`globalSettings` ne le contient pas : le node ne
+    // le connaît pas).
+    fadeMode: false,
+    fadeAlpha: FADE_DEFAULT_ALPHA, // alpha RÉELLEMENT dessiné pour la surimpression B (0..1)
+    _fadeOffset: 0,   // recalage du fondu après un glissement gelé (s'efface avec le déplacement)
+    _fadeLastX: null, // dernière position pointeur (px CSS) prise en compte pour le fondu
+    _fadeCheckbox: null,
 
     // --- Player State ---
     playbackState: {
@@ -482,6 +497,37 @@ const HolafRemoteComparer = {
             return row;
         };
 
+        // MODE FONDU — vraie case à cocher (demande explicite), libellée,
+        // en tête de la zone de contrôles, au même format qu'une ligne de
+        // réglage (`holaf-rc-settings-row`). Décochée (défaut) = volet
+        // historique ; cochée = fondu alpha piloté par la souris.
+        // Aucune couleur en dur (voir js/css/holaf_remote_comparer_styles.css :
+        // `accent-color: var(--holaf-accent-color)`) et aucune icône/emoji :
+        // le libellé suffit et reste lisible par les lecteurs d'écran
+        // (`<label for>` → nom accessible de l'input).
+        const fadeRow = document.createElement("div");
+        fadeRow.className = "holaf-rc-settings-row holaf-rc-settings-row-check";
+
+        const fadeLabel = document.createElement("label");
+        fadeLabel.className = "holaf-rc-fade-label";
+        fadeLabel.htmlFor = "holaf-rc-fade-mode";
+        fadeLabel.textContent = t("rc.fadeMode");
+        fadeLabel.title = t("rc.fadeModeHint");
+
+        const fadeCb = document.createElement("input");
+        fadeCb.type = "checkbox";
+        fadeCb.id = "holaf-rc-fade-mode";
+        fadeCb.className = "holaf-rc-fade-checkbox";
+        fadeCb.checked = this.fadeMode === true;
+        fadeCb.title = t("rc.fadeModeHint");
+        fadeCb.setAttribute("aria-label", t("rc.fadeMode"));
+        fadeCb.addEventListener("change", (e) => this.setFadeMode(e.target.checked));
+        this._fadeCheckbox = fadeCb;
+
+        fadeRow.appendChild(fadeLabel);
+        fadeRow.appendChild(fadeCb);
+        settingsContainer.appendChild(fadeRow);
+
         settingsContainer.appendChild(createSelect(t("rc.imageFormat"), "image_format", [
             {value: "WEBP", text: "WEBP"}, {value: "PNG", text: "PNG"}, {value: "JPEG", text: "JPEG"}
         ]));
@@ -583,6 +629,9 @@ const HolafRemoteComparer = {
             ...this.storedPos,
             isOpen: this.isOpen,
             isSidebarOpen: this.isSidebarOpen,
+            // Mode d'affichage : DÉFAUT = false (volet) — un état persisté sans
+            // cette clé (ancienne version) garde donc le comportement historique.
+            fadeMode: this.fadeMode === true,
             settings: this.globalSettings
         };
         localStorage.setItem(this.STORAGE_KEY, JSON.stringify(state));
@@ -599,6 +648,8 @@ const HolafRemoteComparer = {
                 this.storedPos.height = state.height ?? 500;
                 this.isOpen = !!state.isOpen;
                 this.isSidebarOpen = state.isSidebarOpen ?? true;
+                // Défaut DÉSACTIVÉ : seule la valeur booléenne `true` active le fondu.
+                this.fadeMode = state.fadeMode === true;
                 if (state.settings) {
                     this.globalSettings = { ...this.globalSettings, ...state.settings };
                 }
@@ -628,6 +679,125 @@ const HolafRemoteComparer = {
             this._standaloneHeartbeatInterval = null;
         }
         localStorage.removeItem(COMPARER_STANDALONE_HEARTBEAT_KEY);
+    },
+
+    // --- MODE FONDU (composition alpha A/B) ---
+
+    /**
+     * Mapping PUR « position du pointeur → alpha de la surimpression B ».
+     *
+     * SENS : 1 à GAUCHE (B seul) → 0 à DROITE (A seul), c'est-à-dire le MÊME
+     * sens que le volet (dont la région gauche affiche B). Linéaire, MONOTONE
+     * décroissant, BORNÉ 0..1. `x` et `width` sont dans le MÊME espace (px CSS
+     * du canvas) : le devicePixelRatio n'entre donc jamais dans le calcul.
+     */
+    _fadeAlpha(x, width) {
+        const w = Number(width);
+        if (!Number.isFinite(w) || w <= 0) return FADE_DEFAULT_ALPHA; // géométrie inconnue → neutre
+        const px = Number(x);
+        if (!Number.isFinite(px)) return FADE_DEFAULT_ALPHA;
+        const ratio = Math.min(1, Math.max(0, px / w)); // borne la POSITION
+        return 1 - ratio;                               // borne l'ALPHA (0..1)
+    },
+
+    /**
+     * Largeur du canvas en px CSS — espace de `rawMouseX`. On ne mélange JAMAIS
+     * le backing store (`canvas.width`, qui peut être multiplié par le
+     * devicePixelRatio) avec une position souris : sinon le fondu serait décalé
+     * sur un écran HiDPI.
+     */
+    _canvasCssWidth() {
+        const el = this.canvasEl;
+        if (el && typeof el.getBoundingClientRect === "function") {
+            const r = el.getBoundingClientRect();
+            if (r && r.width > 0) return r.width;
+        }
+        if (this.contentElement && this.contentElement.clientWidth > 0) return this.contentElement.clientWidth;
+        if (el && el.width > 0) return el.width / (window.devicePixelRatio || 1);
+        return 0;
+    },
+
+    /** Alpha de la surimpression B tel qu'il doit être dessiné (toujours borné). */
+    _fadeAlphaB() {
+        const a = Number(this.fadeAlpha);
+        if (!Number.isFinite(a)) return FADE_DEFAULT_ALPHA;
+        return Math.min(1, Math.max(0, a));
+    },
+
+    /**
+     * Met à jour le fondu depuis la position du pointeur (px CSS).
+     *
+     * Hors glissement, la valeur suit un mapping ABSOLU (position → alpha),
+     * plus un RECALAGE `_fadeOffset` qui absorbe l'écart apparu pendant un
+     * glissement (où la valeur est GELÉE) et qui s'efface avec le déplacement du
+     * pointeur : au relâchement il n'y a donc AUCUN saut, et le mapping absolu
+     * revient après environ une largeur de canvas de mouvement.
+     *
+     * @returns {boolean} true si la valeur a été mise à jour.
+     */
+    _updateFadeFromPointer(px) {
+        if (this.fadeMode !== true) return false;
+        const w = this._canvasCssWidth();
+        if (!(w > 0)) return false;
+        const x = Number(px);
+        if (!Number.isFinite(x)) return false;
+        const cx = Math.min(Math.max(x, 0), w);
+
+        const abs = this._fadeAlpha(cx, w);
+        const value = Math.min(1, Math.max(0, abs + this._fadeOffset));
+        this.fadeAlpha = value;
+        // Invariant : fadeAlpha = clamp01(absolu + recalage) — le recalage est
+        // réajusté pour refléter exactement une éventuelle saturation.
+        this._fadeOffset = value - abs;
+
+        const last = this._fadeLastX;
+        this._fadeLastX = cx;
+        if (last !== null && last !== undefined) {
+            const moved = Math.abs(cx - last);
+            // Effacement proportionnel au déplacement (≈ une largeur de canvas
+            // de mouvement ramène le mapping absolu).
+            if (moved > 0) this._fadeOffset *= Math.max(0, 1 - moved / w);
+        }
+        return true;
+    },
+
+    /**
+     * Fin d'un glissement (pan) : la valeur GELÉE du fondu ne doit pas sauter au
+     * relâchement. On mémorise l'écart avec le mapping absolu à la position
+     * courante du pointeur ; cet écart s'effacera avec les mouvements suivants.
+     */
+    _endFadeFreeze() {
+        if (this.fadeMode !== true) return;
+        const w = this._canvasCssWidth();
+        const x = Number(this.rawMouseX);
+        if (!(w > 0) || this.rawMouseX === null || this.rawMouseX === undefined || !Number.isFinite(x)) {
+            this._fadeOffset = 0;
+            this._fadeLastX = null;
+            return;
+        }
+        const cx = Math.min(Math.max(x, 0), w);
+        this._fadeOffset = this._fadeAlphaB() - this._fadeAlpha(cx, w);
+        this._fadeLastX = cx;
+    },
+
+    /**
+     * Active/désactive le MODE FONDU (case à cocher).
+     * Décoché = volet historique, strictement inchangé. Le réglage est persisté
+     * avec l'état de la fenêtre et n'est jamais transmis au backend.
+     */
+    setFadeMode(enabled) {
+        this.fadeMode = enabled === true;
+        // Repart d'un fondu propre : aucun recalage hérité du mode précédent.
+        this._fadeOffset = 0;
+        this._fadeLastX = null;
+        this._syncFadeCheckbox();
+        this.saveState();
+        this.draw();
+        return this.fadeMode;
+    },
+
+    _syncFadeCheckbox() {
+        if (this._fadeCheckbox) this._fadeCheckbox.checked = this.fadeMode === true;
     },
 
     // --- CROSSFADER & INTERACTION ---
@@ -693,6 +863,12 @@ const HolafRemoteComparer = {
             const imgPt = this.vp.screenToImage(e.clientX, e.clientY);
             this.mouseX = imgPt.x;
 
+            // MODE FONDU : la valeur suit la position du pointeur HORS
+            // glissement. Pendant un pan elle est GELÉE (sinon déplacer l'image
+            // ferait défiler le fondu) ; la reprise se fait sans saut via
+            // `_endFadeFreeze()` (recalage, cf. mouseup).
+            if (!this.isPanning) this._updateFadeFromPointer(this.rawMouseX);
+
             this.updateVolumes();
             if (this.isOpen || this.isPoppedOut) this.draw();
         });
@@ -705,6 +881,11 @@ const HolafRemoteComparer = {
             this.isMouseOver = false;
             this.mouseX = null;
             this.rawMouseX = null;
+            // Le fondu GARDE sa dernière valeur (pas de retour brutal à 50 % au
+            // relâchement du survol) ; le prochain survol re-ANCRE le mapping
+            // absolu sur la position d'entrée (même principe que le volet).
+            this._fadeOffset = 0;
+            this._fadeLastX = null;
             this.updateVolumes();
             if (this.isOpen || this.isPoppedOut) this.draw();
         });
@@ -722,6 +903,8 @@ const HolafRemoteComparer = {
             if (this.isPanning) {
                 this.isPanning = false;
                 this.canvasEl.style.cursor = 'crosshair';
+                // Fondu : reprise sans saut après le gel du glissement.
+                this._endFadeFreeze();
             }
         });
     },
@@ -1036,8 +1219,16 @@ const HolafRemoteComparer = {
         const imgA = this.images[0];
         const imgB = this.images.length > 1 ? this.images[1] : null;
 
-        if (!this.isMediaReady(imgA)) return;
-        const sizeA = this.getMediaSize(imgA);
+        // MODE FONDU : une seule image disponible ne doit jamais vider l'écran.
+        // Si A manque/est illisible mais que B est prête, on affiche B seule.
+        // En mode VOLET, on garde la parité stricte : on s'arrête comme avant.
+        const fade = this.fadeMode === true;
+        const readyA = this.isMediaReady(imgA);
+        const readyB = !!imgB && this.isMediaReady(imgB);
+        if (!readyA && !(fade && readyB)) return;
+
+        const baseMedia = readyA ? imgA : imgB;
+        const sizeA = this.getMediaSize(baseMedia);
         
         // Audio has no intrinsic size, force a virtual 16:9 canvas
         const baseW = sizeA.width > 0 ? sizeA.width : 1280;
@@ -1051,10 +1242,19 @@ const HolafRemoteComparer = {
         this.ctx.translate(tx, ty);
         this.ctx.scale(scale, scale);
 
-        // Draw Background (A) — boîte image complète (0,0,baseW,baseH)
-        this.drawMediaItem(this.ctx, imgA, 0, 0, baseW, baseH, true);
+        if (readyA) {
+            // Draw Background (A) — boîte image complète (0,0,baseW,baseH)
+            this.drawMediaItem(this.ctx, imgA, 0, 0, baseW, baseH, true);
+        }
 
-        if (!imgB || !this.isMediaReady(imgB)) {
+        if (!readyB) {
+            this.drawAudioHUD(this.ctx, width, height);
+            return;
+        }
+
+        if (!readyA) {
+            // Fondu avec A absente : B seule, plein cadre (rien à mélanger).
+            this.drawMediaItem(this.ctx, imgB, 0, 0, baseW, baseH, false);
             this.drawAudioHUD(this.ctx, width, height);
             return;
         }
@@ -1066,8 +1266,22 @@ const HolafRemoteComparer = {
         const sizeB = this.getMediaSize(imgB);
         const bRect = this._containRect(sizeB.width, sizeB.height, 0, 0, baseW, baseH);
 
-        // Draw Foreground Split (B)
-        if ((this.isMouseOver || this.isPanning) && this.mouseX !== null) {
+        if (fade) {
+            // MODE FONDU : B est composée en ALPHA sur A (`globalAlpha`), SANS
+            // clip ni ligne de partage — le volet est donc entièrement désactivé.
+            // Coût constant : une seule composition par frame, aucune image
+            // intermédiaire recréée, aucun `getImageData`. Le transform du
+            // viewport (zoom/pan) est déjà appliqué au contexte, donc le fondu
+            // suit exactement le cadrage de A comme B.
+            const alphaB = this._fadeAlphaB();
+            if (alphaB > 0) {
+                this.ctx.save();
+                this.ctx.globalAlpha = alphaB;
+                this.drawMediaItem(this.ctx, imgB, bRect.x, bRect.y, bRect.w, bRect.h, false);
+                this.ctx.restore();
+            }
+        } else if ((this.isMouseOver || this.isPanning) && this.mouseX !== null) {
+            // Draw Foreground Split (B) — comportement historique inchangé.
             this.ctx.save();
             this.ctx.beginPath();
 

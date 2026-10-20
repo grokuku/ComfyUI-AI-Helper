@@ -12,50 +12,31 @@ DOM widget + connexion aux éléments du Elements Picker.
 Option use_llm :
   - True  : Génération intelligente via LLM (System prompt + User prompt)
   - False : Concaténation directe (base_prompt + elements + style) sans LLM
+
+Transport MULTIMODAL : l'image est encodée par
+``aih.llm_helper.image_tensor_to_base64`` (source UNIQUE du pack) puis envoyée
+soit au LLM local (``llm_helper.call_llm(..., image_base64=...)``), soit au
+backend (``payload['image_base64']`` de /api/enhance).
 """
 
-import io
 import json
 import logging
 import re
-import base64
 
 # Socle AIH partagé (bootstrap sys.path fait par le __init__.py racine du pack).
 from aih import credentials, llm_helper
 
-try:
-    from PIL import Image as PILImage
-except Exception:
-    PILImage = None
 
-try:
-    import torch
-except Exception:
-    torch = None
-
-try:
-    import numpy as np
-except Exception:
-    np = None
-
-
-def _tensor_to_base64(tensor, max_pixels=1_000_000):
+def _tensor_to_base64(tensor, max_pixels=llm_helper.VISION_MAX_PIXELS):
     """Convert ComfyUI IMAGE tensor [B,H,W,C] to base64 PNG string.
-    Takes first image in batch. Auto-resizes if total pixels (W*H) > max_pixels (1MP),
-    keeping the aspect ratio. PNG format — Ollama Cloud vision models may not accept JPEG."""
-    if PILImage is None or torch is None or np is None:
-        raise Exception("PIL (Pillow), torch, and numpy are required for image input support")
-    img_array = (tensor[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    pil_img = PILImage.fromarray(img_array)
-    w, h = pil_img.size
-    if w * h > max_pixels:
-        ratio = (max_pixels / (w * h)) ** 0.5
-        new_w = max(1, int(w * ratio))
-        new_h = max(1, int(h * ratio))
-        pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
-    buf = io.BytesIO()
-    pil_img.save(buf, format='PNG')
-    return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    DÉLÉGUÉ à ``aih.llm_helper.image_tensor_to_base64`` : l'encodage vision
+    (1re image du lot, réduction <= 1 Mpx en conservant le ratio, PNG et non
+    JPEG) est le MÊME que celui de la node expérimentale Mask Anything. Ce code
+    n'existe donc qu'à UN seul endroit dans le pack ; le comportement de cette
+    node (chemin local ET payload backend) est inchangé.
+    """
+    return llm_helper.image_tensor_to_base64(tensor, max_pixels=max_pixels)
 
 
 def _clean_output(text, output_format="rich"):

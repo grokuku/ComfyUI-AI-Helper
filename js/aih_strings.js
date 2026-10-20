@@ -552,6 +552,13 @@ import "./aih_i18n.js";
         "en.unknownError": "Erreur inconnue",
         "en.errorPrefix": "Erreur: {error}",
 
+        /* Mask Anything — node expérimentale (aih_mask_anything_widget.js) */
+        "ma.presetLabel": "Preset IA (vision)",
+        "ma.presetPlaceholder": "-- Preset IA (vision) --",
+        "ma.statusIdle": "Prêt — rien n'a encore été exécuté.",
+        "ma.serverUnavailable": "Serveur AIH injoignable : liste des presets indisponible.",
+        "ma.noPresets": "Aucun preset IA sur le serveur (Paramètres ▸ Provider LLM).",
+
         /* Terminal (holaf_terminal.js) */
         "term.panelTitle": "Terminal AIH",
         "term.theme": "Changer le thème",
@@ -1365,6 +1372,8 @@ import "./aih_i18n.js";
         "rc.errNotFound": "Fichier introuvable : {name}",
         "rc.errNotAFile": "Ce n'est pas un fichier : {name}",
         "rc.errInvalidPath": "Chemin invalide : {name}",
+        "rc.fadeMode": "Mode fondu",
+        "rc.fadeModeHint": "Fondu entre les deux médias : il suit la position horizontale de la souris (à gauche le média B, à droite le média A). Glisser pour déplacer l'image fige le fondu.",
 
         /* Shortcuts (holaf_shortcuts.js) */
         "sc.title": "Raccourcis",
@@ -1967,6 +1976,13 @@ import "./aih_i18n.js";
         "en.notConfigured": "⚠️ No AIH server URL configured. Set it in AIH Utilities ▸ Settings ▸ \"AIH · Account\" tab (the Test button calls the remote server).",
         "en.unknownError": "Unknown error",
         "en.errorPrefix": "Error: {error}",
+
+        /* Mask Anything — experimental node (aih_mask_anything_widget.js) */
+        "ma.presetLabel": "AI Preset (vision)",
+        "ma.presetPlaceholder": "-- AI Preset (vision) --",
+        "ma.statusIdle": "Ready — nothing executed yet.",
+        "ma.serverUnavailable": "AIH server unreachable: preset list unavailable.",
+        "ma.noPresets": "No AI preset on the server (Settings ▸ LLM Provider).",
 
         /* Terminal (holaf_terminal.js) */
         "term.panelTitle": "AIH Terminal",
@@ -2780,6 +2796,8 @@ import "./aih_i18n.js";
         "rc.errNotFound": "File not found: {name}",
         "rc.errNotAFile": "Not a file: {name}",
         "rc.errInvalidPath": "Invalid path: {name}",
+        "rc.fadeMode": "Fade mode",
+        "rc.fadeModeHint": "Crossfade between both media: it follows the mouse horizontal position (media B on the left, media A on the right). Dragging to pan freezes the fade.",
 
         /* Shortcuts (holaf_shortcuts.js) */
         "sc.title": "Shortcuts",

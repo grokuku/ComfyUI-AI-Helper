@@ -172,6 +172,27 @@
     align-items: center;
 }
 
+/* Mode fondu : case à cocher libellée (aucune couleur en dur — l'accent vient
+   du thème via --holaf-accent-color). */
+#holaf-remote-comparer-root .holaf-rc-settings-row-check {
+    gap: 8px;
+}
+
+#holaf-remote-comparer-root .holaf-rc-fade-label {
+    cursor: pointer;
+    user-select: none;
+    color: var(--holaf-text-primary);
+}
+
+#holaf-remote-comparer-root .holaf-rc-fade-checkbox {
+    margin: 0;
+    width: 13px;
+    height: 13px;
+    flex-shrink: 0;
+    cursor: pointer;
+    accent-color: var(--holaf-accent-color);
+}
+
 #holaf-remote-comparer-root .holaf-rc-settings-select {
     background: var(--holaf-input-background);
     color: var(--holaf-text-primary);
