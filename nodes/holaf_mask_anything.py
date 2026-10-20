@@ -557,23 +557,55 @@ def extract_json(payload_text):
     return None
 
 
-def _detect_unit(values, width, height):
-    """Unité probable d'un jeu de 4 coordonnées : ``"norm"``, ``"grid"`` ou ``"px"``.
+def vision_frame(width, height, max_pixels=None):
+    """Taille (largeur, hauteur) REELLEMENT envoyee au modele de vision.
 
-    - toutes les valeurs <= 1,5 → normalisées 0-1 (le cas attendu) ;
-    - une valeur dépasse la dimension de l'image → impossible en pixels, donc
-      grille 0-1000 ;
-    - sinon → pixels (une coordonnée en pixels ne dépasse jamais l'image).
+    Reproduit le calcul de ``aih.llm_helper.image_tensor_to_base64`` :
+    plafond ``VISION_MAX_PIXELS`` (1 Mpx), ratio ``(max_pixels/(w*h))**0.5``,
+    ``int()`` TRONQUE, garde ``max(1, ...)``. 3072x4088 -> (866, 1153).
+    """
+    limit = getattr(llm_helper, "VISION_MAX_PIXELS", 1_000_000)
+    if max_pixels is not None:
+        limit = int(max_pixels)
+    frame_w, frame_h = int(width), int(height)
+    if frame_w <= 0 or frame_h <= 0:
+        return (1, 1)
+    if limit and frame_w * frame_h > limit:
+        ratio = (limit / (frame_w * frame_h)) ** 0.5
+        return (max(1, int(frame_w * ratio)), max(1, int(frame_h * ratio)))
+    return (frame_w, frame_h)
+
+
+def _xyxy_numbers(coords, scheme):
+    """4 nombres remis dans l'ordre (x1, y1, x2, y2), sinon None.
+
+    Seul point de remise en ordre : ``"2d"`` = [y1, x1, y2, x2] (``box_2d``).
+    """
+    if not isinstance(coords, (list, tuple)) or len(coords) != 4:
+        return None
+    if scheme == "2d":
+        y1, x1, y2, x2 = coords
+        return (x1, y1, x2, y2)
+    return (coords[0], coords[1], coords[2], coords[3])
+
+
+def _detect_unit(values, frame_w, frame_h):
+    """Unite probable de 4 coordonnees (x1,y1,x2,y2) : norm/grid/px.
+
+    La reference est la taille de l'image REELLEMENT ENVOYEE au modele
+    (``vision_frame``), jamais l'image pleine. Comparaison PAR AXE : une grille
+    0-1000 depasse la largeur de la frame 866x1153 mais pas sa hauteur.
     """
     biggest = max(abs(value) for value in values)
     if biggest <= UNIT_TOLERANCE:
         return "norm"
-    if biggest > max(width, height):
+    if (max(abs(values[0]), abs(values[2])) > frame_w
+            or max(abs(values[1]), abs(values[3])) > frame_h):
         return "grid"
     return "px"
 
 
-def normalize_box(coords, scheme, width, height):
+def normalize_box(coords, scheme, width, height, frame=None):
     """Boîte normalisée ``{"x1","y1","x2","y2","label"}`` ou None si inutilisable.
 
     Étapes : remise en ordre du schéma ``2d`` (y,x,y,x), détection d'unité,
@@ -582,19 +614,24 @@ def normalize_box(coords, scheme, width, height):
     """
     if not coords or len(coords) != 4 or width <= 0 or height <= 0:
         return None
-    if scheme == "2d":
-        y1, x1, y2, x2 = coords
-    else:
-        x1, y1, x2, y2 = coords
-    numbers = (x1, y1, x2, y2)
-    unit = _detect_unit(numbers, width, height)
+    numbers = _xyxy_numbers(coords, scheme)
+    if numbers is None:
+        return None
+    x1, y1, x2, y2 = numbers
+    frame_w = int(width) if frame is None else int(frame[0])
+    frame_h = int(height) if frame is None else int(frame[1])
+    if frame_w <= 0 or frame_h <= 0:
+        frame_w, frame_h = int(width), int(height)
+        if frame_w <= 0 or frame_h <= 0:
+            return None
+    unit = _detect_unit(numbers, frame_w, frame_h)
     if unit == "norm":
         scale_x = scale_y = 1.0
     elif unit == "grid":
         scale_x = scale_y = 1.0 / GRID_SCALE
     else:
-        scale_x = 1.0 / float(width)
-        scale_y = 1.0 / float(height)
+        scale_x = 1.0 / float(frame_w)
+        scale_y = 1.0 / float(frame_h)
 
     nx1, nx2 = x1 * scale_x, x2 * scale_x
     ny1, ny2 = y1 * scale_y, y2 * scale_y
@@ -651,7 +688,7 @@ def _has_non_empty_container(payload):
     return False
 
 
-def parse_boxes(payload_text, width, height):
+def parse_boxes(payload_text, width, height, frame=None, units=None):
     """Réponse LLM → ``(boîtes_normalisées, raison)``.
 
     ``raison`` vaut None en cas de succès, sinon l'une des constantes
@@ -662,28 +699,49 @@ def parse_boxes(payload_text, width, height):
     payload = extract_json(payload_text)
     if payload is None:
         return [], REASON_NOT_JSON
+    frame_w = int(width) if frame is None else int(frame[0])
+    frame_h = int(height) if frame is None else int(frame[1])
+    if frame_w <= 0 or frame_h <= 0:
+        frame_w, frame_h = int(width), int(height)
     entries = _iter_raw_boxes(payload)
     if not entries:
         # Conteneur « boxes » non vide mais aucune entrée exploitable → au bon
         # format, contenu inutilisable : cause DISTINCTE de « rien trouvé ».
         return [], (REASON_INVALID if _has_non_empty_container(payload) else REASON_NO_BOXES)
     boxes = []
+    units_seen = []
     for coords, label, scheme, concept in entries:
-        box = normalize_box(coords, scheme, width, height)
+        numbers = _xyxy_numbers(coords, scheme)
+        if numbers is not None:
+            seen = _detect_unit(numbers, frame_w, frame_h)
+            if seen not in units_seen:
+                units_seen.append(seen)
+        box = normalize_box(coords, scheme, width, height, frame=frame)
         if box is None:
             continue
         box["label"] = label
         box["concept"] = concept
         boxes.append(box)
+    if units is not None:
+        units.extend(units_seen)
+    odd = [name for name in units_seen if name != "norm"]
+    if odd:
+        LOGGER.warning(
+            f"{LOG_PREFIX} unité(s) détectée(s) : {', '.join(units_seen)} "
+            f"(non normalisée(s) : {', '.join(odd)}) — référentiel "
+            f"{frame_w}x{frame_h} (image jointe) et non "
+            f"{int(width)}x{int(height)} (image pleine)"
+        )
     if not boxes:
         return [], REASON_INVALID
     return dedupe_boxes(boxes), None
 
 
-def build_user_prompt(text, width, height):
+def build_user_prompt(text, width, height, frame=None):
     """Message user : description de l'utilisateur + dimensions de l'image."""
+    frame_w, frame_h = vision_frame(width, height) if frame is None else (int(frame[0]), int(frame[1]))
     return (
-        f"Image size: {int(width)}x{int(height)} pixels (width x height).\n"
+        f"Image size: {frame_w}x{frame_h} pixels (width x height).\n"
         f"Elements to locate: {text}\n"
         "Return the JSON object now."
     )
@@ -1407,6 +1465,10 @@ def fit_mask_to_window(mask, window):
     if count != 1:
         raise MaskGeometryError(
             f"masque ambigu : {count} plans (shape={shape})")
+    if (height, width) not in ((win_h, win_w), (SAM3_SIZE, SAM3_SIZE)):
+        raise MaskGeometryError(
+            f"masque {height}x{width} incoherent : ni la fenetre "
+            f"{win_h}x{win_w} ni le repere du detecteur {SAM3_SIZE}x{SAM3_SIZE}")
     if (height, width) == (win_h, win_w):
         plane = mask.reshape(height, width)
     else:
@@ -1955,6 +2017,7 @@ class AIHMaskAnythingNode:
                 "texte vide : décris les éléments à trouver (ex. « le chat, le lampadaire »)",
             )
 
+        frame = vision_frame(width, height)
         try:
             image_base64 = llm_helper.image_tensor_to_base64(image)
         except Exception as exc:  # noqa: BLE001 — encodeur : message clair, pas de crash
@@ -1963,7 +2026,7 @@ class AIHMaskAnythingNode:
                 f"encodage de l'image impossible ({exc})",
             )
 
-        user_prompt = build_user_prompt(description, width, height)
+        user_prompt = build_user_prompt(description, width, height, frame=frame)
         output, error = self._ask_model(
             llm_config, preset_id, seed, user_prompt, image_base64
         )
@@ -1971,7 +2034,7 @@ class AIHMaskAnythingNode:
             return self._fail(image, batch, height, width, error)
 
         LOGGER.info(f"{LOG_PREFIX} réponse brute ({len(output)} cars) : {output[:500]!r}")
-        boxes, reason = parse_boxes(output, width, height)
+        boxes, reason = parse_boxes(output, width, height, frame=frame)
         if reason:
             return self._fail(
                 image, batch, height, width, self._reason_message(reason, output)

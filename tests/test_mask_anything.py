@@ -2798,3 +2798,72 @@ class TestMaskGeometryFallbacks:
         assert not bool(mask.any().item()), "repli visible, pas un masque mal calé"
         assert any("masque vide (repli)" in record.message
                    for record in caplog.records)
+
+
+# === FRAME ENVOYEE au modele : le bug d'echelle ============================
+# `_detect_unit` comparait les coordonnees a l'IMAGE PLEINE : une grille 0-1000
+# sur 3072x4088 ne depasse jamais 3072/4088 -> classee "px" puis divisee par
+# 3072/4088 au lieu de 1000 -> contenu 3x trop petit, colle en haut a gauche.
+# La reference est desormais la taille de l'image REELLEMENT ENVOYEE au modele.
+
+FULL_W, FULL_H = 3072, 4088
+
+
+class TestVisionFrame:
+    def test_frame_reproduces_the_llm_helper_downscale(self):
+        assert M.vision_frame(FULL_W, FULL_H) == (866, 1153)
+        assert M.vision_frame(640, 480) == (640, 480)
+
+    def test_degenerate_dimensions_never_divide_by_zero(self):
+        assert M.vision_frame(0, 0) == (1, 1)
+        assert M.vision_frame(-10, 40) == (1, 1)
+
+
+class TestGridOnALargeImage:
+    GRID_BOX = '[{"box_2d": [250, 500, 750, 900]}]'   # ordre y1,x1,y2,x2
+
+    def test_the_grid_is_read_with_the_sent_frame(self):
+        boxes, reason = M.parse_boxes(
+            self.GRID_BOX, FULL_W, FULL_H, frame=M.vision_frame(FULL_W, FULL_H))
+        assert reason is None and len(boxes) == 1
+        box = boxes[0]
+        assert (box["x1"], box["y1"], box["x2"], box["y2"]) == pytest.approx(
+            (0.50, 0.25, 0.90, 0.75))
+
+    def test_without_a_frame_the_old_shrink_is_reproduced(self):
+        boxes, _ = M.parse_boxes(self.GRID_BOX, FULL_W, FULL_H)
+        box = boxes[0]
+        assert (box["x2"] - box["x1"]) == pytest.approx(400 / FULL_W)
+        assert (box["x2"] - box["x1"]) < 0.20, "0,40 attendus : 3x trop petit"
+
+
+class TestPixelsOfTheSentFrame:
+    PIXELS = '{"boxes":[{"x1":50,"y1":30,"x2":400,"y2":600}]}'
+
+    def test_pixels_are_divided_by_the_frame(self):
+        boxes, reason = M.parse_boxes(
+            self.PIXELS, FULL_W, FULL_H, frame=M.vision_frame(FULL_W, FULL_H))
+        assert reason is None and len(boxes) == 1
+        box = boxes[0]
+        assert (box["x1"], box["y1"], box["x2"], box["y2"]) == pytest.approx(
+            (50 / 866, 30 / 1153, 400 / 866, 600 / 1153), abs=1e-9)
+        assert box["x2"] == pytest.approx(0.4619, abs=1e-3)
+
+    def test_normalized_boxes_are_untouched_by_the_frame(self):
+        raw = '{"boxes":[{"x1":0.1,"y1":0.2,"x2":0.4,"y2":0.5}]}'
+        plain, _ = M.parse_boxes(raw, FULL_W, FULL_H)
+        framed, _ = M.parse_boxes(
+            raw, FULL_W, FULL_H, frame=M.vision_frame(FULL_W, FULL_H))
+        assert plain[0] == framed[0]
+        for box in (plain[0], framed[0]):
+            assert (box["x1"], box["y1"], box["x2"], box["y2"]) == pytest.approx(
+                (0.1, 0.2, 0.4, 0.5))
+
+    def test_a_non_normalized_unit_is_logged_with_the_frame(self, caplog):
+        units = []
+        with caplog.at_level("WARNING"):
+            M.parse_boxes(self.PIXELS, FULL_W, FULL_H,
+                          frame=M.vision_frame(FULL_W, FULL_H), units=units)
+        assert units == ["px"]
+        messages = " ".join(r.message for r in caplog.records)
+        assert "unité(s)" in messages and "866" in messages
