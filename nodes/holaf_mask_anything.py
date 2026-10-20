@@ -124,8 +124,12 @@ d'où l'on ne lit QUE ``cond[0][0]`` (embedding) et la clé STANDARD
 ``unet(img1008, text_embeddings=…, text_mask=…, threshold=…, orig_size=(h, w))``
 (``comfy/ldm/sam3/detector.py:472`` via ``:520``) — le même appel que la node
 native ``SAM3_Detect`` (``comfy_extras/nodes_sam3.py:198-200``). Les masques
-reviennent DÉJÀ à la taille de la fenêtre (``orig_size``), donc le remap est
-celui de la phase 2 (``paste_mask``).
+SONT DEMANDÉS à la taille de la fenêtre (``orig_size``), mais on ne fait JAMAIS
+confiance à la taille RENDUE : ``fit_mask_to_window`` les ramène TOUJOURS à la
+fenêtre avant ``paste_mask`` (un détecteur qui rend sa résolution interne
+1008×1008 collait sinon un masque minuscule dans le coin supérieur gauche), et
+un masque impossible à remettre à l'échelle est COMPTÉ + dit dans le statut
+``ui`` (jamais un masque faux en silence).
 
 Garde de CAPACITÉ (jamais un test de version) : ``sam3_model.get_model_object
 ("diffusion_model")`` puis ``hasattr(unet, "forward_segment")``. MODEL absent,
@@ -326,6 +330,15 @@ VERDICT_CLIP = "clip"       # masque débordant → on le clippe à la boîte
 SAM3_UNAVAILABLE_NOTE = (
     "SAM3 non connecté ou MODEL non-SAM3 → masque depuis les boîtes"
 )
+
+
+class MaskGeometryError(RuntimeError):
+    """Masque du détecteur impossible à ramener à la taille de la FENÊTRE.
+
+    Erreur de GÉOMÉTRIE, jamais de modèle : elle sert de signal de repli
+    explicite (compteur + message ``ui``) pour qu'un masque mal mis à l'échelle
+    ne sorte jamais en silence.
+    """
 
 # Causes d'échec de parsing (distinctes pour l'utilisateur).
 REASON_EMPTY = "empty"        # aucune réponse / réponse vide
@@ -1336,29 +1349,136 @@ def draw_boxes(image, boxes):
     return debug.clamp(0.0, 1.0)
 
 
-def paste_mask(crop_mask, window, width, height):
-    """Recolle un masque de CROP (``[win_h, win_w]``) dans ``[H, W]`` booléen.
+def window_size(window):
+    """Taille ``(hauteur, largeur)`` d'une fenêtre ``(x0, y0, x1, y1)``.
 
-    Le masque est déjà à l'échelle de la fenêtre : il suffit de l'écrire à la
-    position de la fenêtre dans un masque vide de la taille de l'image. C'est
-    ce qui rend la géométrie du crop INVISIBLE en sortie (le masque final est
-    toujours plein format, comme en phase 1).
+    Convention des slices (``mask[y0:y1, x0:x1]``) : max EXCLUSIF. Jamais 0 ni
+    négatif (une fenêtre dégénérée vaut 1 px, comme ``paste_slices``).
+    """
+    x0, y0, x1, y1 = (int(value) for value in window)
+    return (max(1, y1 - y0), max(1, x1 - x0))
+
+
+def fit_mask_to_window(mask, window):
+    """Masque du détecteur → masque BOOLÉEN ``[win_h, win_w]`` de la FENÊTRE.
+
+    POURQUOI cette fonction existe : le détecteur SAM3 travaille en interne en
+    1008×1008 et n'est censé rendre ses masques à la taille demandée
+    (``orig_size``) que par un ``interpolate`` interne. Si ce rééchantillonnage
+    manque (version de ComfyUI, chemin ``forward_from_trunk``, sortie native du
+    détecteur), le masque recollé tel quel sort à l'échelle du DÉTECTEUR : le
+    motif est correct mais MINUSCULE et collé dans le coin de l'image — c'est le
+    bug « les fleurs détectées mais masque quasi noir, fragments dans le coin
+    supérieur gauche ». On ne fait donc JAMAIS confiance à la taille rendue.
+
+    Règles (aucune exception silencieuse) :
+      - la cible est TOUJOURS ``window_size(window)``, jamais la taille du
+        détecteur ;
+      - masque DÉJÀ à la bonne taille → renvoyé tel quel : les pixels du
+        détecteur ne sont pas réinventés par un rééchantillonnage inutile ;
+      - LOGITS flottants → ``interpolate`` BILINÉAIRE (le mode du détecteur)
+        puis binarisation ``> 0`` (SAM3 écrase les logits à ``NO_OBJ_SCORE``
+        = -1024 quand l'objet est absent : ``> 0`` = dans l'objet) ;
+      - masque booléen/entier → ``interpolate`` NEAREST (pas de valeur
+        intermédiaire à inventer, donc aucun seuil arbitraire) ;
+      - un SEUL plan admis : ``[H, W]``, ``[1, H, W]`` et ``[1, 1, H, W]``
+        acceptés ; plusieurs plans (``Q > 1``) refusés — on ne devine pas
+        lequel garder (c'est l'appelant qui apparie, positionnellement).
+
+    Lève ``MaskGeometryError`` si le masque est inutilisable ou ambigu.
+    """
+    if torch is None:
+        raise MaskGeometryError(
+            "torch est requis pour mettre un masque à l'échelle")
+    win_h, win_w = window_size(window)
+    shape = tuple(getattr(mask, "shape", ()) or ())
+    if len(shape) < 2:
+        raise MaskGeometryError(f"masque inutilisable (shape={shape})")
+    height, width = int(shape[-2]), int(shape[-1])
+    if height <= 0 or width <= 0:
+        raise MaskGeometryError(f"masque dégénéré (shape={shape})")
+    # GARDE « UN SEUL PLAN » AVANT le raccourci « déjà à la bonne taille » :
+    # un masque ``[Q>1, win_h, win_w]`` passerait sinon pour un plan unique, et
+    # ``reshape(win_h, win_w)`` lèverait un ``RuntimeError`` brut — que les
+    # appelants ne rattrapent PAS (ils n'attrapent que ``MaskGeometryError``) :
+    # crash au lieu du repli promis.
+    planes = mask.reshape(-1, height, width)
+    count = int(planes.shape[0])
+    if count != 1:
+        raise MaskGeometryError(
+            f"masque ambigu : {count} plans (shape={shape})")
+    if (height, width) == (win_h, win_w):
+        plane = mask.reshape(height, width)
+    else:
+        nearest = not bool(getattr(planes, "is_floating_point", lambda: False)())
+        # ``F.interpolate`` n'accepte QUE du 4D ``[N,C,H,W]`` (un ``[C,H,W]``
+        # serait lu comme une séquence temporelle 3D) : on ajoute donc l'axe
+        # canal, puis on le retire. Le plan unique est déjà garanti ci-dessus.
+        # ``align_corners`` n'est valide QUE pour les modes interpolants : le
+        # passer à ``nearest`` lève (ValueError) sur torch récent.
+        resized = torch.nn.functional.interpolate(
+            planes.float().unsqueeze(1), size=(win_h, win_w),
+            mode="nearest" if nearest else "bilinear",
+            **({} if nearest else {"align_corners": False}),
+        )
+        plane = resized[0, 0]
+    # Binarisation UNIQUE du module : booléen → identité, logits → ``> 0``.
+    return plane > 0
+
+
+def paste_mask(crop_mask, window, width, height):
+    """Recolle un masque du CROP dans ``[H, W]`` booléen, à la bonne ÉCHELLE.
+
+    Le masque est d'abord RAMENÉ À LA TAILLE DE LA FENÊTRE
+    (``fit_mask_to_window``) : un détecteur qui rend 1008×1008 (sa résolution
+    interne) ne peut plus être collé tel quel, ce qui produisait un masque
+    minuscule dans le coin supérieur gauche de l'image. C'est le SEUL point de
+    passage du recollage : tout appelant est protégé, présent ou futur.
 
     Une fenêtre débordante est rognée (voir ``paste_slices``) ; un recollage
-    impossible rend un masque VIDE (signe de repli, jamais d'exception).
+    impossible (masque inutilisable, ou taille finale incohérente avec la
+    fenêtre) rend un masque VIDE et un avertissement console — signe de repli,
+    jamais d'exception et jamais un masque faux en silence.
     """
     if torch is None:
         raise RuntimeError("torch est requis pour recoller un masque")
     width, height = int(width), int(height)
     full = torch.zeros((height, width), dtype=torch.bool)
-    shape = tuple(getattr(crop_mask, "shape", ()) or ())
-    if len(shape) < 2:
+    # PAS de pré-garde « rang < 2 » ici : ``fit_mask_to_window`` refuse déjà ce
+    # cas (``MaskGeometryError``) et l'``except`` ci-dessous est le SEUL chemin
+    # de refus LOGGÉ. Court-circuiter avant lui rendait un masque vide en
+    # SILENCE — exactement ce que ce module promet de ne jamais faire.
+    win_h, win_w = window_size(window)
+    try:
+        fitted = fit_mask_to_window(crop_mask, window)
+    except MaskGeometryError as exc:
+        LOGGER.warning(f"{LOG_PREFIX} masque non recollable : {exc}")
         return full
-    spans = paste_slices(window, shape[-1], shape[-2], width, height)
+    # POST-CONDITION : la taille du masque recollé doit égaler celle de la
+    # fenêtre. Elle est garantie par le helper ; on la VÉRIFIE quand même, pour
+    # qu'un futur changement de helper rende un repli visible au lieu d'un
+    # masque mal calé.
+    if tuple(fitted.shape) != (win_h, win_w):
+        LOGGER.warning(
+            f"{LOG_PREFIX} masque {tuple(fitted.shape)} ≠ fenêtre "
+            f"{(win_h, win_w)} → masque vide (repli)"
+        )
+        return full
+    spans = paste_slices(window, win_w, win_h, width, height)
     if spans is None:
         return full
     dst_x0, dst_y0, dst_x1, dst_y1, src_x0, src_y0, src_x1, src_y1 = spans
-    full[dst_y0:dst_y1, dst_x0:dst_x1] = crop_mask[src_y0:src_y1, src_x0:src_x1]
+    # Même taille des DEUX côtés : sinon torch lèverait (ou diffuserait) et le
+    # masque serait décalé sans le dire.
+    if ((dst_y1 - dst_y0, dst_x1 - dst_x0)
+            != (src_y1 - src_y0, src_x1 - src_x0)):
+        LOGGER.warning(
+            f"{LOG_PREFIX} recollage incohérent "
+            f"(fenêtre {(win_h, win_w)}, masque {tuple(fitted.shape)}) "
+            "→ masque vide (repli)"
+        )
+        return full
+    full[dst_y0:dst_y1, dst_x0:dst_x1] = fitted[src_y0:src_y1, src_x0:src_x1]
     return full
 
 
@@ -1582,8 +1702,11 @@ def detect_sam3_text(unet, image1008, embeddings, attention_mask,
     C'est l'appel PUBLIC de la node native (``comfy_extras/nodes_sam3.py:198-200``) :
     ``sam3_model(frame, text_embeddings=…, text_mask=…, threshold=…, orig_size=…)``
     → dict ``{"boxes", "scores", "masks"}``. ``masks`` sont des LOGITS
-    ``[1, Q, h, w]`` DÉJÀ rééchantillonnés à ``orig_size`` (``detector.py:483-486``) :
-    on les reçoit donc à la taille de la fenêtre, prêts pour ``paste_mask``.
+    ``[1, Q, h, w]`` qui DEVRAIENT déjà être rééchantillonnés à ``orig_size``
+    (``detector.py:483-486``) ; on ne le SUPPOSE pas : la taille rendue est
+    ramenée à la fenêtre juste après l'appel (``fit_mask_to_window``), car un
+    détecteur qui rend sa résolution interne (1008×1008) produisait un masque
+    minuscule collé dans le coin de l'image.
 
     Le SEUILLAGE et la TRONCATURE sont refaits ici, comme le fait la node native
     hors du détecteur (``nodes_sam3.py:216-224``) : le paramètre ``threshold`` du
@@ -1594,7 +1717,9 @@ def detect_sam3_text(unet, image1008, embeddings, attention_mask,
     ``size`` = ``(hauteur, largeur)`` de la fenêtre (repère de ``orig_size``).
     Renvoie une liste de masques BOOLÉENS ``[h, w]`` (``> 0`` = objet : SAM3
     écrase les logits à -1024 quand l'objet est absent, donc « rien trouvé » se
-    voit gratuitement). Lève si la sortie du détecteur est inexploitable.
+    voit gratuitement) — à la taille RENDUE par le détecteur, que l'appelant
+    doit ramener à celle de la fenêtre (``fit_mask_to_window``). Lève si la
+    sortie du détecteur est inexploitable.
     """
     if torch is None:
         raise RuntimeError("torch est requis pour la découverte SAM3")
@@ -1995,7 +2120,7 @@ class AIHMaskAnythingNode:
         #    reste POSITIONNEL (ordre des entrées), y compris après un repli en
         #    boucle : chaque masque retrouve son entrée d'origine.
         masks_by_box = []
-        fallback = clipped = 0
+        fallback = clipped = unscaled = 0
         passes = 0
         batch_fallbacks = 0
         for group in chunk_boxes(entries, batch_size):
@@ -2062,6 +2187,13 @@ class AIHMaskAnythingNode:
                     try:
                         mask = self._finish_mask(
                             logits, entry["window"], width, height)
+                    except MaskGeometryError as exc:
+                        # Géométrie refusée : repli COMPTÉ et visible (jamais un
+                        # masque mal mis à l'échelle en silence).
+                        unscaled += 1
+                        LOGGER.warning(
+                            f"{LOG_PREFIX} masque SAM3 non remis à l'échelle : {exc}")
+                        mask = None
                     except Exception as exc:  # noqa: BLE001 — logits exotiques
                         LOGGER.warning(
                             f"{LOG_PREFIX} masque SAM3 illisible : {exc}")
@@ -2123,6 +2255,7 @@ class AIHMaskAnythingNode:
             "outline": outline,
             "refined": refined,
             "fallback": fallback,
+            "unscaled": unscaled,
             "clipped": clipped,
             "merged": merged_away,
             "dropped": dropped,
@@ -2135,7 +2268,8 @@ class AIHMaskAnythingNode:
         LOGGER.info(
             f"{LOG_PREFIX} SAM3 {'crop' if sam_crop else 'plein'} : "
             f"{refined} forme(s) raffinée(s), "
-            f"{fallback} repli(s), {clipped} clippé(s), {merged_away} fusion(s), "
+            f"{fallback} repli(s), {unscaled} masque(s) non remis à l'échelle, "
+            f"{clipped} clippé(s), {merged_away} fusion(s), "
             f"{passes} passe(s) (lot {batch_size}, "
             f"{batch_fallbacks} repli(s) de batching)"
         )
@@ -2149,6 +2283,7 @@ class AIHMaskAnythingNode:
             "outline": None,
             "refined": 0,
             "fallback": len(expanded),
+            "unscaled": 0,
             "clipped": 0,
             "merged": 0,
             "dropped": dropped,
@@ -2251,7 +2386,8 @@ class AIHMaskAnythingNode:
         """
         unet, device, dtype = runtime
         report = {"masks": [], "groups": 0, "passes": 0, "empty": 0,
-                  "merged": 0, "dropped": 0, "error": None, "prompt": ""}
+                  "merged": 0, "dropped": 0, "unscaled": 0,
+                  "error": None, "prompt": ""}
         limit = max(1, int(cap))
         groups = list(groups)[:limit]
         if not groups:
@@ -2304,6 +2440,18 @@ class AIHMaskAnythingNode:
                 report["empty"] += 1
                 continue
             for crop_mask in shapes:
+                # Le détecteur a pu rendre sa résolution INTERNE (1008×1008) :
+                # on ramène le masque à la taille de la fenêtre AVANT le
+                # recollage, et un échec de géométrie est COMPTÉ + dit dans le
+                # statut ``ui`` (jamais un masque minuscule dans le coin).
+                try:
+                    crop_mask = fit_mask_to_window(crop_mask, window)
+                except MaskGeometryError as exc:
+                    report["unscaled"] += 1
+                    report["error"] = f"masque découvert non remis à l'échelle ({exc})"
+                    LOGGER.warning(
+                        f"{LOG_PREFIX} {report['error']} (groupe {prompt!r})")
+                    continue
                 collected.append(paste_mask(crop_mask, window, width, height))
             if len(collected) >= limit:
                 break
@@ -2363,6 +2511,7 @@ class AIHMaskAnythingNode:
             "discover_empty": report.get("empty", 0),
             "discover_merged": report.get("merged", 0),
             "discover_dropped": report.get("dropped", 0),
+            "discover_unscaled": report.get("unscaled", 0),
             "discover_prompt": report.get("prompt", ""),
             "discover_error": report.get("error"),
         })
@@ -2419,22 +2568,19 @@ class AIHMaskAnythingNode:
 
     @staticmethod
     def _finish_mask(logits, window, width, height):
-        """Logits ``[1,1,1008,1008]`` → masque booléen PLEIN FORMAT ``[H,W]``.
+        """Logits du détecteur → masque booléen PLEIN FORMAT ``[H,W]``.
 
         Deux étapes, dans cet ordre (c'est tout le remap du crop) :
-          1. rééchantillonnage des logits à la taille de la FENÊTRE (le masque
-             est produit dans le repère du crop) ;
+          1. rééchantillonnage à la taille de la FENÊTRE (le masque est produit
+             dans le repère du crop) — par ``fit_mask_to_window``, qui ne fait
+             JAMAIS confiance à la taille rendue par le détecteur (1008×1008
+             natif ⇒ masque minuscule dans le coin) ;
           2. binarisation ``> 0`` (SAM3 sort des LOGITS, pas des probabilités :
              objet absent ⇒ logits écrasés à -1024 ⇒ masque vide) PUIS
              RECOLLAGE à la position de la fenêtre dans l'image.
         """
-        x0, y0, x1, y1 = (int(value) for value in window)
-        win_w = max(1, x1 - x0)
-        win_h = max(1, y1 - y0)
-        resized = torch.nn.functional.interpolate(
-            logits.float(), size=(win_h, win_w), mode="bilinear", align_corners=False
-        )
-        return paste_mask(resized[0, 0] > 0, window, width, height)
+        fitted = fit_mask_to_window(logits, window)
+        return paste_mask(fitted, window, width, height)
 
     @staticmethod
     def _refine_status(plan, width, height, labels):
@@ -2452,6 +2598,8 @@ class AIHMaskAnythingNode:
         parts.append(passes)
         if plan["clipped"]:
             parts.append(f"{plan['clipped']} clippé(s)")
+        if plan.get("unscaled"):
+            parts.append(f"{plan['unscaled']} masque(s) non remis à l'échelle")
         if plan["merged"]:
             parts.append(f"{plan['merged']} doublon(s) fusionné(s)")
         parts.append(f"masque {width}×{height}")
@@ -2469,6 +2617,9 @@ class AIHMaskAnythingNode:
                 discover += f", plafond atteint ({plan['discover_dropped']} ignorée(s))"
             if plan.get("discover_empty"):
                 discover += f", {plan['discover_empty']} groupe(s) sans instance"
+            if plan.get("discover_unscaled"):
+                discover += (f", {plan['discover_unscaled']} masque(s) non "
+                             "remis à l'échelle")
             if not plan.get("discovered"):
                 discover += " → formes par boîte conservées"
             parts.append(discover)

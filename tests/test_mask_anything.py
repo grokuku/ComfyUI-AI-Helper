@@ -45,6 +45,9 @@
 #     (phase 3 : prompt sans ``:N``, ``:1`` généré, masques non remappés, dédup
 #     coupée, ``discover=False`` qui change le résultat, ``sam3_clip`` absent qui
 #     plante, plafond ignoré, seuil ignoré, concept non anglais non utilisé).
+#   - /projects/.aih_tmp/mask_anything_scale_mutate/mutate.py (échelle du masque :
+#     ``fit_mask_to_window`` sans ``interpolate``, garde « un seul plan »
+#     retirée, post-condition de ``paste_mask`` retirée).
 #   Chaque mutant doit faire ROUGIR cette suite (restauration + sha256 vérifiés).
 #
 # Usage :
@@ -2621,3 +2624,177 @@ class TestDiscoveryInteractions:
 def torch_has_intermediate(mask):
     """Vrai si le masque contient au moins une valeur ni 0 ni 1 (bord adouci)."""
     return bool(((mask > 0.0) & (mask < 1.0)).any().item())
+
+
+# === 8. ÉCHELLE DU MASQUE : un détecteur qui rend sa résolution INTERNE ====
+# SAM3 travaille en interne en 1008×1008 (``SAM3_SIZE``) et n'est censé rendre
+# un masque à la taille demandée que par un ``interpolate`` interne. Si ce
+# rééchantillonnage manque, le masque recollé TEL QUEL sort à l'échelle du
+# détecteur : motif correct mais minuscule dans le coin supérieur gauche. Ces
+# deux tests PROUVENT le contraire : la taille finale est celle de la FENÊTRE,
+# et le motif garde sa POSITION.
+
+class _NativeSizeUnet:
+    """Faux ``diffusion_model`` qui rend TOUJOURS 1008×1008 (résolution interne).
+
+    Le vrai SAM3 doit ramener ses logits à ``orig_size`` ; cette doublure
+    reproduit le cas fautif (aucun rééchantillonnage interne) : un disque
+    centré de rayon 300 px dans l'espace 1008² du détecteur.
+    """
+
+    def __init__(self, radius=300):
+        self.radius = int(radius)
+        self.calls = []
+
+    def forward_segment(self, image, point_inputs=None, box_inputs=None,
+                        mask_inputs=None):
+        torch = _torch()
+        self.calls.append(tuple(image.shape))
+        coords = torch.arange(M.SAM3_SIZE, dtype=torch.float32)
+        dy = coords[:, None] - M.SAM3_SIZE / 2
+        dx = coords[None, :] - M.SAM3_SIZE / 2
+        inside = (dy * dy + dx * dx) <= self.radius ** 2
+        # Logits (pas des probabilités) : 0,3 dedans, -1,0 dehors.
+        return torch.where(inside, 0.3, -1.0).reshape(
+            1, 1, M.SAM3_SIZE, M.SAM3_SIZE)
+
+
+@_requires_torch
+class TestNativeResolutionMaskScale:
+    """Un masque 1008×1008 collé sans rééchantillonnage = bug du coin."""
+
+    def test_a_1008_mask_on_a_1920x1080_image_fills_the_frame_centred(
+            self, node, server_env):
+        """MUTANT : recoller tel quel → masque 1008×1008 dans le coin."""
+        server_env["output"] = ('{"boxes":[{"x1":0.1,"y1":0.1,"x2":0.9,'
+                                '"y2":0.9,"label":"fleur"}]}')
+        unet = _NativeSizeUnet()
+        mask = node.mask(
+            _torch().zeros((1, 1080, 1920, 3), dtype=_torch().float32), "f",
+            preset_id=3, sam3_model=_FakeModel(unet), sam_crop=False,
+            expand_px=0, min_area_pct=0, feather=0,
+        )["result"][0][0]
+        assert tuple(mask.shape) == (1080, 1920), "taille = FENÊTRE, pas 1008²"
+        # Centre de l'image : dans le disque. Coin supérieur gauche : dehors.
+        # (Le bug d'origine laissait TOUT le motif dans le coin haut-gauche.)
+        assert mask[540, 960].item() == 1.0
+        assert mask[0, 0].item() == 0.0
+        # Décalages choisis HORS du disque une fois remis à l'échelle de la
+        # fenêtre (rayon 300 dans l'espace 1008²) : rien n'est dilaté.
+        assert mask[540, 960 - 700].item() == 0.0, "rayon dilaté en X ?"
+        assert mask[540 - 400, 960].item() == 0.0, "rayon dilaté en Y ?"
+        # Aucune exception : le masque a été produit par le chemin réel.
+        assert unet.calls and unet.calls[0][0] == 1
+
+    def test_a_1008_mask_on_a_non_square_window_800x300(self):
+        """Fenêtre 800×300 (et décalée) : masque 800×300 au bon ENDROIT."""
+        torch = _torch()
+        coords = torch.arange(M.SAM3_SIZE, dtype=torch.float32)
+        dy = coords[:, None] - M.SAM3_SIZE / 2
+        dx = coords[None, :] - M.SAM3_SIZE / 2
+        disk = ((dy * dy + dx * dx) <= 300 ** 2).reshape(1, 1, M.SAM3_SIZE,
+                                                        M.SAM3_SIZE)
+        window = (10, 20, 810, 320)  # 800 de large, 300 de haut
+        mask = M.paste_mask(disk, window, 1000, 500)
+        assert tuple(mask.shape) == (500, 1000)
+        assert int(mask.sum().item()) > 0
+        # Centre du disque → centre de la fenêtre, ni 1008² ni (0, 0).
+        assert mask[20 + 150, 10 + 400].item() == 1
+        assert mask[0, 0].item() == 0, "coin de l'image intact"
+        assert mask[20, 10].item() == 0, "coin de la fenêtre hors disque"
+        assert mask[20 + 150, 10 + 400 - 380].item() == 0, "rayon dilaté ?"
+
+    def test_a_bool_mask_takes_the_nearest_path(self):
+        """Masque booléen (pas de logits) : NEAREST + binarisation, même échelle."""
+        torch = _torch()
+        small = torch.zeros((1, 1008, 1008), dtype=torch.bool)
+        small[0, 0:504, 0:504] = True
+        mask = M.paste_mask(small, (0, 0, 800, 300), 800, 300)
+        assert tuple(mask.shape) == (300, 800)
+        assert mask[0, 0].item() == 1
+        assert mask[299, 799].item() == 0
+
+
+# === 9. REPLIS DE GÉOMÉTRIE : un masque inutilisable rend un masque VIDE ====
+# ``fit_mask_to_window`` lève ``MaskGeometryError`` (jamais un ``RuntimeError``
+# brut, que les appelants NE rattrapent PAS) et ``paste_mask`` transforme ce
+# refus en masque VIDE + avertissement. Ces branches n'étaient couvertes par
+# aucun test : un masque ``[Q>1, win_h, win_w]`` — pourtant de la taille de la
+# fenêtre — empruntait le raccourci « déjà à la bonne taille » AVANT la garde
+# « un seul plan » et faisait planter la node au lieu de replier.
+
+@_requires_torch
+class TestMaskGeometryFallbacks:
+    def test_a_mask_already_at_window_size_is_returned_as_is(self):
+        """Le raccourci « déjà à la bonne taille » reste pris pour UN plan."""
+        torch = _torch()
+        plane = torch.zeros((30, 40), dtype=torch.bool)
+        plane[3:9, 5:11] = True
+        fitted = M.fit_mask_to_window(plane.reshape(1, 30, 40), (0, 0, 40, 30))
+        assert tuple(fitted.shape) == (30, 40)
+        # Pixels du détecteur NON réinventés : rééchantillonner ici les
+        # décalerait d'un demi-pixel pour rien.
+        assert bool(torch.equal(fitted, plane))
+
+    def test_a_several_planes_mask_of_window_size_raises_geometry_error(self):
+        """[Q>1, win_h, win_w] : ``MaskGeometryError``, pas un RuntimeError brut."""
+        torch = _torch()
+        ambiguous = torch.ones((3, 30, 40), dtype=torch.bool)
+        with pytest.raises(M.MaskGeometryError) as excinfo:
+            M.fit_mask_to_window(ambiguous, (0, 0, 40, 30))
+        assert "3 plans" in str(excinfo.value)
+
+    def test_a_several_planes_mask_pastes_an_empty_mask(self, caplog):
+        """LE BUG LATENT : ici ``reshape`` levait ; maintenant ``paste`` replie."""
+        torch = _torch()
+        with caplog.at_level("WARNING"):
+            mask = M.paste_mask(torch.ones((2, 50, 60), dtype=torch.bool),
+                                (0, 0, 60, 50), 60, 50)
+        assert tuple(mask.shape) == (50, 60)
+        assert not bool(mask.any().item()), "masque VIDE, jamais un masque faux"
+        assert any(M.LOG_PREFIX in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize("shape", [(), (7,), (2,)])
+    def test_a_too_low_rank_mask_is_refused(self, shape, caplog):
+        """``shape`` de longueur < 2 : refus explicite, puis repli vide."""
+        torch = _torch()
+        mask = torch.zeros(shape, dtype=torch.bool)
+        with pytest.raises(M.MaskGeometryError) as excinfo:
+            M.fit_mask_to_window(mask, (0, 0, 40, 30))
+        assert "inutilisable" in str(excinfo.value)
+        with caplog.at_level("WARNING"):
+            pasted = M.paste_mask(mask, (0, 0, 40, 30), 40, 30)
+        assert tuple(pasted.shape) == (30, 40)
+        assert not bool(pasted.any().item())
+        assert any("non recollable" in record.message
+                   for record in caplog.records)
+
+    @pytest.mark.parametrize("shape", [(0, 10), (5, 0), (1, 0, 10), (2, 5, 0)])
+    def test_a_degenerate_dimension_is_refused(self, shape, caplog):
+        """``H`` ou ``W`` nul : aucune exception de tensor ne doit fuiter."""
+        torch = _torch()
+        mask = torch.zeros(shape, dtype=torch.bool)
+        with pytest.raises(M.MaskGeometryError) as excinfo:
+            M.fit_mask_to_window(mask, (0, 0, 40, 30))
+        assert "dégénéré" in str(excinfo.value)
+        with caplog.at_level("WARNING"):
+            pasted = M.paste_mask(mask, (0, 0, 40, 30), 40, 30)
+        assert tuple(pasted.shape) == (30, 40)
+        assert not bool(pasted.any().item())
+
+    def test_a_broken_post_condition_pastes_an_empty_mask(
+            self, monkeypatch, caplog):
+        """Post-condition violée (helper qui rend la mauvaise taille) → vide."""
+        torch = _torch()
+
+        def wrong_size(mask, window):
+            return torch.ones((7, 9), dtype=torch.bool)
+
+        monkeypatch.setattr(M, "fit_mask_to_window", wrong_size)
+        with caplog.at_level("WARNING"):
+            mask = M.paste_mask(torch.ones((1, 1008, 1008), dtype=torch.float32),
+                                (0, 0, 60, 50), 60, 50)
+        assert tuple(mask.shape) == (50, 60)
+        assert not bool(mask.any().item()), "repli visible, pas un masque mal calé"
+        assert any("masque vide (repli)" in record.message
+                   for record in caplog.records)
