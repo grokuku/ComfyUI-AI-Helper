@@ -17,6 +17,13 @@ Transport MULTIMODAL : l'image est encodée par
 ``aih.llm_helper.image_tensor_to_base64`` (source UNIQUE du pack) puis envoyée
 soit au LLM local (``llm_helper.call_llm(..., image_base64=...)``), soit au
 backend (``payload['image_base64']`` de /api/enhance).
+
+Option ``ratio`` : entrée STRING optionnelle (socket seul, ajoutée EN DERNIER
+pour ne décaler aucun widget) prévue pour recevoir la sortie ``ratio`` des nodes
+``AIHResolutionPreset`` / ``AIHResolutionPresetV2`` (format ``"16:9 (landscape)"``).
+Elle est traduite en consigne ANGLAISE (``_ratio_instruction``) ajoutée au
+texte USER — donc présente dans les DEUX chemins LLM (local et /api/enhance) —
+jamais dans le ``negative_prompt`` ni en mode concaténation. Vide = inchangé.
 """
 
 import json
@@ -123,6 +130,70 @@ def _fetch_style(api_url, api_key, style_id):
     return None
 
 
+# Ratio « largeur:hauteur » accepté en tête de la valeur (ex. "16:9", "16:9
+# (landscape)", "~2.39:1"). Sert UNIQUEMENT à déduire la forme de cadre.
+_RATIO_VALUE_RE = re.compile(r"^~?(\d+(?:[.,]\d+)?)\s*:\s*(\d+(?:[.,]\d+)?)")
+
+
+def _ratio_instruction(ratio):
+    """Consigne ANGLAISE injectée dans le message USER envoyé au LLM.
+
+    ``ratio`` vient (en général) de la sortie ``ratio`` d'un node de résolution
+    (``AIHResolutionPreset`` / ``AIHResolutionPresetV2``), au format du pack :
+    ``"16:9 (landscape)"``. Une valeur saisie à la main (``"16:9"``,
+    ``"1:1"``…) est acceptée telle quelle.
+
+    Règles (volontairement simples et vérifiables) :
+      - vide / absente (``""``, ``None``) → ``""`` ⇒ AUCUNE modification du
+        prompt (comportement historique strictement inchangé) ;
+      - valeur parsable ``w:h`` → phrase avec la forme de cadre déduite
+        (``wide`` si w > h, ``tall`` si w < h, ``square`` si w == h) ;
+      - valeur non parsable (``"banane"``) → transmise TELLE QUELLE, sans forme
+        de cadre déduite : on ne devine pas, mais on ne perd pas l'information
+        et on ne lève JAMAIS d'exception (une entrée de node ne doit pas casser
+        un graphe).
+
+    La consigne n'est jamais ajoutée au ``negative_prompt`` ni au mode
+    concaténation (``use_llm=False``) : ce n'est pas du contenu de prompt, mais
+    une instruction de composition pour le LLM.
+
+    Examples:
+        >>> _ratio_instruction("16:9 (landscape)")
+        'Target aspect ratio: 16:9 (landscape) — compose for a wide frame.'
+        >>> _ratio_instruction("")
+        ''
+        >>> _ratio_instruction("banane")
+        'Target aspect ratio: banane.'
+    """
+    if ratio is None:
+        return ""
+    # Une seule ligne : les retours à la ligne d'un widget multiligne casseraient
+    # la lecture de la consigne (et l'assertion de test sur une ligne unique).
+    value = " ".join(str(ratio).split())
+    if not value:
+        return ""
+
+    frame = ""
+    match = _RATIO_VALUE_RE.match(value)
+    if match:
+        try:
+            ratio_w = float(match.group(1).replace(",", "."))
+            ratio_h = float(match.group(2).replace(",", "."))
+        except ValueError:  # pragma: no cover — regex déjà numérique
+            ratio_w = ratio_h = 0.0
+        if ratio_w > 0 and ratio_h > 0:
+            if ratio_w > ratio_h:
+                frame = "wide"
+            elif ratio_w < ratio_h:
+                frame = "tall"
+            else:
+                frame = "square"
+
+    if frame:
+        return f"Target aspect ratio: {value} — compose for a {frame} frame."
+    return f"Target aspect ratio: {value}."
+
+
 def _parse_style_shortlist(raw):
     """Parse la shortlist JSON (ex: '["1","2"]') en liste d'IDs normalisés string.
 
@@ -226,6 +297,13 @@ class AIHEnhanceNode:
                 # JSON sérialisé des éléments (connecté à la sortie elements_json du Elements Picker)
                 "elements": ("STRING", {"forceInput": True, "multiline": True, "default": "[]"}),
                 "llm_config": ("STRING", {"forceInput": True}),
+                # Ratio cible (optionnel), typiquement la sortie « ratio » d'un
+                # node AIHResolutionPreset / AIHResolutionPresetV2 (même type
+                # STRING → branchement direct). Socket seul (pas de widget),
+                # comme `elements` / `llm_config` : les widgets existants et
+                # donc les `widgets_values` des workflows enregistrés ne sont pas
+                # décalés. Vide/absent → comportement historique inchangé.
+                "ratio": ("STRING", {"forceInput": True, "default": ""}),
             }
         }
 
@@ -234,7 +312,8 @@ class AIHEnhanceNode:
 
     def enhance(self, use_llm=True, seed=0, base_prompt="", template_id=0,
                 preset_id=0, output_format="rich", style_id=0, style_shortlist="[]",
-                special_instructions="", elements="[]", llm_config=None, image=None):
+                special_instructions="", elements="[]", llm_config=None, image=None,
+                ratio=""):
         # api_key et api_url lus depuis le fichier de credentials
         api_url = credentials.get_api_url()
         api_key = credentials.get_api_key()
@@ -345,6 +424,21 @@ class AIHEnhanceNode:
         # Ordre unifié : base_prompt + elements (elems_text + elems_raw)
         parts = [p for p in [base_prompt, elems_text, elems_raw] if p]
         combined_text = "\n\n".join(parts)
+
+        # ── Ratio cible (optionnel) ──
+        # Injecté dans le TEXTE USER, et à un SEUL endroit : `combined_text`
+        # alimente (a) le message user du LLM local et (b) `payload['text']` du
+        # backend /api/enhance (qui le recompose en `merged_text` → message user
+        # réellement envoyé au modèle). Les deux chemins portent donc la même
+        # consigne, au même endroit, sans toucher au system prompt ni au
+        # negative_prompt. Vide → aucune modification du prompt (comparaison
+        # exacte verrouillée par tests/test_enhance_ratio.py).
+        # Position résultante IDENTIQUE des deux côtés : la consigne suit le
+        # texte (base_prompt + éléments) et précède le texte de style, car le
+        # backend concatène `text`, EP, random puis style (`_build_merged_text`).
+        ratio_instruction = _ratio_instruction(ratio)
+        if ratio_instruction:
+            combined_text = "\n\n".join(p for p in (combined_text, ratio_instruction) if p)
 
         # Fetch style depuis le backend (style_id déjà résolu si -1 random)
         # Déplacé AVANT la séparation LLM/concaténation pour que style_text

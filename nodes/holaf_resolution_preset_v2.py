@@ -33,7 +33,13 @@ if _NODE_DIR not in _sys.path:
     _sys.path.insert(0, _NODE_DIR)
 
 # MASTER_RESOLUTIONS / ASPECT_RATIOS are read-only imports from the v1 node.
-from holaf_resolution_preset import MASTER_RESOLUTIONS, ASPECT_RATIOS  # noqa: E402  (requires _NODE_DIR above)
+# format_ratio_label is the SINGLE ratio-text formatter of the pack (`"16:9
+# (landscape)"`), shared with the v1 node so both nodes emit the SAME string.
+from holaf_resolution_preset import (  # noqa: E402  (requires _NODE_DIR above)
+    ASPECT_RATIOS,
+    MASTER_RESOLUTIONS,
+    format_ratio_label,
+)
 
 logger = logging.getLogger("Holaf.ResolutionPresetV2")
 
@@ -117,6 +123,11 @@ class HolafResolutionPresetV2:
       - a "Megapixels" mode that computes a resolution from a pixel budget,
       - an orientation-aware ratio selection (portrait vs landscape),
       - optional image-ratio matching across the 9 oriented values.
+
+    A third output ``ratio`` (STRING, appended LAST so width/height keep their
+    slots) describes the ratio actually applied, formatted by
+    ``holaf_resolution_preset.format_ratio_label`` → ``"16:9 (landscape)"``.
+    It is meant to be wired straight into the AIHPromptEnhancer ``ratio`` input.
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -136,8 +147,11 @@ class HolafResolutionPresetV2:
             },
         }
 
-    RETURN_TYPES = ("INT", "INT")
-    RETURN_NAMES = ("width", "height")
+    # The 3rd output ("ratio") is APPENDED LAST: width/height keep their slot
+    # indexes, so links in saved workflows stay valid. Its type is STRING so it
+    # plugs DIRECTLY into the AIHPromptEnhancer ``ratio`` input (intended use).
+    RETURN_TYPES = ("INT", "INT", "STRING")
+    RETURN_NAMES = ("width", "height", "ratio")
     FUNCTION = "get_resolution"
     CATEGORY = "AIH/Image"
 
@@ -184,16 +198,25 @@ class HolafResolutionPresetV2:
         # 2. Megapixels mode: compute an optimal resolution from the budget.
         if model_type == "Megapixels":
             width, height = self._megapixels_resolution(short, orientation, megapixels, multiple_of)
-            logger.info("Megapixels mode: %.2f MP @ %s -> %dx%d", megapixels, RATIO_KEY_MAP[short][1 if orientation else 0], width, height)
-            return (width, height)
+            ratio_key = RATIO_KEY_MAP[short][1 if orientation else 0]
+            logger.info("Megapixels mode: %.2f MP @ %s -> %dx%d", megapixels, ratio_key, width, height)
+            # Ratio EFFECTIVELY applied (drawn value when aspect_ratio=Random,
+            # image-derived when use_image_ratio) — never the raw widget.
+            return (width, height, format_ratio_label(ratio_key))
 
         # 3. Master table mode: deterministic lookup in MASTER_RESOLUTIONS.
-        width, height = self._master_resolution(model_type, use_hd, short, orientation)
-        logger.info("Selected: %s%s @ %s -> %dx%d", model_type, " (HD)" if use_hd else "", RATIO_KEY_MAP[short][1 if orientation else 0], width, height)
-        return (width, height)
+        width, height, ratio_key = self._master_resolution(model_type, use_hd, short, orientation)
+        logger.info("Selected: %s%s @ %s -> %dx%d", model_type, " (HD)" if use_hd else "", ratio_key, width, height)
+        return (width, height, format_ratio_label(ratio_key))
 
     def _master_resolution(self, model_type, use_hd, short, orientation):
-        """Deterministic lookup in MASTER_RESOLUTIONS (mirrors the v1 node)."""
+        """Deterministic lookup in MASTER_RESOLUTIONS (mirrors the v1 node).
+
+        Returns ``(width, height, ratio_key)``: ``ratio_key`` is the full
+        ASPECT_RATIOS / MASTER_RESOLUTIONS key ACTUALLY used for the lookup, so
+        the ``ratio`` output describes the applied ratio (including the 1:1
+        fallback), never the raw widget value.
+        """
         if model_type in HD_MAP:
             master_key = HD_MAP[model_type][1 if use_hd else 0]
         else:
@@ -214,7 +237,7 @@ class HolafResolutionPresetV2:
             full_key = "1:1 Square (Instagram-Medium Format)"
 
         width, height = MASTER_RESOLUTIONS[master_key][full_key]
-        return (int(width), int(height))
+        return (int(width), int(height), full_key)
 
     def _megapixels_resolution(self, short, orientation, megapixels, multiple_of):
         """Compute a resolution from a megapixel budget and the oriented ratio."""

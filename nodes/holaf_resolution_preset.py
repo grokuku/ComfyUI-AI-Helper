@@ -14,6 +14,7 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import math
+import re
 import sys
 import random
 import logging
@@ -211,6 +212,44 @@ MASTER_RESOLUTIONS = {
 }
 
 
+# ── Sortie « ratio » (texte) ────────────────────────────────────────────────
+# Format UNIQUE du pack, partagé par cette node, la v2 et le Prompt Enhancer :
+#     "<w:h> (<orientation>)"   ex. "16:9 (landscape)", "1:1 (square)"
+# Choix justifié : le premier jeton "16:9" est celui qu'un LLM sait interpréter
+# ET qu'un code aval peut re-parser (regex `(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)`),
+# et le mot d'orientation en anglais lève l'ambiguïté des ratios réciproques
+# (9:16 portrait vs 16:9 paysage) — l'erreur la plus fréquente des modèles.
+# Refusé : "1.778 (16:9)" (bruit float) et "16:9 — 1920×1080" (ment quand les
+# dimensions sont arrondies au multiple et duplique les sorties width/height).
+_RATIO_KEY_RE = re.compile(
+    r"^\s*~?\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s+(Portrait|Landscape|Square)\b"
+)
+
+
+def format_ratio_label(ratio_key):
+    """Clé de ratio (table ``ASPECT_RATIOS`` / ``MASTER_RESOLUTIONS``) → texte.
+
+    Exemples :
+        "16:9 Landscape (HD Video-Widescreen)" → ``"16:9 (landscape)"``
+        "1:1 Square (Instagram-Medium Format)"  → ``"1:1 (square)"``
+        "~2.39:1 Landscape (Anamorphic Cinema)" → ``"2.39:1 (landscape)"``
+
+    La valeur décrit l'**INTENTION** de cadrage, PAS le rapport exact des pixels
+    produits : les dimensions sont arrondies (multiple de N en mode mégapixels,
+    buckets du modèle en mode table), donc 1344×768 vaut ``"16:9 (landscape)"``
+    alors que 1344/768 = 1.75. C'est volontaire : c'est le format que le LLM doit
+    composer, pas une mesure.
+
+    Clé inconnue / inattendue → renvoyée telle quelle (jamais d'exception :
+    cette fonction alimente une sortie de node, elle ne doit pas casser un graphe).
+    """
+    match = _RATIO_KEY_RE.match(str(ratio_key or ""))
+    if not match:
+        return str(ratio_key or "").strip()
+    width, height, orientation = match.group(1), match.group(2), match.group(3)
+    return f"{width}:{height} ({orientation.lower()})"
+
+
 class HolafResolutionPreset:
     @classmethod
     def INPUT_TYPES(cls):
@@ -225,8 +264,12 @@ class HolafResolutionPreset:
             }
         }
 
-    RETURN_TYPES = ("INT", "INT")
-    RETURN_NAMES = ("width", "height")
+    # La 3e sortie (« ratio ») est AJOUTÉE EN DERNIER : les slots width/height
+    # gardent leur index, donc les liens des workflows enregistrés restent
+    # valides. Elle est de type STRING pour se brancher DIRECTEMENT sur l'entrée
+    # ``ratio`` de la node AIHPromptEnhancer (interopérabilité voulue).
+    RETURN_TYPES = ("INT", "INT", "STRING")
+    RETURN_NAMES = ("width", "height", "ratio")
     FUNCTION = "get_resolution"
     CATEGORY = "AIH/Image"
 
@@ -266,7 +309,9 @@ class HolafResolutionPreset:
         width, height = MASTER_RESOLUTIONS[model_type][target_ratio_name]
 
         logger.info(f"Selected: {model_type} @ {target_ratio_name}. Resolution: {width}x{height}")
-        return (width, height)
+        # Ratio EFFECTIVEMENT retenu (choix du widget, ratio déduit de l'image ou
+        # tirage « Random » déjà résolu ci-dessus) — jamais le widget brut.
+        return (width, height, format_ratio_label(target_ratio_name))
 
 
 # === ComfyUI node registration =============================================
