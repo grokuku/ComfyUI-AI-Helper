@@ -7,6 +7,12 @@ import re
 import traceback
 import json
 
+# --- Emplacement des données utilisateur (source de vérité : holaf_user_paths) ---
+try:  # import relatif (pack importé comme extension ComfyUI)
+    from . import holaf_user_paths as _user_paths
+except ImportError:  # chargé à plat (sys.path = racine du pack, tests par chemin)
+    import holaf_user_paths as _user_paths
+
 CONFIG_LOCK = asyncio.Lock()
 IS_WINDOWS = platform.system() == "Windows" # Needed for default shell
 
@@ -51,7 +57,13 @@ SENSITIVE_KEY_PATTERN = re.compile(
 )
 
 def get_config_path():
-    return os.path.join(os.path.dirname(__file__), 'config.ini')
+    """Chemin du config.ini des panneaux.
+
+    Nouveau : <ComfyUI>/user/default/AI-Helper/config/config.ini (la migration
+    le déplace hors du pack). Repli sur l'ancien emplacement (racine du pack)
+    tant que rien n'a été migré : aucune préférence utilisateur perdue.
+    """
+    return _user_paths.resolved_config()
 
 def get_config_parser():
     config = configparser.ConfigParser()

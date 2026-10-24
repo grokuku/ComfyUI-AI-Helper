@@ -49,6 +49,14 @@ from pathlib import Path
 
 from aih import store
 
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths). Les refs music3 suivent la migration (nouveau
+# <user>/default/AI-Helper/data/music3/, ancien aihelper/data/music3 sinon).
+try:  # import à plat (aih/__init__.py a mis la racine du pack dans sys.path)
+    import holaf_user_paths as _user_paths
+except ImportError:  # pack importé comme package : import relatif
+    from .. import holaf_user_paths as _user_paths
+
 _LOG = logging.getLogger("aih.sync")
 
 # Limite max de pages pour éviter une boucle infinie en cas de curseur défaillant.
@@ -822,15 +830,11 @@ def sync_music3_local(api_url, api_key):
         list: [] en cas d'erreur (détail dans le log).
     """
     try:
-        store_path = store.get_store_path()
-        user_dir = store_path.parent.parent.parent
-        # ⚠️ Anomalie historique VOLONTAIREMENT préservée : le calcul remonte à
-        # <user>/default/ puis réinsère "aihelper" (héritage de l'ancien layout
-        # d'AI-Helper, avant la migration vers aih/) → les refs music3 vivent
-        # réellement sous user/default/aihelper/data/music3/, et NON sous
-        # user/default/aih/. Ne PAS "corriger" sans prévoir la migration des
-        # données existantes des utilisateurs.
-        music3_dir = os.path.join(user_dir, "aihelper", "data", "music3")
+        # Emplacement HISTORIQUE (user/default/aihelper/data/music3, héritage du
+        # layout d'AI-Helper avant aih/) : résolu par holaf_user_paths, qui suit
+        # la migration vers <user>/default/AI-Helper/data/music3/ et retombe sur
+        # l'ancien chemin tant que rien n'a été déplacé.
+        music3_dir = _user_paths.resolved_music3_dir()
         refs_dir = os.path.join(music3_dir, "references")
 
         manifest = _http_get_json(

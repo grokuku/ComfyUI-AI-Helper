@@ -59,6 +59,31 @@ _AIH_PACK_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _AIH_PACK_ROOT not in sys.path:
     sys.path.insert(0, _AIH_PACK_ROOT)
 
+# --- Données utilisateur : arborescence + migration, AVANT tout consommateur --
+# Motif utilisateur, cité tel quel : « mon but c'est d'alléger mon dossier de
+# custom nodes ». La base principale (holaf_utilities.sqlite, 1,8 Go à elle
+# seule dans custom_nodes/ComfyUI-AI-Helper) et les autres données du pack
+# doivent vivre sous <ComfyUI>/user/default/AI-Helper/ (surchargeable par l'env
+# AIH_USER_ROOT). L'appel doit précéder l'import des sous-modules ci-dessous :
+# sans cela un consommateur ouvrirait la base DANS le pack avant que la
+# migration ne l'ait déplacée.
+#
+# ⚠️ GARDE-FOU PERMANENT (risque de perte de données) : la migration DÉPLACE
+# les données ; si un consommateur lisait encore l'ancien emplacement, le pack
+# créerait une base neuve et IGNORERAIT les 1,8 Go de données utilisateur.
+# holaf_user_paths.migration_blocked_reason() refuse donc toute migration tant
+# que CONSUMERS_WIRED est False — verrou ABSOLU, insensible à l'environnement et
+# à force=True : il a valu False pendant toute la phase 1 (migration prête mais
+# DÉSACTIVÉE, consommateurs non branchés) et ne vaut True que depuis la fin de
+# la phase 2, où TOUS les consommateurs lisent les accesseurs resolved_* — ou
+# tant que AIH_USER_MIGRATION_ENABLED=0 (opt-out explicite). L'appel ci-dessous
+# journalise la raison d'un éventuel report et ne bloque jamais le démarrage.
+try:
+    from .holaf_user_paths import ensure_once as _holaf_ensure_user_data_layout
+    _holaf_ensure_user_data_layout()
+except Exception as _user_paths_err:  # noqa: BLE001 — ne jamais casser le démarrage de ComfyUI
+    print(f"🔴 [Holaf-UserPaths] Unexpected error during user data layout: {_user_paths_err}")
+
 import server
 import asyncio
 import json

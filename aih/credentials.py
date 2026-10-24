@@ -18,10 +18,11 @@ des nodes (source de bugs d'index et de fuites dans les workflows exportes).
 Elles sont stockees dans un fichier local que les nodes Python lisent
 directement via ce helper.
 
-Emplacement du fichier : <ComfyUI>/user/default/aih/credentials.json
-(ou fallback : <ComfyUI>/user/aih/credentials.json si pas de sous-dossier default/)
-⚠️ Chemin conservé À L'IDENTIQUE de l'extension AI-Helper d'origine pour ne pas
-perdre les credentials existants des utilisateurs.
+Emplacement du fichier : <ComfyUI>/user/default/AI-Helper/config/credentials.json
+après migration (résolu par holaf_user_paths.resolved_credentials()).
+Repli sur le chemin historique <ComfyUI>/user/default/aih/credentials.json
+(ou <ComfyUI>/user/aih/credentials.json si pas de sous-dossier default/)
+tant que la migration n'a rien déplacé : aucun credentials existant perdu.
 
 Format JSON :
 {
@@ -40,6 +41,14 @@ import json
 import os
 import logging
 import re
+
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths). Repli sur la chaîne de candidats historique tant que la
+# migration n'a rien déplacé : aucun credentials perdu.
+try:  # import à plat (aih/__init__.py a mis la racine du pack dans sys.path)
+    import holaf_user_paths as _user_paths
+except ImportError:  # pack importé comme package : import relatif
+    from .. import holaf_user_paths as _user_paths
 
 _CREDENTIALS_CACHE = None
 _CREDENTIALS_PATH = None
@@ -81,53 +90,32 @@ def _migrate_to_aih_subfolder(old_path, new_path):
 def get_credentials_path():
     """
     Retourne le chemin du fichier de credentials.
-    Utilise folder_paths.get_user_directory() (= ComfyUI/user/).
+
+    Résolution unique : holaf_user_paths.resolved_credentials() →
+    <user>/default/AI-Helper/config/credentials.json si la migration l'a
+    déplacé, sinon le premier emplacement historique encore présent
+    (user/default/aih/credentials.json, user/aih/…, ~/.config/comfyui/…).
     """
     global _CREDENTIALS_PATH
     if _CREDENTIALS_PATH is not None:
         return _CREDENTIALS_PATH
 
-    candidates = []
+    # Migration paresseuse depuis l'ancien emplacement plat (aih_credentials.json)
     try:
         import folder_paths
         user_dir = folder_paths.get_user_directory()
-        # Nouvel emplacement : user/default/aih/credentials.json
-        new_path = os.path.join(user_dir, "default", "aih", "credentials.json")
-        # Migration depuis l'ancien emplacement : user/default/aih_credentials.json
-        old_path = os.path.join(user_dir, "default", "aih_credentials.json")
-        _migrate_to_aih_subfolder(old_path, new_path)
-        candidates.append(new_path)
-        # Fallback : user/aih/credentials.json (sans sous-dossier default/)
-        candidates.append(os.path.join(user_dir, "aih", "credentials.json"))
     except Exception:
-        pass
+        user_dir = None
+    if user_dir:
+        try:
+            _migrate_to_aih_subfolder(
+                os.path.join(user_dir, "default", "aih_credentials.json"),
+                os.path.join(user_dir, "default", "aih", "credentials.json"),
+            )
+        except Exception as exc:  # pragma: no cover - défensif
+            logging.warning(f"[AIH] credentials: migration paresseuse ignorée ({exc})")
 
-    # Fallback hors runtime ComfyUI : la racine ComfyUI via
-    # folder_paths.base_path (JAMAIS custom_nodes/).
-    try:
-        import folder_paths
-        base = getattr(folder_paths, "base_path", None)
-        if base:
-            cand = os.path.join(base, "user", "default", "aih", "credentials.json")
-            if os.path.isdir(os.path.dirname(cand)):
-                candidates.append(cand)
-    except Exception:
-        pass
-
-    # Fallback final : home
-    candidates.append(os.path.expanduser("~/.config/comfyui/aih/credentials.json"))
-    candidates.append(os.path.expanduser("~/.aih/credentials.json"))
-
-    for p in candidates:
-        if os.path.isfile(p):
-            _CREDENTIALS_PATH = p
-            return p
-
-    # Pas de fichier : retourner le premier candidat (pour save)
-    if candidates:
-        _CREDENTIALS_PATH = candidates[0]
-    else:
-        _CREDENTIALS_PATH = os.path.expanduser("~/.aih/credentials.json")
+    _CREDENTIALS_PATH = _user_paths.resolved_credentials()
     return _CREDENTIALS_PATH
 
 

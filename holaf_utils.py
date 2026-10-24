@@ -5,6 +5,19 @@ import shutil
 import aiofiles
 import hashlib # MODIFIED: Added for checksum calculation
 
+# --- Emplacement des données utilisateur (source de vérité : holaf_user_paths) ---
+# Les miniatures et les fichiers temporaires ne doivent PAS vivre dans
+# custom_nodes/ComfyUI-AI-Helper (le but est d'alléger ce dossier) :
+#   - miniatures → <user>/default/AI-Helper/cache/thumbnails (migré) ;
+#   - temp       → dossier TEMPORAIRE de ComfyUI, dans un sous-dossier propre au
+#                  pack (jamais le temp de ComfyUI lui-même : il est vidé au
+#                  démarrage par shutil.rmtree).
+# Repli intégral sur les anciens chemins tant que rien n'a été migré.
+try:  # import relatif (pack importé comme extension ComfyUI)
+    from . import holaf_user_paths as _user_paths
+except ImportError:  # chargé à plat (sys.path = racine du pack, tests par chemin)
+    import holaf_user_paths as _user_paths
+
 # --- Path and Filename Sanitization ---
 def sanitize_filename(filename):
     if not filename: return "untitled"
@@ -51,9 +64,13 @@ def sanitize_path_canon(path_canon):
 
 # --- File and Directory Paths ---
 BASE_DIR = os.path.dirname(__file__)
-TEMP_UPLOAD_DIR = os.path.join(BASE_DIR, 'temp_uploads')
-TEMP_EXPORT_DIR = os.path.join(BASE_DIR, 'temp_exports') # ADDED
-THUMBNAIL_CACHE_DIR = os.path.join(BASE_DIR, '.cache', 'thumbnails')
+TEMP_UPLOAD_DIR = _user_paths.resolved_temp_dir(
+    'temp_uploads', os.path.join(BASE_DIR, 'temp_uploads')
+)
+TEMP_EXPORT_DIR = _user_paths.resolved_temp_dir(
+    'temp_exports', os.path.join(BASE_DIR, 'temp_exports')
+) # ADDED
+THUMBNAIL_CACHE_DIR = _user_paths.resolved_thumb_cache()
 THUMBNAIL_SIZE = (200, 200) # Global, but related to image viewer / thumbnails
 
 def ensure_directories_exist():

@@ -1,12 +1,36 @@
+import os
 import sqlite3
 import json
 import time
 import threading
-from .holaf_user_data_manager import UserDataManager
+
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths). La base du profiler vit dans profiler/ de la racine
+# utilisateur du pack ; le repli sur l'ancien emplacement est assuré par
+# resolved_db_profiler().
+try:  # import relatif (pack importé comme extension ComfyUI)
+    from . import holaf_user_paths as _user_paths
+except ImportError:  # chargé à plat (sys.path = racine du pack, tests par chemin)
+    import holaf_user_paths as _user_paths
+
+
+def _profiler_db_path():
+    """Chemin de holaf_profiler.db (+ création du dossier parent).
+
+    Passer par holaf_user_paths évite une DEUXIÈME source de vérité (ce module
+    calculait son chemin via UserDataManager, qui le délègue désormais au même
+    helper). Le dossier parent est créé : la base est ouverte directement.
+    """
+    path = _user_paths.resolved_db_profiler()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
+
 
 class ProfilerDatabase:
     def __init__(self):
-        self.db_path = UserDataManager.get_profiler_db_path()
+        self.db_path = _profiler_db_path()
         self._local = threading.local()
         self._init_db()
 

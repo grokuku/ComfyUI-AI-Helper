@@ -244,10 +244,29 @@ def test_nodes_manager_update_allows_legacy(tmp_path, monkeypatch):
 #    dossier nommé ComfyUI-Holaf*.
 # ---------------------------------------------------------------------------
 
-def test_our_database_lives_in_our_own_pack_folder():
+def test_our_database_lives_in_our_own_pack_folder(tmp_path, monkeypatch):
+    """Sans migration (état historique), la base est bien dans NOTRE dossier.
+
+    ⚠️ Depuis la phase 2 du chantier « données utilisateur », cet emplacement
+    n'est plus qu'un REPLI : la base part vers
+    <user>/default/AI-Helper/db/ dès que la migration a lieu. L'invariant
+    vérifié ici reste le même : jamais de chemin dérivé d'un dossier nommé
+    ComfyUI-Holaf*.
+    """
+    monkeypatch.setenv("AIH_SKIP_USER_MIGRATION", "1")
     module = _load_module("holaf_database_path_proof", PACKAGE_DIR / "holaf_database.py")
     assert Path(module.DB_DIR).resolve() == PACKAGE_DIR.resolve()
     assert Path(module.DB_PATH).resolve() == (PACKAGE_DIR / "holaf_utilities.sqlite").resolve()
+
+    # Et une fois la migration faite (racine utilisateur explicite, comme en
+    # production), la MÊME source de vérité renvoie la cible migrée.
+    target_root = tmp_path / "AI-Helper"
+    (target_root / "db").mkdir(parents=True)
+    (target_root / "db" / "holaf_utilities.sqlite").write_bytes(b"DB")
+    monkeypatch.setenv("AIH_USER_ROOT", str(target_root))
+    migrated = _load_module("holaf_database_path_proof_migrated",
+                            PACKAGE_DIR / "holaf_database.py")
+    assert Path(migrated.DB_PATH) == target_root / "db" / "holaf_utilities.sqlite"
 
 
 def test_user_data_root_is_ai_helper_never_legacy(tmp_path, monkeypatch):
@@ -261,6 +280,13 @@ def test_user_data_root_is_ai_helper_never_legacy(tmp_path, monkeypatch):
 
 
 def test_aih_store_lives_under_user_aih_never_legacy(tmp_path, monkeypatch):
+    """Sans migration, le store garde l'ancien emplacement (repli phase 2).
+
+    Le chemin migré (<user>/default/AI-Helper/db/aihelper.db) et la preuve qu'il
+    est réellement lu après migration sont couverts par
+    tests/test_user_paths_consumers.py.
+    """
+    monkeypatch.setenv("AIH_SKIP_USER_MIGRATION", "1")
     monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(base_path=str(tmp_path)))
     module = _load_module("aih_store_path_proof", PACKAGE_DIR / "aih" / "store.py")
 

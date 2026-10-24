@@ -20,11 +20,15 @@ Les handlers testés sont le CODE RÉEL de ``aih/routes.py``, extrait par AST et
 servi par une vraie app aiohttp ; ``blobby.json`` pointe vers ``tmp_path``.
 
 ⚠️ Pas d'import du package ``aih`` complet (évite la dépendance ComfyUI) :
-``folder_paths`` est simulé via ``sys.modules``.
+``folder_paths`` est simulé via ``sys.modules``. Depuis la phase 2 du chantier
+« données utilisateur », ``_get_blobby_file`` délègue la résolution du chemin à
+``holaf_user_paths`` : ce module est donc chargé par chemin et injecté dans le
+namespace des handlers.
 """
 
 import ast
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -62,7 +66,21 @@ def blobby_ns(tmp_path, monkeypatch):
     fake_folder_paths.get_user_directory = lambda: str(tmp_path)
     monkeypatch.setitem(sys.modules, "folder_paths", fake_folder_paths)
 
-    ns = {"os": os, "json": json, "web": web, "logging": logging}
+    # La migration des données utilisateur ne doit JAMAIS s'exécuter pendant les
+    # tests (garde absolue) : avec ce verrou, holaf_user_paths rend l'ANCIEN
+    # chemin (default/aih/blobby.json) → aucune donnée réelle touchée et le
+    # test reste déterministe quel que soit le harnais.
+    monkeypatch.setenv("AIH_SKIP_USER_MIGRATION", "1")
+    monkeypatch.delenv("AIH_USER_ROOT", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "holaf_user_paths_for_blobby_test", PACKAGE_DIR / "holaf_user_paths.py"
+    )
+    user_paths = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(user_paths)
+
+    ns = {"os": os, "json": json, "web": web, "logging": logging,
+          "_user_paths": user_paths}
     _extract_functions(
         ROUTES_FILE,
         {"aih_blobby_exec_route", "aih_blobby_save_route",

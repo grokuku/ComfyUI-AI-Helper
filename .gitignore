@@ -12,6 +12,10 @@ config.ini.tmp
 *.sqlite3
 *.sqlite-journal
 *.sqlite-wal
+# Sidecars WAL/SHM et sauvegardes de migration de schéma : ces fichiers sont des
+# données d'utilisateur, jamais du code (cf. holaf_user_paths.py).
+*.sqlite-shm
+*.sqlite.backup_*
 
 # ── Cache & artefacts temporaires (téléchargements, exports, binaires) ─
 .cache/

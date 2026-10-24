@@ -8,8 +8,21 @@ import hashlib # Required for migration logic
 
 # --- Constants ---
 DB_NAME = "holaf_utilities.sqlite"
-DB_DIR = os.path.dirname(__file__) # In the extension's root directory
-DB_PATH = os.path.join(DB_DIR, DB_NAME)
+
+# --- User data location (SINGLE SOURCE OF TRUTH: holaf_user_paths) ---
+# Emplacement historique : la RACINE DU PACK (ce qui alourdissait
+# custom_nodes/ComfyUI-AI-Helper : 1,8 Go pour cette seule base).
+# holaf_user_paths.resolved_db_utils() renvoie le NOUVEAU chemin
+# (<ComfyUI>/user/default/AI-Helper/db/…) dès que la migration l'a déplacé, et
+# l'ANCIEN chemin tant que rien n'a été migré : comportement inchangé sur une
+# installation non migrée, aucune base neuve créée à côté des données.
+try:  # import relatif (pack importé comme extension ComfyUI)
+    from . import holaf_user_paths as _user_paths
+except ImportError:  # chargé à plat (sys.path = racine du pack, tests par chemin)
+    import holaf_user_paths as _user_paths
+
+DB_PATH = _user_paths.resolved_db_utils()
+DB_DIR = os.path.dirname(DB_PATH)
 # --- SINGLE SOURCE OF TRUTH FOR DB SCHEMA ---
 # Increment this number whenever you make a change to the table structures below.
 # Version 13: Performance Tuning (Composite Indexes + WAL/MMAP Optimizations)
@@ -252,8 +265,13 @@ def _migrate_database_by_copy(current_db_version):
 
     # 1. Rename old database to create a backup
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    backup_path = f"{DB_PATH}.backup_v{current_db_version}_{timestamp}"
+    # Sauvegardes : backups/ de la racine utilisateur une fois l'arborescence en
+    # place, sinon à côté de la base effectivement utilisée (ancien comportement).
+    backup_path = os.path.join(
+        _user_paths.resolved_backups_dir(), f"{DB_NAME}.backup_v{current_db_version}_{timestamp}"
+    )
     try:
+        os.makedirs(os.path.dirname(backup_path), exist_ok=True)
         shutil.move(DB_PATH, backup_path)
         print(f"  > Backed up old database to: {os.path.basename(backup_path)}")
     except Exception as e:

@@ -41,6 +41,15 @@ import sqlite3
 import uuid
 from pathlib import Path
 
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths). Repli intégral sur l'ancien chemin
+# (<user>/default/aih/data/aihelper.db, puis user_data/aih/ du pack) tant que
+# rien n'a été migré : aucune donnée locale perdue.
+try:  # import relatif (aih est un sous-package du pack)
+    from .. import holaf_user_paths as _user_paths
+except ImportError:  # chargé à plat (tests par chemin, sys.path = racine du pack)
+    import holaf_user_paths as _user_paths
+
 # Collections mises en miroir localement (ordre = ordre du backend).
 MIRROR_TABLES = (
     "keywords",
@@ -68,44 +77,30 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def _get_aih_user_dir():
     """Dossier user/default/aih de ComfyUI.
 
-    En runtime ComfyUI, passe par folder_paths.get_user_directory(). Hors
-    runtime (tests), on retombe sur la racine ComfyUI via
-    folder_paths.base_path ; dernier recours : un dossier user_data/aih
-    DANS le pack (jamais custom_nodes/).
+    ⚠️ Cet emplacement est HISTORIQUE (miroirs de collections). La base elle-même
+    est désormais résolue par holaf_user_paths (voir get_store_path) : ce helper
+    reste pour les appelants qui ont besoin du dossier d'origine.
 
     Retourne:
         str: Chemin absolu vers user/default/aih.
     """
-    # 1) Source canonique : ComfyUI user directory
-    try:
-        import folder_paths
-        user_dir = folder_paths.get_user_directory()
-        if user_dir:
-            return os.path.join(user_dir, "default", "aih")
-    except Exception:
-        pass
-    # 2) Fallback sûr : la racine ComfyUI (folder_paths.base_path), JAMAIS custom_nodes
-    try:
-        base = getattr(folder_paths, "base_path", None)
-        if base:
-            d = os.path.join(base, "user", "default", "aih")
-            os.makedirs(d, exist_ok=True)
-            return d
-    except Exception:
-        pass
-    # 3) Dernier recours : DANS le pack lui-même (jamais custom_nodes/)
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data", "aih")
+    # 1) Source canonique : ComfyUI user directory (résolution UNIQUE, qui gère
+    #    --user-directory ; auparavant recalculée ici → divergence possible)
+    return _user_paths.legacy_aih_dir()
 
 
 def get_store_path():
     """Chemin du fichier SQLite local.
 
+    Nouveau : <user>/default/AI-Helper/db/aihelper.db (migré). Repli sur
+    l'ancien <user>/default/aih/data/aihelper.db tant que rien n'a été migré.
+
     Retourne:
-        Path: {user_dir}/aihelper/data/aihelper.db, avec les parents créés.
+        Path: chemin du fichier, avec le dossier parent créé.
     """
-    data_dir = os.path.join(_get_aih_user_dir(), "data")
-    os.makedirs(data_dir, exist_ok=True)
-    return Path(data_dir) / "aihelper.db"
+    path = os.path.abspath(_user_paths.resolved_db_aih())
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return Path(path)
 
 
 def get_conn():

@@ -34,6 +34,15 @@ PYTHON="${PYTHON:-python3}"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
+# ── GARDE ANTI-TEST (obligatoire) ───────────────────────────────────────
+# Ce script importe les modules du pack par chemin absolu. Sans cette garde,
+# l'appel de holaf_user_paths.ensure_user_data_layout() (__init__.py) pourrait
+# DÉPLACER les vraies données de l'utilisateur (base holaf_utilities.sqlite,
+# config.ini, credentials…) depuis custom_nodes vers user/default/AI-Helper
+# pendant une simple exécution de tests. Les tests de migration eux-mêmes
+# forcent explicitement (force=True) sur de FAUX arbres en tmp_path.
+export AIH_SKIP_USER_MIGRATION=1
+
 cd "$WORK_DIR"
 "$PYTHON" -m pytest "$SCRIPT_DIR/tests" --import-mode=importlib "$@"
 PYTEST_STATUS=$?

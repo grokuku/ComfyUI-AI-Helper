@@ -58,6 +58,13 @@ try:
 except Exception:
     _HAS_FOLDER_PATHS = False
 
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths). AIH_SFTP_KNOWN_HOSTS reste prioritaire (p_known_hosts).
+try:  # import à plat (aih/__init__.py a mis la racine du pack dans sys.path)
+    import holaf_user_paths as _user_paths
+except ImportError:  # pack importé comme package : import relatif
+    from .. import holaf_user_paths as _user_paths
+
 # Chunk size pour l'upload (doit correspondre au backend)
 CHUNK_SIZE = 25 * 1024 * 1024  # 25 MB
 
@@ -97,9 +104,10 @@ def _sftp_connect(sftp_config):
                     f"Impossible de persister la host key TOFU ({self._path}) : {exc}"
                 ) from exc
 
-    known_hosts = os.environ.get("AIH_SFTP_KNOWN_HOSTS") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", ".sftp_known_hosts"
-    )
+    # Clés d'hôte SFTP (TOFU) : AIH_SFTP_KNOWN_HOSTS explicite gagne ; sinon
+    # <user>/default/AI-Helper/config/sftp_known_hosts après migration, avec
+    # repli sur les anciens emplacements (custom_nodes/.sftp_known_hosts).
+    known_hosts = _user_paths.resolved_known_hosts()
     ssh = paramiko.SSHClient()
     if os.path.exists(known_hosts):
         ssh.load_host_keys(known_hosts)

@@ -11,6 +11,15 @@ Couvre Ollama, OpenAI, DeepSeek, Mistral, Groq, etc.
 """
 import json
 import logging
+import os
+
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths), avec repli sur l'ancien emplacement tant que rien n'a été
+# migré (user/default/aih/openai_keys.json → config/openai_keys.json).
+try:  # import relatif (pack importé comme extension ComfyUI)
+    from .. import holaf_user_paths as _user_paths
+except ImportError:  # chargé à plat (sys.path = racine du pack, tests par chemin)
+    import holaf_user_paths as _user_paths
 
 class AIHOpenAISettingsNode:
     CATEGORY = "AIH/Prompting"
@@ -51,27 +60,9 @@ class AIHOpenAISettingsNode:
         key = api_key.strip() if api_key else ""
         if not key:
             try:
-                import os, json
-                # Utiliser folder_paths pour trouver le dossier utilisateur
-                keys_path = None
-                try:
-                    import folder_paths
-                    user_dir = folder_paths.get_user_directory()
-                    if user_dir:
-                        keys_path = os.path.join(user_dir, "default", "aih", "openai_keys.json")
-                except Exception:
-                    pass
-                if keys_path is None:
-                    # Fallback sûr : la racine ComfyUI (folder_paths.base_path), JAMAIS custom_nodes
-                    try:
-                        comfy_base = getattr(folder_paths, "base_path", None)
-                        if comfy_base:
-                            keys_path = os.path.join(comfy_base, "user", "default", "aih", "openai_keys.json")
-                    except Exception:
-                        pass
-                if keys_path is None:
-                    # Dernier recours : DANS le pack lui-même (jamais custom_nodes/)
-                    keys_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data", "aih", "openai_keys.json")
+                # Chemin résolu par holaf_user_paths (nouveau emplacement migré,
+                # sinon l'ancien : aucune clé utilisateur perdue).
+                keys_path = _user_paths.resolved_openai_keys()
                 if os.path.isfile(keys_path):
                     with open(keys_path, "r", encoding="utf-8") as f:
                         data = json.load(f)

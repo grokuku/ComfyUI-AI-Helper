@@ -94,6 +94,17 @@ from aiohttp import web
 # (ex ancien helper _credentials du monorepo AI-Helper, renommé aih.credentials au chantier A).
 from aih import credentials
 
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths). Tous les fichiers ci-dessous (presets, clés OpenAI,
+# blobby.json, music3) sont résolus par ses accesseurs resolved_*, avec repli
+# intégral sur les anciens chemins tant que la migration n'a rien déplacé.
+# ⚠️ Le dossier user/default/workflows/ (partagé avec le core ComfyUI via
+# /api/userdata) n'est PAS concerné : il reste calculé à part, plus bas.
+try:  # import à plat (aih/__init__.py a mis la racine du pack dans sys.path)
+    import holaf_user_paths as _user_paths
+except ImportError:  # pack importé comme package : import relatif
+    from .. import holaf_user_paths as _user_paths
+
 # Racine du pack (routes.py vit dans <pack>/aih/). Utilisée par le groupe
 # « local » pour localiser aih_frontend/.
 _PACK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -146,33 +157,22 @@ def extension_assets_no_cache_headers(headers, path, extension_name):
 def _get_aih_user_dir():
     """Dossier user/default/aih de ComfyUI (identique à la source AI-Helper).
 
-    ⚠️ Chemin conservé À L'IDENTIQUE (presets, clés OpenAI, blobby.json...)
-    pour ne pas perdre les données des utilisateurs d'AI-Helper.
+    ⚠️ Emplacement HISTORIQUE conservé pour les miroirs AIH (presets, clés
+    OpenAI, blobby.json...). La résolution est déléguée à holaf_user_paths
+    (get_user_directory() d'abord : gestion de --user-directory) ; les fichiers
+    eux-mêmes sont désormais résolus par les accesseurs resolved_* ci-dessous,
+    qui suivent la migration vers user/default/AI-Helper/.
     """
-    # 1) Source canonique : ComfyUI user directory
-    try:
-        import folder_paths
-        user_dir = folder_paths.get_user_directory()
-        if user_dir:
-            return os.path.join(user_dir, "default", "aih")
-    except Exception:
-        pass
-    # 2) Fallback sûr : la racine ComfyUI (folder_paths.base_path), JAMAIS custom_nodes
-    try:
-        base = getattr(folder_paths, "base_path", None)
-        if base:
-            d = os.path.join(base, "user", "default", "aih")
-            os.makedirs(d, exist_ok=True)
-            return d
-    except Exception:
-        pass
-    # 3) Dernier recours : DANS le pack lui-même (jamais custom_nodes/)
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "user_data", "aih")
+    return _user_paths.legacy_aih_dir()
 
 
 def _get_presets_path():
-    """Chemin du fichier de presets de l'Elements Picker (inchangé)."""
-    return os.path.join(_get_aih_user_dir(), "aih_elements_presets.json")
+    """Chemin du fichier de presets de l'Elements Picker.
+
+    Nouveau : <user>/default/AI-Helper/presets/ (migré) ; repli sur l'ancien
+    <user>/default/aih/aih_elements_presets.json tant que rien n'a été migré.
+    """
+    return _user_paths.resolved_presets()
 
 
 # ── Workflows sauvegardés (outil « Réparer un workflow ») ──────────────
@@ -514,7 +514,7 @@ def _register_credentials_group(r):
     async def aih_get_openai_keys(request):
         """Retourne les clés API stockées, optionnellement filtrées par base_url."""
         try:
-            keys_path = os.path.join(_get_aih_user_dir(), "openai_keys.json")
+            keys_path = _user_paths.resolved_openai_keys()
             data = {}
             if os.path.isfile(keys_path):
                 with open(keys_path, "r", encoding="utf-8") as f:
@@ -537,7 +537,7 @@ def _register_credentials_group(r):
             if not base_url:
                 return web.json_response({"status": "error", "message": "base_url required"}, status=400)
 
-            keys_path = os.path.join(_get_aih_user_dir(), "openai_keys.json")
+            keys_path = _user_paths.resolved_openai_keys()
             os.makedirs(os.path.dirname(keys_path), exist_ok=True)
 
             # Lire les clés existantes
@@ -599,30 +599,40 @@ def _register_update_group(r):
 # GROUPE 3 — Blobby Companion (settings + exec SÉCURISÉ)
 
 def _get_blobby_file():
-    """Chemin des paramètres du companion : user/default/aih/blobby.json.
+    """Chemin des paramètres du companion.
 
-    Porté du blobby companion de l'ancien monorepo AI-Helper (chemin inchangé),
-    avec migration paresseuse depuis l'ancien user/default/aih_blobby.json.
-    Calculé à la volée (et non à l'import comme la source) pour rester
-    testable hors ComfyUI.
+    Nouveau : <user>/default/AI-Helper/config/blobby.json (migré) ; repli sur
+    l'ancien <user>/default/aih/blobby.json tant que rien n'a été migré.
+    Porté du blobby companion de l'ancien monorepo AI-Helper, avec migration
+    paresseuse depuis l'ancien user/default/aih_blobby.json (faite par
+    holaf_user_paths, qui liste cet emplacement en dernier recours).
+    Calculé à la volée pour rester testable hors ComfyUI.
     """
+    blobby_file = _user_paths.resolved_blobby()
+
+    # Migration paresseuse depuis l'ancien emplacement plat
+    # (user/default/aih_blobby.json) : le helper le liste en dernier recours, on
+    # le consolide ici vers l'emplacement canonique résolu, pour ne pas laisser
+    # deux fichiers divergents.
     try:
         import folder_paths
         user_dir = folder_paths.get_user_directory()
     except Exception:
-        user_dir = os.path.expanduser("~")
-    blobby_file = os.path.join(user_dir, "default", "aih", "blobby.json")
-
-    # Migration depuis l'ancien emplacement : user/default/aih_blobby.json
-    try:
-        old_blobby = os.path.join(user_dir, "default", "aih_blobby.json")
-        if os.path.isfile(old_blobby) and not os.path.isfile(blobby_file):
-            import shutil
-            os.makedirs(os.path.dirname(blobby_file), exist_ok=True)
-            shutil.move(old_blobby, blobby_file)
-            logging.info(f"[Blobby] Migrated {old_blobby} → {blobby_file}")
-    except Exception as e:
-        logging.warning(f"[Blobby] Migration failed: {e}")
+        user_dir = None
+    if user_dir:
+        try:
+            old_blobby = os.path.join(user_dir, "default", "aih_blobby.json")
+            target = blobby_file
+            if os.path.abspath(target) == os.path.abspath(old_blobby):
+                target = os.path.join(user_dir, "default", "aih", "blobby.json")
+            if os.path.isfile(old_blobby) and not os.path.isfile(target):
+                import shutil
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.move(old_blobby, target)
+                logging.info(f"[Blobby] Migrated {old_blobby} → {target}")
+                blobby_file = target
+        except Exception as e:
+            logging.warning(f"[Blobby] Migration failed: {e}")
     return blobby_file
 
 
@@ -1381,15 +1391,14 @@ def _register_local_group(r):
     def _music3_paths():
         """Retourne (music3_dir, refs_dir) ou (None, None) si indispo.
 
-        ⚠️ Anomalie historique PRÉSERVÉE (PLAN_FUSION.md §3.9) : les refs
+        ⚠️ Emplacement HISTORIQUE conservé (PLAN_FUSION.md §3.9) : les refs
         music3 vivent sous user/default/aihelper/data/music3/ (layout pré-aih/
-        d'AI-Helper), PAS sous user/default/aih/. Ne pas « corriger » sans
-        migration des données utilisateurs.
+        d'AI-Helper), PAS sous user/default/aih/. holaf_user_paths résout
+        désormais ce dossier (nouvelle racine après migration, ancien
+        emplacement sinon) : la migration des données music3 est ainsi suivie.
         """
         try:
-            store_path = _store.get_store_path()
-            user_dir = store_path.parent.parent.parent
-            music3_dir = os.path.join(user_dir, "aihelper", "data", "music3")
+            music3_dir = _user_paths.resolved_music3_dir()
             return music3_dir, os.path.join(music3_dir, "references")
         except Exception:
             return None, None

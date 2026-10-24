@@ -39,9 +39,18 @@ except ImportError:
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths). Auparavant ce module recalculait le chemin de la base de
+# son côté (« <pack>/../holaf_utilities.sqlite ») : DEUX sources de vérité qui
+# pouvaient diverger de holaf_database.DB_PATH dès que la base était migrée.
+try:  # import relatif (pack importé comme extension ComfyUI)
+    from .. import holaf_user_paths as _user_paths
+except ImportError:  # chargé à plat (sys.path = racine du pack, tests par chemin)
+    import holaf_user_paths as _user_paths
+
 # MODIFIED: Changed DB name to match the unified database file.
 EXTENSION_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-HOLAF_MODELS_DB_PATH = os.path.join(EXTENSION_BASE_DIR, '..', 'holaf_utilities.sqlite')
+HOLAF_MODELS_DB_PATH = _user_paths.resolved_db_utils()
 MODEL_TYPES_CONFIG_PATH = os.path.join(EXTENSION_BASE_DIR, '..', 'model_types.json')
 
 MODEL_TYPE_DEFINITIONS = []

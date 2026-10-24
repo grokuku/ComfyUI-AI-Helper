@@ -48,6 +48,14 @@ from pathlib import Path
 
 from aih import store
 
+# Emplacement des données utilisateur : UNE seule source de vérité
+# (holaf_user_paths). Les refs music3 suivent la migration (nouveau
+# <user>/default/AI-Helper/data/music3/, ancien aihelper/data/music3 sinon).
+try:  # import à plat (aih/__init__.py a mis la racine du pack dans sys.path)
+    import holaf_user_paths as _user_paths
+except ImportError:  # pack importé comme package : import relatif
+    from .. import holaf_user_paths as _user_paths
+
 _LOG = logging.getLogger("aih.local_source")
 
 
@@ -296,19 +304,18 @@ def read_style_local(style_id):
 def _local_music3_refs_dir():
     """Dossier local des références music3 (miroir écrit par sync_engine).
 
-    Chemin cohérent avec sync_engine.sync_music3_local() :
-      user_dir = store.get_store_path().parent.parent.parent, puis
-      user_dir/aihelper/data/music3/references.
+    Chemin cohérent avec sync_engine.sync_music3_local() : les deux passent
+    désormais par holaf_user_paths.resolved_music3_dir(), qui renvoie le
+    nouveau <user>/default/AI-Helper/data/music3/ après migration et l'ancien
+    user/default/aihelper/data/music3/ tant que rien n'a été déplacé.
 
     Retourne:
-        str|None: Chemin du dossier références, ou None si store indispo.
+        str|None: Chemin du dossier références, ou None si résolution KO.
     """
     try:
-        store_path = store.get_store_path()
+        return os.path.join(_user_paths.resolved_music3_dir(), "references")
     except Exception:  # pragma: no cover - défensif
         return None
-    user_dir = store_path.parent.parent.parent
-    return os.path.join(user_dir, "aihelper", "data", "music3", "references")
 
 
 def read_music_ref_local(relpath):
