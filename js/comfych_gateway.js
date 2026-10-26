@@ -16,11 +16,26 @@
  * exécution, donc un seul jeu de contrôles.
  */
 
+import "./aih_i18n.js";
+import "./aih_strings.js";
+import "./aih_dialog.js";
 import "./comfych/modal_gateway.js";
 
 export const AIH_COMFYCH_FRONTEND = {
     /** Chemin servi (relatif au WEB_DIRECTORY du pack). */
     entry: "comfych/modal_gateway.js",
+
+    /**
+     * Dépendances de la fenêtre de suivi de run.
+     *
+     * ComfyCH n'invente AUCUN système de fenêtre : le suivi de run est un
+     * AIH.Dialog non modal (js/aih_dialog.js) et ses libellés viennent des
+     * dictionnaires du pack (js/aih_strings.js). Ces imports garantissent
+     * l'ordre de chargement (ComfyUI importe les modules du WEB_DIRECTORY en
+     * PARALLÈLE) : sans eux, la première ouverture pourrait tomber avant que
+     * ces briques ne soient disponibles.
+     */
+    dependencies: ["aih_i18n.js", "aih_strings.js", "aih_dialog.js"],
 
     /**
      * Le pont est-il disponible ? (le module s'exécute dès son import)

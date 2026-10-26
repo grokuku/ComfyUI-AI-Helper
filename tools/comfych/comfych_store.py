@@ -51,6 +51,10 @@ STATUS_FILENAME = "last_operation.status"
 DEFAULT_CONFIG = {
     "api_url": "",
     "api_key": "",
+    # Nom de l'app Modal dont le bouton « Redémarrer le worker » arrête les
+    # containers (vide = nom par défaut de apps/all_in_one.py). Utile quand
+    # l'utilisateur déploie une variante (all_in_one_l4 → « modal-comfy-gateway-l4 »).
+    "worker_app_name": "",
     "last_sync": None,
     "last_deploy": None,
     "last_user_sync": None,

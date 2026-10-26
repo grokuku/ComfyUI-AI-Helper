@@ -566,8 +566,10 @@ console.log("5. prompt enhancer : bouton « Test enhance » (NOUVEAU consommateu
 
 console.log("6. périmètre par phases : lot 2d branché, listes disjointes, interdits inchangés");
 {
-    assert.strictEqual(CURRENT_PHASE, "2d", "le lot en cours est bien la phase 2d");
-    assert.deepStrictEqual(Object.keys(PHASES).slice(-1), ["2d"], "2d est le dernier lot livré");
+    assert.strictEqual(CURRENT_PHASE, "2e",
+        "le lot en cours est la phase 2e (la 2d reste livrée et branchée)");
+    assert.deepStrictEqual(Object.keys(PHASES), ["2a", "2b", "2c", "2d", "2e"],
+        "les lots 2a → 2e sont livrés, dans l'ordre (aucun recul de périmètre)");
     assert.strictEqual(PHASE_2D_CONSUMERS.length, 1, "la phase 2d couvre 1 nouveau fichier");
 
     const r = checkIconPerimetre(PACKAGE_DIR, "2d");

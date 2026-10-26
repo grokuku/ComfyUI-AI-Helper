@@ -10,9 +10,12 @@ Il apporte :
 
 - un **sélecteur de GPU** (Local / L4 / L40S / A100 / H100) et un bouton **⚙**
   de réglages, dans le menu **`AI Helper ▾` → Outils & Dev → ComfyCH** ;
-- des routes `/api/modal/*` (sync des modèles, déploiement, logs, réglages…) ;
+- des routes `/api/modal/*` (sync des modèles, déploiement, **redémarrage du
+  worker**, logs, réglages…) ;
 - l'**interception du bouton Queue** : quand un GPU cloud est choisi, les
-  workflows partent sur Modal au lieu de la machine locale.
+  workflows partent sur Modal au lieu de la machine locale ;
+- une **fenêtre de suivi de run non bloquante** (infos, logs du worker en
+  direct, erreur copiable) — voir « Suivi de run » plus bas.
 
 ---
 
@@ -116,7 +119,8 @@ Repris dans `tools/comfych/` : `__init__.py` (routes + opérations),
 - **`tests/` du dépôt ComfyCH : non repris.** Ils testent le pipeline Modal
   standalone avec des stubs internes de `modal`/`fastapi` (absents du venv de
   développement) ; la couverture utile ici est apportée par
-  `tests/test_comfych_integration.py` (pack) et `js/test_comfych_menu.mjs`.
+  `tests/test_comfych_integration.py`, `tests/test_comfych_restart_worker.py`
+  (pack) et `js/test_comfych_menu.mjs` / `js/test_comfych_run_monitor.mjs`.
   Le dépôt `/projects/ComfyCH` reste la référence de ces tests.
 - **`.git`/`__pycache__` : non repris** (bruit).
 - **`web/modal_gateway.js` : déplacé vers `js/comfych/modal_gateway.js`**, car
@@ -174,6 +178,84 @@ ComfyCH est chargé sous le nom **unique** `holaf_comfych` (jamais `tools` ni
 reste un paquet tiers nommé `tools` installé dans l'interpréteur de ComfyUI (le
 pack étant en tête de `sys.path`) : vérifié absent du venv de référence
 (`importlib.util.find_spec("tools")` → `None`).
+
+---
+
+## Suivi de run : fenêtre NON bloquante (remplace l'overlay de chargement)
+
+Pendant un rendu cloud, l'ancien `#modal-loading-overlay`
+(`js/comfych/modal_gateway.js`) affichait **une ligne d'info dans une bulle
+centrée** sur un fond `position: fixed` plein écran : la bulle était en
+`pointer-events: auto` **au milieu de ComfyUI** et rien n'était consultable
+(progression, logs, erreur).
+
+Le suivi est désormais une **fenêtre `AIH.Dialog` en `modal: false`** (la
+primitive de fenêtre du pack — aucun second système de modale) :
+
+- **non bloquante** : aucun overlay n'est créé, ComfyUI reste utilisable ; la
+  fenêtre se déplace, se redimensionne (position mémorisée) et se **ferme sans
+  annuler le run** (aucun `AbortController` touché) ;
+- **rouvrable** : l'état (lignes, statut, erreur) vit dans le module, pas dans le
+  DOM. Point d'entrée : le **badge « File : N »** du sous-menu
+  `AI Helper ▾ → ComfyCH` (aussi indicateur discret du run en cours), et
+  `window.AIHComfyCHHost.openRunMonitor()` ;
+- **infos du run** : identifiant, état (transfert / génération / tentative /
+  terminé / échec / annulé), GPU, **durée** (tick 1 s), file d'attente,
+  activité du log. Il n'existe **pas** de pourcentage de progression côté
+  gateway (`POST /generate` est une requête unique) : la progression affichée
+  est donc l'état + la durée + l'activité du log, jamais un faux pourcentage ;
+- **logs en direct** : polling de la route **existante**
+  `GET /api/modal/worker-logs?lines=400&gpu=…` (tail du `comfyui.log` du worker
+  Modal, lu par une fonction **CPU** : aucun réveil GPU). Seul le **delta** est
+  ajouté (ancrage sur la dernière ligne connue ; ancre introuvable = log
+  réinitialisé, signalé) ;
+- **plafond** : `RUN_LOG_MAX_LINES = 800` lignes conservées au maximum, le
+  nombre de lignes masquées est **affiché** (jamais 100 000 lignes en mémoire) ;
+- **défilement** : suivi automatique du bas, **pause** dès que l'utilisateur
+  remonte (on ne lui arrache pas sa lecture) + bouton « Aller à la fin » ;
+- **à la fin** : log complet, bloc d'erreur mis en évidence, boutons **Copier le
+  log**, **Copier l'erreur** (`navigator.clipboard` + repli `execCommand`) et
+  **Télécharger .txt** (Blob local).
+
+Fermer la fenêtre n'annule pas le run ; l'annulation reste **explicite**
+(« Annuler la file » : rendus *en attente* uniquement, état `cancelled` distinct
+de `failed`).
+
+---
+
+## Redémarrer le worker Modal (sync PUIS redémarrage)
+
+**Pourquoi un ordre imposé.** Le worker recopie le volume `/user-settings` dans
+`ComfyUI/user` **uniquement au démarrage du container**
+(`tools/comfych/workers/base_worker.py`, `_sync_user_settings_from_volume`,
+appelé depuis `start_checkpoint` **et** `start_restore` ; aucun `reload`
+pendant la vie du container). Redémarrer **avant** la synchronisation ferait
+donc relire l'**ancien volume** par le container neuf : la sync serait perdue
+en silence.
+
+`POST /api/modal/restart-worker` exécute donc, dans cet ordre :
+
+1. `modal run sync.py` (fichiers locaux → volume) — si cette étape échoue, la
+   séquence **s'arrête** (« étapes suivantes ANNULÉES ») et le worker n'est pas
+   redémarré ;
+2. `modal container list --app <app> --json` puis `modal container stop <id>`
+   pour chaque container (repli en sortie texte si la CLI n'accepte pas
+   `--json`). **Aucun container actif n'est pas un échec** (« rien à arrêter »),
+   mais une CLI **incapable de lister** est un **échec explicite** : l'UI
+   n'affiche jamais un faux « redémarré ». Le nom de l'app vient de
+   `worker_app_name` (config), défaut `modal-comfy-gateway`.
+
+**Garde-fous.** Opération déjà en cours (sync, deploy…) → `409` explicite
+(`_op_busy_response`) et rien n'est lancé. Rendu en cours → le serveur ne peut
+pas le savoir (les rendus vont du navigateur au gateway) : c'est le client qui
+l'annonce (`render_in_progress`) et il ne le fait qu'après **confirmation de
+l'utilisateur** (`confirm: true`) ; sans confirmation, le serveur refuse (`409`,
+`needs_confirm`).
+
+**Où.** Modale de réglages ComfyCH, étape **Build** : ligne
+« ♻️ Worker Modal → ♻️ Redémarrer », avec un rappel de l'ordre. Les logs de
+l'opération s'affichent dans le panneau de logs **existant** (SSE
+`/api/modal/logs/stream`).
 
 ---
 

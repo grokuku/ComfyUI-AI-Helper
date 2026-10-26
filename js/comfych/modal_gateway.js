@@ -18,8 +18,38 @@
  * @version 1.0.0
  * @see https://github.com/caru-ini/modal-comfyui
  */
+
+// ─── Dépendances du pack (imports ESM relatifs) ────────────────────────────
+// Ce module est chargé comme module ES par le pack (js/comfych_gateway.js) :
+//  - les icônes viennent de la FAÇADE du pack (js/aih_icons.js — jamais la
+//    brique vendorisée directement, jamais d'emoji dans l'UI) ;
+//  - la fenêtre de suivi de run utilise AIH.Dialog (js/aih_dialog.js, importé
+//    par le chargeur AVANT ce module) : c'est la seule primitive de fenêtre du
+//    pack, aucun second système de modale n'est créé ici.
+import { aihIconSvg } from "../aih_icons.js";
+
 (function () {
     'use strict';
+
+    // ─── i18n ───────────────────────────────────────────────────────────────
+    /**
+     * Traduit une clé via AIH.I18n du pack, avec repli sur le texte FR fourni.
+     *
+     * ComfyCH est une copie INTÉGRÉE dont l'UI historique est en français : le
+     * repli garde le module utilisable seul (aucune dépendance dure au pack).
+     * Les libellés AJOUTÉS passent par les clés « comfych.run.* » de
+     * js/aih_strings.js (parité FR/EN stricte).
+     *
+     * @param {string} key - Clé i18n.
+     * @param {string} [fallback] - Texte français si la clé manque.
+     * @param {object} [params] - Interpolation.
+     * @returns {string}
+     */
+    function t(key, fallback, params) {
+        var I18n = window.AIH && window.AIH.I18n;
+        var value = (I18n && typeof I18n.t === 'function') ? I18n.t(key, params) : '';
+        return (value && value !== key) ? value : (fallback || key);
+    }
 
     // ─── Configuration ───────────────────────────────────────────────────────
 
@@ -191,11 +221,30 @@
                     next.resolve(result);
                 })
                 .catch(function (err) {
-                    hideLoading();
-                    next.status = 'failed';
-                    next.error = err.message || 'Unknown error';
+                    var message = (err && err.message) || 'Unknown error';
+                    // Un item annulé pendant l'exécution garde son état propre :
+                    // l'UI distingue nettement échec / annulation / succès.
+                    if (next.status === 'cancelled' || next.cancelled) {
+                        next.status = 'cancelled';
+                        next.error = next.error || t('comfych.run.cancelledByUser', 'Annulé par l\'utilisateur');
+                        RunMonitor.finish('cancelled', next.error);
+                    } else {
+                        next.status = 'failed';
+                        next.error = message;
+                        // Le suivi de run reste lisible APRÈS l'échec : statut,
+                        // log complet et bouton « Copier l'erreur ».
+                        RunMonitor.finish('failed', message);
+                    }
                     next.reject(err);
-                    showNotification('❌ Render #' + next.id + ' échoué: ' + (next.error || '').substring(0, 80) + '. Queue continue.', 'error');
+                    showNotification(
+                        next.status === 'cancelled'
+                            ? t('comfych.run.notifyCancelled', 'Render #{id} annulé.', { id: next.id })
+                            : t('comfych.run.notifyFailed', 'Render #{id} échoué : {message}', {
+                                id: next.id,
+                                message: String(next.error || '').substring(0, 80),
+                            }),
+                        next.status === 'cancelled' ? 'info' : 'error'
+                    );
                 })
                 .then(function () {
                     self.activeCount--;
@@ -220,41 +269,88 @@
                 });
         },
 
+        /**
+         * Recompte les items par état (source unique des compteurs affichés).
+         * @returns {{pending:number, processing:number, failed:number, cancelled:number, total:number}}
+         */
+        counts: function () {
+            var counts = { pending: 0, processing: 0, failed: 0, cancelled: 0, total: 0 };
+            for (var i = 0; i < this.items.length; i++) {
+                var s = this.items[i].status;
+                if (s === 'pending') counts.pending++;
+                else if (s === 'processing') counts.processing++;
+                else if (s === 'failed') counts.failed++;
+                else if (s === 'cancelled') counts.cancelled++;
+            }
+            counts.total = this.items.length;
+            return counts;
+        },
+
         updateUI: function () {
             var badge = document.getElementById('modal-queue-badge');
             if (!badge) return;
 
-            var pending = 0, active = 0, failed = 0;
-            for (var i = 0; i < this.items.length; i++) {
-                var s = this.items[i].status;
-                if (s === 'pending') pending++;
-                else if (s === 'processing') active++;
-                else if (s === 'failed') failed++;
-            }
-
-            if (pending + active === 0) {
+            var counts = this.counts();
+            var active = counts.pending + counts.processing;
+            // L'indicateur reste visible tant qu'un run est SUIVI : il est le
+            // point d'entrée de la fenêtre de suivi (rouvrable après la fin).
+            var hasRun = RunMonitor.hasRun();
+            if (active === 0 && !hasRun) {
                 badge.style.display = 'none';
                 return;
             }
 
             badge.style.display = 'inline-block';
-            var text = '🎮 Queue: ' + (pending + active);
-            if (active > 0) text += ' (1 running)';
-            if (failed > 0) text += ' · ' + failed + ' ❌';
+            badge.title = t(
+                'comfych.run.badgeTitle',
+                'Ouvrir le suivi du run (ne bloque pas ComfyUI)'
+            );
+            var text = '';
+            if (active > 0) {
+                text = t('comfych.run.badgeQueue', 'File : {count}', { count: active });
+                if (counts.processing > 0) {
+                    text += ' · ' + runStatusLabel(RunMonitor.status);
+                }
+            } else {
+                text = runStatusLabel(RunMonitor.status);
+            }
+            if (counts.failed > 0) {
+                text += ' · ' + t('comfych.run.badgeFailed', '{count} en échec', {
+                    count: counts.failed,
+                });
+            }
             badge.textContent = text;
-            badge.style.borderColor = failed > 0 ? '#c0392b' : (active > 0 ? '#4a8a4a' : '#333');
+            badge.style.borderColor = counts.failed > 0
+                ? '#c0392b'
+                : (active > 0 ? '#4a8a4a' : '#333');
         },
 
+        /**
+         * Annule les rendus EN ATTENTE (jamais le rendu en cours).
+         *
+         * État distinct (`cancelled`) : l'UI doit pouvoir distinguer une
+         * annulation volontaire d'un échec du worker.
+         */
         clearPending: function () {
+            var cancelled = 0;
             for (var i = 0; i < this.items.length; i++) {
                 if (this.items[i].status === 'pending') {
-                    this.items[i].status = 'failed';
-                    this.items[i].error = 'Cancelled by user';
+                    this.items[i].status = 'cancelled';
+                    this.items[i].error = t('comfych.run.cancelledByUser', 'Annulé par l\'utilisateur');
                     this.items[i].reject(new Error('Cancelled by user'));
+                    cancelled++;
                 }
             }
             this.updateUI();
-            showNotification('🗑️ Queue cleared', 'info');
+            RunMonitor.renderInfo();
+            showNotification(
+                cancelled > 0
+                    ? t('comfych.run.queueCleared', '{count} rendu(s) en attente annulé(s)', {
+                        count: cancelled,
+                    })
+                    : t('comfych.run.queueEmpty', 'Aucun rendu en attente'),
+                'info'
+            );
         },
     };
 
@@ -519,13 +615,28 @@
             'cursor: pointer',
         ].join(';') + ';';
         queueBadge.textContent = 'Queue: 0';
-        queueBadge.title = 'Click to clear pending items';
-        queueBadge.addEventListener('click', function () {
-            RenderQueue.clearPending();
+        queueBadge.title = t(
+            'comfych.run.badgeTitle',
+            'Ouvrir le suivi du run (ne bloque pas ComfyUI)'
+        );
+        // Point d'entrée du suivi de run DANS le sous-menu ComfyCH : le badge
+        // est aussi l'indicateur discret du run en cours (« File : 1 · … »).
+        // Il n'efface PLUS la file au clic (action destructive inattendue) :
+        // l'annulation est explicite, dans la fenêtre de suivi.
+        queueBadge.addEventListener('click', function (event) {
+            event.stopPropagation();
+            RunMonitor.toggle();
         });
         container.appendChild(queueBadge);
 
         container.appendChild(settingsBtn);
+        // Le menu AIH reconstruit ses contrôles à chaque ouverture : l'état du
+        // badge (indicateur de run) est réappliqué APRÈS le montage, car le
+        // conteneur n'est pas encore dans le document à la construction — un
+        // getElementById immédiat ne trouverait pas le badge.
+        setTimeout(function () {
+            RenderQueue.updateUI();
+        }, 0);
         return container;
     }
 
@@ -595,6 +706,54 @@
             openSettingsModal();
         },
 
+        /**
+         * Ouvre (ou ferme) la fenêtre de suivi du run — point d'entrée
+         * programmatique, en plus du badge « File : N » du sous-menu ComfyCH.
+         * Non bloquant : ComfyUI reste utilisable.
+         * @returns {object|null} Contrôleur AIH.Dialog, ou null si fermée.
+         */
+        openRunMonitor: function () {
+            try {
+                return RunMonitor.toggle();
+            } catch (e) {
+                console.error('Modal Gateway: suivi de run indisponible', e);
+                return null;
+            }
+        },
+
+        /** Un run est-il suivi (en cours ou dernier terminé) ? */
+        hasRun: function () {
+            return RunMonitor.hasRun();
+        },
+
+        /**
+         * Redémarre le worker Modal (SYNC puis redémarrage, dans cet ordre).
+         *
+         * Demande confirmation si un rendu est en cours ; fail-closed : sans
+         * confirmation, rien n'est envoyé au serveur.
+         * @returns {Promise<void>}
+         */
+        restartWorker: function () {
+            return restartWorker();
+        },
+
+        /**
+         * État du suivi (lecture seule) — sert aussi de point d'observation
+         * aux tests (aucune écriture exposée).
+         * @returns {{status:string, running:boolean, lines:number, dropped:number, paused:boolean}}
+         */
+        runState: function () {
+            return {
+                status: RunMonitor.status,
+                running: RunMonitor.isRunning(),
+                runId: RunMonitor.item ? RunMonitor.item.id : null,
+                lines: RunMonitor.lines.length,
+                dropped: RunMonitor.dropped,
+                paused: RunMonitor.paused,
+                maxLines: RUN_LOG_MAX_LINES,
+            };
+        },
+
         /** Mode de rendu effectif courant (« local » ou « modal:<gpu> »). */
         currentMode: function () {
             return currentRenderMode();
@@ -650,7 +809,13 @@
         currentGpu = gpu;
 
         // Step 1: encode local images
-        showLoading('☁️  Transfert des fichiers vers ' + gpu + ' (queue #' + item.id + ')...');
+        // Le suivi de run REMPLACE l'ancien overlay plein écran : la fenêtre
+        // est non bloquante (AIH.Dialog modal:false) et reste fermable sans
+        // interrompre le rendu.
+        RunMonitor.begin(
+            item,
+            t('comfych.run.uploading', 'Transfert des fichiers vers {gpu}…', { gpu: gpu })
+        );
         try {
             var enrichedWorkflow = await encodeLocalImages(item.workflow);
 
@@ -669,7 +834,14 @@
             var response = null;
             for (var attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
-                    showLoading('☁️  Génération sur ' + gpu + ' (queue #' + item.id + ', tentative ' + attempt + '/' + maxRetries + ')...\nPatiente, le worker démarre.');
+                    RunMonitor.setPhase(
+                        'generating',
+                        t(
+                            'comfych.run.generating',
+                            'Génération sur {gpu} (tentative {attempt}/{max}) — le worker démarre…',
+                            { gpu: gpu, attempt: attempt, max: maxRetries }
+                        )
+                    );
 
                     var controller = new AbortController();
                     var timeoutId = setTimeout(function () { controller.abort(); }, CONFIG.TIMEOUT_MS);
@@ -698,7 +870,14 @@
                     }
                     if (attempt < maxRetries) {
                         console.warn('Modal Gateway: fetch attempt ' + attempt + ' failed, retrying in 5s...', fetchErr.message);
-                        showLoading('⏳ Worker en cours de démarrage... nouvelle tentative dans 5s (' + (attempt + 1) + '/' + maxRetries + ')');
+                        RunMonitor.setPhase(
+                            'retrying',
+                            t(
+                                'comfych.run.retrying',
+                                'Worker en cours de démarrage — nouvelle tentative dans 5s ({attempt}/{max})',
+                                { attempt: attempt + 1, max: maxRetries }
+                            )
+                        );
                         await new Promise(function(resolve) { setTimeout(resolve, 5000); });
                     } else {
                         throw fetchErr; // All retries exhausted
@@ -766,9 +945,14 @@
                 showNotification('✅  Génération terminée sur ' + gpu + ' (Render #' + item.id + ')', 'info');
             }
 
+            // Le run est conclu AVANT l'affichage des images rapatriées : le
+            // suivi indique « Terminé » et garde le log complet consultable.
+            RunMonitor.finish('success');
             return result;
-        } finally {
-            hideLoading();
+        } catch (err) {
+            // L'erreur remonte à RenderQueue.process() qui conclut le suivi
+            // (statut « Échec », message et log copiables) et continue la file.
+            throw err;
         }
     }
 
@@ -969,85 +1153,717 @@
         console.log('Modal Gateway: ' + images.length + ' image(s) affichée(s) dans l\'overlay');
     }
 
-    // ─── Indicateur de chargement ───────────────────────────────────────────
+    // ─── Suivi de run (fenêtre NON bloquante) ───────────────────────────────
+    //
+    // REMPLACE l'ancien overlay de chargement (#modal-loading-overlay) : fond
+    // plein écran `position: fixed` + bulle CENTRÉE en `pointer-events: auto`,
+    // qui captait les clics au milieu de ComfyUI et n'affichait qu'une ligne
+    // d'info. Ici, la fenêtre est un AIH.Dialog NON modal (`modal: false`) :
+    // aucun overlay n'est créé (js/aih_dialog.js, l.430-468), ComfyUI reste
+    // utilisable, la fenêtre est déplaçable/redimensionnable et FERMER
+    // n'annule JAMAIS le run (aucun AbortController n'est touché).
 
-    // Handlers du drag de l'overlay de chargement.
-    // Retenus ici pour pouvoir être retirés par hideLoading() : sinon chaque
-    // showLoading() accumule deux listeners document qui retiennent des nœuds
-    // détachés (fuite mémoire sur session longue).
-    var _loadingDragMove = null;
-    var _loadingDragUp = null;
+    /** Identifiant stable de la fenêtre de suivi (anti-doublon AIH.Dialog). */
+    var RUN_MONITOR_ID = 'comfych-run-monitor';
+
+    /** Plafond de lignes conservées (mémoire bornée, signalé dans l'UI). */
+    var RUN_LOG_MAX_LINES = 800;
+
+    /** Lignes demandées au worker à chaque rafraîchissement (≤ 2000 côté serveur). */
+    var RUN_LOG_TAIL_LINES = 400;
+
+    /** Période de rafraîchissement du log worker (ms). */
+    var RUN_LOG_POLL_MS = 2500;
+
+    /** Seuil (px) en dessous duquel le défilement est considéré « en bas ». */
+    var RUN_SCROLL_BOTTOM_PX = 24;
+
+    /** États terminaux du suivi (le run ne reprend plus). */
+    var RUN_END_STATES = { success: true, failed: true, cancelled: true };
+
+    /** Crée un élément avec une classe et un texte (aucun innerHTML de données). */
+    function runEl(tag, className, text) {
+        var el = document.createElement(tag);
+        if (className) el.className = className;
+        if (text !== undefined && text !== null) el.textContent = text;
+        return el;
+    }
+
+    /** Bouton d'action du suivi (icône de la façade du pack, jamais d'emoji). */
+    function runButton(action, label, iconName) {
+        var btn = runEl('button', 'comfych-run-btn');
+        btn.type = 'button';
+        btn.dataset.act = action;
+        if (iconName) {
+            var icon = runEl('span', 'comfych-run-icon');
+            icon.innerHTML = aihIconSvg(iconName, { size: 13 });
+            btn.appendChild(icon);
+        }
+        btn.appendChild(document.createTextNode(label));
+        return btn;
+    }
+
+    /** Durée lisible ("12s", "2min 05s"). */
+    function runDuration(startedAt, endedAt) {
+        if (!startedAt) return '';
+        var until = endedAt || Date.now();
+        var seconds = Math.max(0, Math.round((until - startedAt) / 1000));
+        if (seconds < 60) return seconds + 's';
+        var minutes = Math.floor(seconds / 60);
+        var rest = seconds % 60;
+        return minutes + 'min ' + (rest < 10 ? '0' : '') + rest + 's';
+    }
+
+    /** Libellé traduit d'un état de run. */
+    function runStatusLabel(status) {
+        switch (status) {
+            case 'uploading': return t('comfych.run.stateUploading', 'Transfert des fichiers');
+            case 'generating': return t('comfych.run.stateGenerating', 'Génération');
+            case 'retrying': return t('comfych.run.stateRetrying', 'Nouvelle tentative');
+            case 'success': return t('comfych.run.stateSuccess', 'Terminé');
+            case 'failed': return t('comfych.run.stateFailed', 'Échec');
+            case 'cancelled': return t('comfych.run.stateCancelled', 'Annulé');
+            default: return t('comfych.run.stateIdle', 'Aucun run');
+        }
+    }
 
     /**
-     * Affiche un overlay semi-transparent avec un message de chargement.
-     * @param {string} msg - Message à afficher.
+     * Copie *text* dans le presse-papiers.
+     *
+     * ``navigator.clipboard`` d'abord (contexte sécurisé), puis repli par
+     * ``<textarea>`` + ``document.execCommand('copy')`` quand l'API est absente
+     * ou refusée (iframe, permissions).
+     *
+     * @param {string} text
+     * @returns {Promise<boolean>} true si la copie a réussi.
      */
-    function showLoading(msg) {
-        var existing = document.getElementById('modal-loading-overlay');
-        if (existing) {
-            var content = document.getElementById('modal-loading-content');
-            if (content) content.textContent = msg;
-            return;
+    function copyToClipboard(text) {
+        var value = String(text === undefined || text === null ? '' : text);
+        var clip = navigator && navigator.clipboard;
+        if (clip && typeof clip.writeText === 'function') {
+            return Promise.resolve(clip.writeText(value)).then(
+                function () { return true; },
+                function () { return fallbackCopy(value); }
+            );
         }
+        return Promise.resolve(fallbackCopy(value));
+    }
 
-        var overlay = document.createElement('div');
-        overlay.id = 'modal-loading-overlay';
+    /** Repli de copie (aucune API moderne disponible). */
+    function fallbackCopy(value) {
+        try {
+            var area = document.createElement('textarea');
+            area.value = value;
+            area.setAttribute('readonly', 'readonly');
+            area.style.position = 'fixed';
+            area.style.top = '-1000px';
+            area.style.opacity = '0';
+            document.body.appendChild(area);
+            area.select();
+            var ok = typeof document.execCommand === 'function' && document.execCommand('copy');
+            area.remove();
+            return !!ok;
+        } catch (e) {
+            return false;
+        }
+    }
 
-        var inner = document.createElement('div');
-        inner.id = 'modal-loading-content';
-        inner.textContent = msg;
+    /**
+     * Fenêtre de suivi du run Modal (infos + logs en direct + erreur copiable).
+     *
+     * Contrat :
+     *  - NON BLOQUANTE : aucune couche plein écran, aucun piège de focus — la
+     *    fenêtre se déplace, se redimensionne (position mémorisée) et se ferme
+     *    sans interrompre le rendu ;
+     *  - ROUVRABLE : l'état (lignes, statut, erreur) vit ICI, pas dans le DOM ;
+     *  - LOGS EN DIRECT : polling de la route existante
+     *    ``GET /api/modal/worker-logs`` (tail du log ComfyUI du worker Modal),
+     *    différé par ancre pour n'ajouter que les lignes nouvelles ;
+     *  - PLAFOND : ``RUN_LOG_MAX_LINES`` lignes conservées, le reste est
+     *    signalé (jamais 100 000 lignes en mémoire).
+     */
+    var RunMonitor = {
+        item: null,        // run suivi (item de RenderQueue), null = aucun
+        status: 'idle',    // uploading | generating | retrying | success | failed | cancelled
+        phase: '',         // message de phase (texte lisible)
+        error: '',         // message d'erreur du run
+        lines: [],         // lignes affichées (≤ RUN_LOG_MAX_LINES)
+        dropped: 0,        // lignes retirées par le plafond
+        tail: [],          // dernière queue reçue du worker (base du diff)
+        logWarning: '',    // log worker indisponible (raison lisible)
+        startedAt: 0,
+        endedAt: 0,
+        paused: false,     // défilement auto suspendu (l'utilisateur remonte)
+        ctrl: null,        // contrôleur AIH.Dialog
+        els: null,         // éléments DOM montés
+        _pollTimer: null,
+        _tickTimer: null,
+        _polling: false,
 
-        overlay.appendChild(inner);
+        /** Un run est-il suivi (en cours OU dernier terminé) ? */
+        hasRun: function () {
+            return !!this.item;
+        },
 
-        // Make loading overlay draggable
-        (function() {
-            var isDragging = false, offsetX = 0, offsetY = 0;
-            inner.style.cursor = 'grab';
-            inner.addEventListener('mousedown', function(e) {
-                isDragging = true;
-                var rect = inner.getBoundingClientRect();
-                offsetX = e.clientX - rect.left;
-                offsetY = e.clientY - rect.top;
-                inner.style.position = 'fixed';
-                inner.style.left = rect.left + 'px';
-                inner.style.top = rect.top + 'px';
-                inner.style.transform = 'none';
-                inner.style.cursor = 'grabbing';
-                e.preventDefault();
+        /** La fenêtre est-elle ouverte ? */
+        isOpen: function () {
+            return !!this.ctrl;
+        },
+
+        /** Le run suivi est-il encore en cours ? */
+        isRunning: function () {
+            return !!this.item && !RUN_END_STATES[this.status];
+        },
+
+        /** Démarre le suivi d'un run et ouvre la fenêtre. */
+        begin: function (item, message) {
+            this.item = item || null;
+            this.status = 'uploading';
+            this.phase = message || '';
+            this.error = '';
+            this.lines = [];
+            this.dropped = 0;
+            this.tail = [];
+            this.logWarning = '';
+            this.startedAt = Date.now();
+            this.endedAt = 0;
+            this.paused = false;
+            this.open();
+            this.renderInfo();
+            this.startPolling();
+            RenderQueue.updateUI();
+        },
+
+        /** Change la phase du run (transfert, génération, nouvelle tentative). */
+        setPhase: function (status, message) {
+            if (!this.item || RUN_END_STATES[this.status]) return;
+            this.status = status || this.status;
+            this.phase = message || this.phase;
+            this.renderInfo();
+        },
+
+        /**
+         * Conclut le run suivi.
+         * @param {'success'|'failed'|'cancelled'} outcome
+         * @param {string} [errorMessage]
+         */
+        finish: function (outcome, errorMessage) {
+            if (!this.item) return;
+            this.status = outcome || 'failed';
+            this.error = errorMessage ? String(errorMessage) : '';
+            this.endedAt = Date.now();
+            this.phase = '';
+            this.stopTick();
+            this.stopPolling();
+            this.renderInfo();
+            this.renderError();
+            this.renderLog();
+            // Deux dernières lectures : le worker peut finir d'écrire son log
+            // APRÈS la réponse HTTP (flush du volume).
+            var self = this;
+            this.poll();
+            setTimeout(function () { self.poll(); }, 2000);
+            if (this.status === 'success') this.scrollToEnd(true);
+            RenderQueue.updateUI();
+        },
+
+        /** Ouvre (ou ramène au premier plan) la fenêtre de suivi. */
+        open: function () {
+            if (this.ctrl) {
+                if (typeof this.ctrl.bringToFront === 'function') this.ctrl.bringToFront();
+                this.renderInfo();
+                return this.ctrl;
+            }
+            var Dialog = window.AIH && window.AIH.Dialog;
+            if (!Dialog || typeof Dialog.open !== 'function') {
+                // Dégradé : le pack n'est pas chargé (le chargeur importe
+                // pourtant aih_dialog.js avant ce module → cas exceptionnel).
+                console.warn('Modal Gateway: AIH.Dialog indisponible — suivi en notification seulement.');
+                showNotification(this.phase || runStatusLabel(this.status), 'info');
+                return null;
+            }
+            var self = this;
+            this.ctrl = Dialog.open({
+                id: RUN_MONITOR_ID,
+                title: t('comfych.run.title', 'Run Modal') + (this.item ? ' #' + this.item.id : ''),
+                width: '640px',
+                height: '480px',
+                minWidth: '340px',
+                minHeight: '240px',
+                maxWidth: '96vw',
+                maxHeight: '92vh',
+                // ↓ AUCUN overlay : « modal: false » (aih_dialog.js l.430-468).
+                modal: false,
+                resizable: true,
+                draggable: true,
+                // Échap ferme la fenêtre — et n'annule PAS le run.
+                closeOnEscape: true,
+                focusTrap: false,
+                content: function (body) {
+                    self.els = self.build(body);
+                },
+                onClose: function () {
+                    // Fermer ≠ annuler : on oublie seulement le DOM.
+                    self.ctrl = null;
+                    self.els = null;
+                },
             });
-            _loadingDragMove = function(e) {
-                if (!isDragging) return;
-                inner.style.left = Math.max(0, e.clientX - offsetX) + 'px';
-                inner.style.top = Math.max(0, e.clientY - offsetY) + 'px';
+            this.renderInfo();
+            this.renderLog();
+            this.renderError();
+            return this.ctrl;
+        },
+
+        /** Ferme la fenêtre (le run continue). */
+        close: function () {
+            if (this.ctrl && typeof this.ctrl.close === 'function') this.ctrl.close();
+            this.ctrl = null;
+            this.els = null;
+        },
+
+        /** Bascule ouvert/fermé (point d'entrée du menu ComfyCH). */
+        toggle: function () {
+            if (this.ctrl) {
+                this.close();
+                return null;
+            }
+            return this.open();
+        },
+
+        /** Construit le contenu de la fenêtre (appelé une fois par ouverture). */
+        build: function (body) {
+            var self = this;
+            var root = runEl('div', 'comfych-run');
+
+            var info = runEl('div', 'comfych-run-info');
+            var cells = {};
+            [
+                ['id', t('comfych.run.fieldRun', 'Run')],
+                ['state', t('comfych.run.fieldState', 'État')],
+                ['gpu', t('comfych.run.fieldGpu', 'GPU')],
+                ['duration', t('comfych.run.fieldDuration', 'Durée')],
+                ['queue', t('comfych.run.fieldQueue', 'File')],
+                ['activity', t('comfych.run.fieldActivity', 'Activité du log')],
+            ].forEach(function (def) {
+                var cell = runEl('div', 'comfych-run-cell comfych-run-cell--' + def[0]);
+                cell.appendChild(runEl('span', 'k', def[1]));
+                var value = runEl('span', 'v', '—');
+                cell.appendChild(value);
+                cells[def[0]] = { cell: cell, value: value };
+                info.appendChild(cell);
+            });
+            root.appendChild(info);
+
+            var toolbar = runEl('div', 'comfych-run-toolbar');
+            var notice = runEl('span', 'comfych-run-notice');
+            notice.style.display = 'none';
+            toolbar.appendChild(notice);
+
+            var toEnd = runButton('to-end', t('comfych.run.goToEnd', 'Aller à la fin'), 'arrow-down');
+            toEnd.style.display = 'none';
+            toolbar.appendChild(toEnd);
+            toolbar.appendChild(runButton('copy-all', t('comfych.run.copyAll', 'Copier le log'), 'copy'));
+            var copyError = runButton('copy-error', t('comfych.run.copyError', "Copier l'erreur"), 'alert-triangle');
+            toolbar.appendChild(copyError);
+            var downloadBtn = runButton('download', t('comfych.run.download', 'Télécharger .txt'), 'download');
+            downloadBtn.style.display = 'none';
+            toolbar.appendChild(downloadBtn);
+            var cancelBtn = runButton('cancel-pending', t('comfych.run.cancelQueue', 'Annuler la file'), 'ban');
+            cancelBtn.style.display = 'none';
+            toolbar.appendChild(cancelBtn);
+            root.appendChild(toolbar);
+
+            var errorBox = runEl('div', 'comfych-run-error');
+            errorBox.style.display = 'none';
+            errorBox.setAttribute('role', 'alert');
+            root.appendChild(errorBox);
+
+            var log = runEl('pre', 'comfych-run-log');
+            log.tabIndex = 0;
+            log.setAttribute('role', 'log');
+            log.setAttribute('aria-live', 'polite');
+            log.setAttribute('aria-label', t('comfych.run.logAria', 'Logs du worker Modal'));
+            root.appendChild(log);
+
+            // Pause du défilement : dès que l'utilisateur remonte, on ne lui
+            // arrache plus la lecture (« Aller à la fin » réarme).
+            log.addEventListener('scroll', function () { self.onLogScroll(); });
+
+            toolbar.addEventListener('click', function (event) {
+                var node = event.target;
+                var btn = node && typeof node.closest === 'function'
+                    ? node.closest('button[data-act]')
+                    : null;
+                if (!btn) return;
+                self.onAction(btn.dataset.act);
+            });
+
+            body.appendChild(root);
+            return {
+                root: root,
+                info: cells,
+                toolbar: toolbar,
+                notice: notice,
+                toEnd: toEnd,
+                copyError: copyError,
+                download: downloadBtn,
+                cancel: cancelBtn,
+                errorBox: errorBox,
+                log: log,
             };
-            _loadingDragUp = function() {
-                if (isDragging) {
-                    isDragging = false;
-                    inner.style.cursor = 'grab';
+        },
+
+        /** Traite un clic d'action de la barre d'outils. */
+        onAction: function (action) {
+            var self = this;
+            if (action === 'to-end') {
+                this.paused = false;
+                this.scrollToEnd(true);
+                this.renderToEndButton();
+                return;
+            }
+            if (action === 'copy-all') {
+                copyToClipboard(this.fullLogText()).then(function (ok) {
+                    showNotification(
+                        ok ? t('comfych.run.copied', 'Log copié dans le presse-papiers')
+                           : t('comfych.run.copyFailed', 'Copie impossible (presse-papiers refusé)'),
+                        ok ? 'success' : 'error'
+                    );
+                });
+                return;
+            }
+            if (action === 'copy-error') {
+                copyToClipboard(this.errorText()).then(function (ok) {
+                    showNotification(
+                        ok ? t('comfych.run.copiedError', "Message d'erreur copié")
+                           : t('comfych.run.copyFailed', 'Copie impossible (presse-papiers refusé)'),
+                        ok ? 'success' : 'error'
+                    );
+                });
+                return;
+            }
+            if (action === 'download') {
+                this.download();
+                return;
+            }
+            if (action === 'cancel-pending') {
+                RenderQueue.clearPending();
+                self.renderInfo();
+            }
+        },
+
+        /** Met à jour les infos (id, état, GPU, durée, file, activité). */
+        renderInfo: function () {
+            var els = this.els;
+            if (!els) return;
+            var item = this.item;
+            var running = this.isRunning();
+
+            els.info.id.value.textContent = item ? ('#' + item.id) : '—';
+            els.info.state.value.textContent = runStatusLabel(this.status);
+            els.info.state.cell.className = 'comfych-run-cell comfych-run-cell--state'
+                + (RUN_END_STATES[this.status] ? ' is-' + this.status : '');
+            els.info.gpu.value.textContent = item && item.gpu
+                ? String(item.gpu).toUpperCase()
+                : '—';
+            els.info.duration.value.textContent = runDuration(this.startedAt, this.endedAt) || '—';
+
+            var counts = RenderQueue.counts();
+            els.info.queue.value.textContent = counts.pending > 0
+                ? String(counts.pending)
+                : t('comfych.run.queueIdle', 'Vide');
+
+            var activity = this.phase;
+            if (running && !activity) activity = runStatusLabel(this.status);
+            if (!running) activity = '';
+            els.info.activity.value.textContent = activity || '—';
+
+            els.download.style.display = RUN_END_STATES[this.status] ? '' : 'none';
+            els.cancel.style.display = counts.pending > 0 ? '' : 'none';
+
+            if (this.ctrl && typeof this.ctrl.setTitle === 'function') {
+                this.ctrl.setTitle(
+                    t('comfych.run.title', 'Run Modal') + (item ? ' #' + item.id : '')
+                );
+            }
+        },
+
+        /** Réécrit la zone de log (plafonnée) et suit le bas si autorisé. */
+        renderLog: function () {
+            var els = this.els;
+            if (!els) return;
+            var text = '';
+            if (this.dropped > 0) {
+                text += '── ' + t(
+                    'comfych.run.capped',
+                    '… {count} ligne(s) plus anciennes masquées (plafond {max})',
+                    { count: this.dropped, max: RUN_LOG_MAX_LINES }
+                ) + ' ──\n';
+            }
+            if (this.logWarning) text += '!! ' + this.logWarning + '\n';
+            if (this.lines.length) text += this.lines.join('\n');
+            if (!text) text = t('comfych.run.emptyLog', 'En attente des logs du worker Modal…');
+            els.log.textContent = text;
+
+            els.notice.textContent = this.dropped > 0
+                ? t(
+                    'comfych.run.cappedShort',
+                    '{count} ligne(s) masquée(s)',
+                    { count: this.dropped }
+                )
+                : '';
+            els.notice.style.display = this.dropped > 0 ? 'inline' : 'none';
+
+            if (!this.paused) this.scrollToEnd(false);
+        },
+
+        /** Affiche (ou non) le bloc d'erreur / d'annulation. */
+        renderError: function () {
+            var els = this.els;
+            if (!els) return;
+            var text = '';
+            if (this.status === 'failed') text = this.errorText();
+            else if (this.status === 'cancelled') text = this.error || t('comfych.run.cancelledHint', 'Run annulé.');
+            if (!text) {
+                els.errorBox.style.display = 'none';
+                els.errorBox.textContent = '';
+                return;
+            }
+            els.errorBox.style.display = 'block';
+            els.errorBox.textContent = text;
+        },
+
+        /** Texte copié par « Copier l'erreur » : jamais vide. */
+        errorText: function () {
+            var parts = [];
+            if (this.error) parts.push(this.error);
+            var excerpt = this.logExcerpt();
+            if (excerpt) parts.push(excerpt);
+            if (!parts.length) return t('comfych.run.noError', 'Aucune erreur détectée dans les logs.');
+            return parts.join('\n\n');
+        },
+
+        /** Extrait du log utile au débogage (dernier traceback, sinon motifs d'erreur). */
+        logExcerpt: function () {
+            var lines = this.lines;
+            var start = -1;
+            for (var i = lines.length - 1; i >= 0; i--) {
+                if (/^Traceback \(most recent call last\)/.test(lines[i])) {
+                    start = i;
+                    break;
                 }
-            };
-            document.addEventListener('mousemove', _loadingDragMove);
-            document.addEventListener('mouseup', _loadingDragUp);
-        })();
+            }
+            var picked = [];
+            if (start >= 0) {
+                picked = lines.slice(start);
+            } else {
+                var re = /(Traceback|Error|Exception|ERROR|CRITICAL|failed|missing_node_type|out of memory|HTTP 5\d\d)/;
+                for (var j = 0; j < lines.length; j++) {
+                    if (re.test(lines[j])) picked.push(lines[j]);
+                }
+                if (picked.length > 200) picked = picked.slice(-200);
+            }
+            return picked.join('\n').trim();
+        },
 
-        document.body.appendChild(overlay);
-    }
+        /** Contenu complet copié/téléchargé (en-tête + log + erreur). */
+        fullLogText: function () {
+            var item = this.item || {};
+            var head = t(
+                'comfych.run.fileHeader',
+                'Run Modal #{id} · {state} · GPU {gpu} · durée {duration}',
+                {
+                    id: item.id === undefined ? '?' : item.id,
+                    state: runStatusLabel(this.status),
+                    gpu: item.gpu ? String(item.gpu).toUpperCase() : '?',
+                    duration: runDuration(this.startedAt, this.endedAt) || '?',
+                }
+            );
+            var header = [head];
+            if (this.dropped > 0) {
+                header.push(t(
+                    'comfych.run.capped',
+                    '… {count} ligne(s) plus anciennes masquées (plafond {max})',
+                    { count: this.dropped, max: RUN_LOG_MAX_LINES }
+                ));
+            }
+            if (this.error) {
+                header.push(t('comfych.run.errorLine', 'Erreur : {message}', { message: this.error }));
+            }
+            return header.join('\n') + '\n\n' + this.lines.join('\n');
+        },
 
-    /**
-     * Supprime l'overlay de chargement (et ses listeners document).
-     */
-    function hideLoading() {
-        if (_loadingDragMove) {
-            document.removeEventListener('mousemove', _loadingDragMove);
-            _loadingDragMove = null;
-        }
-        if (_loadingDragUp) {
-            document.removeEventListener('mouseup', _loadingDragUp);
-            _loadingDragUp = null;
-        }
-        var el = document.getElementById('modal-loading-overlay');
-        if (el) el.remove();
-    }
+        /** Télécharge le log complet en .txt (coût nul : Blob local). */
+        download: function () {
+            var text = this.fullLogText();
+            var id = this.item && this.item.id !== undefined ? this.item.id : Date.now();
+            var name = 'comfych-run-' + id + '.txt';
+            try {
+                var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+                var url = URL.createObjectURL(blob);
+                var link = document.createElement('a');
+                link.href = url;
+                link.download = name;
+                link.style.display = 'none';
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                setTimeout(function () {
+                    try { URL.revokeObjectURL(url); } catch (e) { /* silencieux */ }
+                }, 0);
+            } catch (e) {
+                showNotification(
+                    t('comfych.run.downloadFailed', 'Téléchargement impossible : {message}', {
+                        message: (e && e.message) ? e.message : String(e),
+                    }),
+                    'error'
+                );
+            }
+        },
+
+        /** Ajoute des lignes au log (plafond appliqué, trou signalé). */
+        appendLines: function (lines) {
+            if (!lines || !lines.length) return;
+            for (var i = 0; i < lines.length; i++) this.lines.push(String(lines[i]));
+            if (this.lines.length > RUN_LOG_MAX_LINES) {
+                var excess = this.lines.length - RUN_LOG_MAX_LINES;
+                this.lines.splice(0, excess);
+                this.dropped += excess;
+            }
+            this.renderLog();
+        },
+
+        /**
+         * Enregistre une NOUVELLE queue de log worker et n'ajoute que le delta.
+         *
+         * La route renvoie les N dernières lignes (fin = EOF) : on repère la
+         * dernière ligne déjà connue dans la nouvelle queue et on n'ajoute que
+         * ce qui suit. Ancre introuvable = log réinitialisé (rotation) → on le
+         * signale et on repart de la nouvelle queue.
+         */
+        setWorkerTail: function (newLines) {
+            if (!newLines || !newLines.length) return;
+            var old = this.tail;
+            var appended;
+            if (!old.length) {
+                appended = newLines.slice();
+            } else {
+                var anchor = old[old.length - 1];
+                var index = -1;
+                for (var i = newLines.length - 1; i >= 0; i--) {
+                    if (newLines[i] === anchor) {
+                        index = i;
+                        break;
+                    }
+                }
+                if (index >= 0) {
+                    appended = newLines.slice(index + 1);
+                } else {
+                    appended = [t('comfych.run.logReset', '── log du worker réinitialisé ──')]
+                        .concat(newLines);
+                }
+            }
+            this.tail = newLines.slice();
+            if (appended.length) this.appendLines(appended);
+        },
+
+        /** Démarre le rafraîchissement périodique du log worker. */
+        startPolling: function () {
+            var self = this;
+            this.stopPolling();
+            this.poll();
+            this._pollTimer = setInterval(function () { self.poll(); }, RUN_LOG_POLL_MS);
+            this.startTick();
+        },
+
+        /** Arrête le rafraîchissement du log worker. */
+        stopPolling: function () {
+            if (this._pollTimer) {
+                clearInterval(this._pollTimer);
+                this._pollTimer = null;
+            }
+        },
+
+        /** Tick 1 s : met à jour la durée affichée. */
+        startTick: function () {
+            var self = this;
+            if (this._tickTimer) return;
+            this._tickTimer = setInterval(function () {
+                if (!self.isRunning()) self.stopTick();
+                self.renderInfo();
+            }, 1000);
+        },
+
+        /** Arrête le tick de durée. */
+        stopTick: function () {
+            if (this._tickTimer) {
+                clearInterval(this._tickTimer);
+                this._tickTimer = null;
+            }
+        },
+
+        /** Lit la queue du log ComfyUI du worker Modal (route existante). */
+        poll: function () {
+            var self = this;
+            if (this._polling || !this.item) return;
+            this._polling = true;
+            var url = '/api/modal/worker-logs?lines=' + RUN_LOG_TAIL_LINES;
+            if (this.item.gpu) url += '&gpu=' + encodeURIComponent(this.item.gpu);
+            Promise.resolve(fetch(url))
+                .then(function (resp) { return resp.json(); })
+                .then(function (data) {
+                    if (data && Array.isArray(data.lines)) {
+                        self.logWarning = '';
+                        self.setWorkerTail(data.lines);
+                    } else if (data && data.error) {
+                        self.logWarning = t(
+                            'comfych.run.logUnavailable',
+                            'Logs worker indisponibles : {message}',
+                            { message: String(data.error) }
+                        );
+                        self.renderLog();
+                    }
+                    self.renderInfo();
+                })
+                .catch(function (e) {
+                    self.logWarning = t(
+                        'comfych.run.logUnavailable',
+                        'Logs worker indisponibles : {message}',
+                        { message: (e && e.message) ? e.message : String(e) }
+                    );
+                    self.renderLog();
+                })
+                .then(function () { self._polling = false; });
+        },
+
+        /** Défile en bas (sans casser la pause si *force* est faux). */
+        scrollToEnd: function (force) {
+            var els = this.els;
+            if (!els || !els.log) return;
+            if (force) this.paused = false;
+            if (this.paused) return;
+            try {
+                els.log.scrollTop = els.log.scrollHeight;
+            } catch (e) { /* jsdom / navigateur sans layout : sans effet */ }
+        },
+
+        /** Détecte le défilement manuel : en bas = auto, sinon pause. */
+        onLogScroll: function () {
+            var els = this.els;
+            if (!els || !els.log) return;
+            var log = els.log;
+            var atBottom = (log.scrollHeight - log.scrollTop - log.clientHeight) <= RUN_SCROLL_BOTTOM_PX;
+            this.paused = !atBottom;
+            this.renderToEndButton();
+        },
+
+        /** Affiche le bouton « Aller à la fin » uniquement en pause. */
+        renderToEndButton: function () {
+            var els = this.els;
+            if (!els || !els.toEnd) return;
+            els.toEnd.style.display = this.paused ? '' : 'none';
+        },
+    };
 
     // ─── Notifications utilisateur ──────────────────────────────────────────
 
@@ -1118,46 +1934,71 @@
             '  padding: 4px 8px;',
             '}',
             '',
-            // ─── Overlay de chargement ───
-            '#modal-loading-overlay {',
-            '  position: fixed;',
-            '  top: 0;',
-            '  left: 0;',
-            '  width: 100%;',
-            '  height: 100%;',
-            '  background: rgba(0, 0, 0, 0.25);',
-            '  display: flex;',
-            '  align-items: center;',
-            '  justify-content: center;',
-            '  z-index: 99999;',
-            '  pointer-events: none;',
+            // ─── Suivi de run (fenêtre AIH.Dialog NON bloquante) ───
+            // Plus d'overlay plein écran : la fenêtre est un AIH.Dialog
+            // modal:false (déplaçable/redimensionnable, sans fond capturant).
+            '.comfych-run {',
+            '  display: flex; flex-direction: column; gap: 8px;',
+            '  height: 100%; min-height: 0;',
+            '  font-family: sans-serif; font-size: 12px;',
+            '  color: var(--aih-text, #e0e0e0);',
             '}',
-            '#modal-loading-content {',
-            '  background: #1a1a2e;',
-            '  color: #fff;',
-            '  padding: 24px 36px;',
-            '  border-radius: 12px;',
-            '  font-size: 18px;',
-            '  font-family: sans-serif;',
-            '  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);',
-            '  border: 1px solid rgba(255, 255, 255, 0.1);',
-            '  max-width: 80vw;',
-            '  text-align: center;',
-            '  line-height: 1.5;',
-            '  pointer-events: auto;',
+            '.comfych-run-info {',
+            '  flex: 0 0 auto; display: grid;',
+            '  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));',
+            '  gap: 6px 8px;',
             '}',
-            '#modal-loading-content::before {',
-            '  content: "";',
-            '  display: inline-block;',
-            '  width: 20px;',
-            '  height: 20px;',
-            '  margin-right: 12px;',
-            '  border: 3px solid rgba(255, 255, 255, 0.2);',
-            '  border-top-color: #4caf50;',
-            '  border-radius: 50%;',
-            '  animation: modal-spin 0.8s linear infinite;',
-            '  vertical-align: middle;',
+            '.comfych-run-cell {',
+            '  display: flex; flex-direction: column; gap: 2px; min-width: 0;',
+            '  padding: 4px 8px; border-radius: 6px;',
+            '  background: rgba(255, 255, 255, 0.04);',
+            '  border: 1px solid var(--aih-border, #3f3f3f);',
             '}',
+            '.comfych-run-cell .k {',
+            '  font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;',
+            '  color: var(--aih-text-secondary, #a0a0a0);',
+            '}',
+            '.comfych-run-cell .v {',
+            '  font-size: 12px; white-space: nowrap;',
+            '  overflow: hidden; text-overflow: ellipsis;',
+            '}',
+            '.comfych-run-cell--state .v { font-weight: 600; }',
+            '.comfych-run-cell.is-success .v { color: #4ade80; }',
+            '.comfych-run-cell.is-failed .v { color: #f87171; }',
+            '.comfych-run-cell.is-cancelled .v { color: #fbbf24; }',
+            '.comfych-run-toolbar {',
+            '  flex: 0 0 auto; display: flex; flex-wrap: wrap;',
+            '  align-items: center; gap: 6px;',
+            '}',
+            '.comfych-run-notice { font-size: 11px; color: #fbbf24; }',
+            '.comfych-run-btn {',
+            '  display: inline-flex; align-items: center; gap: 4px;',
+            '  padding: 3px 9px; border-radius: 6px; cursor: pointer;',
+            '  font-size: 11px; color: inherit;',
+            '  background: var(--aih-btn-bg, #3a3a3e);',
+            '  border: 1px solid var(--aih-btn-border, #555);',
+            '}',
+            '.comfych-run-btn:hover { background: var(--aih-btn-bg-hover, #4a4a4e); }',
+            '.comfych-run-icon { display: inline-flex; align-items: center; }',
+            '.comfych-run-error {',
+            '  flex: 0 0 auto; max-height: 110px; overflow: auto;',
+            '  padding: 6px 8px; border-radius: 4px;',
+            '  border-left: 3px solid #f87171;',
+            '  background: rgba(248, 113, 113, 0.10);',
+            '  white-space: pre-wrap; word-break: break-word;',
+            '  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;',
+            '  font-size: 11px;',
+            '}',
+            '.comfych-run-log {',
+            '  flex: 1 1 auto; min-height: 80px; margin: 0; overflow: auto;',
+            '  padding: 6px 8px; border-radius: 6px;',
+            '  background: #111114;',
+            '  border: 1px solid var(--aih-border, #3f3f3f);',
+            '  white-space: pre-wrap; word-break: break-word;',
+            '  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;',
+            '  font-size: 11px; line-height: 1.45;',
+            '}',
+            '.comfych-run-log:focus { outline: 1px solid var(--aih-accent, #d8700d); }',
             '@keyframes modal-spin { to { transform: rotate(360deg); } }',
             '',
             // ─── Notification ───
@@ -1836,14 +2677,16 @@
         deploy: 'cfg-run-deploy',
         'sync-user': 'cfg-sync-user',
         'sync-custom-nodes': 'cfg-sync-custom-nodes',
+        'restart-worker': 'cfg-run-restart-worker',
     };
 
     /** Libellé d'opération utilisé dans les notifications. */
     var OP_LABELS = {
-        sync: 'Sync modèles',
-        deploy: 'Déploiement',
-        'sync-user': 'Sync user settings',
-        'sync-custom-nodes': 'Sync custom nodes',
+        sync: t('comfych.op.sync', 'Sync modèles'),
+        deploy: t('comfych.op.deploy', 'Déploiement'),
+        'sync-user': t('comfych.op.syncUser', 'Sync user settings'),
+        'sync-custom-nodes': t('comfych.op.syncNodes', 'Sync custom nodes'),
+        'restart-worker': t('comfych.op.restartWorker', 'Redémarrage du worker'),
     };
 
     /** Période (ms) de la vérification de l'état serveur pendant une opération. */
@@ -2108,7 +2951,20 @@
         }
     }
 
-    async function runOperation(operation) {
+    /**
+     * Lance une opération (sync/deploy/redémarrage) et affiche les logs en
+     * direct via SSE.
+     *
+     * @param {string} operation - Nom d'opération (= segment de la route).
+     * @param {object} [options] - ``options.body`` : corps JSON à envoyer
+     *   (ex. ``{render_in_progress, confirm}`` pour le redémarrage du worker).
+     */
+    async function runOperation(operation, options) {
+        var requestOptions = { method: 'POST' };
+        if (options && options.body) {
+            requestOptions.headers = { 'Content-Type': 'application/json' };
+            requestOptions.body = JSON.stringify(options.body);
+        }
         var btnId = OP_BUTTON_IDS[operation] || ('cfg-run-' + operation);
         var btn = document.getElementById(btnId);
         var logSection = document.getElementById('modal-log-section');
@@ -2230,7 +3086,7 @@
 
         try {
             // Lancer l'opération
-            var opResp = await fetch('/api/modal/' + operation, { method: 'POST' });
+            var opResp = await fetch('/api/modal/' + operation, requestOptions);
 
             // 409 : une autre opération occupe le slot. Message explicite
             // (laquelle, depuis combien de temps) + bouton de secours —
@@ -2500,6 +3356,11 @@
             '        <div class="modal-row"><span>📁 User settings locaux</span><span class="val muted" id="status-user-settings">⏳ Vérification...</span></div>',
             '        <div class="modal-row"><span>🔄 Dernière sync user</span><span class="val muted" id="status-user-sync">⏳ Jamais</span></div>',
             '        <div class="modal-hint">Les workflows, clés API et préférences UI sont copiés vers le volume. Un redémarrage du worker est nécessaire pour appliquer les changements.</div>',
+            // Le bouton de redémarrage ENCHAÎNE toujours sync → redémarrage :
+            // le worker ne recopie le volume dans user/ qu'au démarrage du
+            // container (redémarrer d'abord relirait l'ANCIEN volume).
+            '        <div class="modal-row"><span>♻️ Worker Modal</span><span class="val"><button id="cfg-run-restart-worker" class="modal-btn modal-btn--sm" title="Synchronise les fichiers locaux vers le volume, PUIS redémarre le worker (ordre imposé : le worker ne relit le volume qu\'au démarrage)">♻️ Redémarrer</button></span></div>',
+            '        <div class="modal-hint">« Redémarrer » enchaîne une sync puis l\'arrêt des containers : dans cet ordre, parce que le worker ne relit le volume <code>user/</code> qu\'au démarrage du container.</div>',
             '        <div class="modal-row"><span>🖥️ Logs du worker (ComfyUI)</span><span class="val"><button id="cfg-worker-logs" class="modal-btn modal-btn--sm" title="Tracebacks d\'import des custom nodes, dépendances manquantes, erreurs réseau">🖥️ Voir</button></span></div>',
             '      </div>',
             '      <div class="modal-step-foot">',
@@ -3538,6 +4399,63 @@
         document.getElementById('cfg-sync-custom-nodes').onclick = function() {
             runOperation('sync-custom-nodes');
         };
+        var restartWorkerBtn = document.getElementById('cfg-run-restart-worker');
+        if (restartWorkerBtn) {
+            restartWorkerBtn.onclick = function () { restartWorker(); };
+        }
+    }
+
+    // ─── Redémarrage du worker (sync PUIS redémarrage) ────────────────────
+
+    /**
+     * Demande confirmation avant d'interrompre un rendu en cours.
+     *
+     * Fail-closed : sans UI de confirmation disponible, on ne redémarre PAS
+     * (un redémarrage pendant un rendu le fait échouer côté gateway).
+     *
+     * @returns {Promise<boolean>}
+     */
+    function confirmRestartDuringRender() {
+        var title = t('comfych.run.restartConfirmTitle', 'Redémarrer le worker ?');
+        var message = t(
+            'comfych.run.restartConfirmBody',
+            'Un rendu est en cours : redémarrer le worker va l\'interrompre et le faire échouer. Continuer ?'
+        );
+        var confirmText = t('comfych.run.restartConfirmAction', 'Redémarrer');
+        var cancelText = t('dialog.cancel', 'Annuler');
+        var A = window.AIH;
+        if (A && typeof A.confirm === 'function') {
+            return Promise.resolve(
+                A.confirm(title, message, { danger: true, confirmText: confirmText, cancelText: cancelText })
+            ).then(function (ok) { return !!ok; }, function () { return false; });
+        }
+        if (typeof window.aihShowConfirm === 'function') {
+            return Promise.resolve(window.aihShowConfirm(title, message)).then(
+                function (ok) { return !!ok; },
+                function () { return false; }
+            );
+        }
+        return Promise.resolve(false);
+    }
+
+    /**
+     * « Redémarrer le worker » : SYNC puis redémarrage, dans cet ordre.
+     *
+     * L'ordre est imposé par le worker lui-même
+     * (workers/base_worker.py, ``_sync_user_settings_from_volume`` : copie du
+     * volume vers ``ComfyUI/user`` au DÉMARRAGE du container, jamais pendant).
+     * Redémarrer sans syncer rechargerait donc l'ancien volume — d'où un seul
+     * bouton qui enchaîne les deux, et un serveur qui refuse l'inversion.
+     */
+    async function restartWorker() {
+        var renderActive = RenderQueue.counts().processing > 0;
+        var body = { render_in_progress: renderActive, confirm: false };
+        if (renderActive) {
+            var confirmed = await confirmRestartDuringRender();
+            if (!confirmed) return;
+            body.confirm = true;
+        }
+        runOperation('restart-worker', { body: body });
     }
 
     // ─── Initialisation via l'API d'extension ComfyUI ───────────────────────

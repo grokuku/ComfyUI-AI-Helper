@@ -299,6 +299,22 @@ def _spawn_op(operation: str, cmd: list[str]) -> bool:
     return True
 
 
+def _spawn_sequence(operation: str, steps: list) -> bool:
+    """Réserve le slot puis lance une SÉQUENCE d'étapes en tâche de fond.
+
+    Même contrat que :func:`_spawn_op` (``False`` = slot déjà occupé, rien n'est
+    lancé), mais pour une opération composée de plusieurs étapes ordonnées
+    (voir :func:`_worker_restart_steps`).
+    """
+    if not _try_acquire_op(operation):
+        return False
+    task = asyncio.create_task(_run_sequence(operation, steps))
+    _task_op_tokens[task] = _op_token
+    _background_tasks.add(task)
+    task.add_done_callback(_on_op_task_done)
+    return True
+
+
 async def _run_async(operation: str, cmd: list[str]):
     """Exécute une commande modal et écrit les logs + status.
 
@@ -306,7 +322,17 @@ async def _run_async(operation: str, cmd: list[str]):
     partagent les mêmes fichiers de logs et le même volume.
     """
     async with _OP_LOCK:
-        await _run_async_inner(operation, cmd)
+        await _run_sequence_inner(operation, [_cmd_step(operation, cmd)])
+
+
+async def _run_sequence(operation: str, steps: list):
+    """Exécute une séquence d'étapes, sérialisée par _OP_LOCK.
+
+    Une seule opération à la fois : elles partagent les mêmes fichiers de logs
+    et le même volume Modal.
+    """
+    async with _OP_LOCK:
+        await _run_sequence_inner(operation, steps)
 
 
 async def _stream_process(
@@ -346,26 +372,55 @@ async def _stream_process(
             f.write(decoded + "\n")
 
 
-async def _run_async_inner(operation: str, cmd: list[str]):
-    """Exécute réellement la commande (appelée sous _OP_LOCK)."""
-    log_path = _log_path()
-    status_path = _status_path()
+def _append_log(log_path: Path, line: str) -> None:
+    """Ajoute UNE ligne au log d'opération (best-effort, jamais bloquant)."""
+    try:
+        with open(log_path, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass  # log non inscriptible : ne jamais tuer l'opération
 
-    # Nettoyer les logs précédents
-    log_path.write_text("")
-    if status_path.exists():
-        status_path.unlink()
 
-    project_dir = str(PROJECT_ROOT)
+def _cmd_step(label: str, cmd: list[str]):
+    """Étape « lancer une commande modal et streamer sa sortie ».
 
-    # Amorcer le log AVANT tout : import Modal, résolution de l'app et
-    # credentials peuvent prendre plusieurs secondes pendant lesquelles le SSE
-    # n'aurait rien à afficher (l'utilisateur croit que rien ne se passe).
-    started_at = time.time()
-    with open(log_path, "a") as f:
-        f.write(f"═══ Opération: {operation} ═══\n")
-        f.write(f"Lancement de: {' '.join(cmd)}\n")
-        f.write("Initialisation de modal (import, résolution de l'app)…\n")
+    Returns
+    -------
+    tuple[str, callable]
+        ``(libellé, exécuteur)`` où l'exécuteur est une coroutine
+        ``(log_path, started_at) -> code de retour``.
+    """
+
+    async def _step(log_path: Path, started_at: float) -> int:
+        # Amorcer le log AVANT tout : import Modal, résolution de l'app et
+        # credentials peuvent prendre plusieurs secondes pendant lesquelles le
+        # SSE n'aurait rien à afficher (l'utilisateur croit que rien ne se passe).
+        _append_log(log_path, f"Lancement de: {' '.join(cmd)}")
+        _append_log(log_path, "Initialisation de modal (import, résolution de l'app)…")
+        return await _run_cmd(cmd, log_path, started_at)
+
+    # Commande visible sur l'étape (diagnostic + tests d'ordre de séquence).
+    _step.cmd = list(cmd)
+
+    return (label, _step)
+
+
+async def _run_cmd(
+    cmd: list[str], log_path: Path, started_at: float | None = None
+) -> int:
+    """Lance UNE commande, copie sa sortie dans *log_path*, retourne son code.
+
+    Returns
+    -------
+    int
+        Code de retour du subprocess, ou ``1`` s'il n'a pas pu être lancé ou
+        s'il a dépassé ``_OP_TIMEOUT_SECONDS`` (il est alors tué et l'échec est
+        journalisé — sans quoi ``modal run`` bloqué ne rendrait jamais la main,
+        ``_on_op_task_done`` ne serait jamais appelé et le slot d'opération
+        resterait réservé à vie : tous les boutons renverraient 409).
+    """
+    if started_at is None:
+        started_at = time.time()
 
     # S'assurer que le CLI modal est dans le PATH
     env = os.environ.copy()
@@ -376,77 +431,299 @@ async def _run_async_inner(operation: str, cmd: list[str]):
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=project_dir,
+            cwd=str(PROJECT_ROOT),
             env=env,
         )
     except (OSError, ValueError) as e:
         # modal absent ou commande invalide → logguer et marquer l'échec
         # (sinon le SSE attendrait un status qui ne viendrait jamais)
-        with open(log_path, "a") as f:
-            f.write(f"ERROR: impossible de lancer la commande: {e}\n")
-        status_path.write_text("1")
-        return
+        _append_log(log_path, f"ERROR: impossible de lancer la commande: {e}")
+        return 1
 
-    # Lire et écrire les logs en temps réel, avec un timeout global : sans lui,
-    # un ``modal run`` bloqué (credentials, prompt interactif, réseau) ne rend
-    # jamais la main, ``_on_op_task_done`` n'est jamais appelé et le slot
-    # d'opération reste réservé à vie (tous les boutons renverraient 409).
-    timed_out = False
+    # Lire et écrire les logs en temps réel, avec un timeout global.
     try:
         await asyncio.wait_for(
             _stream_process(process, log_path, started_at),
             timeout=_OP_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        timed_out = True
         try:
             process.kill()
         except Exception:  # noqa: BLE001 — le process peut déjà être mort
             pass
-        with open(log_path, "a") as f:
-            f.write(
-                f"\nERROR: opération interrompue après {_OP_TIMEOUT_SECONDS}s "
-                f"(timeout)\n"
-            )
-
-    if timed_out:
-        # Reaper le process tué (évite un zombie) puis marquer l'échec : le
-        # SSE attend un status, sans quoi l'UI tournerait indéfiniment.
+        # Reaper le process tué (évite un zombie) : le SSE attend un status,
+        # sans quoi l'UI tournerait indéfiniment.
         try:
             await process.wait()
         except Exception:  # noqa: BLE001
             pass
-        status_path.write_text("1")
-        return
+        _append_log(
+            log_path,
+            f"\nERROR: opération interrompue après {_OP_TIMEOUT_SECONDS}s "
+            f"(timeout)",
+        )
+        return 1
 
     await process.wait()
+    return int(process.returncode or 0)
 
-    # Écrire le code de retour
-    status_path.write_text(str(process.returncode))
+
+# Opérations dont le succès met à jour une date de la configuration.
+_OPERATION_DATE_KEYS = {
+    "sync": "last_sync",
+    "deploy": "last_deploy",
+    "sync_user": "last_user_sync",
+}
+
+
+async def _run_sequence_inner(operation: str, steps: list) -> None:
+    """Exécute les *steps* d'une opération, EN SÉQUENCE, dans le même log.
+
+    Chaque étape est un couple ``(libellé, exécuteur)`` (voir :func:`_cmd_step`).
+    Une étape qui échoue INTERROMPT la séquence : c'est ce qui garantit qu'un
+    redémarrage de worker n'a JAMAIS lieu quand la synchronisation qui le
+    précède a échoué (voir :func:`_worker_restart_steps`).
+    """
+    log_path = _log_path()
+    status_path = _status_path()
+
+    # Nettoyer les logs précédents
+    log_path.write_text("")
+    if status_path.exists():
+        status_path.unlink()
+
+    started_at = time.time()
+    _append_log(log_path, f"═══ Opération: {operation} ═══")
+
+    multi = len(steps) > 1
+    code = 1
+    for index, (label, runner) in enumerate(steps, 1):
+        if multi:
+            _append_log(log_path, f"─── Étape {index}/{len(steps)} : {label} ───")
+        code = await runner(log_path, started_at)
+        if code != 0:
+            if index < len(steps):
+                _append_log(
+                    log_path,
+                    f"ERROR: étape « {label} » échouée (code {code}) — "
+                    "étapes suivantes ANNULÉES",
+                )
+            break
+
+    # Écrire le code de retour (le SSE s'en sert pour conclure l'opération).
+    status_path.write_text(str(code))
 
     # Ligne de fin : le log se termine toujours par un marqueur lisible, même
     # si la dernière ligne du subprocess était une progression partielle.
-    with open(log_path, "a") as f:
-        f.write(
-            f"═══ Terminé (code {process.returncode}) en "
-            f"{int(time.time() - started_at)}s ═══\n"
-        )
+    _append_log(
+        log_path,
+        f"═══ Terminé (code {code}) en {int(time.time() - started_at)}s ═══",
+    )
 
-    # Mettre à jour last_sync ou last_deploy dans la config
-    config = load_config()
-    now = datetime.now().isoformat()
-    if process.returncode == 0:
-        if operation == "sync":
-            config["last_sync"] = now
-        elif operation == "deploy":
-            config["last_deploy"] = now
-            # NOTE : la liste des nodes installés n'est plus dérivée de la
-            # sélection (custom_nodes_ext / custom_nodes_local) — elle vient du
-            # volume réel, voir ``synced_custom_nodes`` (écrit par sync.py) et
-            # GET /api/modal/plugins/installed.
-        elif operation == "sync_user":
-            config["last_user_sync"] = now
+    # Mettre à jour la date de la configuration (succès uniquement).
+    date_key = _OPERATION_DATE_KEYS.get(operation)
+    if code == 0 and date_key:
+        # NOTE : la liste des nodes installés n'est plus dérivée de la sélection
+        # (custom_nodes_ext / custom_nodes_local) — elle vient du volume réel,
+        # voir ``synced_custom_nodes`` (écrit par sync.py) et
+        # GET /api/modal/plugins/installed.
+        config = load_config()
+        config[date_key] = datetime.now().isoformat()
         save_config(config)
+
+
+# ─── Redémarrage du worker Modal (SYNC puis redémarrage) ────────────────────
+# L'ORDRE de la séquence est vital : le worker ne recopie le volume « user »
+# (/user-settings) dans ComfyUI/user qu'AU DÉMARRAGE du container
+# (workers/base_worker.py, _sync_user_settings_from_volume, appelé depuis
+# start_checkpoint ET start_restore — aucun reload pendant la vie du container).
+# Redémarrer AVANT la sync ferait donc relire l'ANCIEN volume par le container
+# neuf : la synchronisation serait perdue.
+WORKER_APP_NAME = "modal-comfy-gateway"
+"""Nom de l'app Modal déployée (apps/all_in_one.py) dont on redémarre les containers."""
+
+WORKER_APP_NAME_CONFIG_KEY = "worker_app_name"
+"""Clé de configuration permettant de viser une autre app (all_in_one_l4, …)."""
+
+# Identifiants de containers Modal (``cs-…``/``ta-…``/``ct-…``/``co-…``).
+_CONTAINER_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9])((?:cs|ta|ct|co)-[A-Za-z0-9]{4,})(?![A-Za-z0-9])"
+)
+
+# Clés possibles d'un identifiant de container dans une sortie JSON.
+_CONTAINER_ID_KEYS = (
+    "container_id",
+    "containerId",
+    "container",
+    "task_id",
+    "taskId",
+    "id",
+)
+
+
+def worker_app_name(config: dict | None = None) -> str:
+    """Nom de l'app Modal à redémarrer (config ``worker_app_name``, sinon défaut)."""
+    source = load_config() if config is None else config
+    name = str(source.get(WORKER_APP_NAME_CONFIG_KEY) or "").strip()
+    return name or WORKER_APP_NAME
+
+
+def _parse_container_ids(payload: str) -> list[str]:
+    """Extrait les identifiants de containers d'une sortie ``modal container list``.
+
+    Tolérant par construction : la CLI Modal a changé plusieurs fois de format.
+    Accepte du JSON (liste de chaînes, ou d'objets portant ``container_id`` /
+    ``id`` / ``task_id``…) ET du texte brut (identifiants ``cs-…``/``ta-…``).
+    Les doublons sont retirés, l'ordre d'apparition conservé.
+    """
+    found: list[str] = []
+
+    def _add(value) -> None:
+        text = str(value or "").strip()
+        if text and _CONTAINER_ID_RE.fullmatch(text) and text not in found:
+            found.append(text)
+
+    def _walk(value) -> None:
+        if isinstance(value, str):
+            _add(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _walk(item)
+        elif isinstance(value, dict):
+            for key in _CONTAINER_ID_KEYS:
+                if key in value:
+                    _walk(value[key])
+                    return
+
+    text = str(payload or "")
+    try:
+        _walk(json.loads(text))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    # Repli texte : couvre les sorties tabulaires et les JSON d'un autre format.
+    for match in _CONTAINER_ID_RE.finditer(text):
+        _add(match.group(1))
+    return found
+
+
+async def _modal_cli_output(cmd: list[str], timeout: float = 120.0) -> tuple[int, str]:
+    """Exécute une commande ``modal`` et retourne ``(code, sortie combinée)``."""
+    env = os.environ.copy()
+    env["PATH"] = f"{os.path.dirname(sys.executable)}:{env.get('PATH', '')}"
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+        )
+    except (OSError, ValueError) as e:
+        return 1, f"impossible de lancer « {' '.join(cmd)} » : {e}"
+    try:
+        raw, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await process.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        return 1, f"« {' '.join(cmd)} » interrompu après {int(timeout)}s (timeout)"
+    return int(process.returncode or 0), raw.decode("utf-8", errors="replace")
+
+
+def _worker_restart_step(app_name: str | None = None):
+    """Étape « redémarrer le worker » : stoppe les containers de l'app déployée.
+
+    Le prochain rendu démarre alors un container NEUF, qui relit le volume
+    (donc le ``user/`` fraîchement synchronisé). Aucun container actif n'est un
+    succès (« rien à arrêter »), mais une CLI incapable de LISTER les containers
+    est un ÉCHEC explicite : on n'affiche jamais un faux « redémarré ».
+    """
+
+    async def _step(log_path: Path, started_at: float) -> int:
+        name = app_name or worker_app_name()
+        _append_log(log_path, f"Recherche des containers actifs de l'app « {name} »…")
+
+        code, output = await _modal_cli_output(
+            ["modal", "container", "list", "--app", name, "--json"]
+        )
+        ids = _parse_container_ids(output) if code == 0 else []
+        if code != 0 or not ids:
+            # Certaines versions de la CLI n'ont pas ``--json`` : second essai
+            # en texte brut. On ne conclut JAMAIS « aucun container » sur échec.
+            fallback_code, fallback_output = await _modal_cli_output(
+                ["modal", "container", "list", "--app", name]
+            )
+            output = (output + "\n" + fallback_output).strip()
+            if fallback_code == 0:
+                code = 0
+                ids = _parse_container_ids(fallback_output)
+
+        if code != 0:
+            # La CLI refuse de lister les containers : le redémarrage ciblé est
+            # impossible. On le DIT (sortie brute conservée pour diagnostic).
+            _append_log(log_path, output or "(aucune sortie)")
+            _append_log(
+                log_path,
+                "ERROR: la CLI Modal ne permet pas de lister les containers "
+                f"(code {code}). Utilisez « Déployer » pour redémarrer le worker.",
+            )
+            return 1
+
+        if not ids:
+            _append_log(
+                log_path,
+                "Aucun container actif pour cette app : le prochain rendu "
+                "démarrera un worker neuf (il relira donc le volume à jour).",
+            )
+            return 0
+
+        _append_log(log_path, f"{len(ids)} container(s) à arrêter : {', '.join(ids)}")
+        failure = 0
+        for container_id in ids:
+            stop_code, stop_output = await _modal_cli_output(
+                ["modal", "container", "stop", container_id], timeout=180.0
+            )
+            for line in (stop_output or "").strip().splitlines():
+                if line.strip():
+                    _append_log(log_path, f"  {line.rstrip()}")
+            if stop_code != 0:
+                _append_log(
+                    log_path,
+                    f"ERROR: arrêt de {container_id} impossible (code {stop_code})",
+                )
+                failure = failure or stop_code or 1
+            else:
+                _append_log(log_path, f"  ✓ {container_id} arrêté")
+        if failure:
+            return failure
+        _append_log(
+            log_path,
+            "Worker redémarré : le prochain rendu relit le volume (user/ à jour).",
+        )
+        return 0
+
+    return ("Redémarrage du worker", _step)
+
+
+def _worker_restart_steps(app_name: str | None = None) -> list:
+    """Séquence du bouton « Redémarrer le worker ».
+
+    ORDRE NON NÉGOCIABLE :
+      1. ``modal run sync.py`` — pousse les fichiers locaux vers le volume ;
+      2. arrêt des containers — le container neuf recopie volume → ``user/``.
+    Voir le commentaire au-dessus de ``WORKER_APP_NAME``.
+    """
+    return [
+        _cmd_step(
+            "Sync des fichiers vers le volume Modal", ["modal", "run", "sync.py"]
+        ),
+        _worker_restart_step(app_name),
+    ]
 
 
 def _check_modal_installed() -> bool:
@@ -1269,6 +1546,55 @@ if PromptServer is not None:
                 return _op_busy_response()
             return web.json_response({"ok": True, "message": "Sync custom nodes lancée"})
 
+        # ── POST /api/modal/restart-worker — SYNC puis redémarrage du worker ──
+        async def post_restart_worker(request):
+            """Redémarre le worker Modal APRÈS avoir synchronisé le volume.
+
+            L'ORDRE est la raison d'être de cette route : le worker ne recopie
+            le volume ``user/`` (``/user-settings``) vers ``ComfyUI/user``
+            qu'AU DÉMARRAGE du container (workers/base_worker.py,
+            ``_sync_user_settings_from_volume``). Redémarrer AVANT la sync
+            ferait donc recharger l'ANCIEN volume par le container neuf.
+
+            Garde-fous :
+            - une opération déjà en cours (sync, deploy…) → 409 explicite via
+              :func:`_op_busy_response` (aucune séquence lancée) ;
+            - un RENDU en cours n'est pas observable côté serveur (les rendus
+              vont du navigateur au gateway) : c'est le client qui l'annonce
+              par ``render_in_progress``, et il ne doit le faire qu'après
+              confirmation de l'utilisateur (``confirm: true``), sinon 409.
+            """
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+
+            if data.get("render_in_progress") and not data.get("confirm"):
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": (
+                            "Un rendu est en cours : confirmez le redémarrage "
+                            "(confirm: true) pour interrompre le worker."
+                        ),
+                        "needs_confirm": True,
+                    },
+                    status=409,
+                )
+
+            if not _spawn_sequence("restart_worker", _worker_restart_steps()):
+                return _op_busy_response()
+            return web.json_response(
+                {
+                    "ok": True,
+                    "message": "Sync puis redémarrage du worker lancés",
+                    # Ordre contractuel de la séquence (le front l'affiche).
+                    "sequence": ["sync", "restart"],
+                }
+            )
+
         # ── GET /api/modal/op/status — état du slot d'opération ──
         async def get_op_status(request):
             return web.json_response({
@@ -1340,6 +1666,7 @@ if PromptServer is not None:
             ("POST", "/api/modal/sync-user", post_sync_user),
             ("POST", "/api/modal/sync-custom-nodes", post_sync_custom_nodes),
             ("GET", "/api/modal/op/status", get_op_status),
+            ("POST", "/api/modal/restart-worker", post_restart_worker),
             ("POST", "/api/modal/op/reset", post_op_reset),
             ("GET", "/api/modal/plugins/installed", get_plugins_installed),
         ]

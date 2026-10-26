@@ -88,10 +88,19 @@ export const PHASES = Object.freeze({
     "2d": Object.freeze([
         "js/aih_enhance_widget.js",               // « Test enhance » (clé en.testEnhance)
     ]),
+    /**
+     * PHASE 2e — SUIVI DE RUN ComfyCH : la fenêtre de suivi (non bloquante)
+     * n'utilise AUCUN emoji — ses quatre boutons d'action (aller à la fin,
+     * copier le log, copier l'erreur, télécharger) portent une icône de la
+     * façade. Fichier NOUVEAU consommateur (aucun lot antérieur ne l'a migré).
+     */
+    "2e": Object.freeze([
+        "js/comfych/modal_gateway.js",            // boutons du suivi de run (icônes, pas d'emoji)
+    ]),
 });
 
 /** Lot en cours (celui dont les fichiers doivent consommer réellement). */
-export const CURRENT_PHASE = "2d";
+export const CURRENT_PHASE = "2e";
 
 /** Alias historique : la phase 2a reste adressable sous son ancien nom. */
 export const PHASE_2A_CONSUMERS = PHASES["2a"];
@@ -104,6 +113,9 @@ export const PHASE_2C_CONSUMERS = PHASES["2c"];
 
 /** Alias explicite de la phase 2d. */
 export const PHASE_2D_CONSUMERS = PHASES["2d"];
+
+/** Alias explicite de la phase 2e. */
+export const PHASE_2E_CONSUMERS = PHASES["2e"];
 
 /** Union de TOUS les fichiers autorisés (toutes phases livrées confondues). */
 export const ALLOWED_CONSUMERS = Object.freeze(
