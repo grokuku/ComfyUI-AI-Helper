@@ -760,6 +760,19 @@ import { aihIconSvg } from "../aih_icons.js";
         },
 
         /**
+         * Extrait les lignes d'erreur d'un log (primitive PURE, bornée).
+         *
+         * Exposée pour que le pack puisse réutiliser EXACTEMENT la même
+         * heuristique (et pour les tests : aucun DOM requis).
+         * @param {string[]} lines - Lignes du log.
+         * @param {number} [maxLines] - Plafond (défaut : interne).
+         * @returns {string} Extrait court, vide si aucune erreur détectable.
+         */
+        extractErrorExcerpt: function (lines, maxLines) {
+            return extractErrorExcerpt(lines, maxLines);
+        },
+
+        /**
          * Indicateur « il y a du contenu plus bas » d'une zone défilante.
          *
          * Primitive d'UI GÉNÉRIQUE (aucune dépendance à ComfyCH) : le pack peut
@@ -1183,6 +1196,26 @@ import { aihIconSvg } from "../aih_icons.js";
     /** Plafond de lignes conservées (mémoire bornée, signalé dans l'UI). */
     var RUN_LOG_MAX_LINES = 800;
 
+    /**
+     * Plafond de lignes copiées par « Copier l'erreur ».
+     *
+     * RETOUR UTILISATEUR : « copy error et copy log ça fait la même chose ».
+     * C'était vrai en pratique : l'extrait remontait TOUT depuis le dernier
+     * « Traceback », soit le log entier quand le traceback était en haut —
+     * et jusqu'à 200 lignes par le repli par motifs. « Copier l'erreur » doit
+     * rester un EXTRAIT court (message + pile), le log complet restant le rôle
+     * de « Copier le log ».
+     */
+    var RUN_ERROR_MAX_LINES = 60;
+
+    /**
+     * Motifs qui trahissent une ERREUR dans un log ComfyUI / worker Modal.
+     * Inclut les lignes de pile (``Traceback``), les exceptions Python
+     * (``RuntimeError``…), les erreurs de chargement ComfyUI
+     * (``missing_node_type``) et les échecs mémoire/HTTP 5xx.
+     */
+    var RUN_ERROR_LINE_RE = /(\bERROR\b|\bCRITICAL\b|\bFATAL\b|Traceback \(most recent call last\)|\b[A-Za-z]*(?:Error|Exception)\b|missing_node_type|out of memory|CUDA error|HTTP 5\d\d)/;
+
     /** Lignes demandées au worker à chaque rafraîchissement (≤ 2000 côté serveur). */
     var RUN_LOG_TAIL_LINES = 400;
 
@@ -1217,8 +1250,7 @@ import { aihIconSvg } from "../aih_icons.js";
         return btn;
     }
 
-    /** Durée lisible ("12s", "2min 05s"). */
-    function runDuration(startedAt, endedAt) {
+    /** Durée lisible ("12s", "2min 05s"). */    function runDuration(startedAt, endedAt) {
         if (!startedAt) return '';
         var until = endedAt || Date.now();
         var seconds = Math.max(0, Math.round((until - startedAt) / 1000));
@@ -1226,6 +1258,86 @@ import { aihIconSvg } from "../aih_icons.js";
         var minutes = Math.floor(seconds / 60);
         var rest = seconds % 60;
         return minutes + 'min ' + (rest < 10 ? '0' : '') + rest + 's';
+    }
+
+    /**
+     * Une ligne du log ressemble-t-elle à une ERREUR ? (détection seule)
+     *
+     * @param {string} line
+     * @returns {boolean}
+     */
+    function isErrorLine(line) {
+        return RUN_ERROR_LINE_RE.test(String(line === undefined || line === null ? '' : line));
+    }
+
+    /**
+     * Ligne est-elle une CONTINUATION de pile / d'exception ?
+     *
+     * Couvre les lignes indentées (``  File "…", line 12``), les lignes
+     * ``Caused by``/``During handling of…`` et les chaînages ``^^^``.
+     */
+    function isStackContinuation(line) {
+        var value = String(line === undefined || line === null ? '' : line);
+        if (!value.trim()) return false;
+        if (/^\s+/.test(value)) return true;                       // indentation
+        if (/^(Caused by|During handling)/i.test(value)) return true;
+        return /^\s*[\^~]+\s*$/.test(value);                      // soulignement Python
+    }
+
+    /**
+     * Extrait COURTE des lignes d'erreur d'un log (fonction PURE, testable).
+     *
+     * Stratégie (heuristique demandée, bornée dans TOUS les cas) :
+     *   1. s'il existe au moins un ``Traceback (most recent call last)``, on
+     *      renvoie le DERNIER bloc (traceback + suite), plafonné ;
+     *   2. sinon on garde les lignes qui matchent ``RUN_ERROR_LINE_RE`` ET
+     *      leurs lignes de continuation (pile indentée), les PLUS RÉCENTES
+     *      d'abord si le plafond est dépassé.
+     *
+     * Un log de 2000 lignes ne produit donc jamais 2000 lignes copiées :
+     * « Copier l'erreur » reste un extrait, « Copier le log » copie tout.
+     *
+     * @param {string[]} lines - Lignes du log.
+     * @param {number} [maxLines] - Plafond (défaut RUN_ERROR_MAX_LINES).
+     * @returns {string} Extrait (vide si aucune erreur détectable).
+     */
+    function extractErrorExcerpt(lines, maxLines) {
+        var limit = maxLines > 0 ? maxLines : RUN_ERROR_MAX_LINES;
+        if (!Array.isArray(lines) || lines.length === 0) return '';
+
+        var start = -1;
+        for (var i = lines.length - 1; i >= 0; i--) {
+            if (/^\s*Traceback \(most recent call last\)/.test(lines[i])) { start = i; break; }
+        }
+        if (start >= 0) {
+            var block = lines.slice(start);
+            // ``slice`` peut être énorme si le traceback est EN HAUT : on garde
+            // la FIN du bloc (l'exception finale est la plus informative).
+            if (block.length > limit) block = block.slice(-limit);
+            return block.join('\n').trim();
+        }
+
+        var picked = [];
+        for (var j = 0; j < lines.length; j++) {
+            if (!isErrorLine(lines[j])) continue;
+            picked.push(lines[j]);
+            for (var k = j + 1; k < lines.length; k++) {
+                if (!isStackContinuation(lines[k])) break;
+                picked.push(lines[k]);
+                j = k;
+            }
+        }
+        if (picked.length > limit) picked = picked.slice(-limit);
+        return picked.join('\n').trim();
+    }
+
+    /** Y a-t-il une erreur détectable (message du run ou log) ? */
+    function logHasError(lines) {
+        if (!Array.isArray(lines)) return false;
+        for (var i = 0; i < lines.length; i++) {
+            if (isErrorLine(lines[i])) return true;
+        }
+        return false;
     }
 
     /** Libellé traduit d'un état de run. */
@@ -1547,6 +1659,12 @@ import { aihIconSvg } from "../aih_icons.js";
                 return;
             }
             if (action === 'copy-error') {
+                // Bouton désactivé = aucune erreur : ne JAMAIS copier le log
+                // entier à la place (les deux boutons feraient la même chose).
+                if (!this.hasError()) {
+                    showNotification(t('comfych.run.copyErrorNone', 'Aucune erreur à copier'), 'info');
+                    return;
+                }
                 copyToClipboard(this.errorText()).then(function (ok) {
                     showNotification(
                         ok ? t('comfych.run.copiedError', "Message d'erreur copié")
@@ -1628,7 +1746,29 @@ import { aihIconSvg } from "../aih_icons.js";
                 : '';
             els.notice.style.display = this.dropped > 0 ? 'inline' : 'none';
 
+            // L'état du bouton dépend aussi du LOG (une erreur peut apparaître
+            // en cours de route, avant même la conclusion du run).
+            this.renderCopyErrorState();
+
             if (!this.paused) this.scrollToEnd(false);
+        },
+
+        /**
+         * Active/désactive « Copier l'erreur » selon qu'une erreur existe.
+         *
+         * Désactivé : l'infobulle explique POURQUOI (aucune erreur détectée)
+         * et le clic ne copie rien — il ne recopie surtout pas le log complet.
+         */
+        renderCopyErrorState: function () {
+            var els = this.els;
+            if (!els || !els.copyError) return;
+            var enabled = this.hasError();
+            els.copyError.disabled = !enabled;
+            els.copyError.classList.toggle('is-disabled', !enabled);
+            els.copyError.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+            els.copyError.title = enabled
+                ? t('comfych.run.copyErrorHint', "Copie le message d'erreur et l'extrait de pile (jamais le log complet)")
+                : t('comfych.run.copyErrorNone', 'Aucune erreur à copier');
         },
 
         /** Affiche (ou non) le bloc d'erreur / d'annulation. */
@@ -1641,43 +1781,45 @@ import { aihIconSvg } from "../aih_icons.js";
             if (!text) {
                 els.errorBox.style.display = 'none';
                 els.errorBox.textContent = '';
+                this.renderCopyErrorState();
                 return;
             }
             els.errorBox.style.display = 'block';
             els.errorBox.textContent = text;
+            this.renderCopyErrorState();
         },
 
-        /** Texte copié par « Copier l'erreur » : jamais vide. */
+        /**
+         * Une erreur est-elle copiable ? (message du run ou log)
+         *
+         * Sans erreur détectable, le bouton « Copier l'erreur » est DÉSACTIVÉ :
+         * il ne doit jamais recopier le log entier à la place d'une erreur
+         * (c'était l'impression donnée par les deux boutons identiques).
+         */
+        hasError: function () {
+            if (this.error) return true;
+            if (this.status === 'failed' || this.status === 'cancelled') return true;
+            return logHasError(this.lines);
+        },
+
+        /** Texte copié par « Copier l'erreur » : message + extrait BORNÉ. */
         errorText: function () {
             var parts = [];
             if (this.error) parts.push(this.error);
             var excerpt = this.logExcerpt();
-            if (excerpt) parts.push(excerpt);
+            // Le message du run peut déjà contenir le log : pas de doublon.
+            if (excerpt && parts.indexOf(excerpt) === -1) parts.push(excerpt);
             if (!parts.length) return t('comfych.run.noError', 'Aucune erreur détectée dans les logs.');
             return parts.join('\n\n');
         },
 
-        /** Extrait du log utile au débogage (dernier traceback, sinon motifs d'erreur). */
+        /**
+         * Extrait du log utile au débogage : DERNIER traceback ou lignes
+         * d'erreur (+ continuations), toujours plafonné à RUN_ERROR_MAX_LINES.
+         * Fonction PURE réutilisable (voir extractErrorExcerpt).
+         */
         logExcerpt: function () {
-            var lines = this.lines;
-            var start = -1;
-            for (var i = lines.length - 1; i >= 0; i--) {
-                if (/^Traceback \(most recent call last\)/.test(lines[i])) {
-                    start = i;
-                    break;
-                }
-            }
-            var picked = [];
-            if (start >= 0) {
-                picked = lines.slice(start);
-            } else {
-                var re = /(Traceback|Error|Exception|ERROR|CRITICAL|failed|missing_node_type|out of memory|HTTP 5\d\d)/;
-                for (var j = 0; j < lines.length; j++) {
-                    if (re.test(lines[j])) picked.push(lines[j]);
-                }
-                if (picked.length > 200) picked = picked.slice(-200);
-            }
-            return picked.join('\n').trim();
+            return extractErrorExcerpt(this.lines, RUN_ERROR_MAX_LINES);
         },
 
         /** Contenu complet copié/téléchargé (en-tête + log + erreur). */
@@ -1993,6 +2135,12 @@ import { aihIconSvg } from "../aih_icons.js";
             '  border: 1px solid var(--aih-btn-border, #555);',
             '}',
             '.comfych-run-btn:hover { background: var(--aih-btn-bg-hover, #4a4a4e); }',
+            // Bouton SANS erreur à copier : visiblement inactif (jamais muet).
+            '.comfych-run-btn:disabled, .comfych-run-btn.is-disabled {',
+            '  opacity: 0.45; cursor: not-allowed;',
+            '  background: transparent;',
+            '}',
+            '.comfych-run-btn:disabled:hover { background: transparent; }',
             '.comfych-run-icon { display: inline-flex; align-items: center; }',
             '.comfych-run-error {',
             '  flex: 0 0 auto; max-height: 110px; overflow: auto;',

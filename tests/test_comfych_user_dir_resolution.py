@@ -247,8 +247,9 @@ class _FakeUploads(list):
 
 
 class _FakeBatchUpload:
-    def __init__(self, uploads):
+    def __init__(self, uploads, force=False):
         self.uploads = uploads
+        self.force = force
 
     def __enter__(self):
         return self
@@ -262,13 +263,17 @@ class _FakeBatchUpload:
 
 class _FakeVolume:
     uploads: ClassVar[list] = []
+    batch_forces: ClassVar[list] = []
 
     @classmethod
     def from_name(cls, *_args, **_kwargs):
         return cls()
 
-    def batch_upload(self):
-        return _FakeBatchUpload(self.uploads)
+    def batch_upload(self, force=False):
+        # ``force`` est MÉMORISÉ : sans ``force=True``, Modal refuse d'écraser
+        # un fichier déjà présent sur le volume (credentials.json périmé).
+        type(self).batch_forces.append(bool(force))
+        return _FakeBatchUpload(self.uploads, force=force)
 
     def commit(self):
         return None
@@ -301,6 +306,7 @@ def sync_module(monkeypatch, tmp_path):
     """Charge ``sync.py`` avec ``modal``/``helpers``/``models`` remplacés."""
     uploads: list = []
     _FakeVolume.uploads = uploads
+    _FakeVolume.batch_forces = []
 
     modal_stub = types.ModuleType("modal")
     modal_stub.Volume = _FakeVolume
@@ -335,7 +341,12 @@ def sync_module(monkeypatch, tmp_path):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, "comfych_sync_under_test", module)
     spec.loader.exec_module(module)
-    return types.SimpleNamespace(module=module, uploads=uploads, config_file=config_file)
+    return types.SimpleNamespace(
+        module=module,
+        uploads=uploads,
+        forces=_FakeVolume.batch_forces,
+        config_file=config_file,
+    )
 
 
 def _missing_candidates(tmp_path):

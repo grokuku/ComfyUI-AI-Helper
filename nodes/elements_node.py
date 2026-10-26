@@ -271,11 +271,36 @@ def _pick_from_list(items, seed, element_index, raw_text):
     return items[h % len(items)]
 
 
-def _call_llm_process(api_url, api_key, preset_id, instruction, input_text=""):
+def _call_llm_process(api_url, api_key, preset_id, instruction, input_text="", errors=None):
     """Appelle POST /api/keywords/llm-process.
 
     Retourne le texte output (str) ou None si erreur/timeout/réponse vide.
+
+    ``errors`` (liste optionnelle, remplie par appel) reçoit la RAISON lisible
+    de chaque échec : le node s'en sert pour la remonter dans l'UI (au lieu de
+    N warnings muets en console qui laissent l'utilisateur devant une liste
+    vide sans explication). Le PREMIER échec est journalisé en WARNING, les
+    répétitions en DEBUG : un backend injoignable ne doit pas noyer le log.
     """
+    def _fail(reason):
+        """Journalise l'échec (1er en WARNING, suivants en DEBUG) et l'enregistre."""
+        msg = f"[AIH Elements] LLM call failed: {reason}"
+        if errors is not None and errors:
+            logging.debug(msg)
+        else:
+            logging.warning(msg)
+        if errors is not None:
+            errors.append(str(reason))
+
+    # Serveur non configuré (server_url vide) : l'URL relative
+    # "/keywords/llm-process" ne peut pas aboutir (« Invalid URL … No scheme
+    # supplied »). Ce n'est pas un bug réseau — inutile d'émettre la requête.
+    if not (api_url or "").strip():
+        _fail(
+            "serveur AIH non configuré (server_url vide) — Settings ▸ onglet « AIH · Compte »"
+        )
+        return None
+
     try:
         import requests
         headers = {
@@ -296,10 +321,41 @@ def _call_llm_process(api_url, api_key, preset_id, instruction, input_text=""):
         r.raise_for_status()
         data = r.json()
         output = data.get("output", "")
-        return output if output else None
+        if not output:
+            _fail("réponse vide du backend")
+            return None
+        return output
     except Exception as e:
-        logging.warning(f"[AIH Elements] LLM call failed: {e}")
+        _fail(e)
         return None
+
+
+def _llm_warning_message(errors, skipped=0):
+    """Message d'UI expliquant un dégradé LLM (None si rien à signaler).
+
+    Le comportement dégradé du node (repli local, éléments ignorés) est
+    désormais COHÉRENT avec celui du node Enhance : il produit toujours un
+    résultat, mais la RAISON est visible dans l'UI, pas seulement en console.
+
+    Args:
+        errors: raisons des échecs d'appel LLM (liste de str).
+        skipped: nombre d'éléments retirés faute de réponse LLM.
+
+    Retourne:
+        str|None: message prêt à afficher, ou None si aucun échec.
+    """
+    if not errors:
+        return None
+    first = str(errors[0]).strip()
+    if len(first) > 160:
+        first = first[:157] + "…"
+    parts = [f"⚠️ LLM indisponible ({first})"]
+    if skipped:
+        parts.append(f"{skipped} élément(s) ignoré(s)")
+    if len(errors) > 1:
+        parts.append(f"{len(errors)} appel(s) en échec")
+    parts.append("repli local — vérifiez Settings ▸ AIH · Compte (server_url + api_key)")
+    return " — ".join(parts)
 
 
 def _parse_llm_list(output_text):
@@ -440,6 +496,10 @@ class AIHElementsNode:
             context.append(elements_input.strip())
 
         indices_to_skip = set()  # indices d'éléments LLM à skip (liste vide)
+        # Raisons des échecs d'appel LLM (backend injoignable, preset absent, 401…).
+        # Sert UNIQUEMENT à expliquer le résultat dans l'UI (`ui["warning"]`) :
+        # le comportement de repli, lui, reste inchangé.
+        llm_errors = []
 
         for i, el in enumerate(elements):
             if el.get("type") not in ("raw", "text"):
@@ -490,7 +550,8 @@ class AIHElementsNode:
                 else:
                     # Backend existant (comportement actuel)
                     output = _call_llm_process(
-                        api_url, api_key, preset_id, instruction, input_text
+                        api_url, api_key, preset_id, instruction, input_text,
+                        llm_errors,
                     )
                     items = _parse_llm_list(output) if output else []
                 if items:
@@ -526,7 +587,8 @@ class AIHElementsNode:
                 else:
                     # Backend existant (comportement actuel)
                     output = _call_llm_process(
-                        api_url, api_key, preset_id, instruction, input_text
+                        api_url, api_key, preset_id, instruction, input_text,
+                        llm_errors,
                     )
                     filtered = _parse_llm_list(output) if output else []
                 if filtered:
@@ -556,6 +618,11 @@ class AIHElementsNode:
                 el for i, el in enumerate(elements) if i not in indices_to_skip
             ]
 
+        # Message d'UI expliquant un dégradé LLM (None si tout s'est bien passé).
+        # Il est ajouté à `ui["warning"]` : visible dans la node (toast) sans
+        # JAMAIS polluer la sortie `elements` (qui part vers le prompt).
+        llm_warning = _llm_warning_message(llm_errors, len(indices_to_skip))
+
         # --- Injecter elements_input comme élément réel dans la payload ---
         # Bug #1 & #2 : elements_input était seulement dans le context LLM,
         # jamais dans le payload final. Il faut l'ajouter comme un élément raw
@@ -572,8 +639,16 @@ class AIHElementsNode:
 
         # Vérifier qu'il y a du contenu à générer
         if not elements and random_count <= 0:
+            # Message le PLUS honnête possible : si les éléments ont disparu
+            # parce que le LLM n'a pas répondu, dire POURQUOI (backend non
+            # configuré, 401, timeout…) au lieu de « Aucun filtre
+            # sélectionné », qui envoie l'utilisateur sur la mauvaise piste.
+            warning = _llm_warning_message(llm_errors, len(indices_to_skip))
+            message = "⚠️ Aucun filtre sélectionné. Ajoutez des filtres dans la liste."
+            if warning:
+                message = warning
             return {
-                "ui": {"elements": ["⚠️ Aucun filtre sélectionné. Ajoutez des filtres dans la liste."]},
+                "ui": {"elements": [message], "warning": [message]},
                 "result": ("", llm_config)
             }
 
@@ -621,14 +696,25 @@ class AIHElementsNode:
                 prompt = re.sub(r'\s*,\s*', ', ', prompt)
                 prompt = re.sub(r',+', ',', prompt).strip(' ,')
 
+            ui = {"elements": [prompt]}
+            if llm_warning:
+                ui["warning"] = [llm_warning]
             return {
-                "ui": {"elements": [prompt]},
+                "ui": ui,
                 "result": (prompt, llm_config)
             }
-        except Exception:
-            # Fallback silencieux : utiliser le prompt construit localement
+        except Exception as e:
+            # Repli LOCAL (jamais un échec de workflow) : le prompt construit
+            # localement est renvoyé ; la raison est remontée dans l'UI au lieu
+            # d'être avalée en silence (« fallback silencieux » historique).
+            logging.warning(f"[AIH Elements] /api/generate injoignable : {e}")
+            notice = llm_warning or (
+                "⚠️ Backend AIH injoignable — filtres et éléments aléatoires "
+                "résolus localement. Vérifiez Settings ▸ AIH · Compte "
+                "(server_url + api_key)."
+            )
             return {
-                "ui": {"elements": [final_prompt]},
+                "ui": {"elements": [final_prompt], "warning": [notice]},
                 "result": (final_prompt, llm_config)
             }
 

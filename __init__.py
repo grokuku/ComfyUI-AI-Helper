@@ -84,6 +84,21 @@ try:
 except Exception as _user_paths_err:  # noqa: BLE001 — ne jamais casser le démarrage de ComfyUI
     print(f"🔴 [Holaf-UserPaths] Unexpected error during user data layout: {_user_paths_err}")
 
+# --- Diagnostic des credentials AIH : UNE ligne au démarrage -----------------
+# Sur le worker Modal, ce démarrage est le SEUL moment où l'on peut vérifier
+# ce que ComfyUI a réellement sous la main (le container a recopié le volume
+# /user-settings dans ComfyUI/user juste avant, voir
+# tools/comfych/workers/base_worker.py:_sync_user_settings_from_volume).
+# La ligne dit présence/valeur des DEUX champs et le chemin lu — jamais la clé :
+#   credentials: server_url=<vide|renseignée> api_key=<vide|renseignée> (source: fichier …)
+# Elle permet de trancher entre fichier absent, fichier vide (volume périmé) et
+# fichier correct (problème en aval), sans relancer un rendu pour le deviner.
+try:
+    from aih import credentials as _aih_credentials
+    print(f"🔵 [Holaf-AIH] {_aih_credentials.credentials_status_line()}")
+except Exception as _aih_credentials_err:  # noqa: BLE001 — jamais bloquant
+    print(f"🟡 [Holaf-AIH] diagnostic credentials indisponible : {_aih_credentials_err}")
+
 import server
 import asyncio
 import json

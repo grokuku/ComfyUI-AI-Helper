@@ -1084,6 +1084,80 @@ USER_SETTINGS_EXCLUDE_SUFFIXES = {".log", ".tmp", ".temp"}
 # du volume). Les réglages qu'elle contient sont alors perdus côté worker.
 MAX_USER_DB_MB = 200
 
+# Fichier de credentials AIH : ``<user>/default/AI-Helper/config/credentials.json``
+# (nouvel emplacement) ou ``<user>/default/aih/credentials.json`` (historique).
+# Il porte ``server_url`` + ``api_key`` lus par les nodes AIH du worker.
+CREDENTIALS_FILENAME = "credentials.json"
+
+
+def _value_presence(value) -> str:
+    """« renseignée » / « vide » — JAMAIS la valeur (clé API en clair).
+
+    C'est la seule information nécessaire au diagnostic : le log ne doit
+    jamais contenir la clé elle-même (il finit dans un volume, puis dans le
+    navigateur via la fenêtre de suivi du run).
+    """
+    return "renseignée" if str(value or "").strip() else "vide"
+
+
+def _credentials_sync_report(user_dir, selected) -> list:
+    """Lignes de diagnostic de ``credentials.json`` avant l'upload.
+
+    Répond à la question qui compte quand le worker se plaint de
+    « credentials incomplets (api_key ou server_url manquant) » :
+      1. le fichier est-il DANS le périmètre poussé (``user/``) ? ;
+      2. est-il renseigné CÔTÉ LOCAL ?
+    Si (1) est oui et (2) aussi, le problème est en aval (volume périmé /
+    worker non redémarré) ; si (1) est non, la résolution du dossier ``user/``
+    locale ne voit pas le fichier que l'UI vient d'écrire.
+
+    Args:
+        user_dir: dossier ``user/`` local effectivement synchronisé.
+        selected: fichiers retenus par :func:`_select_user_setting_files`.
+
+    Retours:
+        list[str]: UNE ligne de synthèse, plus une ligne d'aide si absent.
+    """
+    user_dir = Path(user_dir)
+    creds = [p for p in selected if Path(p).name == CREDENTIALS_FILENAME]
+    if not creds:
+        return [
+            f"📁 user/ : {len(selected)} fichier(s), "
+            f"{CREDENTIALS_FILENAME} présent=non — les nodes AIH du worker "
+            f"n'auront ni server_url ni api_key (renseignez Settings ▸ "
+            f"onglet « AIH · Compte » puis relancez la sync)",
+        ]
+
+    # Plusieurs emplacements peuvent coexister (nouveau + historique) : le
+    # worker retient le NOUVEAU s'il est présent, on cite le premier trouvé.
+    chosen = sorted(creds, key=lambda p: ("aih" in Path(p).parts, str(p)))[0]
+    try:
+        with open(chosen, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            data = {}
+        read_error = ""
+    except (OSError, ValueError) as exc:
+        data = {}
+        read_error = f" (illisible : {type(exc).__name__})"
+
+    rel = Path(chosen).relative_to(user_dir) if Path(chosen).is_relative_to(user_dir) else chosen
+    lines = [
+        f"📁 user/ : {len(selected)} fichier(s), {CREDENTIALS_FILENAME} présent=oui "
+        f"({rel}), server_url={_value_presence(data.get('server_url'))}, "
+        f"api_key={_value_presence(data.get('api_key'))}{read_error}"
+    ]
+    if not str(data.get("server_url") or "").strip():
+        lines.append(
+            "   ↳ server_url VIDE en local : le worker ne pourra résoudre aucune "
+            "URL relative (Settings ▸ onglet « AIH · Compte »)"
+        )
+    if not str(data.get("api_key") or "").strip():
+        lines.append(
+            "   ↳ api_key VIDE en local : les appels AIH du worker seront refusés"
+        )
+    return lines
+
 
 def _is_sqlite_file(path: Path) -> bool:
     """True si *path* est une base SQLite (``.db`` / ``.sqlite``)."""
@@ -1275,6 +1349,11 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         dbs = sum(1 for f in files_to_upload if _is_sqlite_file(f))
 
         print(f"📁 Dossier user/ local : {user_dir}", flush=True)
+        # Diagnostic CREDENTIALS : une seule ligne qui dit si le fichier lu par
+        # les nodes AIH du worker est bien DANS le périmètre et renseigné. Jamais
+        # la valeur de la clé (seulement « vide » / « renseignée »).
+        for line in _credentials_sync_report(user_dir, files_to_upload):
+            print(line, flush=True)
         print(
             f"📁 Uploading {len(files_to_upload)} user setting file(s)"
             f" (dont {dbs} base(s) SQLite)…",
@@ -1283,14 +1362,24 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
 
         uploaded = 0
         skipped = 0
+        skipped_names: list[str] = []
         # Dossier de travail des snapshots SQLite : nettoyé quoi qu'il
         # arrive, il ne doit jamais rester de copie de base sur disque.
         tmp_root = Path(tempfile.mkdtemp(prefix="comfych-user-sync-"))
         # Un SEUL batch_upload pour tous les fichiers : chaque
         # ``with user_vol.batch_upload()`` ouvre une session réseau, la
         # rouvrir par fichier rendait l'upload très lent.
+        #
+        # ⚠️ ``force=True`` est INDISPENSABLE. Par défaut, Modal REFUSE
+        # d'écraser un fichier déjà présent sur le volume
+        # (``batch_upload(force=False)`` → ``put_file`` lève ``FileExistsError``).
+        # L'ancien code avalait cette exception en comptant « already present » :
+        # un fichier poussé une première fois n'était donc PLUS JAMAIS mis à
+        # jour. C'est exactement le piège qui vidait les credentials du worker :
+        # ``credentials.json`` (server_url + api_key) restait sur le volume dans
+        # sa version d'origine, et le container la recopiait à chaque démarrage.
         try:
-            with user_vol.batch_upload() as batch:
+            with user_vol.batch_upload(force=True) as batch:
                 for index, f in enumerate(files_to_upload):
                     rel_path = f.relative_to(user_dir)
                     if _is_sqlite_file(f):
@@ -1305,13 +1394,34 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
                             uploaded += 1
                         except FileExistsError:
                             skipped += 1
-        except FileExistsError:
-            # Batch refusé d'emblée (ex. conflit signalé hors put_file)
+                            skipped_names.append(str(dest_rel))
+        except FileExistsError as exc:
+            # Batch refusé d'emblée (ex. conflit signalé hors put_file).
             skipped += 1
+            skipped_names.append(f"(batch) {exc}")
         finally:
             shutil.rmtree(tmp_root, ignore_errors=True)
 
-        print(f"✅ User settings synced to volume ({uploaded} uploaded, {skipped} already present)")
+        print(
+            f"✅ User settings synced to volume ({uploaded} uploaded "
+            f"(fichiers existants remplacés), {skipped} skipped)",
+            flush=True,
+        )
+        if skipped_names:
+            preview = ", ".join(skipped_names[:5])
+            more = f" (+{len(skipped_names) - 5})" if len(skipped_names) > 5 else ""
+            print(
+                f"⚠️ NON transféré(s) : {preview}{more} — si "
+                f"{CREDENTIALS_FILENAME} apparaît ici, le volume garde son "
+                f"ancienne version et le worker lira des credentials périmés",
+                flush=True,
+            )
+        print(
+            "ℹ️ Le worker ne relit le volume qu'à son DÉMARRAGE : "
+            "redémarrez-le pour que les réglages (dont credentials.json) soient "
+            "pris en compte.",
+            flush=True,
+        )
 
     # ── User settings only mode ────────────────────────────────────────
     if sync_user_only:

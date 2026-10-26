@@ -28,12 +28,47 @@ this same instance, keeping the ``ANY_TYPE`` singleton unique pack-wide.
 
 import os
 import logging
+import threading
 import numpy as np
 import torch
 import folder_paths
 from PIL import Image
 
 logger = logging.getLogger("Holaf")
+
+# ── Replis de chemin déjà signalés (UNE fois par process) ───────────────────
+# Un `base_path` (ou un `subfolder`) hors du dossier autorisé est un cas
+# NORMAL lorsqu'une configuration a été conçue sur une autre machine : sur le
+# worker Modal, le `base_path` local `/config/outputs/ComfyUI/` tombe hors de
+# `/root/comfy/ComfyUI/output` à CHAQUE sauvegarde. Répéter le WARNING noie les
+# vraies erreurs dans les logs du worker ; il est donc émis UNE fois (texte
+# complet, avec la marche à suivre), puis seulement en DEBUG. Le GARDE-FOU de
+# sécurité, lui, n'est pas touché : le chemin hors zone reste REFUSÉ.
+_WARNED_PATH_FALLBACKS = set()
+_WARNED_PATH_FALLBACKS_LOCK = threading.Lock()
+
+
+def _warn_path_fallback_once(key, message):
+    """Émet *message* en WARNING une seule fois par *key* (DEBUG ensuite).
+
+    Args:
+        key: identité du repli (ex. ``("base_path", chemin_absolu)``).
+        message: texte du premier avertissement (complet et informatif).
+    """
+    with _WARNED_PATH_FALLBACKS_LOCK:
+        already = key in _WARNED_PATH_FALLBACKS
+        if not already:
+            _WARNED_PATH_FALLBACKS.add(key)
+    if already:
+        logger.debug("Repli de chemin déjà signalé : %s", message)
+        return
+    logger.warning(message)
+
+
+def reset_path_fallback_warnings():
+    """Oublie les replis déjà signalés (tests / nouvelle exécution explicite)."""
+    with _WARNED_PATH_FALLBACKS_LOCK:
+        _WARNED_PATH_FALLBACKS.clear()
 
 
 def validate_base_path(base_path, allowed_base=None):
@@ -47,7 +82,12 @@ def validate_base_path(base_path, allowed_base=None):
     abs_base = os.path.abspath(os.path.expanduser(base_path))
     abs_allowed = os.path.abspath(allowed_base)
     if not (abs_base == abs_allowed or abs_base.startswith(abs_allowed + os.sep)):
-        logger.warning(f"base_path '{base_path}' resolves outside allowed directory '{allowed_base}'. Falling back.")
+        _warn_path_fallback_once(
+            ("base_path", abs_base, abs_allowed),
+            f"base_path '{base_path}' resolves outside allowed directory '{allowed_base}'. "
+            f"Falling back to '{allowed_base}' (chemin hors zone REFUSÉ — signalé une "
+            f"seule fois ; corrigez le widget base_path ou la configuration du node).",
+        )
         return allowed_base
     return base_path
 
@@ -65,7 +105,11 @@ def validate_subfolder(base_path, subfolder, allowed_base=None):
     full_path = os.path.join(base_path, subfolder)
     abs_full = os.path.abspath(full_path)
     if not (abs_full == abs_allowed or abs_full.startswith(abs_allowed + os.sep)):
-        logger.warning(f"subfolder '{subfolder}' resolves outside allowed directory '{allowed_base}'. Discarding subfolder.")
+        _warn_path_fallback_once(
+            ("subfolder", abs_full, abs_allowed),
+            f"subfolder '{subfolder}' resolves outside allowed directory '{allowed_base}'. "
+            f"Discarding subfolder (contenu hors zone REFUSÉ — signalé une seule fois).",
+        )
         return ""
     return subfolder
 
