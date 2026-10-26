@@ -1,26 +1,38 @@
 """Routeur FastAPI partagé pour les apps Modal Gateway (all_in_one*, lite, l4).
 
-Factorise le code de routage dupliqué entre ``apps/all_in_one*.py`` et ajoute
-l'**idempotence** sur ``/generate`` :
+Factorise le code de routage dupliqué entre ``apps/all_in_one*.py`` et sépare
+**le lancement du rendu** de **la durée de la requête HTTP**.
 
-- le client envoie un ``request_id`` dans le corps de la requête ;
-- si un job avec ce ``request_id`` a déjà été exécuté, le routeur retourne le
-  résultat **en cache** sans relancer le workflow (évite la double facturation
-  quand un retry réseau renvoie la requête après que le job a terminé) ;
-- si un job identique est **en cours**, le second appel attend le même job
-  au lieu de le relancer.
+Architecture (cf. ``docs/COMFYCH.md``)::
 
-Le cache est en mémoire (TTL 1h, max 10 entrées) — suffisant pour le cas
-d'usage d'un gateway mono-utilisateur. Les clients sans ``request_id``
-continuent de fonctionner (comportement d'origine).
+    navigateur --POST /generate (async)--> gateway --run_job.spawn()--> worker
+         |                                    |                          |
+         +----GET /job/<id> (polling court)---+--- volume /cache/jobs/<id>/+
+
+Pourquoi ce découplage : un rendu dure plusieurs minutes alors qu'une requête
+HTTP peut être coupée à tout instant (déconnexion du navigateur, timeout d'un
+proxy, redéploiement, timeout de fonction Modal). Tant que le gateway attendait
+le résultat **dans la même requête**, toute coupure :
+
+1. arrêtait le suivi du rendu (donc, le conteneur n'ayant plus d'entrée,
+   ``scaledown_window`` l'arrêtait en plein rendu) ;
+2. faisait répondre au client un ``503 « Job interrompu »`` **alors que le
+   rendu avait produit ses images** → l'UI affichait « Échec » à tort.
+
+Désormais : le gateway **lance** le job (``.spawn()``, jamais annulé par une
+déconnexion cliente), le résultat est **persisté sur le volume** par le worker,
+et le client **suit un identifiant de job** par requêtes courtes. Le résultat
+reste récupérable après n'importe quelle coupure (``GET /job/<id>``).
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import math
+import os
 import time
-from pathlib import Path
+import uuid
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,68 +41,151 @@ from pydantic import BaseModel
 
 import auth
 
-# ─── Idempotence ────────────────────────────────────────────────────────────
+# ─── Budgets et délais (configurables par variables d'environnement) ─────────
+
+GATEWAY_TIMEOUT_ENV = "COMFYCH_GATEWAY_TIMEOUT_S"
+"""Variable d'env. qui fixe le ``timeout`` des fonctions web Modal (secondes)."""
+
+DEFAULT_GATEWAY_TIMEOUT_SECONDS = 3600
+"""Timeout par défaut des fonctions web Modal (1 h).
+
+Sans ``timeout=`` explicite, Modal applique **300 s** : toute requête plus
+longue était tuée par Modal (entrée annulée → ``CancelledError`` → 503), ce qui
+rendait par construction impossible tout rendu dépassant 5 minutes. Le rendu
+n'est plus attendu dans une requête (soumission + polling), ce budget borne
+donc seulement la durée d'UNE requête."""
+
+MIN_GATEWAY_TIMEOUT_SECONDS = 120
+"""Plancher du timeout web : en dessous, même le mode bloquant historique
+(attente du résultat dans la requête) ne peut pas fonctionner."""
+
+SYNC_WAIT_ENV = "COMFYCH_SYNC_WAIT_S"
+"""Budget d'attente du mode bloquant historique (secondes)."""
+
+DEFAULT_SYNC_WAIT_SECONDS = 900
+"""Budget du mode bloquant (compatibilité) : au-delà, on répond un 504
+**explicite** en indiquant comment reprendre (``GET /job/<id>``)."""
+
+JOB_POLL_INTERVAL_ENV = "COMFYCH_JOB_POLL_INTERVAL_S"
+"""Intervalle de lecture de l'état d'un job côté gateway (secondes)."""
+
+DEFAULT_JOB_POLL_INTERVAL_SECONDS = 2.0
+
+JOB_BUDGET_ENV = "COMFYCH_JOB_TIMEOUT_S"
+"""Budget d'exécution d'un job (le **même** que celui lu par le worker)."""
+
+DEFAULT_JOB_BUDGET_SECONDS = 3600
+"""Budget après lequel un job encore « running » est déclaré perdu.
+
+Un job dont le conteneur GPU a été arrêté sans écrire de résultat (préemption
+sans relance) resterait sinon « running » à vie : au-delà de ce budget on
+répond un échec **honnête** (« job sans résultat après N s ») plutôt que de
+laisser le client attendre indéfiniment."""
+
+
+def job_budget_seconds() -> float:
+    """Budget d'un job (secondes) + marge de lecture, configurable par env."""
+    return _env_number(JOB_BUDGET_ENV, DEFAULT_JOB_BUDGET_SECONDS, 30) + 60
+
+
+JOB_TIMEOUT_FALLBACK_SECONDS = DEFAULT_JOB_BUDGET_SECONDS + 60
+"""Repli quand le worker ne déclare pas son budget dans le manifeste."""
+
+JOB_ID_MAX_LENGTH = 96
+
+# ─── Idempotence / cache des résultats ──────────────────────────────────────
 
 _IDEMPOTENCY_TTL_SECONDS = 3600  # 1 heure
 _IDEMPOTENCY_MAX_ENTRIES = 10
 
-# Budget de polling du leader (secondes). Le résultat doit rester disponible
-# pour les followers un peu plus longtemps que ce budget, le temps que le
-# leader termine de récupérer les images (/view) et les sideloads.
-_MAX_POLL_ATTEMPTS = 600  # 600 * 1s = 10 minutes
-# Marge de 30 s au-dessus du poll, mais toujours sous le timeout navigateur
-# (660 s) : le serveur peut ainsi répondre un 504 propre avant l'abandon client.
-_FOLLOWER_WAIT_TIMEOUT_SECONDS = _MAX_POLL_ATTEMPTS + 30  # 630s
-
-# Timeout côté navigateur (web/modal_gateway.js) : 660 000 ms (11 min).
-# Le serveur doit rester en dessous pour pouvoir répondre une erreur propre
-# (504) avant que le client n'abandonne la requête.
-
-# request_id -> (timestamp, result)
+# job_id -> (timestamp, result)
 _idempotency_cache: dict[str, tuple[float, dict]] = {}
-# request_id -> {"event": asyncio.Event, "result": dict | None, "error": Response | None}
-_idempotency_inflight: dict[str, dict] = {}
-_idempotency_lock = asyncio.Lock()
+# job_id -> {"call": FunctionCall | None, "started_at": float, "gpu": str}
+_jobs: dict[str, dict] = {}
+_jobs_lock = asyncio.Lock()
 
 
-def _idempotency_get(request_id: str) -> dict | None:
-    entry = _idempotency_cache.get(request_id)
+def _env_number(name: str, default: float, minimum: float = 1.0) -> float:
+    """Nombre lu dans l'environnement, borné ; *default* si absent/invalide."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        print(f"[Gateway] ⚠️ {name}={raw!r} invalide — valeur par défaut {default}")
+        return float(default)
+    if math.isnan(value) or value < minimum:
+        return float(default)
+    return value
+
+
+def gateway_timeout_seconds() -> int:
+    """``timeout`` des fonctions web Modal (voir ``GATEWAY_TIMEOUT_ENV``).
+
+    Sert aussi d'invariant : ``sync_wait_seconds() < gateway_timeout_seconds()``
+    pour que le mode bloquant puisse répondre un 504 **avant** que Modal ne tue
+    la requête.
+    """
+    value = _env_number(
+        GATEWAY_TIMEOUT_ENV,
+        DEFAULT_GATEWAY_TIMEOUT_SECONDS,
+        MIN_GATEWAY_TIMEOUT_SECONDS,
+    )
+    return int(value)
+
+
+def gateway_startup_timeout_seconds() -> int:
+    """``startup_timeout`` des fonctions web Modal (montée du conteneur)."""
+    return max(300, gateway_timeout_seconds())
+
+
+def sync_wait_seconds() -> float:
+    """Budget du mode bloquant historique, toujours sous le timeout Modal.
+
+    Plancher à **1 s** (et non à plusieurs minutes) : la valeur est un budget
+    d'attente, pas une garantie — un utilisateur peut la réduire, et les tests
+    l'abaissent pour vérifier le 504 de reprise sans attendre 15 minutes.
+    """
+    value = _env_number(SYNC_WAIT_ENV, DEFAULT_SYNC_WAIT_SECONDS, 1.0)
+    ceiling = max(1.0, gateway_timeout_seconds() - 30)
+    return float(min(value, ceiling))
+
+
+def job_poll_interval_seconds() -> float:
+    """Intervalle de lecture de l'état d'un job (secondes, ≥ 0,2)."""
+    return max(0.2, _env_number(JOB_POLL_INTERVAL_ENV, DEFAULT_JOB_POLL_INTERVAL_SECONDS, 0.2))
+
+
+def _idempotency_get(job_id: str) -> dict | None:
+    entry = _idempotency_cache.get(job_id)
     if entry is None:
         return None
     ts, result = entry
     if time.time() - ts > _IDEMPOTENCY_TTL_SECONDS:
-        _idempotency_cache.pop(request_id, None)
+        _idempotency_cache.pop(job_id, None)
         return None
     return result
 
 
-def _idempotency_put(request_id: str, result: dict) -> None:
-    _idempotency_cache[request_id] = (time.time(), result)
+def _idempotency_put(job_id: str, result: dict) -> None:
+    _idempotency_cache[job_id] = (time.time(), result)
     if len(_idempotency_cache) > _IDEMPOTENCY_MAX_ENTRIES:
-        # Éviction FIFO : retirer l'entrée la plus ancienne
         oldest = min(_idempotency_cache, key=lambda k: _idempotency_cache[k][0])
         _idempotency_cache.pop(oldest, None)
 
 
-def _idempotency_finish(request_id: str, entry: dict | None, result, error):
-    """Clôture un job idempotent : met en cache, réveille les suiveurs, retourne.
+def resolve_job_id(request_id: str = "", job_id: str = "") -> str:
+    """Identifiant de job stable : ``job_id`` puis ``request_id``, sinon aléatoire."""
+    candidate = str(job_id or request_id or "").strip()
+    if candidate and len(candidate) <= JOB_ID_MAX_LENGTH:
+        safe = "".join(
+            c for c in candidate if c.isalnum() or c in "-_."
+        )
+        if safe:
+            return safe
+    return "job-" + uuid.uuid4().hex[:12]
 
-    *result* est un dict (succès) ; *error* une Response (échec). Un seul des
-    deux est non-None.
-    """
-    if request_id and entry is not None:
-        if result is not None:
-            _idempotency_put(request_id, result)
-            entry["result"] = result
-        elif error is not None:
-            entry["error"] = error
-        # set() sur un Event déjà levé est un no-op : l'appel reste idempotent.
-        entry["event"].set()
-        # Pop défensif : ne retirer que si l'entrée est toujours celle en vol
-        # (un follower peut avoir nettoyé puis remplacé l'entrée après timeout).
-        if _idempotency_inflight.get(request_id) is entry:
-            _idempotency_inflight.pop(request_id, None)
-    return result if result is not None else error
 
 
 # ─── Modèle de requête ──────────────────────────────────────────────────────
@@ -99,7 +194,9 @@ def _idempotency_finish(request_id: str, entry: dict | None, result, error):
 class GenerateRequest(BaseModel):
     workflow: dict
     gpu: str = "L4"
-    request_id: str = ""  # idempotence : même request_id → pas de double exécution
+    request_id: str = ""  # idempotence : même id → même job (jamais ré-exécuté)
+    job_id: str = ""  # alias explicite de request_id
+    async_mode: bool = False  # True = rendre la main tout de suite (recommandé)
 
 
 # ─── Métadonnées GPU ────────────────────────────────────────────────────────
@@ -117,6 +214,7 @@ def build_router(
     cors_origins: list[str],
     title: str,
     logs_reader=None,
+    job_reader=None,
 ) -> FastAPI:
     """Construit le routeur FastAPI public pour une app Modal Gateway.
 
@@ -128,6 +226,12 @@ def build_router(
     ``GET /logs`` l'appelle au lieu de réveiller un container GPU : un cold
     start GPU dure 1 à 3 minutes, alors qu'un log doit s'afficher tout de
     suite. ``None`` conserve l'ancien chemin (``worker.logs_tail``, coûteux).
+
+    ``job_reader`` est la **fonction CPU** qui lit sur le volume l'état d'un job
+    (``read_job_result``). C'est elle qui rend le résultat **récupérable** :
+    elle fonctionne depuis n'importe quel conteneur du gateway, après une
+    coupure réseau, un redémarrage du gateway ou même la mort du conteneur GPU
+    (le worker persiste son résultat avant de répondre).
     """
     web_app = FastAPI(title=title)
 
@@ -144,13 +248,135 @@ def build_router(
 
     # ─── POST /generate ────────────────────────────────────────────────────
 
+    async def _job_state_from_volume(job_id: str) -> dict | None:
+        """État du job lu par la fonction CPU (volume) — source de vérité.
+
+        Fonctionne même si ce conteneur du gateway n'a jamais vu le job (autre
+        conteneur, redéploiement) ou si le conteneur GPU est mort : le worker
+        écrit son résultat sur le volume **avant** de répondre.
+        """
+        if job_reader is None:
+            return None
+        try:
+            state = await job_reader.remote.aio(job_id)
+        except Exception as exc:  # noqa: BLE001 — le repli mémoire reste possible
+            print(f"[Gateway] Job {job_id}: lecture volume impossible ({exc})")
+            return None
+        return state if isinstance(state, dict) else None
+
+    def _public_result(state: dict, gpu: str) -> dict:
+        """Réponse « succès » normalisée (identique à l'ancien format)."""
+        return {
+            "images": state.get("images") or [],
+            "job_id": state.get("job_id") or state.get("prompt_id") or "",
+            "prompt_id": state.get("prompt_id") or "",
+            "gpu": gpu,
+            "status": "done",
+            "persisted": bool(state.get("images")),
+        }
+
+    async def _job_status(job_id: str):
+        """Photographie de l'état d'un job (mémoire → volume → handle Modal).
+
+        Returns
+        -------
+        tuple[dict, int]
+            ``(payload, http_status)``. ``payload['status']`` vaut ``done``
+            (résultat complet, images en base64), ``failed`` (erreur réelle du
+            rendu), ``running`` (en cours) ou ``unknown`` (inconnu de ce
+            déploiement).
+        """
+        cached = _idempotency_get(job_id)
+        if cached is not None:
+            return cached, 200
+
+        state = await _job_state_from_volume(job_id)
+        if state and state.get("status") == "done":
+            result = _public_result(state, last_gpu.get("default", "L4"))
+            _idempotency_put(job_id, result)
+            return result, 200
+        if state and state.get("status") == "failed":
+            return {
+                "status": "failed",
+                "job_id": job_id,
+                "prompt_id": state.get("prompt_id") or "",
+                "error": state.get("error") or "rendu en échec",
+                "images": [],
+            }, 200
+
+        record = _jobs.get(job_id)
+        started_at = (state or {}).get("started_at") or (record or {}).get("started_at") or 0
+        # Handle Modal encore en mémoire : interrogation non bloquante.
+        if record and record.get("call") is not None:
+            try:
+                result = await record["call"].get.aio(timeout=0)
+            except asyncio.TimeoutError:
+                result = None
+            except Exception as exc:  # noqa: BLE001 — input disparu (préemption…)
+                print(f"[Gateway] Job {job_id}: handle indisponible ({exc})")
+                result = None
+            if isinstance(result, dict) and result.get("status") == "done":
+                payload = _public_result(result, record.get("gpu", "L4"))
+                _idempotency_put(job_id, payload)
+                return payload, 200
+            if isinstance(result, dict) and result.get("status") == "failed":
+                return {
+                    "status": "failed",
+                    "job_id": job_id,
+                    "prompt_id": result.get("prompt_id") or "",
+                    "error": result.get("error") or "rendu en échec",
+                    "images": [],
+                }, 200
+
+        if state and state.get("status") == "running":
+            elapsed = time.time() - float(started_at or time.time())
+            budget = float(state.get("budget") or job_budget_seconds())
+            if elapsed > budget:
+                # Le conteneur a disparu sans écrire de résultat : on le dit
+                # franchement plutôt que de laisser tourner une attente infinie.
+                return {
+                    "status": "failed",
+                    "job_id": job_id,
+                    "prompt_id": state.get("prompt_id") or "",
+                    "error": (
+                        f"job sans résultat après {int(elapsed)}s "
+                        "(conteneur arrêté ou rendu interrompu)"
+                    ),
+                    "images": [],
+                }, 200
+            return {
+                "status": "running",
+                "job_id": job_id,
+                "prompt_id": state.get("prompt_id") or "",
+                "elapsed": round(elapsed, 1),
+            }, 200
+
+        if record is not None:
+            return {
+                "status": "running",
+                "job_id": job_id,
+                "elapsed": round(time.time() - float(started_at or time.time()), 1),
+            }, 200
+
+        return {"status": "unknown", "job_id": job_id}, 404
+
     @web_app.post("/generate", dependencies=[Depends(auth.require_api_key)])
     async def generate(req: GenerateRequest):
-        """Dispatch un workflow vers le worker GPU, attend le résultat, et
-        retourne les images générées en base64.
+        """Lance un rendu et le suit — sans lier la durée du rendu à la requête.
 
-        Idempotent : si ``request_id`` est fourni et que le job est déjà
-        terminé (cache) ou en cours, il n'est pas relancé.
+        Deux modes :
+
+        - ``async_mode=True`` (recommandé, utilisé par l'extension) : la
+          requête rend la main **immédiatement** avec ``{"status": ...,
+          "job_id": ...}`` ; le client suit ensuite ``GET /job/<job_id>``. Un
+          rendu de 20 minutes ne peut donc plus être coupé par un timeout HTTP.
+        - mode bloquant historique (``async_mode=False``) : attend le résultat
+          dans la requête, borné par ``sync_wait_seconds()`` et toujours **sous**
+          le timeout de la fonction Modal.
+
+        Idempotent sur ``job_id``/``request_id`` : si le job est déjà terminé,
+        le résultat en cache (ou sur le volume) est renvoyé sans ré-exécution ;
+        s'il tourne encore, l'appel **s'y rattache** au lieu de le relancer.
         """
         worker_cls = worker_map.get(req.gpu)
         if not worker_cls:
@@ -163,210 +389,120 @@ def build_router(
         # Stocke le GPU utilisé par défaut pour les appels suivants
         last_gpu["default"] = req.gpu
 
-        request_id = (req.request_id or "").strip()
+        job_id = resolve_job_id(req.request_id, req.job_id)
 
-        # ── Idempotence : déjà terminé ? ──────────────────────────────────
-        if request_id:
-            cached = _idempotency_get(request_id)
-            if cached is not None:
-                print(f"[Gateway] Idempotence: réponse en cache pour {request_id} — pas de re-exécution")
-                return cached
+        # ── 1. Le job existe-t-il déjà (cache, volume, handle en mémoire) ? ──
+        payload, _ = await _job_status(job_id)
+        if payload.get("status") == "done":
+            print(f"[Gateway] Job {job_id}: déjà terminé — résultat réutilisé")
+            return payload
+        if payload.get("status") == "failed":
+            # Un échec n'est pas mis en cache : le client peut relancer.
+            print(f"[Gateway] Job {job_id}: échec précédent — {payload.get('error')}")
+            if req.async_mode:
+                return JSONResponse(payload, status_code=200)
+            return JSONResponse(payload, status_code=500)
+        if payload.get("status") in {"running"}:
+            print(f"[Gateway] Job {job_id}: déjà en cours — rattachement (aucune relance)")
+            if req.async_mode:
+                return JSONResponse(payload, status_code=202)
+            return await _wait_for_job(job_id, req)
 
-        # ── Idempotence : leader ou suiveur ? ─────────────────────────────
-        entry = None
-        is_leader = True
-        if request_id:
-            async with _idempotency_lock:
-                entry = _idempotency_inflight.get(request_id)
-                if entry is None:
-                    entry = {"event": asyncio.Event(), "result": None, "error": None}
-                    _idempotency_inflight[request_id] = entry
-                else:
-                    is_leader = False
-
-            if not is_leader:
-                # Un appel identique est déjà en cours → attendre sa conclusion.
-                # Le wait est borné : si le leader meurt sans clôturer l'entrée
-                # (déconnexion client, crash container, redéploiement), on ne
-                # bloque pas les followers à vie et on nettoie l'entrée.
-                print(f"[Gateway] Idempotence: job déjà en cours pour {request_id} — attente du résultat")
-                try:
-                    await asyncio.wait_for(
-                        entry["event"].wait(),
-                        timeout=_FOLLOWER_WAIT_TIMEOUT_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    print(
-                        f"[Gateway] Idempotence: timeout en attente du leader pour {request_id} "
-                        f"({_FOLLOWER_WAIT_TIMEOUT_SECONDS}s) — nettoyage de l'entrée"
-                    )
-                    async with _idempotency_lock:
-                        if _idempotency_inflight.get(request_id) is entry:
-                            _idempotency_inflight.pop(request_id, None)
-                    entry["event"].set()  # libère d'éventuels autres followers
-                    return JSONResponse(
-                        {
-                            "error": (
-                                "Le job précédent n'a pas abouti "
-                                "(timeout en attente du résultat)"
-                            )
-                        },
-                        status_code=504,
-                    )
-                if entry["result"] is not None:
-                    return entry["result"]
-                if entry["error"] is not None:
-                    return entry["error"]
-                # Cas défensif : entrée clôturée sans résultat ni erreur.
-                return JSONResponse(
-                    {"error": "Le job précédent s'est terminé sans résultat"},
-                    status_code=503,
-                )
-
+        # ── 2. Démarrage : `.spawn()` = entrée DÉTACHÉE de cette requête ─────
+        # Une déconnexion du navigateur (ou un timeout de cette requête) ne
+        # l'annule donc jamais : le rendu va au bout et son résultat est
+        # persisté sur le volume par le worker.
         try:
-            # Instanciation dans le try : toute exception (ou annulation) est
-            # capturée par les handlers ci-dessous et clôture l'entrée.
             worker = worker_cls()
-
-            # ── 1. Envoyer le workflow et récupérer le prompt_id ──────────
-            prompt_result = await worker.prompt.remote.aio(req.workflow)
-            print(f"[Gateway] prompt_result = {prompt_result}")
-            if prompt_result.get("error"):
-                return _idempotency_finish(
-                    request_id, entry, None,
-                    JSONResponse({"error": prompt_result["error"]}, status_code=500),
-                )
-            prompt_id = prompt_result.get("prompt_id")
-            print(f"[Gateway] prompt_id = {prompt_id}")
-            if not prompt_id:
-                return _idempotency_finish(
-                    request_id, entry, None,
-                    JSONResponse({"error": "No prompt_id returned by worker"}, status_code=500),
-                )
-
-            # ── 2. Poller l'historique jusqu'à complétion (timeout: 10 min) ──
-            max_attempts = _MAX_POLL_ATTEMPTS  # 600 * 1s = 10 minutes
-            outputs = None
-            for attempt in range(max_attempts):
-                await asyncio.sleep(1)
-                try:
-                    history = await worker.history.remote.aio(prompt_id)
-                    print(f"[Gateway] attempt {attempt}: history keys = {list(history.keys()) if isinstance(history, dict) else type(history)}")
-                    if isinstance(history, dict) and history.get("error"):
-                        return _idempotency_finish(
-                            request_id, entry, None,
-                            JSONResponse({"error": history["error"]}, status_code=500),
-                        )
-                    if isinstance(history, dict) and prompt_id in history:
-                        history_data = history[prompt_id]
-                        outputs = history_data.get("outputs", {})
-                        print(f"[Gateway] Found in history. outputs = {outputs}")
-                        break
-                except Exception:
-                    # Le job n'est pas encore dans l'historique — on continue
-                    pass
-            else:
-                return _idempotency_finish(
-                    request_id, entry, None,
-                    JSONResponse({"error": "Timeout waiting for generation to complete"}, status_code=504),
-                )
-
-            # ── 3. Récupérer les images de sortie via /view ──────────────
-            images = []
-            print(f"[Gateway] Processing outputs: {len(outputs)} nodes")
-            for node_id, node_outputs in outputs.items():
-                for output_key, output_data in node_outputs.items():
-                    if isinstance(output_data, list):
-                        for item in output_data:
-                            if isinstance(item, dict) and "filename" in item:
-                                filename = item["filename"]
-                                subfolder = item.get("subfolder", "")
-                                image_type = item.get("type", "output")
-                                print(f"[Gateway] Found image: filename={filename}, subfolder={subfolder}, type={image_type}")
-                                try:
-                                    img_data = await worker.view.remote.aio(
-                                        filename, subfolder, image_type
-                                    )
-                                    if img_data and img_data.get("error"):
-                                        return _idempotency_finish(
-                                            request_id, entry, None,
-                                            JSONResponse({"error": img_data["error"]}, status_code=500),
-                                        )
-                                    print(f"[Gateway] img_data keys = {list(img_data.keys()) if isinstance(img_data, dict) else type(img_data)}")
-                                    if img_data and "data" in img_data:
-                                        images.append({
-                                            "filename": filename,
-                                            "subfolder": subfolder,
-                                            "type": image_type,
-                                            "data": img_data["data"],
-                                        })
-                                except Exception as e:
-                                    print(
-                                        f"[Modal Gateway] Error fetching image {filename}: {e}"
-                                    )
-
-            # ── 3b. Récupérer les fichiers sideload (.txt, .json) ──────
-            sideload_exts = [".txt", ".json"]
-            sideload_files = []
-            for img in images:
-                base_name = Path(img["filename"]).stem
-                subfolder = img.get("subfolder", "")
-                for ext in sideload_exts:
-                    side_name = base_name + ext
-                    try:
-                        file_data = await worker.view.remote.aio(side_name, subfolder, "output")
-                        if file_data and not file_data.get("error") and file_data.get("data"):
-                            sideload_files.append({
-                                "filename": side_name,
-                                "subfolder": subfolder,
-                                "type": "output",
-                                "data": file_data["data"],
-                                "content_type": file_data.get("content_type", "application/octet-stream"),
-                                "is_sideload": True,
-                            })
-                            print(f"[Gateway] Sideload fetched: {side_name}")
-                    except Exception:
-                        pass  # File doesn't exist, skip silently
-
-            images.extend(sideload_files)
-
-            # ── 4. Retourner le résultat formaté pour l'extension JS ─────
-            print(f"[Gateway] Total images collected: {len(images)}")
-            print(f"[Gateway] Returning: {len(images)} images, job_id={prompt_id}")
-            return _idempotency_finish(
-                request_id, entry,
-                {"images": images, "job_id": prompt_id, "gpu": req.gpu},
-                None,
+            call = await worker.run_job.spawn.aio(req.workflow, job_id)
+        except Exception as exc:  # noqa: BLE001 — jamais de 503 trompeur
+            print(f"[Gateway] Job {job_id}: lancement impossible ({exc})")
+            return JSONResponse(
+                {"status": "failed", "job_id": job_id, "error": f"lancement impossible : {exc}"},
+                status_code=500,
             )
 
-        except asyncio.CancelledError:
-            # Annulation (déconnexion client, redéploiement, arrêt du serveur) :
-            # clôturer coûte que coûte pour réveiller les followers et éviter
-            # une entrée inflight fantôme, puis propager l'annulation.
-            print(f"[Modal Gateway] Generate annulé pour {request_id or '(sans id)'}")
-            _idempotency_finish(
-                request_id, entry, None,
-                JSONResponse(
-                    {"error": "Job interrompu (déconnexion client ou redéploiement)"},
-                    status_code=503,
+        async with _jobs_lock:
+            _jobs[job_id] = {
+                "call": call,
+                "started_at": time.time(),
+                "gpu": req.gpu,
+            }
+        print(f"[Gateway] Job {job_id}: lancé sur {req.gpu} (async_mode={req.async_mode})")
+
+        if req.async_mode:
+            return JSONResponse(
+                {
+                    "status": "running",
+                    "job_id": job_id,
+                    "gpu": req.gpu,
+                    "object_id": getattr(call, "object_id", ""),
+                },
+                status_code=202,
+            )
+        return await _wait_for_job(job_id, req)
+
+    async def _wait_for_job(job_id: str, req: GenerateRequest):
+        """Attente borné du résultat (mode bloquant) — jamais de 503 trompeur.
+
+        Si le budget est dépassé, on répond un ``504`` **explicite** qui donne
+        l'identifiant du job : le rendu continue côté worker et le client peut
+        le récupérer via ``GET /job/<job_id>``. C'est la correction du « faux
+        échec » : une requête coupée ne dit plus que le job a échoué.
+        """
+        budget = sync_wait_seconds()
+        interval = job_poll_interval_seconds()
+        deadline = time.time() + budget
+        while time.time() < deadline:
+            payload, _ = await _job_status(job_id)
+            if payload.get("status") == "done":
+                return payload
+            if payload.get("status") == "failed":
+                return JSONResponse(payload, status_code=500)
+            if payload.get("status") == "unknown":
+                return JSONResponse(payload, status_code=404)
+            await asyncio.sleep(interval)
+        elapsed = int(budget)
+        print(f"[Gateway] Job {job_id}: budget d'attente épuisé ({elapsed}s) — le job continue")
+        return JSONResponse(
+            {
+                "status": "running",
+                "job_id": job_id,
+                "error": (
+                    f"résultat non disponible après {elapsed}s : le rendu continue sur "
+                    f"le worker, reprendre avec GET /job/{job_id}"
                 ),
-            )
-            raise
-        except Exception as e:
-            print(f"[Modal Gateway] Error in generate: {e}")
-            return _idempotency_finish(
-                request_id, entry, None,
-                JSONResponse({"error": str(e)}, status_code=500),
-            )
-        except BaseException as e:
-            # Filet de sécurité (SystemExit, KeyboardInterrupt…) : clôturer
-            # l'entrée avant de propager, sinon les followers attendraient à vie.
-            _idempotency_finish(
-                request_id, entry, None,
-                JSONResponse({"error": f"Job interrompu: {e}"}, status_code=500),
-            )
-            raise
+                "resume_url": f"/job/{job_id}",
+            },
+            status_code=504,
+        )
 
+    # ─── GET /job/{job_id} — suivi et RÉCUPÉRATION du résultat ─────────────
+
+    @web_app.get("/job/{job_id}", dependencies=[Depends(auth.require_api_key)])
+    async def job_status(job_id: str):
+        """État d'un job (``running`` | ``done`` | ``failed`` | ``unknown``).
+
+        Route de **reprise** : les images d'un job terminé sont toujours
+        renvoyées (base64), même si :
+        - la requête ``/generate`` a été coupée (déconnexion, timeout, proxy) ;
+        - l'extension a été rechargée / la fenêtre de suivi fermée ;
+        - le conteneur du gateway a redémarré entre-temps ;
+        - le conteneur GPU s'est arrêté après avoir persisté son résultat.
+        """
+        payload, _ = await _job_status(job_id)
+        if payload.get("status") == "unknown":
+            return JSONResponse(
+                {
+                    "status": "unknown",
+                    "job_id": job_id,
+                    "error": "job inconnu (jamais lancé, ou store de résultats expiré)",
+                },
+                status_code=404,
+            )
+        if payload.get("status") == "failed":
+            return JSONResponse(payload, status_code=200)
+        return JSONResponse(payload, status_code=200)
     # ─── POST /upload/image ────────────────────────────────────────────────
 
     @web_app.post("/upload/image", dependencies=[Depends(auth.require_api_key)])

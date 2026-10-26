@@ -73,12 +73,47 @@ import { aihIconSvg } from "../aih_icons.js";
 
         /**
          * Timeout par défaut des requêtes vers Modal (en ms).
-         * 11 min : doit rester AU-DESSUS du budget de polling serveur
-         * (600 s dans gateway_router.py) pour que le serveur puisse répondre
-         * une erreur propre (504) avant que le navigateur n'abandonne.
+         *
+         * Depuis le passage en « spawn + polling », AUCUNE requête n'attend
+         * plus la fin d'un rendu : ce budget ne borne que les appels courts
+         * (soumission, lecture d'état). Il n'a donc plus à couvrir la durée
+         * d'un rendu et peut rester bas.
          * Surchargeable : localStorage.setItem('modal-timeout-ms', '900000').
          */
         TIMEOUT_MS: parseInt(localStorage.getItem('modal-timeout-ms'), 10) || 660000,
+
+        /** Budget de la requête de SOUMISSION (courte : le gateway rend la main). */
+        SUBMIT_TIMEOUT_MS: parseInt(localStorage.getItem('modal-submit-timeout-ms'), 10) || 60000,
+
+        /** Budget d'une lecture d'état de job (``GET /job/<id>``). */
+        JOB_POLL_TIMEOUT_MS: 20000,
+
+        /** Intervalle entre deux lectures d'état (ms). */
+        JOB_POLL_MS: parseInt(localStorage.getItem('modal-job-poll-ms'), 10) || 2500,
+
+        /** Délai avant une nouvelle tentative de soumission (ms). */
+        RETRY_DELAY_MS: parseInt(localStorage.getItem('modal-retry-delay-ms'), 10) || 5000,
+
+        /**
+         * Nombre de réponses « job inconnu » tolérées avant d'abandonner.
+         *
+         * Juste après la soumission, le worker n'a pas encore écrit son
+         * manifeste : quelques réponses ``unknown`` sont normales.
+         */
+        JOB_UNKNOWN_TOLERANCE: 8,
+
+        /**
+         * Budget TOTAL d'attente d'un rendu côté navigateur (ms).
+         *
+         * Le rendu vit côté worker (budget serveur ``COMFYCH_JOB_TIMEOUT_S``,
+         * défaut 1 h) : au-delà, on arrête de suivre — le résultat reste
+         * récupérable via ``GET /job/<id>``.
+         * Surchargeable : localStorage.setItem('modal-job-max-wait-ms', '…').
+         */
+        JOB_MAX_WAIT_MS: parseInt(localStorage.getItem('modal-job-max-wait-ms'), 10) || 3600000,
+
+        /** Budget de la dernière tentative de récupération après coupure. */
+        RECOVER_TIMEOUT_MS: 30000,
 
         /** Intervalle entre les tentatives d'interception de l'API (en ms). */
         RETRY_INTERVAL: 800,
@@ -747,6 +782,9 @@ import { aihIconSvg } from "../aih_icons.js";
                 status: RunMonitor.status,
                 running: RunMonitor.isRunning(),
                 runId: RunMonitor.item ? RunMonitor.item.id : null,
+                jobId: RunMonitor.item ? (RunMonitor.item.jobId || RunMonitor.item.requestId || null) : null,
+                phase: RunMonitor.phase,
+                error: RunMonitor.error,
                 lines: RunMonitor.lines.length,
                 dropped: RunMonitor.dropped,
                 paused: RunMonitor.paused,
@@ -856,130 +894,376 @@ import { aihIconSvg } from "../aih_icons.js";
             console.log('Modal Gateway: workflow has SaveImage?', JSON.stringify(enrichedWorkflow).includes('SaveImage'));
             console.log('Modal Gateway: workflow sample =', JSON.stringify(enrichedWorkflow).substring(0, 500));
 
-            // Step 2: send to Modal with retry (handles worker cold start 303 redirects)
-            var maxRetries = 3;
-            var response = null;
-            for (var attempt = 1; attempt <= maxRetries; attempt++) {
-                try {
-                    RunMonitor.setPhase(
-                        'generating',
-                        t(
-                            'comfych.run.generating',
-                            'Génération sur {gpu} (tentative {attempt}/{max}) — le worker démarre…',
-                            { gpu: gpu, attempt: attempt, max: maxRetries }
-                        )
-                    );
-
-                    var controller = new AbortController();
-                    var timeoutId = setTimeout(function () { controller.abort(); }, CONFIG.TIMEOUT_MS);
-
-                    response = await fetch(CONFIG.API_URL + '/generate', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-API-Key': CONFIG.API_KEY,
-                        },
-                        body: JSON.stringify({
-                            workflow: enrichedWorkflow,
-                            gpu: gpu,
-                            request_id: item.requestId,
-                        }),
-                        signal: controller.signal,
-                    });
-
-                    clearTimeout(timeoutId);
-                    break; // Success, exit retry loop
-                } catch (fetchErr) {
-                    clearTimeout(timeoutId);
-                    if (attempt < maxRetries && fetchErr.name === 'AbortError') {
-                        // AbortError = timeout, not a cold start issue
-                        throw fetchErr;
-                    }
-                    if (attempt < maxRetries) {
-                        console.warn('Modal Gateway: fetch attempt ' + attempt + ' failed, retrying in 5s...', fetchErr.message);
-                        RunMonitor.setPhase(
-                            'retrying',
-                            t(
-                                'comfych.run.retrying',
-                                'Worker en cours de démarrage — nouvelle tentative dans 5s ({attempt}/{max})',
-                                { attempt: attempt + 1, max: maxRetries }
-                            )
-                        );
-                        await new Promise(function(resolve) { setTimeout(resolve, 5000); });
-                    } else {
-                        throw fetchErr; // All retries exhausted
-                    }
-                }
+            // Step 2: SOUMETTRE le job (requête courte) puis le SUIVRE par
+            // polling — le rendu n'est plus attaché à une requête HTTP.
+            //
+            // Avant : un unique `fetch` attendait le résultat, parfois
+            // plusieurs minutes. Toute coupure de cette requête (déconnexion,
+            // timeout d'un proxy, redéploiement, timeout de fonction Modal)
+            // donnait un `503 Job interrompu` alors que le rendu avait bel et
+            // bien produit ses images → l'UI affichait « Échec » à tort.
+            // Maintenant : le gateway lance le job (spawn, jamais annulé par
+            // une déconnexion) et le résultat est persisté côté worker ; le
+            // client interroge `GET /job/<id>` par requêtes courtes.
+            var submit = await submitCloudJob(enrichedWorkflow, gpu, item);
+            var result = submit.result;
+            if (!result) {
+                result = await waitForCloudJob(submit.jobId, gpu, item);
             }
 
-            if (!response) {
-                throw new Error('All fetch attempts failed');
-            }
-
-            if (!response.ok) {
-                var errorText = '';
-                try {
-                    var errJson = await response.json();
-                    errorText = errJson.detail || errJson.error || JSON.stringify(errJson);
-                } catch (_) {
-                    try { errorText = await response.text(); } catch (_2) { errorText = '(erreur de lecture)'; }
-                }
-                throw new Error('HTTP ' + response.status + ': ' + errorText);
-            }
-
-            var result = await response.json();
-
-            // Step 3: process response — save locally + display
-            if (result.images && result.images.length > 0) {
-                var imageCount = 0;
-                // Toutes les images affichables sont collectées pendant la
-                // boucle puis affichées en UNE seule passe : sinon l'overlay
-                // se déclenche sur la 1re image et les suivantes restent en
-                // attente jusqu'au rendu suivant.
-                var pendingDisplay = [];
-                for (var i = 0; i < result.images.length; i++) {
-                    var img = result.images[i];
-                    if (img.data) {
-                        // Save all files locally (images ET sideloads)
-                        fetch('/api/modal/save-local', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                filename: img.filename || ('modal_output_' + i + '.png'),
-                                subfolder: img.subfolder || '',
-                                type: img.type || 'output',
-                                data: img.data,
-                            }),
-                        }).catch(function (e) {
-                            console.warn('Modal Gateway: auto-save failed for', img.filename, e);
-                        });
-
-                        // Only display image files (skip .txt, .json sideloads)
-                        if (!img.is_sideload) {
-                            imageCount++;
-                            pendingDisplay.push({
-                                data: img.data,
-                                filename: img.filename || ('output_' + i + '.png'),
-                            });
-                        }
-                    }
-                }
-                if (pendingDisplay.length > 0) {
-                    displayImagesInCanvas(pendingDisplay);
-                }
-                showNotification('✅  ' + imageCount + ' image(s) + ' + (result.images.length - imageCount) + ' fichier(s) — Render #' + item.id, 'success');
-            } else {
-                showNotification('✅  Génération terminée sur ' + gpu + ' (Render #' + item.id + ')', 'info');
-            }
+            presentCloudResult(result, gpu, item);
 
             // Le run est conclu AVANT l'affichage des images rapatriées : le
             // suivi indique « Terminé » et garde le log complet consultable.
             RunMonitor.finish('success');
             return result;
         } catch (err) {
+            // ── RÉCUPÉRATION : une connexion coupée ne doit JAMAIS transformer
+            // un rendu réussi en « Échec ».
+            //
+            // Le job vit côté worker et persiste son résultat sur le volume :
+            // si l'erreur n'est pas un échec RÉEL du rendu (pas de `jobFailed`),
+            // on redemande l'état du job. S'il a produit des images, on les
+            // affiche et on conclut « Terminé » — avec une note honnête disant
+            // que la connexion a été perdue (distinction explicite entre « le
+            // rendu a échoué » et « on a perdu le fil »).
+            var recovered = await recoverCloudResult(item, err);
+            if (recovered && recovered.status === 'running') {
+                // Le job VIT encore (soumission interrompue, réponse perdue) : on
+                // reprend le suivi au lieu de conclure à l'échec. C'est ce qui
+                // manque pour qu'un 503 de redéploiement ne perde pas le rendu.
+                RunMonitor.appendLines([
+                    t(
+                        'comfych.run.resumeNote',
+                        'ℹ️ Réponse du gateway perdue — le job {job} tourne toujours, reprise du suivi.',
+                        { job: item.jobId || item.requestId }
+                    )
+                ]);
+                var resumed = await waitForCloudJob(item.jobId || item.requestId, gpu, item);
+                presentCloudResult(resumed, gpu, item);
+                RunMonitor.finish('success');
+                return resumed;
+            }
+            if (recovered) {
+                presentCloudResult(recovered, gpu, item);
+                RunMonitor.appendLines([
+                    t(
+                        'comfych.run.recoveredNote',
+                        'ℹ️ Connexion perdue avec le gateway — résultat récupéré depuis le volume du worker (job {job}).',
+                        { job: item.jobId || item.requestId }
+                    )
+                ]);
+                RunMonitor.finish('success');
+                showNotification(
+                    t(
+                        'comfych.run.recoveredNotice',
+                        '✅ Rendu #{id} terminé — résultat récupéré après une coupure de connexion.',
+                        { id: item.id }
+                    ),
+                    'success'
+                );
+                return recovered;
+            }
             // L'erreur remonte à RenderQueue.process() qui conclut le suivi
             // (statut « Échec », message et log copiables) et continue la file.
             throw err;
+        }
+    }
+
+    /** Petite pause asynchrone (ms). */
+    function sleep(ms) {
+        return new Promise(function (resolve) { setTimeout(resolve, ms); });
+    }
+
+    /**
+     * Appel JSON au gateway avec timeout propre (AbortController local).
+     *
+     * Un `AbortController` par requête, JAMAIS partagé : aucune fermeture de
+     * fenêtre ni changement de vue ne peut annuler un rendu en cours (le job
+     * vit de toute façon côté worker).
+     *
+     * @param {string} path - Chemin relatif de l'API (``/generate``, ``/job/…``).
+     * @param {object|null} body - Corps JSON (``null`` = GET).
+     * @param {number} timeoutMs - Budget de CETTE requête.
+     * @returns {Promise<object>} Le JSON décodé.
+     */
+    async function modalJson(path, body, timeoutMs) {
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function () { controller.abort(); }, timeoutMs || CONFIG.SUBMIT_TIMEOUT_MS);
+        try {
+            var response = await fetch(CONFIG.API_URL + path, {
+                method: body ? 'POST' : 'GET',
+                headers: body
+                    ? { 'Content-Type': 'application/json', 'X-API-Key': CONFIG.API_KEY }
+                    : { 'X-API-Key': CONFIG.API_KEY },
+                body: body ? JSON.stringify(body) : undefined,
+                signal: controller.signal,
+            });
+            var text = await response.text();
+            var data = null;
+            try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { error: text }; }
+            if (!response.ok && (!data || typeof data !== 'object')) {
+                data = { error: 'HTTP ' + response.status };
+            }
+            if (data && typeof data === 'object') {
+                data.__httpStatus = response.status;
+            }
+            return data || {};
+        } finally {
+            clearTimeout(timeoutId);
+        }
+    }
+
+    /**
+     * Soumet un rendu au gateway **sans attendre le résultat**.
+     *
+     * ``async_mode: true`` → le gateway lance le job (``spawn``) et rend la
+     * main immédiatement. La requête ne dure donc que quelques centaines de
+     * millisecondes : aucun timeout intermédiaire ne peut plus la couper en
+     * plein rendu, et une déconnexion n'annule plus le travail.
+     *
+     * Reste compatible avec un gateway ANCIEN (réponse 200 contenant
+     * directement ``images``) : dans ce cas le résultat est renvoyé tel quel.
+     *
+     * @param {object} workflow - Workflow au format API.
+     * @param {string} gpu - GPU cible.
+     * @param {object} item - Item de RenderQueue (porte ``requestId``).
+     * @returns {Promise<{jobId: string, result: object|null}>}
+     */
+    async function submitCloudJob(workflow, gpu, item) {
+        var maxAttempts = 3;
+        var lastError = null;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                RunMonitor.setPhase(
+                    'generating',
+                    attempt === 1
+                        ? t('comfych.run.submitting', 'Envoi du rendu à {gpu}…', { gpu: gpu })
+                        : t('comfych.run.submittingRetry', 'Nouvel envoi à {gpu} (tentative {attempt}/{max})…', {
+                            gpu: gpu, attempt: attempt, max: maxAttempts,
+                        })
+                );
+                var data = await modalJson('/generate', {
+                    workflow: workflow,
+                    gpu: gpu,
+                    request_id: item.requestId,
+                    job_id: item.requestId,
+                    async_mode: true,
+                }, CONFIG.SUBMIT_TIMEOUT_MS);
+
+                if (data.status === 'failed') {
+                    var failure = new Error(data.error || 'rendu en échec');
+                    failure.jobFailed = true;
+                    throw failure;
+                }
+                // Gateway ancien (ou `async_mode` ignoré par un gateway qui
+                // attend déjà le résultat) : le corps porte DÉJÀ le résultat.
+                // On teste la PRÉSENCE de `images`, pas sa longueur : un rendu
+                // terminé sans sortie donne `images: []`, qui est un état
+                // FINAL et non « en cours » (sinon on interrogerait /job pour
+                // un job que ce gateway n'a jamais nommé).
+                // La réponse 202 du mode asynchrone ne contient aucune clé
+                // `images`, elle n'est donc jamais prise pour un résultat.
+                if (Array.isArray(data.images)) {
+                    return { jobId: data.job_id || item.requestId, result: data };
+                }
+                if (data.status === 'done') {
+                    return { jobId: data.job_id || item.requestId, result: data };
+                }
+                // Réponse HTTP en ERREUR (5xx d'un proxy ou d'un redéploiement,
+                // 4xx) : ce n'est PAS une soumission réussie. L'erreur n'est
+                // pas `jobFailed` pour autant (le job peut très bien tourner ou
+                // être terminé) : l'appelant demande alors au store de jobs ce
+                // qui s'est réellement passé (`recoverCloudResult`).
+                // Pas de nouvelle tentative ici : la reprise est un meilleur
+                // outil qu'un réessai à l'aveugle.
+                var httpStatus = Number(data.__httpStatus) || 0;
+                if (httpStatus >= 400) {
+                    var httpError = new Error(
+                        data.error || data.detail || data.message || ('HTTP ' + httpStatus)
+                    );
+                    httpError.httpStatus = httpStatus;
+                    httpError.noRetry = true;
+                    throw httpError;
+                }
+                var jobId = data.job_id || item.requestId;
+                item.jobId = jobId;
+                return { jobId: jobId, result: null };
+            } catch (err) {
+                lastError = err;
+                if (err && err.jobFailed) throw err;
+                if (err && err.noRetry) throw err;
+                if (err && err.name === 'AbortError') {
+                    // Budget de CETTE requête dépassé (et non « rendu trop long »).
+                    if (attempt >= maxAttempts) throw err;
+                }
+                if (attempt < maxAttempts) {
+                    RunMonitor.setPhase(
+                        'retrying',
+                        t('comfych.run.retrying', 'Nouvelle tentative dans 5s ({attempt}/{max})', {
+                            attempt: attempt + 1, max: maxAttempts,
+                        })
+                    );
+                    await sleep(CONFIG.RETRY_DELAY_MS);
+                }
+            }
+        }
+        throw lastError || new Error('soumission du rendu impossible');
+    }
+
+    /**
+     * Suit un job jusqu'à son résultat, par requêtes COURTES.
+     *
+     * Un échec réseau pendant le suivi n'est PAS un échec du rendu : le job
+     * continue sur le worker, on réessaie donc la lecture. Seul un statut
+     * ``failed`` (rapporté par le worker) est une vraie erreur.
+     *
+     * @param {string} jobId - Identifiant du job.
+     * @param {string} gpu - GPU cible (affichage).
+     * @param {object} item - Item de RenderQueue.
+     * @returns {Promise<object>} Le résultat (``status: 'done'`` + ``images``).
+     */
+    async function waitForCloudJob(jobId, gpu, item) {
+        var deadline = Date.now() + CONFIG.JOB_MAX_WAIT_MS;
+        var transient = 0;
+        var unknown = 0;
+        var startedAt = Date.now();
+        while (Date.now() < deadline) {
+            await sleep(CONFIG.JOB_POLL_MS);
+            var state;
+            try {
+                state = await modalJson('/job/' + encodeURIComponent(jobId), null, CONFIG.JOB_POLL_TIMEOUT_MS);
+                transient = 0;
+            } catch (err) {
+                transient++;
+                RunMonitor.setPhase(
+                    'retrying',
+                    t(
+                        'comfych.run.reconnecting',
+                        'Connexion au gateway perdue — reprise du suivi ({count})…',
+                        { count: transient }
+                    )
+                );
+                continue;
+            }
+            if (state && state.status === 'done') return state;
+            if (state && state.status === 'failed') {
+                var failure = new Error(state.error || 'rendu en échec');
+                failure.jobFailed = true;
+                throw failure;
+            }
+            if (state && state.status === 'unknown') {
+                unknown++;
+                // Juste après la soumission, le worker n'a pas encore écrit son
+                // manifeste : on laisse un délai avant de conclure.
+                if (unknown > CONFIG.JOB_UNKNOWN_TOLERANCE) {
+                    var missing = new Error(
+                        t('comfych.run.jobUnknown', 'Job {job} inconnu du gateway.', { job: jobId })
+                    );
+                    missing.jobFailed = true;
+                    throw missing;
+                }
+                continue;
+            }
+            unknown = 0;
+            var elapsed = Math.round((Date.now() - startedAt) / 1000);
+            RunMonitor.setPhase(
+                'generating',
+                t('comfych.run.running', 'Rendu en cours sur {gpu} ({elapsed}s)…', {
+                    gpu: gpu, elapsed: elapsed,
+                })
+            );
+        }
+        throw new Error(
+            t('comfych.run.waitBudget', 'Budget d\'attente dépassé pour le job {job}.', { job: jobId })
+        );
+    }
+
+    /**
+     * Tente de récupérer le résultat d'un job après une erreur de transport.
+     *
+     * C'est la correction du « faux échec » : si les images existent (le worker
+     * les a persistées), l'UI doit afficher « Terminé », pas « Échec ».
+     *
+     * Renvoie ``null`` quand il n'y a réellement aucun résultat (échec réel,
+     * job jamais lancé, ou état illisible) ; renvoie l'état ``running`` quand
+     * le job VIT encore — l'appelant reprend alors le suivi au lieu de
+     * conclure à l'échec (une coupure de connexion n'arrête pas le worker).
+     *
+     * @param {object} item - Item de RenderQueue (porte ``jobId``).
+     * @param {Error} err - Erreur d'origine (pour ne pas masquer un vrai échec).
+     * @returns {Promise<object|null>}
+     */
+    async function recoverCloudResult(item, err) {
+        if (!item || (!item.jobId && !item.requestId)) return null;
+        if (err && err.jobFailed) return null; // échec RÉEL : ne rien masquer
+        var jobId = item.jobId || item.requestId;
+        try {
+            var state = await modalJson('/job/' + encodeURIComponent(jobId), null, CONFIG.RECOVER_TIMEOUT_MS);
+            if (state && state.status === 'done' && Array.isArray(state.images)) {
+                return state;
+            }
+            // Le job existe et tourne : la réponse perdue n'a rien annulé.
+            if (state && state.status === 'running') {
+                item.jobId = jobId;
+                return state;
+            }
+        } catch (e) {
+            console.warn('Modal Gateway: récupération du job ' + jobId + ' impossible', e && e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Affiche (et enregistre localement) le résultat d'un rendu cloud.
+     *
+     * @param {object} result - ``{images: [{data, filename, subfolder, type, is_sideload}]}``.
+     * @param {string} gpu - GPU utilisé (messages).
+     * @param {object} item - Item de RenderQueue.
+     */
+    function presentCloudResult(result, gpu, item) {
+        if (result && result.images && result.images.length > 0) {
+            var imageCount = 0;
+            // Toutes les images affichables sont collectées puis affichées en
+            // UNE seule passe : sinon l'overlay se déclenche sur la 1re image et
+            // les suivantes restent en attente jusqu'au rendu suivant.
+            var pendingDisplay = [];
+            for (var i = 0; i < result.images.length; i++) {
+                var img = result.images[i] || {};
+                if (!img.data) continue;
+                // Save all files locally (images ET sideloads)
+                fetch('/api/modal/save-local', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        filename: img.filename || ('modal_output_' + i + '.png'),
+                        subfolder: img.subfolder || '',
+                        type: img.type || 'output',
+                        data: img.data,
+                    }),
+                }).catch(function (e) {
+                    console.warn('Modal Gateway: auto-save failed for', img.filename, e);
+                });
+
+                // Only display image files (skip .txt, .json sideloads)
+                if (!img.is_sideload) {
+                    imageCount++;
+                    pendingDisplay.push({
+                        data: img.data,
+                        filename: img.filename || ('output_' + i + '.png'),
+                    });
+                }
+            }
+            if (pendingDisplay.length > 0) {
+                displayImagesInCanvas(pendingDisplay);
+            }
+            showNotification(
+                '✅  ' + imageCount + ' image(s) + ' + (result.images.length - imageCount)
+                + ' fichier(s) — Render #' + item.id,
+                'success'
+            );
+        } else {
+            showNotification('✅  Génération terminée sur ' + gpu + ' (Render #' + item.id + ')', 'info');
         }
     }
 

@@ -28,14 +28,18 @@ Usage (Phase 4 — ``apps/all_in_one.py``)
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -157,6 +161,41 @@ complété par le log interne de comfy-cli (en-tête du wrapper seul)."""
 
 COMFY_CLI_LOG_TAIL_LINES = 300
 """Nombre de lignes lues dans le log interne de comfy-cli (complément)."""
+
+
+# ── Job store : résultat de rendu PERSISTANT (survit au conteneur) ───────
+
+JOBS_VOLUME_DIR = Path("/cache/jobs")
+"""Dossier des jobs sur le volume ``comfy-models`` (monté en ``/cache``).
+
+Un rendu écrit ses images dans le FS **éphémère** du conteneur (``output/`` de
+ComfyUI, parfois ``/dev/shm``) : tout cela disparaît dès que le conteneur
+s'arrête (scaledown 30 s, préemption, redéploiement) — donc avant que le
+gateway ait pu rapatrier les images. Chaque job écrit donc son résultat ICI
+(manifeste + fichiers) avant de répondre : il reste récupérable par une
+fonction **CPU** (``read_job_result`` des apps) sans réveiller de GPU, même si
+le conteneur GPU est mort entre-temps."""
+
+JOB_MANIFEST_NAME = "manifest.json"
+"""Nom du manifeste d'un job dans ``<JOBS_VOLUME_DIR>/<job_id>/``."""
+
+JOB_MAX_PERSIST_BYTES = int(
+    os.environ.get("COMFYCH_JOB_MAX_BYTES") or 512 * 1024 * 1024
+)
+"""Plafond (octets) des fichiers persistés pour un job (garde-fou volume)."""
+
+JOB_TIMEOUT_SECONDS = float(os.environ.get("COMFYCH_JOB_TIMEOUT_S") or 3600)
+"""Budget d'exécution du job **dans le conteneur** (défaut 1 h).
+
+Le rendu est suivi par le worker lui-même (et non par le gateway) : c'est ce
+qui garde une entrée Modal active pendant toute la durée du rendu, donc le
+conteneur vivant même si plus aucun client n'écoute."""
+
+JOB_POLL_INTERVAL_SECONDS = float(os.environ.get("COMFYCH_JOB_POLL_S") or 2)
+"""Intervalle (s) entre deux lectures de l'historique ComfyUI par le job."""
+
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
+"""Forme d'un ``job_id`` utilisable comme nom de dossier (jamais de ``..``)."""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -494,6 +533,193 @@ def read_log_tail(
             "error": str(e),
             **log_freshness(log_path),
         }
+
+
+def job_id_is_safe(job_id: object) -> bool:
+    """True si *job_id* peut servir de nom de dossier (aucun séparateur)."""
+    return isinstance(job_id, str) and JOB_ID_RE.match(job_id) is not None
+
+
+def job_dir(job_id: str, root: Path | str | None = None) -> Path:
+    """Dossier du job *job_id* ; ``ValueError`` si l'identifiant est douteux."""
+    if not job_id_is_safe(job_id):
+        raise ValueError(f"job_id invalide : {job_id!r}")
+    base = Path(JOBS_VOLUME_DIR if root is None else root)
+    return base / str(job_id)
+
+
+def read_job_state(
+    job_id: str,
+    root: Path | str | None = None,
+    include_data: bool = True,
+    max_bytes: int | None = None,
+) -> dict:
+    """État d'un job lu **sur le volume** (source de vérité durable).
+
+    Fonction pure (aucun réseau, aucun accès à l'instance du worker) : les
+    fonctions CPU ``read_job_result`` des apps l'appellent telle quelle, et le
+gateway s'en sert pour retrouver un résultat produit par un autre conteneur.
+
+    Parameters
+    ----------
+    job_id : str
+        Identifiant du job (``request_id`` côté client).
+    root : Path | str | None
+        Racine du store (défaut ``JOBS_VOLUME_DIR``) ; patchable en test.
+    include_data : bool
+        Ajouter le contenu base64 des fichiers (images) au retour.
+    max_bytes : int | None
+        Plafond de lecture par fichier (défaut ``JOB_MAX_PERSIST_BYTES``).
+
+    Returns
+    -------
+    dict
+        ``{"status": "missing"}`` si aucun manifeste ; sinon le manifeste
+        (``status``: ``running`` | ``done`` | ``failed``, ``images``…),
+        complété des ``data`` base64 quand *include_data* est vrai.
+    """
+    try:
+        directory = job_dir(job_id, root)
+    except (ValueError, OSError):
+        return {"status": "missing", "job_id": str(job_id), "error": "job_id invalide"}
+
+    manifest_path = directory / JOB_MANIFEST_NAME
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"status": "missing", "job_id": job_id, "dir": str(directory)}
+    if not isinstance(payload, dict):
+        return {"status": "missing", "job_id": job_id, "dir": str(directory)}
+
+    state = dict(payload)
+    state.setdefault("job_id", job_id)
+    state["dir"] = str(directory)
+    files = state.get("images")
+    if not isinstance(files, list):
+        files = []
+    cap = JOB_MAX_PERSIST_BYTES if max_bytes is None else max_bytes
+
+    if include_data:
+        materialized = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            entry = dict(item)
+            path = entry.get("path")
+            try:
+                if path and Path(path).is_file():
+                    raw = Path(path).read_bytes()[:cap]
+                    entry["data"] = base64.b64encode(raw).decode("ascii")
+                    entry["size"] = len(raw)
+            except OSError:
+                entry.pop("data", None)
+            materialized.append(entry)
+        files = materialized
+    state["images"] = files
+    return state
+
+
+def write_job_state(
+    job_id: str,
+    payload: dict,
+    root: Path | str | None = None,
+) -> str:
+    """Met à jour (fusion) le manifeste du job sur le volume.
+
+    Écriture atomique (fichier temporaire + ``replace``) : une fonction CPU
+    peut lire le manifeste à tout instant sans tomber sur un JSON tronqué.
+
+    Returns
+    -------
+    str
+        Chemin du manifeste écrit, ou ``""`` en cas d'échec (jamais d'exception :
+        ne pas pouvoir persister ne doit pas annuler un rendu réussi).
+    """
+    try:
+        directory = job_dir(job_id, root)
+        directory.mkdir(parents=True, exist_ok=True)
+        manifest_path = directory / JOB_MANIFEST_NAME
+        current: dict = {}
+        try:
+            loaded = json.loads(manifest_path.read_text())
+            if isinstance(loaded, dict):
+                current = loaded
+        except (OSError, json.JSONDecodeError):
+            current = {}
+        current.update(payload or {})
+        current["job_id"] = job_id
+        current["updated_at"] = time.time()
+        tmp_path = manifest_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(current, indent=2))
+        tmp_path.replace(manifest_path)
+        return str(manifest_path)
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def persist_job_images(
+    job_id: str,
+    images,
+    root: Path | str | None = None,
+    max_bytes: int | None = None,
+) -> dict:
+    """Écrit les fichiers d'un job sur le volume et retourne leur manifeste.
+
+    Les images arrivent en base64 depuis ComfyUI : elles sont écrites **telles
+    quelles** sur le volume (jamais dans un répertoire éphémère comme
+    ``/dev/shm``), puis référencées par chemin dans le manifeste. Le contenu
+    base64 n'est PAS stocké dans le manifeste (taille / lisibilité).
+
+    Returns
+    -------
+    dict
+        ``{"files": [...], "bytes": int, "skipped": [...]}`` ; les entrées
+        ``files`` portent ``filename``/``subfolder``/``type``/``content_type``/
+        ``path``/``size``.
+    """
+    try:
+        directory = job_dir(job_id, root)
+        directory.mkdir(parents=True, exist_ok=True)
+    except (OSError, ValueError):
+        return {"files": [], "bytes": 0, "skipped": [str(img) for img in images or []]}
+
+    cap = JOB_MAX_PERSIST_BYTES if max_bytes is None else max_bytes
+    saved: list[dict] = []
+    skipped: list[str] = []
+    total = 0
+    for img in images or []:
+        if not isinstance(img, dict):
+            continue
+        name = os.path.basename(str(img.get("filename") or ""))
+        if not name:
+            continue
+        try:
+            raw = base64.b64decode(img.get("data") or "")
+        except (ValueError, TypeError):
+            skipped.append(name)
+            continue
+        if total + len(raw) > cap:
+            skipped.append(name)
+            continue
+        target = directory / name
+        try:
+            target.write_bytes(raw)
+        except OSError:
+            skipped.append(name)
+            continue
+        total += len(raw)
+        saved.append(
+            {
+                "filename": name,
+                "subfolder": img.get("subfolder", ""),
+                "type": img.get("type", "output"),
+                "content_type": img.get("content_type", "application/octet-stream"),
+                "is_sideload": bool(img.get("is_sideload")),
+                "path": str(target),
+                "size": len(raw),
+            }
+        )
+    return {"files": saved, "bytes": total, "skipped": skipped}
 
 
 def rotate_log(path: Path | str = COMFY_LOG_PATH) -> None:
@@ -1288,6 +1514,14 @@ class ComfyWorker:
         try to parse them as nodes and fail with a ``missing_node_type``
         error.
         """
+        return await self._submit_prompt(workflow)
+
+    async def _submit_prompt(self, workflow: dict) -> dict:
+        """Envoie le workflow à ComfyUI et rend la main dès la mise en file.
+
+        Partagé par ``prompt`` (proxy brut, utilisé par les routes
+        ``/history``/``/view``) et ``run_job`` (rendu suivi jusqu'au bout).
+        """
         # ── Extraire extra_data avant le filtrage (il contient les images base64) ──
         extra_data = workflow.pop("extra_data", None) or {}
 
@@ -1325,6 +1559,225 @@ class ComfyWorker:
                 print(f"[ComfyWorker] /prompt error {resp.status_code}: {error_text}")
                 return {"error": f"ComfyUI returned {resp.status_code}: {error_text}"}
             return resp.json()
+
+    # ── Job de rendu (découplé du client HTTP) ─────────────────────────────
+
+    @modal.method()
+    async def run_job(self, workflow: dict, job_id: str = "") -> dict:
+        """Exécute un rendu **de bout en bout** et persiste son résultat.
+
+        Pourquoi une seule entrée Modal qui vit toute la durée du rendu :
+
+        - un rendu dure plusieurs minutes ; quand c'est le gateway qui suit
+          l'avancement (un ``history`` par seconde), toute coupure de la
+          requête HTTP (déconnexion du navigateur, timeout intermédiaire,
+          redéploiement) arrête le suivi. Plus aucune entrée n'arrive alors au
+          conteneur GPU, ``scaledown_window`` (30 s) l'arrête et
+          ``@modal.exit`` tue ComfyUI **en plein rendu** ;
+        - lancée par ``.spawn()`` depuis le gateway, cette entrée n'est **pas
+          annulée** quand le client HTTP disparaît : le rendu va au bout et
+          son résultat est écrit sur le volume.
+
+        Le suivi se fait en local (``127.0.0.1:8000``) : aucune dépendance à un
+        client, aucune facturation de sortie intermédiaire.
+
+        Parameters
+        ----------
+        workflow : dict
+            Workflow au format API ComfyUI.
+        job_id : str
+            Identifiant stable du job (le ``request_id`` du client) : c'est lui
+            qui permet de **retrouver le résultat** après une coupure.
+
+        Returns
+        -------
+        dict
+            ``{"status": "done"|"failed", "job_id", "prompt_id", "images":
+            [{filename, subfolder, type, content_type, data}], "persisted":
+            bool, "dir": str, "elapsed": float, "error": str|None}``.
+        """
+        job = job_id if job_id_is_safe(job_id) else ""
+        if not job:
+            job = f"job-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        started_at = time.time()
+        write_job_state(
+            job,
+            {
+                "status": "running",
+                "started_at": started_at,
+                "budget": JOB_TIMEOUT_SECONDS + 60,
+                "worker_build_id": WORKER_BUILD_ID,
+            },
+        )
+        commit_log_volume()
+        print(f"[ComfyWorker] Job {job} : démarrage du rendu")
+
+        prompt_id = ""
+        try:
+            submitted = await self._submit_prompt(workflow)
+            if submitted.get("error"):
+                raise RuntimeError(str(submitted["error"]))
+            prompt_id = str(submitted.get("prompt_id") or "")
+            if not prompt_id:
+                raise RuntimeError("ComfyUI n'a renvoyé aucun prompt_id")
+            write_job_state(job, {"status": "running", "prompt_id": prompt_id})
+
+            entry = await self._wait_for_prompt(prompt_id, started_at)
+            images = await self._collect_outputs(entry.get("outputs") or {})
+            persisted = persist_job_images(job, images)
+            elapsed = time.time() - started_at
+            result = {
+                "status": "done",
+                "job_id": job,
+                "prompt_id": prompt_id,
+                "images": images,
+                "persisted": bool(persisted.get("files")),
+                "dir": str(job_dir(job)),
+                "count": len(images),
+                "elapsed": elapsed,
+                "error": None,
+            }
+            write_job_state(
+                job,
+                {
+                    "status": "done",
+                    "prompt_id": prompt_id,
+                    "finished_at": time.time(),
+                    "elapsed": elapsed,
+                    "images": persisted.get("files", []),
+                    "bytes": persisted.get("bytes", 0),
+                    "error": None,
+                },
+            )
+            commit_log_volume()
+            print(
+                f"[ComfyWorker] Job {job} : terminé en {elapsed:.1f}s — "
+                f"{len(images)} fichier(s), {persisted.get('bytes', 0)} octet(s) "
+                f"persistés dans {job_dir(job)}"
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001 — l'échec est un RÉSULTAT du job
+            elapsed = time.time() - started_at
+            message = f"{type(exc).__name__}: {exc}"
+            print(f"[ComfyWorker] Job {job} : échec après {elapsed:.1f}s — {message}")
+            write_job_state(
+                job,
+                {
+                    "status": "failed",
+                    "prompt_id": prompt_id,
+                    "finished_at": time.time(),
+                    "elapsed": elapsed,
+                    "error": message,
+                },
+            )
+            commit_log_volume()
+            return {
+                "status": "failed",
+                "job_id": job,
+                "prompt_id": prompt_id,
+                "images": [],
+                "persisted": False,
+                "dir": str(job_dir(job)),
+                "count": 0,
+                "elapsed": elapsed,
+                "error": message,
+            }
+
+    async def _wait_for_prompt(self, prompt_id: str, started_at: float) -> dict:
+        """Attend la fin du prompt en interrogeant ComfyUI **en local**.
+
+        La boucle tourne dans le conteneur : c'est elle qui maintient l'entrée
+        Modal vivante (donc le conteneur), indépendamment de tout client.
+
+        Raises
+        ------
+        TimeoutError
+            Si le rendu dépasse ``JOB_TIMEOUT_SECONDS``.
+        """
+        deadline = started_at + JOB_TIMEOUT_SECONDS
+        interval = max(0.2, JOB_POLL_INTERVAL_SECONDS)
+        async with httpx.AsyncClient(timeout=30) as client:
+            while time.time() < deadline:
+                try:
+                    resp = await client.get(
+                        f"http://127.0.0.1:8000/history/{prompt_id}"
+                    )
+                    if resp.status_code == 200:
+                        history = resp.json()
+                        if isinstance(history, dict) and prompt_id in history:
+                            entry = history[prompt_id]
+                            return entry if isinstance(entry, dict) else {}
+                except httpx.HTTPError as exc:
+                    print(f"[ComfyWorker] Job : /history indisponible ({exc})")
+                await asyncio.sleep(interval)
+        raise TimeoutError(
+            f"rendu non terminé après {JOB_TIMEOUT_SECONDS:.0f}s "
+            "(COMFYCH_JOB_TIMEOUT_S)"
+        )
+
+    async def _collect_outputs(self, outputs: dict) -> list[dict]:
+        """Rapatrie les fichiers produits (images + sideloads) en base64.
+
+        Lit ComfyUI en local (``/view``), donc aussi les fichiers que les nodes
+        posent dans un répertoire temporaire : le contenu part ensuite sur le
+        volume (``persist_job_images``), ce qui rend le résultat durable.
+        """
+        collected: list[dict] = []
+        if not isinstance(outputs, dict):
+            return collected
+        items: list[dict] = []
+        for node_outputs in outputs.values():
+            if not isinstance(node_outputs, dict):
+                continue
+            for output_data in node_outputs.values():
+                if not isinstance(output_data, list):
+                    continue
+                for item in output_data:
+                    if isinstance(item, dict) and item.get("filename"):
+                        items.append(item)
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            for item in items:
+                filename = str(item["filename"])
+                subfolder = item.get("subfolder", "")
+                view_type = item.get("type", "output")
+                fetched = await self._fetch_view(
+                    client, filename, subfolder, view_type
+                )
+                if fetched:
+                    collected.append(fetched)
+                # Sideloads (.txt/.json) : même base de nom, dans le même dossier.
+                for ext in (".txt", ".json"):
+                    side_name = Path(filename).stem + ext
+                    side = await self._fetch_view(
+                        client, side_name, subfolder, view_type
+                    )
+                    if side:
+                        side["is_sideload"] = True
+                        collected.append(side)
+        return collected
+
+    async def _fetch_view(
+        self, client: httpx.AsyncClient, filename: str, subfolder: str, view_type: str
+    ) -> dict | None:
+        """Lit un fichier produit via ``/view`` local ; ``None`` s'il n'existe pas."""
+        try:
+            resp = await client.get(
+                "http://127.0.0.1:8000/view",
+                params={"filename": filename, "subfolder": subfolder, "type": view_type},
+            )
+        except httpx.HTTPError as exc:
+            print(f"[ComfyWorker] Job : /view {filename} indisponible ({exc})")
+            return None
+        if resp.status_code != 200:
+            return None
+        return {
+            "filename": filename,
+            "subfolder": subfolder,
+            "type": view_type,
+            "content_type": resp.headers.get("content-type", "application/octet-stream"),
+            "data": base64.b64encode(resp.content).decode("ascii"),
+        }
 
     async def _restore_embedded_image(self, img: dict) -> None:
         """Restore a base64-embedded image into ComfyUI's input folder.

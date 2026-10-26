@@ -124,7 +124,7 @@ Les deux passent `COMFYCH_DEPLOY_FORCE_TOKEN` au build, qui régénère l'emprei
 L'empreinte est posée en **dernière** couche (`ENV`) : aucune couche `pip` déjà en
 cache n'est réexécutée.
 
-### Dépendances optionnelles des custom nodes
+### Dépendances compilées (`sageattention` & co)
 
 Certains custom nodes importent une dépendance **optionnelle** qu'ils ne
 déclarent jamais dans leur `requirements.txt` : le node se charge, puis le rendu
@@ -148,6 +148,45 @@ redéployer (🚀 Déployer) pour que la liste prenne effet.
 Les noms sont validés (liste blanche de caractères) : une entrée contenant un
 métacaractère shell (`;`, `&`, `|`, `$`, espaces…) est ignorée à l'enregistrement
 et au build.
+
+**Paquets compilés : l'échec est normal et NON bloquant.** `sageattention` (et
+les paquets du même genre) compilent des noyaux CUDA : sans GPU pendant le
+build, `pip` échoue souvent (`nvcc` absent, `CUDA_HOME` vide, wheel introuvable
+pour la version de torch). C'est pour cela que la commande de build est
+suffixée d'un `|| echo …` (`image.py:_pip_install_command`) : le code de retour
+est toujours `0`, le message `⚠️ Échec installation … (build continue)` apparaît
+dans le log du build, et **l'image est quand même construite et déployée**. Les
+autres paquets de la liste sont installés indépendamment (un échec n'annule pas
+les suivants). Conséquences pratiques :
+
+- ne pas conclure à un déploiement raté parce que `sageattention` a échoué :
+lire la ligne `⚠️` et vérifier que le déploiement va au bout ;
+- seul le node qui en dépend échouera, **à l'exécution** du rendu — les autres
+nodes sont intacts ;
+- après toute modification de la liste, il faut **redéployer** (🚀 Déployer)
+pour que l'image soit reconstruite ; l'empreinte de déploiement intègre
+`extra_pip_packages` (`image.py:deploy_stamp`), donc la couche est bien
+rejouée.
+
+### Après un changement du pack : re-synchroniser les custom nodes
+
+**Le worker ne charge PAS le pack depuis le dépôt** : au démarrage il crée des
+symlinks depuis le volume Modal `/custom_nodes`
+(`workers/base_worker.py:_sync_custom_nodes_from_volume`). Le dépôt local et le
+volume sont deux copies distinctes.
+
+Donc, après avoir modifié le pack (code d'un node, `js/`, `aih/`, …) :
+
+1. **Sync custom nodes** (bouton de la modale ComfyCH / `POST` de sync des
+nodes) — c'est ce qui pousse le code vers le volume ;
+2. **redémarrer le worker** (le container ne relit le volume qu'à son
+démarrage) ;
+3. redéployer **seulement** si `tools/comfych/` ou les dépendances ont changé
+(c'est l'image, pas le volume, qui porte le gateway et les `pip install`).
+
+Sans l'étape 1, un rendu cloud utilise **l'ancienne** version du pack, même
+après un `git pull` et un rechargement de la page : c'est la cause n°1 des
+« mes modifications ne sont pas prises en compte ».
 
 ## Sécurité
 

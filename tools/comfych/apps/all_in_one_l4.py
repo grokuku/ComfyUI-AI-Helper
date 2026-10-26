@@ -14,9 +14,13 @@ from __future__ import annotations
 import modal
 
 import auth
-from gateway_router import build_router
+from gateway_router import (
+    build_router,
+    gateway_startup_timeout_seconds,
+    gateway_timeout_seconds,
+)
 from image import image
-from workers.base_worker import COMFY_LOG_PATH, read_log_tail
+from workers.base_worker import COMFY_LOG_PATH, read_job_state, read_log_tail
 from workers.l4_worker import L4Worker
 
 app = modal.App(
@@ -96,6 +100,35 @@ def read_worker_logs(lines: int = 200) -> dict:
     return result
 
 
+# ─── Lecture des jobs (résultats persistés) sans GPU ───
+
+
+@app.function(
+    volumes={"/cache": MODELS_VOLUME},
+    cpu=1,
+    memory=512,
+    timeout=120,
+)
+def read_job_result(job_id: str) -> dict:
+    """Lit l'état/résultat d'un job **sur le volume**, sans réveiller de GPU.
+
+    C'est la brique qui rend un rendu **récupérable** : le worker persiste ses
+    images dans ``/cache/jobs/<job_id>/`` avant de répondre, donc une
+    déconnexion du navigateur, un timeout HTTP, un redémarrage du gateway ou
+    même l'arrêt du conteneur GPU n'empêchent plus de retrouver le résultat.
+
+    Le retour de ``read_job_state`` est renvoyé tel quel : ``status`` vaut
+    ``running`` / ``done`` / ``failed`` / ``missing``, et les images sont
+    incluses en base64 quand le job est terminé.
+    """
+    try:
+        MODELS_VOLUME.reload()  # rend visibles les écritures des autres containers
+    except Exception:  # noqa: BLE001 — reload best effort (volume non monté)
+        pass
+
+    return read_job_state(job_id)
+
+
 # ─── Routeur FastAPI public ───
 
 WORKER_MAP = {
@@ -112,11 +145,21 @@ web_app = build_router(
     ],
     title="Modal ComfyUI Gateway (L4)",
     logs_reader=read_worker_logs,
+    job_reader=read_job_result,
 )
 
 
 # Point d'entrée Modal — expose le routeur FastAPI
-@app.function()
+#
+# ``timeout`` EXPLICITE : sans lui, Modal applique 300 s et tue la requête
+# (entrée annulée → CancelledError → 503 « Job interrompu ») — c'était la
+# cause du faux échec des rendus longs. La valeur est configurable
+# (COMFYCH_GATEWAY_TIMEOUT_S) ; depuis le passage en mode
+# « spawn + polling », elle ne borne plus qu'UNE requête, pas le rendu.
+@app.function(
+    timeout=gateway_timeout_seconds(),
+    startup_timeout=gateway_startup_timeout_seconds(),
+)
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app(label="gateway-l4")
 def gateway():
