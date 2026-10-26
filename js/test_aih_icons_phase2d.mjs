@@ -77,6 +77,9 @@ const MIGRATED = [
     { key: "menu.models", fr: "Models", en: "Models", icon: "package", size: 13, file: "js/holaf_main.js", was: "📦" },
     { key: "menu.members", fr: "Membres", en: "Members", icon: "users", size: 13, file: "js/holaf_main.js", was: "👥" },
     { key: "menu.repairWorkflow", fr: "Réparer un workflow", en: "Repair a workflow", icon: "wrench", size: 13, file: "js/holaf_main.js", was: "🛠" },
+    // Entrée NOUVELLE (intégration ComfyCH) : icône de la brique dès l'origine,
+    // donc aucun emoji remplacé — `was` documente l'absence d'antériorité.
+    { key: "menu.comfych", fr: "ComfyCH", en: "ComfyCH", icon: "cloud", size: 13, file: "js/holaf_main.js", was: "— (nouvelle entrée)" },
     { key: "menu.chat", fr: "Chat", en: "Chat", icon: "message-square", size: 13, file: "js/holaf_main.js", was: "💬" },
     { key: "menu.aihUpdate", fr: "AIH Update", en: "AIH Update", icon: "refresh", size: 13, file: "js/holaf_main.js", was: "🔄" },
     // ── Workflows : onglets et actions (js/aih_workflow_share.js) ──────────

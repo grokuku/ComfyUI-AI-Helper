@@ -41,6 +41,11 @@ export const WIP_FEATURES = {
         label: "Chat",
         description: "Chat avec Blobby (indépendant de l'activation de Blobby).",
     },
+    comfych: {
+        id: "comfych",
+        label: "ComfyCH",
+        description: "Génération distante Modal : sélecteur de GPU + réglages dans le menu AIH.",
+    },
 };
 
 const STORAGE_KEY = "Holaf_WIP_Features";

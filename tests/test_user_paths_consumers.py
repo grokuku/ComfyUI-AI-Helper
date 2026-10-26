@@ -60,6 +60,9 @@ CONSUMER_FILES = (
     "aih/local_source.py",
     "aih/sync_engine.py",
     "aih/model_manager.py",
+    # ComfyCH (intégré sous tools/comfych/) : sa config et ses logs d'opération
+    # vivaient dans le dossier de son code, donc dans le pack.
+    "tools/comfych/comfych_store.py",
 )
 
 IMAGES = 50

@@ -297,7 +297,7 @@ def test_migration_plan_order_and_targets(tmp_path):
     assert keys == [
         "db_aih", "db_profiler", "credentials", "openai_keys", "sftp_known_hosts",
         "db_utils", "db_utils_backups", "config_ini", "presets", "blobby",
-        "music3", "thumbnails",
+        "music3", "thumbnails", "comfych_config", "comfych_logs",
     ]
     assert plan[5]["kind"] == "sqlite"
     assert plan[5]["new"] == str(tmp_path / "r" / "db" / "holaf_utilities.sqlite")

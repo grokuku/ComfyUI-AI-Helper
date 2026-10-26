@@ -1,0 +1,13 @@
+{
+  "api_url": "",
+  "api_key": "",
+  "last_sync": null,
+  "last_deploy": null,
+  "last_user_sync": null,
+  "custom_nodes": [],
+  "custom_nodes_ext": [],
+  "custom_nodes_local": [],
+  "models_to_sync": [],
+  "local_output_dir": "",
+  "extra_pip_packages": []
+}

@@ -95,15 +95,57 @@ from aiohttp import web
 import time # For time.sleep in periodic task wrapper
 import re # Added for finalize_upload_model_route for subfolder splitting
 
+# --- ComfyCH (générateur distant Modal) : PARTIE INTÉGRANTE, TOUJOURS CHARGÉE --
+# ComfyCH vit sous tools/comfych/ (son code reste là : c'est le cwd de
+# `modal run sync.py`). Il est chargé ICI, après le bootstrap des données
+# utilisateur (sa config et ses logs passent par holaf_user_paths), et AVANT le
+# reste du pack : ses routes /api/modal/* sont montées par un monkeypatch de
+# PromptServer.add_routes, qui doit être en place au moment où ComfyUI appelle
+# cette méthode.
+#
+# Aucun drapeau serveur conditionnel : le module est TOUJOURS chargé. Seule sa
+# VISIBILITÉ est pilotée par la feature WIP `comfych` (js/holaf_wip_settings.js).
+# Masqué ≠ désactivé : l'interception du bouton Queue reste en place et ne fait
+# simplement rien (mode de rendu forcé à « local »).
+_COMFYCH_DIR = os.path.join(_AIH_PACK_ROOT, "tools", "comfych")
+COMFYCH_AVAILABLE = False
+try:
+    # Nom de module UNIQUE (pas `tools` ni `comfych` dans sys.modules : aucune
+    # collision avec un paquet du même nom) + recherche de sous-modules pour que
+    # les imports relatifs internes (comfych_store, comfych_paths) fonctionnent.
+    _comfych_spec = importlib.util.spec_from_file_location(
+        "holaf_comfych",
+        os.path.join(_COMFYCH_DIR, "__init__.py"),
+        submodule_search_locations=[_COMFYCH_DIR],
+    )
+    _holaf_comfych = importlib.util.module_from_spec(_comfych_spec)
+    sys.modules["holaf_comfych"] = _holaf_comfych
+    _comfych_spec.loader.exec_module(_holaf_comfych)
+    COMFYCH_AVAILABLE = True
+    # Forçage du mode de rendu EN MÉMOIRE, à CHAQUE démarrage. Le fichier de
+    # configuration N'EST PAS modifié (api_url, api_key, GPU préféré, listes
+    # restent intacts) : mémoriser un choix plus tard = retirer ce forçage,
+    # sans avoir écrasé le réglage de l'utilisateur. Les jobs déjà lancés sur
+    # Modal NE SONT PAS annulés (aucune tâche n'est tuée ici).
+    print(
+        "🔵 [Holaf-ComfyCH] mode rendu forcé à « local » au démarrage "
+        "(config intacte : aucun fichier modifié)."
+    )
+except Exception as _comfych_err:  # noqa: BLE001 — ne jamais casser le démarrage
+    _holaf_comfych = None
+    print(f"🔴 [Holaf-ComfyCH] chargement de tools/comfych impossible : {_comfych_err}")
+
 # import atexit # Option pour le futur
 
 # --- Holaf Utilities Submodules ---
-from . import holaf_database
-from . import holaf_config
-from . import holaf_utils # Also initializes its dirs and cleans up temp uploads
-from . import holaf_terminal
-from . import holaf_image_viewer_backend
-from . import holaf_server_management
+from . import (  # isort-style : un SEUL bloc trié (aucun changement sémantique)
+    holaf_config,
+    holaf_database,
+    holaf_image_viewer_backend,
+    holaf_server_management,
+    holaf_terminal,
+    holaf_utils,  # Also initializes its dirs and cleans up temp uploads
+)
 
 # --- Profiler Engine Import ---
 try:

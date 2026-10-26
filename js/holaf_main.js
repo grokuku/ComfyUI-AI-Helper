@@ -147,6 +147,19 @@ const HolafUtilitiesMenu = {
             }
         });
 
+        // Fermeture au CLAVIER : Échap referme le menu s'il est ouvert.
+        // Jusqu'ici seul le clic extérieur le fermait, ce qui piégeait les
+        // utilisateurs au clavier (le menu restait par-dessus la scène). On ne
+        // consomme l'événement QUE si le menu est ouvert, pour ne pas voler
+        // Échap aux dialogues/fenêtres du pack. Une ligne contenant un
+        // contrôle (ex. sélecteur ComfyCH) laisse le focus au contrôle.
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape' && e.key !== 'Esc') return;
+            if (!this.dropdownMenuEl || this.dropdownMenuEl.style.display !== "block") return;
+            this.hideDropdown();
+            if (typeof mainButton.focus === "function") mainButton.focus();
+        });
+
         menuContainer.appendChild(mainButton);
 
         const settingsButton = app.menu?.settingsGroup?.element;
@@ -225,6 +238,10 @@ const HolafUtilitiesMenu = {
             { label: t("menu.nodesManager"), handlerName: "holafNodesManager", wipFeature: 'custom_nodes_manager' },
             { label: t("menu.workflowProfiler"), special: "profiler_standalone", wipFeature: 'workflow_profiler' },
             { label: t("menu.repairWorkflow"), icon: "wrench", special: "aih_repair_workflow" },
+            // ComfyCH (générateur distant Modal) : le sous-menu porte le
+            // sélecteur de GPU + le bouton ⚙ ; il n'existe QUE si la feature
+            // WIP `comfych` est activée (défaut : masqué).
+            { label: t("menu.comfych"), icon: "cloud", special: "comfych_panel", wipFeature: 'comfych' },
             { special: 'aih_blobby_toggle', wipFeature: 'blobby' },
             { label: t("menu.chat"), icon: "message-square", special: 'aih_chat', wipFeature: 'chat' },
 
@@ -304,6 +321,13 @@ const HolafUtilitiesMenu = {
             // + pastille ON/OFF), ne ferme pas le menu au clic.
             if (itemInfo.special === 'aih_blobby_toggle') {
                 this.dropdownMenuEl.appendChild(this.buildAihBlobbyToggleItem());
+                return;
+            }
+
+            // Ligne ComfyCH : structure dédiée (libellé + contrôles 🎮/GPU/⚙
+            // fournis par le module comfych), ne ferme pas le menu au clic.
+            if (itemInfo.special === 'comfych_panel') {
+                this.dropdownMenuEl.appendChild(this.buildComfychItem());
                 return;
             }
 
@@ -509,6 +533,103 @@ const HolafUtilitiesMenu = {
         } else {
             AIH.ask({ title: t("menu.sectionAIH"), message: t("main.aihEntryNotAvailable", { special }), buttons: [{ text: t("dialog.ok"), value: true }] });
         }
+    },
+
+    // ── ComfyCH (sous-menu de la section « Outils & Dev ») ──
+    //
+    // ARBITRAGE (documenté dans docs/COMFYCH.md) : la ligne « ComfyCH » porte
+    // EN LIGNE ses contrôles (sélecteur de GPU à droite du libellé + bouton ⚙),
+    // au lieu d'un panneau volant (flyout) imbriqué. Raisons :
+    //   - un seul niveau de menu → aucune gestion de survol entre section et
+    //     sous-panneau (donc rien qui puisse se refermer au passage) ;
+    //   - la fermeture (Échap, clic extérieur) et la navigation clavier restent
+    //     celles du menu EXISTANT, déjà testées ;
+    //   - le sélecteur reste visible/atteignable au clavier DANS le menu.
+    //
+    // Les contrôles viennent de window.AIHComfyCHHost (js/comfych/modal_gateway.js,
+    // via le chargeur js/comfych_gateway.js) : il les CONSTRUIT (buildControls)
+    // au lieu de les déplacer, le menu étant rebâti à chaque ouverture.
+    buildComfychItem() {
+        const li = document.createElement("li");
+        li.id = "holaf-menu-comfych";
+        Object.assign(li.style, {
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "8px",
+            // Ligne de CONTRÔLES (et non une action) : curseur par défaut.
+            cursor: "default",
+        });
+
+        const labelSpan = document.createElement("span");
+        labelSpan.style.display = "inline-flex";
+        labelSpan.style.alignItems = "center";
+        labelSpan.style.gap = "6px";
+        const iconEl = document.createElement("span");
+        iconEl.className = "aih-icon";
+        iconEl.innerHTML = aihIconSvg("cloud", { size: 13 });
+        labelSpan.appendChild(iconEl);
+        labelSpan.appendChild(document.createTextNode(t("menu.comfych")));
+        li.appendChild(labelSpan);
+
+        const controls = document.createElement("span");
+        controls.id = "holaf-menu-comfych-controls";
+        controls.style.display = "inline-flex";
+        controls.style.alignItems = "center";
+        li.appendChild(controls);
+
+        // Le menu n'est bâti qu'UNE fois au démarrage : si le module ComfyCH se
+        // charge ensuite (modules importés en parallèle par ComfyUI), il doit
+        // pouvoir réclamer une reconstruction — c'est le rôle du rappel
+        // onReady du pont. Il ne déclenche qu'une seule fois (à l'arrivée de la
+        // config serveur), donc pas de boucle de reconstruction.
+        if (window.AIHComfyCHHost && typeof window.AIHComfyCHHost === "object") {
+            window.AIHComfyCHHost.onReady = () => {
+                if (window.holaf && typeof window.holaf.rebuildMenu === "function") {
+                    window.holaf.rebuildMenu();
+                }
+            };
+        }
+
+        // Montage : le module ComfyCH peut se charger APRÈS ce rendu (modules
+        // importés en parallèle par ComfyUI) → on retente brièvement, puis on
+        // affiche un état explicite plutôt qu'une ligne vide silencieuse.
+        const mount = () => {
+            const host = window.AIHComfyCHHost;
+            if (!host || typeof host.buildControls !== "function") return false;
+            let element = null;
+            try {
+                element = host.buildControls();
+            } catch (err) {
+                console.error("[AIH] ComfyCH : construction des contrôles impossible", err);
+                return false;
+            }
+            if (!element) return false;
+            controls.innerHTML = "";
+            controls.appendChild(element);
+            return true;
+        };
+
+        if (!mount()) {
+            let tries = 0;
+            const timer = setInterval(() => {
+                tries++;
+                if (mount() || tries >= 20 || !li.isConnected) {
+                    clearInterval(timer);
+                    if (!li.isConnected) return;
+                    if (!controls.firstChild) {
+                        controls.textContent = t("menu.comfychUnavailable");
+                        controls.style.fontSize = "11px";
+                        controls.style.opacity = "0.75";
+                    }
+                }
+            }, 200);
+        }
+
+        // Le menu ne doit pas se fermer quand on manipule les contrôles : un
+        // clic DANS la ligne est un geste d'usage, pas une sélection d'entrée.
+        li.addEventListener("click", (e) => e.stopPropagation());
+        return li;
     },
 
     // Ligne « 🧡 Activer Blobby ↔ Blobby (test) » avec pastille ON/OFF.

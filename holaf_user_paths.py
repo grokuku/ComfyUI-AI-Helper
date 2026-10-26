@@ -101,6 +101,11 @@ DB_UTILS_FILENAME = "holaf_utilities.sqlite"
 DB_UTILS_BACKUP_PATTERN = DB_UTILS_FILENAME + ".backup_*"
 DB_AIH_FILENAME = "aihelper.db"
 DB_PROFILER_FILENAME = "holaf_profiler.db"
+# Réglages de ComfyCH (ex-tools/comfych/config.json) : cible
+# <user>/default/AI-Helper/config/comfych.json.
+COMFYCH_CONFIG_FILENAME = "comfych.json"
+# Nom HISTORIQUE du fichier, dans le dossier de code de ComfyCH.
+COMFYCH_LEGACY_CONFIG_NAME = "config.json"
 
 _TRUTHY = ("1", "true", "yes", "on")
 _FALSEY = ("0", "false", "no", "off", "")
@@ -319,6 +324,28 @@ def p_music3_dir(root=None):
 def p_thumb_cache(root=None):
     """Cache des miniatures (ex-.cache/thumbnails dans le pack)."""
     return _under(root, "cache", "thumbnails")
+
+
+def p_comfych_config(root=None):
+    """Réglages de ComfyCH (ex-tools/comfych/config.json, dont api_key).
+
+    ComfyCH (intégré au pack sous ``tools/comfych/``) écrivait son
+    ``config.json`` DANS le dossier de son code, c'est-à-dire dans le pack :
+    mêmes raisons que les autres données utilisateur (survivre à une
+    réinstallation, séparer code et données, ne pas embarquer un secret dans
+    une sauvegarde du pack).
+    """
+    return _under(root, "config", COMFYCH_CONFIG_FILENAME)
+
+
+def p_comfych_logs(root=None):
+    """Journaux des opérations ComfyCH (ex-tools/comfych/logs/).
+
+    ``last_operation.log`` / ``last_operation.status`` : réécrits à chaque
+    opération, jamais des données durables — mais hors du dossier servi en
+    statique par ComfyUI.
+    """
+    return _under(root, "logs", "comfych")
 
 
 def p_backups_dir(root=None):
@@ -540,6 +567,25 @@ def legacy_blobby_paths(comfy_user_dir=None):
     ]
 
 
+def legacy_comfych_config_paths():
+    """config.json de ComfyCH : DANS son dossier de code (tools/comfych/).
+
+    Volontairement limité à l'intérieur du pack : un ``custom_nodes/ComfyCH/``
+    séparé, s'il est encore installé, garde SON fichier (il serait sinon
+    recréé vide par l'extension autonome). Les emplacements externes
+    plausibles (``<custom_nodes>/ComfyCH/config.json``, ``<custom_nodes>/*/``,
+    ``~/.comfych/``) sont traités par l'IMPORT AUTOMATIQUE de
+    ``tools/comfych/comfych_store.py``, qui COPIE puis renomme l'ancien en
+    ``.migrated`` au lieu de le déplacer.
+    """
+    return [os.path.join(PACK_ROOT, "tools", "comfych", COMFYCH_LEGACY_CONFIG_NAME)]
+
+
+def legacy_comfych_logs_paths():
+    """logs/ de ComfyCH : DANS son dossier de code (tools/comfych/logs)."""
+    return [os.path.join(PACK_ROOT, "tools", "comfych", "logs")]
+
+
 def legacy_known_hosts_paths():
     """sftp_known_hosts : custom_nodes/.sftp_known_hosts puis racine du pack."""
     return [
@@ -575,6 +621,14 @@ def resolved_db_profiler(root=None, comfy_user_dir=None):
 
 def resolved_config(root=None):
     return resolve_data_path(p_config(root), legacy_config_paths())
+
+
+def resolved_comfych_config(root=None):
+    return resolve_data_path(p_comfych_config(root), legacy_comfych_config_paths())
+
+
+def resolved_comfych_logs(root=None):
+    return resolve_data_path(p_comfych_logs(root), legacy_comfych_logs_paths(), kind="dir")
 
 
 def resolved_credentials(root=None, comfy_user_dir=None):
@@ -1104,6 +1158,26 @@ def build_migration_plan(comfy_user_dir=None, pack_root=None, root=None):
             "legacy": [os.path.join(pack, ".cache", "thumbnails")],
             "prune_stop": pack,
         },
+        # 8) ComfyCH (intégré sous tools/comfych/) : sa config (dont api_key)
+        #    et ses journaux d'opération vivaient DANS le pack. Traités en
+        #    DERNIER : ce sont les données les moins bloquantes, et l'import
+        #    automatique de comfych_store.py couvre le cas d'une migration
+        #    désactivée (elle COPIE alors le fichier sans le déplacer).
+        {
+            "key": "comfych_config",
+            "kind": "file",
+            "new": dst("config", COMFYCH_CONFIG_FILENAME),
+            "legacy": [
+                os.path.join(pack, "tools", "comfych", COMFYCH_LEGACY_CONFIG_NAME)
+            ],
+        },
+        {
+            "key": "comfych_logs",
+            "kind": "dir",
+            "new": dst("logs", "comfych"),
+            "legacy": [os.path.join(pack, "tools", "comfych", "logs")],
+            "prune_stop": pack,
+        },
     ]
 
 
@@ -1118,6 +1192,7 @@ def layout_dirs(root=None):
         os.path.join(base, "data", "music3"),
         os.path.join(base, "backups"),
         os.path.join(base, "cache", "thumbnails"),
+        os.path.join(base, "logs", "comfych"),
     ]
 
 
@@ -1519,6 +1594,9 @@ def reset_ensure_once():
 #   aih/local_source.py:316           refs music3 → resolved_music3_dir()
 #   aih/sync_engine.py:837            sync_music3_local() → resolved_music3_dir()
 #   aih/model_manager.py:110          sftp_known_hosts → resolved_known_hosts()
+#   tools/comfych/comfych_store.py     config.json + logs/ de ComfyCH →
+#                                    resolved_comfych_config() /
+#                                    resolved_comfych_logs()
 #
 # INCHANGÉ VOLONTAIREMENT : aih/routes.py:179-198 (_get_workflows_dir, dossier
 # user/default/workflows PARTAGÉ avec le core ComfyUI via /api/userdata), ainsi

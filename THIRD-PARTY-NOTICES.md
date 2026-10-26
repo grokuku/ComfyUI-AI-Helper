@@ -74,7 +74,22 @@ THE SOFTWARE.
 
 ---
 
-## 3. Python dependencies (installed via pip)
+## 3. ComfyCH (Modal Gateway) — code intégré, même auteur
+
+- **Chemin intégré :** `tools/comfych/` (code Python) et
+  `js/comfych/modal_gateway.js` (frontend)
+- **Origine :** projet ComfyCH / « Modal Gateway » (dépôt `grokuku/ComfyCH`),
+  du même auteur que ce pack. Code intégré avec l'accord de son auteur et
+  modifié pour le pack (chemins, import de configuration, interface) —
+  voir `docs/COMFYCH.md`.
+- **Licence :** aucune licence explicite n'est fournie dans le dépôt d'origine.
+- **Dépendances NON embarquées :** le paquet pip `modal` (+ `fastapi`, `httpx`)
+  n'est **pas** requis par ce pack ; il reste **optionnel** (voir
+  `docs/COMFYCH.md`) et n'est jamais installé par `requirements.txt`.
+
+---
+
+## 4. Python dependencies (installed via pip)
 
 The Python packages below are declared in `requirements.txt` and installed into the
 user's ComfyUI Python environment via pip. They are **distributed separately by their

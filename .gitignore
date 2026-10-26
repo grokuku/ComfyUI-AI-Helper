@@ -25,3 +25,11 @@ bin/
 
 # ── Host keys SFTP (TOFU) ────────────────────────────────────────────
 .sftp_known_hosts
+
+# ── ComfyCH : la configuration (clé API en clair) et les journaux d'opération
+# vivent dans l'arborescence utilisateur (user/default/AI-Helper/), PAS ici.
+# Ces deux lignes évitent qu'un ancien fichier déposé dans tools/comfych/ (avant
+# migration) soit commité avec la clé API.
+tools/comfych/config.json
+tools/comfych/config.json.migrated*
+tools/comfych/logs/

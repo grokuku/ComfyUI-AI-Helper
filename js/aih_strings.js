@@ -120,6 +120,8 @@ import "./aih_i18n.js";
         "wip.blobby.desc": "Assistant IA (toggle Blobby Companion).",
         "wip.chat": "Chat",
         "wip.chat.desc": "Chat avec Blobby (indépendant de l'activation de Blobby).",
+        "wip.comfych": "ComfyCH",
+        "wip.comfych.desc": "Génération distante Modal : sélecteur de GPU + réglages dans le menu AIH.",
 
         /* Chrome fenêtres / divers */
         "window.zoomOut": "Réduire le zoom",
@@ -1397,6 +1399,9 @@ import "./aih_i18n.js";
 
         /* Réparer un workflow (aih_repair_workflow.js) */
         "menu.repairWorkflow": "Réparer un workflow",
+        /* ComfyCH (sous-menu du menu AIH, js/holaf_main.js) */
+        "menu.comfych": "ComfyCH",
+        "menu.comfychUnavailable": "Contrôles indisponibles (module non chargé)",
         "rw.title": "Réparer un workflow (niveau JSON)",
         "rw.section.sources": "1 · Sources",
         "rw.saved.title": "Workflows sauvegardés",
@@ -1545,6 +1550,8 @@ import "./aih_i18n.js";
         "wip.blobby.desc": "AI assistant (toggle Blobby Companion).",
         "wip.chat": "Chat",
         "wip.chat.desc": "Chat with Blobby (independent of Blobby activation).",
+        "wip.comfych": "ComfyCH",
+        "wip.comfych.desc": "Modal remote generation: GPU selector + settings in the AIH menu.",
 
         /* Window chrome / misc */
         "window.zoomOut": "Zoom out",
@@ -2821,6 +2828,9 @@ import "./aih_i18n.js";
 
         /* Repair a workflow (aih_repair_workflow.js) */
         "menu.repairWorkflow": "Repair a workflow",
+        /* ComfyCH (AIH menu sub-entry, js/holaf_main.js) */
+        "menu.comfych": "ComfyCH",
+        "menu.comfychUnavailable": "Controls unavailable (module not loaded)",
         "rw.title": "Repair a workflow (JSON level)",
         "rw.section.sources": "1 · Sources",
         "rw.saved.title": "Saved workflows",
