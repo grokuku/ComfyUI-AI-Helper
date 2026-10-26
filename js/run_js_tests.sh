@@ -63,6 +63,23 @@ echo "════════════════════════�
 echo " Tests JS (js/test_*.mjs) — node $(node --version 2>/dev/null)"
 echo "════════════════════════════════════════════════════════════════"
 
+# ── Nettoyage des artefacts de MUTATION laissés par un run interrompu ────
+# Plusieurs tests écrivent un MUTANT du module juste à côté de la source
+# (``js/.__mut_*.js``, ``js/comfych/.__mut_*.js``) pour que les imports
+# relatifs résolvent comme en production, puis le suppriment. Si un run est
+# tué entre-temps (Ctrl-C, timeout, crash de node), le fichier reste et le run
+# SUIVANT échoue pour une raison sans rapport (« consommateur hors périmètre :
+# js/comfych/.__mut_hint_1.js » dans les tests d'icônes) : la suite devenait
+# non rejouable. Ces fichiers ne sont JAMAIS des sources : on les enlève avant
+# de commencer, en le disant.
+stale_mutants=$(find . -maxdepth 2 -name '.__mut_*' -type f 2>/dev/null)
+if [ -n "$stale_mutants" ]; then
+    echo ""
+    echo "🧹 Artefact(s) de mutation d'un run interrompu supprimé(s) :"
+    echo "$stale_mutants" | sed 's/^/   /'
+    echo "$stale_mutants" | while IFS= read -r f; do rm -f "$f"; done
+fi
+
 for t in "${TESTS[@]}"; do
     echo ""
     echo "── $t ──────────────────────────────────────────────────────────"

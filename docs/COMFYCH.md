@@ -146,6 +146,132 @@ avec un message dans les journaux d'opération.
 
 ---
 
+## Modules locaux dans l'image : la liste `add_local_python_source` est un CONTRAT
+
+`modal run sync.py` monte **`/root/sync.py`** dans le container, mais **pas ses
+modules frères**. Tout module local importé par un fichier d'app doit donc être
+**déclaré explicitement** :
+
+```python
+# tools/comfych/sync.py
+IMAGE_LOCAL_PYTHON_SOURCES = ("comfych_paths", "helpers", "models")
+...
+_sync_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("aria2")                      # installations D'ABORD
+    .pip_install("huggingface_hub")
+    .add_local_python_source(*IMAGE_LOCAL_PYTHON_SOURCES, copy=True)  # CODE EN DERNIER
+)
+```
+
+Deux règles, chacune verrouillée par un test :
+
+1. **Un module oublié = retry infini.** L'oubli de `comfych_paths` (après le
+déplacement de la résolution des chemins ComfyUI dans ce module) a produit, en
+production :
+
+   ```
+   File "/root/sync.py", line 36, in <module>
+       from comfych_paths import (...)
+   ModuleNotFoundError: No module named 'comfych_paths'
+   Runner failed with exception …
+   … toujours en cours (66s) (76s) (86s) (96s) (108s) (118s)
+   ```
+
+   Modal relance le container en boucle (temps GPU brûlé) et **toutes** les
+   fonctions distantes sont inutilisables. `tests/test_comfych_image_modules.py`
+   compare, par **analyse AST**, les imports locaux réels de `sync.py` à
+   `IMAGE_LOCAL_PYTHON_SOURCES` : la récidive est impossible. En complément,
+   `sync.py` exécute `_preflight_image_modules()` **avant tout appel distant** et
+   sort en code 1 avec le nom du module manquant.
+
+2. **Le code local se déclare APRÈS les installations.** `add_local_python_source`
+   en tête de chaîne change le hash des couches suivantes : chaque édition d'un
+   module du pack faisait rejouer `apt install` + `pip install` (et, dans
+   `image.py`, `comfy install --nvidia` : plusieurs minutes). Il est donc placé
+   en **dernier**, avant l'empreinte `COMFYCH_DEPLOY_STAMP`.
+
+Les imports **sous `try:`** (`comfych_store`) sont *optionnels* : le script se
+charge sans eux (repli prévu) et ils ne sont pas exigés dans l'image.
+
+---
+
+## Une seule source de vérité pour le pack : le VOLUME (code) + l'IMAGE (deps)
+
+Répartition **imposée** (cf. `base_worker._sync_custom_nodes_from_volume`) :
+
+| Quoi | Où | Pourquoi |
+|---|---|---|
+| **Code des nodes** du pack (`__init__.py`, `aih/`, `nodes/`, `js/`…) | **Volume** `comfy-custom-nodes` (archive des custom nodes) | c'est ce que le worker lie dans `ComfyUI/custom_nodes` au démarrage ; une correction de code ne demande **aucun** redéploiement |
+| **Dépendances pip** du pack (`requirements.txt` : `watchdog`, `aiohttp`, `av`…) | **Image** Modal (build) | payées une fois, persistantes ; les installs runtime ne survivent pas au snapshot |
+| **Code du gateway** (`tools/comfych/` : `sync.py`, `image.py`, `apps/`, `workers/`) | **Image** Modal (`add_local_python_source`) | inutile côté worker, et il contient la configuration locale (clé API) |
+
+Conséquences **à ne pas inverser** :
+
+- Le pack **n'est plus exclu** de l'archive. L'ancien message
+  `⊘ ComfyUI-AI-Helper exclu (gateway ComfyCH (code déjà présent dans l'image))`
+  était **faux** : l'image ne contient que ses `requirements.txt`, jamais son
+  code → le pack n'existait **ni dans l'image, ni sur le volume**, et ses nodes
+  étaient introuvables sur le worker (`AIH Prompt Enhancer not found`).
+- `tools/comfych` (code du gateway) est **élagué** de l'archive, par **chemin**
+  (pas par nom) : jamais deux copies, et la `config.json` locale (clé API) ne
+  part jamais dans un volume. Le log l'affiche :
+  `⊘ comfych/ exclu (code du gateway : embarqué dans l'image)`.
+- **Jamais les deux** pour la même chose : deux copies d'un même pack dans
+  `custom_nodes/` se neutralisent (piège historique). Sur le worker, le gateway
+  absent affiche une ligne **informative** (`ℹ️ gateway absent de cette
+  installation`), pas une erreur.
+- **Un dossier de `custom_nodes/` sans `__init__.py` n'est pas un custom node**
+  (ComfyUI ne le charge pas) : il est exclu du packaging avec sa raison
+  (`⊘ ComfyCH exclu (pas de __init__.py — pas un custom node)`), de même qu'un
+  dossier désactivé par suffixe (`.disabled`, `.bak`, `.off`).
+
+---
+
+## Swap du volume `custom_nodes` : jamais destructif
+
+`extract_custom_nodes_from_volume` suit un ordre strict, et **rien n'est
+supprimé avant que le remplacement soit complet** :
+
+1. extraction + validation de l'archive dans `.staging` (liens, `..` et
+   échappements refusés **avant** toute écriture ; archive vide ou tronquée →
+   refus immédiat, **volume intact**) ;
+2. l'ancien contenu est **renommé** dans `.backup` (renommage = instantané,
+   aucun octet copié) puis marqué complet (`.backup/.complete`) ;
+3. les entrées du staging sont installées à la place ;
+4. **si l'installation échoue** : l'installation partielle est retirée et
+   l'ancien contenu est **restauré** depuis `.backup` avant que l'erreur ne
+   remonte (volume inchangé, `commit()` jamais appelé) ;
+5. **si elle réussit** : le manifeste `.nodes_manifest.json` est écrit, le
+   volume est commité, et la génération précédente reste dans `.backup` (une
+   seule génération, remplacée au swap suivant).
+
+L'ancien code **supprimait tout** (`shutil.rmtree`) avant d'installer : un échec
+au milieu (quota, container tué) laissait le volume **vide ou partiel**, et
+Modal persiste l'état à l'arrêt du container → perte définitive (symptôme vécu :
+« ComfyCH n'existe plus »). Une sauvegarde `.backup` **incomplète** (swap
+interrompu) n'est jamais écrasée : le swap suivant refuse de démarrer plutôt que
+de détruire le seul exemplaire restant.
+
+Espace : `.backup` double la taille des nodes. Pour le libérer :
+
+```bash
+modal volume rm comfy-custom-nodes /.backup --recursive
+```
+
+---
+
+## Anti-retry-infini côté gateway (échec rapide et clair)
+
+Un container qui plante **à l'import** est relancé en boucle par le superviseur
+Modal. Le gateway compte les `Runner failed with exception` du flux de logs :
+au-delà de `_RETRY_ABORT_THRESHOLD` (3), il **tue le subprocess** et sort en
+échec avec un message qui dit quoi corriger (cause déterministe, module à
+déclarer), au lieu d'attendre le timeout global de 30 min
+(`_OP_TIMEOUT_SECONDS`) et de brûler du temps GPU.
+
+---
+
 ## Ce qui a été repris de ComfyCH (et ce qui ne l'a pas été)
 
 Repris dans `tools/comfych/` : `__init__.py` (routes + opérations),
@@ -325,6 +451,131 @@ l'utilisateur** (`confirm: true`) ; sans confirmation, le serveur refuse (`409`,
 « ♻️ Worker Modal → ♻️ Redémarrer », avec un rappel de l'ordre. Les logs de
 l'opération s'affichent dans le panneau de logs **existant** (SSE
 `/api/modal/logs/stream`).
+
+---
+
+## Dépendances des custom nodes et « Deployment skipped »
+
+**Les dépendances des custom nodes sont installées dans l'image au build.** Le
+build scanne le dossier `custom_nodes` **local** (celui de la machine qui lance
+`modal deploy`) et installe, dans cet ordre :
+
+1. le `requirements.txt` **du pack AI-Helper** — toujours, en priorité (`watchdog`,
+   `aiohttp`, `av`, `psutil`… : sans eux le pack ne s'importe pas du tout sur le
+   worker et **tous** ses nodes disparaissent de ComfyUI) ;
+2. le `requirements.txt` de **chaque** custom node détecté (`cv2`, `gguf`, `pywt`,
+   `dlib`…) ;
+3. les `extra_pip_packages` de la configuration.
+
+Une dépendance en échec **n'arrête jamais le build** (le node échouera au
+chargement), mais laisse une ligne `❌ ÉCHEC des dépendances de <node>` dans le
+log de déploiement : le nom du node fautif y est lisible, plus besoin de traquer
+un `ModuleNotFoundError` opaque dans le log du worker. Le dossier est résolu par
+`$COMFYCH_CUSTOM_NODES_DIR`, sinon par la position du pack (`custom_nodes/…`) ;
+s'il est introuvable, le build le dit explicitement.
+
+**Le code, lui, ne vient PAS de l'image** : les nodes sont liés depuis le volume
+`comfy-custom-nodes` au démarrage du worker (voir « Une seule source de
+vérité »). Un `pip` manquant côté worker = `requirements.txt` incomplet sur la
+machine locale, puis redéploiement ; un node absent = sync des custom nodes.
+
+**« ✓ Deployment skipped: no changes detected! ⏭️ »** : `modal deploy` n'a
+**aucun flag `--force`**. Si la définition de l'app n'a pas changé, la CLI saute
+le déploiement et l'image n'est **pas** reconstruite — les dépendances ajoutées
+ne sont donc jamais installées. L'image porte pour cela une **empreinte de
+déploiement** (`COMFYCH_DEPLOY_STAMP` : contenu des `requirements.txt`, liste des
+nodes détectés, `extra_pip_packages`) : toute modification de dépendances change
+l'empreinte, donc l'image, donc le déploiement n'est plus sauté.
+
+Pour forcer malgré tout (cache douteux, image à rafraîchir) :
+
+- bouton **« 🔨 Forcer le déploiement »** (étape **Build** de la modale, sous
+  « 🚀 Déployer ») ;
+- ou `POST /api/modal/deploy` avec `{"force": true}`.
+
+Les deux posent `COMFYCH_DEPLOY_FORCE_TOKEN` sur le subprocess `modal deploy`,
+qui régénère l'empreinte. C'est une couche `ENV` posée **en dernier** : aucune
+couche `pip` déjà en cache n'est réexécutée.
+
+---
+
+## Erreurs fréquentes du worker (configuration, pas bugs)
+
+Ces messages apparaissent dans le log du rendu cloud. Aucun n'est un bug du
+pack : ce sont des **écarts entre la machine locale et l'image du worker**.
+Ils sont documentés ici pour être traités en une minute.
+
+### `ModuleNotFoundError: No module named 'sageattention'` (comfyui-kjnodes)
+
+Le node `comfyui-kjnodes` importe **optionnellement** `sageattention` ; l'image
+du worker ne l'installe pas. Selon la version du node, l'import est toléré
+(performance moindre) ou fait échouer **ce node-là** (les autres continuent).
+
+**Marche à suivre** — ajouter le paquet à l'image :
+1. `tools/comfych/config.json` → clé **`extra_pip_packages`** (liste de
+   paquets pip ajoutés à l'image `image.py`) ;
+2. y ajouter `"sageattention"` — ou, si aucune roue précompilée ne correspond à
+   la version de torch/CUDA de l'image, `"sageattention>=2"` ;
+3. relancer **`modal deploy apps/all_in_one.py`** (l'image est reconstruite :
+   les couches suivantes sont rejouées, c'est normal).
+
+Si le paquet reste introuvable pour la plateforme, l'alternative est de
+**retirer** `comfyui-kjnodes` de `custom_nodes_ext` (ou de désactiver les nodes
+du pack qui en dépendent) : le reste du graphe rend sans lui.
+
+### `AIHUpscale: Value not in list: model_name: '4x-AnimeSharp.pth' not in [...]`
+
+Le workflow référence un modèle d'upscale **absent du volume du worker**. La
+liste affichée entre crochets est celle réellement montée : c'est la preuve que
+le fichier n'a jamais été synchronisé (il n'existe pas localement au bon
+endroit, ou il a été ajouté après la dernière sync).
+
+**Marche à suivre** :
+1. vérifier la présence **locale** du fichier dans
+   `ComfyUI/models/upscale_models/` (le pack synchronise ce dossier, pas un
+   chemin arbitraire) ;
+2. l'ajouter à la liste **`models_to_sync`** de `tools/comfych/models.py` s'il
+   vit dans un sous-dossier ou vient de HuggingFace / d'une URL externe ;
+3. relancer la sync des modèles (`modal run sync.py`), puis **redémarrer le
+   worker** (les modèles sont liés au démarrage par
+   `_link_models_from_manifest`).
+
+### `ComfyUI-Manager: InvalidChannel https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main`
+
+**Bruit.** ComfyUI-Manager publie ses catalogues depuis une branche qui n'existe
+plus sous ce nom ; la version embarquée dans l'image tente l'ancienne URL et
+affiche cette erreur **une fois par tentative de rafraîchissement**. Cela
+n'affecte ni le chargement des nodes ni le rendu. Rien à corriger côté pack :
+mettre à jour `ComfyUI-Manager` dans `custom_nodes_ext` fait disparaître le
+message.
+
+### `base_path '…' resolves outside allowed directory '…'. Falling back.`
+
+**Informatif (une seule fois par chemin).** Le widget `base_path` contient un
+chemin **de la machine locale** (ex. `/config/outputs/ComfyUI/`) ; le worker le
+refuse par sécurité et écrit dans **son** dossier de sortie. Le garde-fou reste
+actif ; le message n'est plus répété à chaque image (voir
+`nodes/holaf_node_helpers.py`, `_warn_path_fallback_once`). Corriger le widget
+(chemin relatif au dossier de sortie) fait disparaître l'avertissement.
+
+### `[AIH sync] credentials incomplets (api_key ou server_url manquant)`
+
+Voir la section suivante : la sync pousse désormais le fichier **même s'il
+existe déjà** sur le volume, et deux lignes de diagnostic disent précisément où
+ça casse (côté sync, puis au démarrage du worker).
+
+### Vérifier ce que le worker a réellement lu (credentials)
+
+1. **Log de la sync** (`modal run sync.py`) :
+   `📁 user/ : N fichier(s), credentials.json présent=oui (default/AI-Helper/config/credentials.json), server_url=renseignée, api_key=renseignée`
+   — si `présent=non`, le fichier n'est pas dans le dossier `user/`
+   effectivement synchronisé (résolution de `user/`, ou réglages enregistrés
+   ailleurs) ; si `vide`, l'UI n'a rien écrit là que la sync lit.
+   La valeur de la clé n'est **jamais** affichée (seulement sa présence).
+2. **Log du worker** (démarrage) :
+   `🔵 [Holaf-AIH] credentials: server_url=renseignée api_key=renseignée (source: fichier /root/comfy/ComfyUI/user/default/…/credentials.json)`
+   — `ABSENT` ou `vide` = le volume n'a pas la bonne version : relancer la sync
+   **puis** redémarrer le worker (il ne relit le volume qu'au démarrage).
 
 ---
 

@@ -189,3 +189,55 @@ def get_api_key():
         )
         return ""
     return key
+
+
+# ── Diagnostic de démarrage (worker Modal / ComfyUI) ────────────────────
+
+def _presence(value):
+    """« renseignée » ou « vide » — JAMAIS la valeur (clé API en clair)."""
+    return "renseignée" if str(value or "").strip() else "vide"
+
+
+def credentials_status_line():
+    """Ligne de diagnostic NEUTRE décrivant les credentials effectivement lus.
+
+    Objectif : trancher en UNE ligne, depuis le log de démarrage du worker, les
+    trois causes possibles d'un « credentials incomplets » alors que les
+    réglages sont renseignés côté local :
+      - fichier ABSENT à ce chemin (mauvaise résolution de ``user/`` ou volume
+        non synchronisé) ;
+      - fichier présent mais VIDE (l'UI a écrit ailleurs, ou la sync n'a jamais
+        poussé la version remplie) ;
+      - fichier présent et renseigné (le problème est alors côté backend/URL).
+
+    La valeur de la clé n'est JAMAIS incluse, seulement sa présence (le log
+    part dans un volume, puis dans le navigateur via le suivi de run).
+
+    Retours:
+        str: ``credentials: server_url=<vide|renseignée> api_key=<vide|renseignée>
+        (source: fichier <chemin>)``.
+    """
+    path = get_credentials_path()
+    exists = os.path.isfile(path)
+    creds = _load_aih_credentials(use_cache=False) if exists else {}
+    raw_key = creds.get("api_key", "")
+    key_state = _presence(raw_key)
+    if key_state == "renseignée" and is_masked_api_key(raw_key):
+        # Une valeur de masquage n'est PAS utilisable : elle est déjà ignorée
+        # par get_api_key(), le diagnostic doit le dire (sinon on cherche au
+        # mauvais endroit).
+        key_state = "masquée (ignorée)"
+    source = f"source: fichier {path}"
+    if not exists:
+        source += " — ABSENT (valeurs par défaut : vides)"
+    return (
+        f"credentials: server_url={_presence(creds.get('server_url'))} "
+        f"api_key={key_state} ({source})"
+    )
+
+
+def log_credentials_status(prefix="[AIH credentials]"):
+    """Écrit :func:`credentials_status_line` dans le log (INFO) et le renvoie."""
+    line = credentials_status_line()
+    logging.info(f"{prefix} {line}")
+    return line

@@ -33,3 +33,4 @@ bin/
 tools/comfych/config.json
 tools/comfych/config.json.migrated*
 tools/comfych/logs/
+*.whl

@@ -15,6 +15,7 @@ Usage::
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -64,6 +65,13 @@ _CUSTOM_NODES_ROOT = "/custom_nodes"
 # Dossiers internes du volume (jamais considérés comme des nodes).
 _STAGING_DIR_NAME = ".staging"
 _UPLOAD_DIR_NAME = "_upload"
+# Sauvegarde de secours du contenu précédent, créée PENDANT le swap (renommage,
+# aucune copie) et conservée une génération : elle n'est remplacée qu'une fois le
+# swap suivant réellement terminé (voir :func:`_swap_volume_content`).
+_BACKUP_DIR_NAME = ".backup"
+# Marqueur écrit dans ``.backup`` quand l'ancien contenu y est COMPLET : sans
+# lui, la sauvegarde vient d'un swap interrompu et ne doit jamais être écrasée.
+_BACKUP_COMPLETE_MARKER = ".complete"
 
 _CACHE_ROOT = Path("/cache")
 
@@ -80,19 +88,42 @@ PROJECT_ROOT_NAME = (
     _SCRIPT_DIR.parents[1].name if _SCRIPT_DIR.parent.name == "tools" else _SCRIPT_DIR.name
 )
 
-# Dossiers de custom_nodes/ qui ne sont PAS des nodes : le gateway lui-même et
-# le dossier de données ComfyUI.
-EXCLUDED_NODE_NAMES = {"user", PROJECT_ROOT_NAME}
+GATEWAY_CODE_DIR = _SCRIPT_DIR
+"""Dossier du CODE du gateway (``tools/comfych``, ou ``custom_nodes/ComfyCH``).
+
+DÉCISION « UNE SEULE SOURCE DE VÉRITÉ » (documentée dans ``docs/COMFYCH.md``) :
+
+* le **code des nodes du pack** vient du **VOLUME** (archive des custom nodes) :
+  c'est lui que ``base_worker._sync_custom_nodes_from_volume`` lie dans
+  ``ComfyUI/custom_nodes`` au démarrage ;
+* le **code du gateway** (``sync.py``, ``image.py``, ``apps/``, ``workers/``) est
+  embarqué dans l'**IMAGE** Modal par ``add_local_python_source`` et n'est
+  JAMAIS poussé sur le volume : il n'a aucun usage côté worker, et il contient
+  la configuration locale (clé API).
+
+Conséquence : ``tools/comfych`` est élagué de l'archive du pack, et un dossier
+de ``custom_nodes/`` qui EST ce dossier (installation ComfyCH autonome) n'est
+pas un node — il est exclu de la sélection.
+"""
+
+# Dossiers de custom_nodes/ qui ne sont PAS des nodes : uniquement le dossier
+# de données ComfyUI. Le PACK n'est plus exclu : ses nodes doivent arriver sur
+# le worker par le volume, l'image ne contenant que ses dépendances pip
+# (l'ancienne exclusion « code déjà présent dans l'image » était FAUSSE et
+# rendait ses nodes introuvables côté worker : « AIH Prompt Enhancer not
+# found »).
+EXCLUDED_NODE_NAMES = {"user"}
 
 
-def _contains_gateway_code(entry) -> bool:
-    """True si *entry* contient le CODE de ComfyCH (donc n'est pas un node).
+def _is_gateway_code_dir(entry) -> bool:
+    """True si *entry* EST le dossier du code du gateway (jamais un node).
 
     Indépendant de tout nom de dossier : couvre les deux dispositions (node à
-    plat ``custom_nodes/ComfyCH`` ou imbriqué ``custom_nodes/<pack>/tools``).
+    plat ``custom_nodes/ComfyCH`` ou imbriqué ``custom_nodes/<pack>/tools/
+    comfych``).
     """
     try:
-        return _SCRIPT_DIR == Path(entry).resolve() or _SCRIPT_DIR.is_relative_to(Path(entry).resolve())
+        return GATEWAY_CODE_DIR == Path(entry).resolve()
     except (OSError, ValueError):
         return False
 
@@ -260,6 +291,10 @@ EXCLUDE_FILE_EXTS = {
     ".tar",
     ".gz",
     ".7z",
+    # Roues pypi téléchargées à la main dans le dossier d'un pack : artefacts de
+    # build (les dépendances du worker viennent des ``requirements.txt``, cf.
+    # docs/COMFYCH.md). Mesuré sur le pack AI-Helper : 8 MB sur 9,2 MB d'archive.
+    ".whl",
     ".pyc",
     ".pyo",
     # Contenu lourd, jamais du code : LUTs, images HDR/EXR, raws d'images.
@@ -367,23 +402,55 @@ _SKIP_MEDIA_FILE = "média de démonstration"
 _SKIP_LARGE_IMAGE = "image volumineuse"
 
 
+# Suffixes qui marquent un dossier de custom_nodes DÉSACTIVÉ à la main
+# (``ComfyUI-GGUF.disabled``, ``X.bak``…). Jamais des nodes.
+DISABLED_NODE_SUFFIXES = (".disabled", ".disabled_by_user", ".bak", ".off")
+
+
+def _not_a_node_reason(entry) -> str | None:
+    """Raison pour laquelle *entry* n'est PAS un custom node chargeable.
+
+    ComfyUI ne charge un dossier de ``custom_nodes/`` QUE s'il contient un
+    ``__init__.py`` : un dossier sans ``__init__.py`` (ex. un dépôt frère dont
+    on a retiré le ``__init__.py`` pour qu'il ne soit pas chargé, un reste
+    d'installation, un dossier de données) n'est pas un node et n'a rien à
+    faire dans l'archive — sa présence sur le volume écraserait du code
+    existant pour rien.
+    """
+    lowered = Path(entry).name.lower()
+    for suffix in DISABLED_NODE_SUFFIXES:
+        if lowered.endswith(suffix):
+            return f"node désactivé (suffixe « {suffix} »)"
+    if not (Path(entry) / "__init__.py").is_file():
+        return "pas de __init__.py — pas un custom node"
+    return None
+
+
 def _node_skip_reason(name: str, entry=None) -> str | None:
     """Raison d'exclure le dossier *name* de custom_nodes/, ou ``None``.
 
-    Le gateway lui-même (``PROJECT_ROOT_NAME``, et tout dossier contenant son
-    code — cf. :func:`_contains_gateway_code`) et ``user`` ne sont pas des
-    nodes ; les dossiers techniques (``__pycache__``, ``.git``…) et les dossiers
-    cachés de bookkeeping du volume (``.staging``…) non plus. Les radicaux de
-    contenu (:data:`CONTENT_DIR_STEMS`) ne s'appliquent PAS ici : un node peut
+    Le dossier du CODE du gateway (cf. :func:`_is_gateway_code_dir`) et
+    ``user`` ne sont pas des nodes ; les dossiers techniques
+    (``__pycache__``, ``.git``…) et les dossiers cachés de bookkeeping du
+    volume (``.staging``…) non plus. Les radicaux de contenu
+    (:data:`CONTENT_DIR_STEMS`) ne s'appliquent PAS ici : un node peut
     légitimement s'appeler ``ComfyUI-Workflows``.
+
+    Le PACK AI-Helper n'est PAS exclu : c'est un custom node comme un autre, et
+    son code doit arriver sur le worker par le VOLUME (l'image n'embarque que
+    ses ``requirements.txt``). Son sous-dossier ``tools/comfych`` (code du
+    gateway), lui, est élagué du packaging — voir :func:`_is_gateway_code_dir`.
     """
-    if name == PROJECT_ROOT_NAME:
-        return "gateway ComfyCH (code déjà présent dans l'image)"
-    if entry is not None and _contains_gateway_code(entry):
-        return "gateway ComfyCH (code déjà présent dans l'image)"
+    if entry is not None and _is_gateway_code_dir(entry):
+        return "gateway ComfyCH (code du gateway : embarqué dans l'image)"
     if name in EXCLUDED_NODE_NAMES:
         return "données ComfyUI, pas un custom node"
-    return _dir_exclusion_reason(name, node_root=True)
+    reason = _dir_exclusion_reason(name, node_root=True)
+    if reason is not None:
+        return reason
+    if entry is not None:
+        return _not_a_node_reason(entry)
+    return None
 
 
 def _select_node_dirs(custom_nodes_dir) -> tuple[list, list]:
@@ -503,6 +570,9 @@ def _new_archive_counters() -> dict:
         "skipped_media": 0,
         "image_exts": set(),
         "skipped_large_images": 0,
+        # Nom du sous-dossier de code du gateway élagué (``tools/comfych``)
+        # s'il a été rencontré : trace dans le résumé du packaging.
+        "gateway_dir": "",
     }
 
 
@@ -514,6 +584,10 @@ def _iter_node_files(node_dir, counters: dict | None = None):
     l'extraction par :func:`_validate_tar_members`. Les images dépassant
     ``MAX_IMAGE_MB`` sont écartées ici, avant tout ajout au tar.
 
+    Le CODE DU GATEWAY (``tools/comfych``) est élagué par CHEMIN, pas par nom :
+    il est embarqué dans l'image Modal et ne doit jamais partir dans le volume
+    (ni ses logs, ni sa configuration locale qui porte la clé API).
+
     *counters* (facultatif, cf. :func:`_new_archive_counters`) est incrémenté
     au passage pour que l'appelant puisse rapporter ce qui a été écarté.
     """
@@ -521,6 +595,12 @@ def _iter_node_files(node_dir, counters: dict | None = None):
     for root, dirs, filenames in os.walk(node_dir):
         kept_dirs = []
         for dir_name in sorted(dirs):
+            child = os.path.join(root, dir_name)
+            if _is_gateway_code_dir(child):
+                # Auto-archivage du gateway : jamais dans sa propre archive.
+                if counters is not None:
+                    counters["gateway_dir"] = dir_name
+                continue
             reason = _dir_exclusion_reason(dir_name)
             if reason is not None:
                 if counters is not None and reason == _SKIP_DEMO_DIR:
@@ -634,6 +714,7 @@ def _build_custom_nodes_archive(
         "skipped_large_images": counters["skipped_large_images"],
         "image_exts": sorted(counters["image_exts"]),
         "kept_hidden_dirs": sorted(counters["hidden_dirs"]),
+        "skipped_gateway_dir": counters["gateway_dir"],
         "size": os.path.getsize(archive_path),
     }
 
@@ -720,6 +801,13 @@ def _archive_exclusion_summary_lines(stats: dict) -> list[str]:
         lines.append(
             f"  ✔ sous-module(s) caché(s) conservé(s) : {_format_node_list(names)}"
         )
+    if stats.get("skipped_gateway_dir"):
+        # Code du gateway : embarqué dans l'image, jamais dans le volume (source
+        # de vérité unique, cf. docs/COMFYCH.md).
+        lines.append(
+            f"  ⊘ {stats['skipped_gateway_dir']}/ exclu "
+            f"(code du gateway : embarqué dans l'image)"
+        )
     return lines
 
 # ── Read config.json for local models to sync ────────────────────────────
@@ -794,11 +882,154 @@ local_models_dir: Path | None = first_existing(models_dir_candidates())
 # chunks directly to the volume (see upload_model_chunk below). The image
 # only needs Python sources + aria2 + huggingface_hub for HF downloads.
 
+# ── Modules LOCAUX embarqués dans l'image (source de vérité du CODE) ──
+# ``modal run sync.py`` monte ``/root/sync.py`` dans le container, mais PAS ses
+# modules frères. Tout module local importé par CE fichier doit donc être
+# déclaré ici : sinon le container plante à l'import et Modal RÉESSAIE en boucle
+# (log réel :
+#
+#     File "/root/sync.py", line 36, in <module>
+#         from comfych_paths import (...)
+#     ModuleNotFoundError: No module named 'comfych_paths'
+#     Runner failed with exception … toujours en cours (66s) (76s) (86s) …
+#
+# ). Toutes les fonctions distantes deviennent alors inutilisables.
+# ``test_comfych_image_modules.py`` compare AUTOMATIQUEMENT cette liste aux
+# imports locaux RÉELS de ce fichier (analyse AST) : la récidive est impossible.
+IMAGE_LOCAL_PYTHON_SOURCES = ("comfych_paths", "helpers", "models")
+
+# Modules locaux importés de façon OPTIONNELLE (sous ``try:``) : le script se
+# charge sans eux grâce au repli prévu dans le code, ils ne sont donc pas
+# exigés dans l'image. ``comfych_store`` en fait partie et n'est PAS ajouté
+# volontairement : il résout l'arborescence utilisateur du pack via
+# ``holaf_user_paths`` (absent du container de sync, utile seulement au
+# processus LOCAL ``modal run``).
+OPTIONAL_LOCAL_PYTHON_SOURCES = ("comfych_store",)
+
+
+def _module_level_import_names(tree) -> tuple[set[str], set[str]]:
+    """``(imports de niveau MODULE requis, optionnels)`` d'un arbre AST.
+
+    « Requis » = imports exécutés à CHAQUE chargement du module : leur absence
+    dans le container tue le démarrage. Les imports placés dans un ``try:``
+    (repli assumé) ou derrière un ``if`` de niveau module (``TYPE_CHECKING``)
+    sont « optionnels » : le module se charge sans eux.
+
+    Les imports faits DANS une fonction ne sont pas examinés : ils sont
+    paresseux (ex. ``import tarfile``) et ne peuvent pas empêcher le container
+    de démarrer.
+    """
+
+    def _names_of(node) -> set[str]:
+        found: set[str] = set()
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                found.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if getattr(node, "level", 0) or not node.module:
+                return found  # import relatif : hors sujet pour l'image
+            found.add(node.module.split(".")[0])
+        return found
+
+    required: set[str] = set()
+    optional: set[str] = set()
+
+    def _walk(statements, is_optional: bool) -> None:
+        for stmt in statements:
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                (optional if is_optional else required).update(_names_of(stmt))
+            elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+                _walk(stmt.body, True)
+                for handler in stmt.handlers:
+                    _walk(handler.body, True)
+                _walk(getattr(stmt, "finalbody", []), True)
+            elif isinstance(stmt, ast.If):
+                _walk(stmt.body, True)
+                _walk(stmt.orelse, True)
+            elif isinstance(stmt, ast.With):
+                _walk(stmt.body, is_optional)
+
+    _walk(tree.body, False)
+    return required, optional
+
+
+def local_import_modules(source_path=None) -> dict:
+    """Imports **locaux** de *source_path* (modules FRÈRES du même dossier).
+
+    Retourne ``{"required": [...], "optional": [...], "available": [...]}``.
+    « Local » = un module frère existe (``<dir>/<nom>.py`` ou
+    ``<dir>/<nom>/__init__.py``). Les modules de la stdlib et les paquets pip
+    ne sont donc jamais concernés — aucun jugement à porter sur eux.
+    """
+    path = Path(source_path) if source_path is not None else Path(__file__)
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, ValueError):
+        return {"required": [], "optional": [], "available": []}
+
+    required, optional = _module_level_import_names(tree)
+    directory = path.parent
+    available = {
+        name
+        for name in (required | optional)
+        if (directory / f"{name}.py").is_file()
+        or (directory / name / "__init__.py").is_file()
+    }
+    return {
+        "required": sorted(required & available),
+        "optional": sorted(optional & available - required),
+        "available": sorted(available),
+    }
+
+
+def missing_local_python_sources(declared=None, source_path=None) -> list[str]:
+    """Modules locaux REQUIS par le script mais ABSENTS de *declared*.
+
+    C'est la liste qui rend impossible la régression « ModuleNotFoundError: No
+    module named 'comfych_paths' » : un test la veut vide, et un mutant (module
+    retiré de la déclaration) la rend non vide.
+    """
+    if declared is None:
+        declared = IMAGE_LOCAL_PYTHON_SOURCES
+    declared_set = set(declared or ())
+    required = local_import_modules(source_path)["required"]
+    return sorted(name for name in required if name not in declared_set)
+
+
+def _preflight_image_modules() -> None:
+    """Échoue VITE et CLAIREMENT si l'image ne peut pas importer un module local.
+
+    Un container qui plante à l'import est relancé indéfiniment par Modal
+    (« Runner failed with exception » … « toujours en cours (66s) (76s) ») : du
+    temps GPU brûlé pour un défaut DÉTERMINISTE, détectable AVANT tout appel
+    distant. La vérification porte sur la MÊME liste que l'image (aucune seconde
+    source de vérité) et produit un message qui nomme le module manquant.
+    """
+    missing = missing_local_python_sources()
+    if not missing:
+        return
+    _fail(
+        "Image Modal INCOMPLÈTE pour sync.py",
+        "Module(s) local(aux) importé(s) mais ABSENT(s) de "
+        f"add_local_python_source : {_format_node_list(missing)}.\n"
+        f"Déclaré(s) : {_format_node_list(IMAGE_LOCAL_PYTHON_SOURCES)}.\n"
+        "Sans eux, CHAQUE fonction distante plante à l'import et Modal réessaie "
+        "en boucle (coût GPU, aucun node synchronisé).",
+    )
+
+
 _sync_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("helpers", "models", copy=True)
+    # Les INSTALLATIONS d'abord : les couches apt/pip restent en cache quand on
+    # édite seulement un module du pack. Avec ``add_local_python_source`` AVANT
+    # elles, chaque édition de ``helpers.py``/``models.py``/``comfych_paths.py``
+    # changeait le hash des couches apt+pip et les faisait rejouer au run
+    # suivant (impression que « ça réinstalle » à chaque sync).
     .apt_install("aria2")
     .pip_install("huggingface_hub")
+    # Le CODE local EN DERNIER. ``comfych_paths`` est indispensable : sync.py
+    # l'importe au niveau module (résolution des chemins ComfyUI).
+    .add_local_python_source(*IMAGE_LOCAL_PYTHON_SOURCES, copy=True)
 )
 
 app = modal.App("comfy-sync", image=_sync_image)
@@ -901,11 +1132,17 @@ def link_model(filename: str, model_dir: str) -> dict:
 # ── Volume custom nodes : extraction / swap / manifeste ─────────────────
 
 
-def _extract_archive_to_staging(archive_path: str, staging_dir: str) -> None:
+def _extract_archive_to_staging(archive_path: str, staging_dir: str) -> list[str]:
     """Valide puis extrait l'archive tar.gz *archive_path* dans *staging_dir*.
 
     Les liens, chemins absolus, ``..`` et échappements sont rejetés par
-    :func:`_validate_tar_members` AVANT toute écriture.
+    :func:`_validate_tar_members` AVANT toute écriture. L'extraction se fait
+    dans un dossier de staging : **le contenu existant du volume n'est pas
+    touché ici** (une archive corrompue ou tronquée laisse donc le volume
+    intact).
+
+    Retourne la liste des entrées de premier niveau extraites (toujours non
+    vide : une archive vide est refusée).
     """
     import shutil as _shutil
     import tarfile
@@ -918,38 +1155,167 @@ def _extract_archive_to_staging(archive_path: str, staging_dir: str) -> None:
         _validate_tar_members(tar.getmembers(), staging_dir)
         tar.extractall(path=staging_dir)
 
+    extracted = sorted(os.listdir(staging_dir))
+    if not extracted:
+        raise ValueError(
+            f"Archive VIDE ({os.path.basename(archive_path)}) : rien à installer — "
+            "le volume est laissé en l'état."
+        )
+    return extracted
+
+
+def _move_path(src: str, dst: str) -> None:
+    """Déplace *src* vers *dst* (renommage atomique, repli copie+déplacement).
+
+    Indirection volontaire : les tests de rollback simulent un échec en
+    remplaçant cette fonction, sans patcher ``os`` globalement.
+    """
+    try:
+        os.replace(src, dst)
+    except OSError:
+        # Montages différents (impossible dans le volume, mais un test ou un
+        # montage exotique peut l'être) : repli non atomique assumé.
+        import shutil as _shutil
+
+        _shutil.move(src, dst)
+
+
+def _remove_path(path: str) -> None:
+    """Supprime un fichier, un lien ou un dossier (*path* peut ne pas exister)."""
+    import shutil as _shutil
+
+    if os.path.isdir(path) and not os.path.islink(path):
+        _shutil.rmtree(path)
+    elif os.path.exists(path) or os.path.islink(path):
+        os.remove(path)
+
+
+# Préfixe des dossiers internes du volume : jamais swappés (staging, upload,
+# sauvegarde, manifeste).
+_INTERNAL_ENTRIES = {_STAGING_DIR_NAME, _UPLOAD_DIR_NAME, _BACKUP_DIR_NAME}
+
+
+def _is_internal_entry(name: str) -> bool:
+    """True si l'entrée de premier niveau *name* est interne au volume.
+
+    Les entrées cachées (``.staging``, ``.backup``, ``.nodes_manifest.json``,
+    ``.Trash``…) ne sont jamais des nodes et sont PRÉSERVÉES par le swap : les
+    supprimer avant d'installer le nouveau contenu exposerait le volume à une
+    perte de données en cas d'échec.
+    """
+    return name in _INTERNAL_ENTRIES or name.startswith(".")
+
 
 def _swap_volume_content(base_path: str, staging_dir: str) -> list[str]:
     """Remplace le contenu de *base_path* par celui de *staging_dir*.
 
-    Les dossiers internes (``.staging``, ``_upload``) sont préservés. Retourne
-    la liste triée des nodes (dossiers) présents après le swap.
+    SWAP NON DESTRUCTIF, en quatre temps :
+
+    1. l'ancien contenu est **renommé** dans ``.backup`` (renommage : aucun
+       octet copié, aucune consommation d'espace supplémentaire), puis marqué
+       complet (``.backup/.complete``) ;
+    2. les entrées du staging sont installées dans ``base_path`` ;
+    3. en cas d'échec en (2), l'installation partielle est retirée et
+       **l'ancien contenu est restauré** depuis ``.backup`` avant que
+       l'exception ne remonte (la sauvegarde n'est jamais détruite tant que la
+       restauration n'est pas complète) ;
+    4. en cas de succès, la génération précédente est **conservée** (une seule
+       génération, cf. ``.complete``) : un sync raté ou un contenu douteux peut
+       toujours être comparé/restauré.
+
+    L'ancien code SUPPRIMAIT tout le contenu de ``custom_nodes`` avant
+    d'installer le nouveau : un échec au milieu (quota, disque plein, entrée
+    non déplaçable, container tué) laissait le volume VIDE ou partiel — d'où des
+    packs qui « disparaissent » après un sync raté (« ComfyCH n'existe plus »).
+
+    Retourne la liste triée des nodes (dossiers) présents après le swap.
     """
     import shutil as _shutil
 
-    internal = {_STAGING_DIR_NAME, _UPLOAD_DIR_NAME}
+    backup_dir = os.path.join(base_path, _BACKUP_DIR_NAME)
+    marker = os.path.join(backup_dir, _BACKUP_COMPLETE_MARKER)
 
-    # Suppression de l'ancien contenu (sauf dossiers internes)
+    # Rien à installer : ne pas toucher au volume (garde-fou explicite).
+    if not os.path.isdir(staging_dir) or not os.listdir(staging_dir):
+        raise ValueError("Staging vide : swap annulé, le volume est laissé en l'état.")
+
+    # Sauvegarde existante : remplaçable SEULEMENT si le swap qui l'a créée est
+    # allé au bout (marqueur). Sinon elle peut être le seul exemplaire des
+    # anciens nodes (swap interrompu) — on refuse plutôt que de la détruire.
+    if os.path.isdir(backup_dir) and os.listdir(backup_dir):
+        if not os.path.isfile(marker):
+            raise RuntimeError(
+                f"{backup_dir} contient une sauvegarde INCOMPLÈTE (swap interrompu) : "
+                "swap refusé pour ne rien détruire. Examinez/restaurez-la, puis "
+                "relancez le sync."
+            )
+        _shutil.rmtree(backup_dir)
+    os.makedirs(backup_dir, exist_ok=True)
+
+    # (1) Ancien contenu → sauvegarde (renommage : réversible et instantané).
+    saved: list[str] = []
     for item in os.listdir(base_path):
-        if item in internal:
+        if _is_internal_entry(item):
             continue
-        item_path = os.path.join(base_path, item)
-        if os.path.isdir(item_path) and not os.path.islink(item_path):
-            _shutil.rmtree(item_path)
+        _move_path(os.path.join(base_path, item), os.path.join(backup_dir, item))
+        saved.append(item)
+    _write_backup_marker(marker, saved)
+
+    # (2) Nouveau contenu du staging → volume.
+    installed: list[str] = []
+    try:
+        for item in sorted(os.listdir(staging_dir)):
+            _move_path(os.path.join(staging_dir, item), os.path.join(base_path, item))
+            installed.append(item)
+    except (OSError, shutil.Error, ValueError) as exc:
+        # (3) ROLLBACK : retirer ce qui a été installé, remettre l'ancien contenu.
+        for item in installed:
+            try:
+                _remove_path(os.path.join(base_path, item))
+            except OSError:
+                pass
+        restored = 0
+        for item in saved:
+            try:
+                _move_path(os.path.join(backup_dir, item), os.path.join(base_path, item))
+                restored += 1
+            except OSError:
+                pass  # ce qui reste dans .backup y demeure (jamais supprimé)
+        if restored == len(saved):
+            # Ancien contenu intégralement restauré : la sauvegarde est vide.
+            try:
+                _remove_path(marker)
+                os.rmdir(backup_dir)
+            except OSError:
+                pass
         else:
-            os.remove(item_path)
+            print(
+                f"⚠️ Restauration PARTIELLE ({restored}/{len(saved)}) : le reste est "
+                f"conservé dans {backup_dir}",
+                flush=True,
+            )
+        raise RuntimeError(
+            f"Échec pendant l'installation du nouveau contenu ({exc}) : ancien "
+            f"contenu restauré ({restored}/{len(saved)} entrée(s)), volume inchangé."
+        ) from exc
 
-    for item in os.listdir(staging_dir):
-        _shutil.move(os.path.join(staging_dir, item), os.path.join(base_path, item))
-
+    # (4) Succès : staging vidé, génération précédente conservée dans .backup.
     _shutil.rmtree(staging_dir)
 
     return sorted(
         d for d in os.listdir(base_path)
-        if d not in internal
-        and not d.startswith(".")
+        if not _is_internal_entry(d)
         and os.path.isdir(os.path.join(base_path, d))
     )
+
+
+def _write_backup_marker(marker_path: str, entries) -> None:
+    """Marque la sauvegarde comme COMPLÈTE (entrées sauvegardées, dénombrable)."""
+    try:
+        with open(marker_path, "w") as f:
+            json.dump({"complete": True, "entries": list(entries)}, f, indent=2)
+    except OSError as exc:  # pragma: no cover - écriture de quelques octets
+        print(f"⚠️ Marqueur de sauvegarde non écrit ({marker_path}) : {exc}", flush=True)
 
 
 def _write_nodes_manifest(base_path: str, nodes: list[str]) -> None:
@@ -976,12 +1342,17 @@ def extract_custom_nodes_from_volume(archive_name: str) -> dict:
     aucun contenu binaire ne transite par un argument RPC (l'ancien transport
     ``bytes`` faisait sérialiser plusieurs Go côté client → OOM/SIGKILL).
 
-    Même pipeline qu'avant : validation des membres, extraction en
-    ``.staging``, swap atomique, manifeste, ``commit()``. L'archive temporaire
-    et le dossier ``_upload`` sont supprimés AVANT le commit (sinon la
-    suppression ne serait pas persistée).
+    Même pipeline qu'avant — validation des membres, extraction en
+    ``.staging``, swap, manifeste, ``commit()`` — mais le swap est
+    **non destructif** : l'ancien contenu est renommé en ``.backup`` avant
+    toute installation et restauré si le swap échoue (cf.
+    :func:`_swap_volume_content`). Une archive corrompue, tronquée ou vide est
+    refusée AVANT de toucher au volume. L'archive temporaire et le dossier
+    ``_upload`` sont supprimés AVANT le commit (sinon la suppression ne serait
+    pas persistée).
     """
     import shutil as _shutil
+    import tarfile
 
     name = str(archive_name or "")
     if not name or name in (".", "..") or "/" in name or "\\" in name:
@@ -995,8 +1366,25 @@ def extract_custom_nodes_from_volume(archive_name: str) -> dict:
     if not os.path.isfile(archive_path):
         raise FileNotFoundError(f"Archive introuvable sur le volume : {archive_path}")
 
-    _extract_archive_to_staging(archive_path, staging_dir)
-    nodes = _swap_volume_content(base_path, staging_dir)
+    try:
+        expected = _extract_archive_to_staging(archive_path, staging_dir)
+        print(
+            f"📦 {len(expected)} entrée(s) extraites dans {staging_dir} : "
+            f"{', '.join(expected[:10])}{' …' if len(expected) > 10 else ''}",
+            flush=True,
+        )
+        nodes = _swap_volume_content(base_path, staging_dir)
+    # ``EOFError`` = gzip tronqué (« Compressed file ended before the
+    # end-of-stream marker was reached »), ``tarfile.TarError`` = archive
+    # corrompue : aucun des deux ne doit empêcher le message explicite.
+    except (OSError, ValueError, RuntimeError, EOFError, tarfile.TarError) as exc:
+        # Le volume n'a pas été modifié (ou a été restauré) : on le dit, et on
+        # laisse l'exception remonter → code ≠ 0 côté ``modal run``.
+        print(
+            f"❌ Extraction ANNULÉE, volume inchangé : {exc}",
+            flush=True,
+        )
+        raise
 
     # Le swap préserve ``_upload`` : on le supprime explicitement (archive
     # consommée et éventuels restes d'un run précédent).
@@ -1083,6 +1471,84 @@ USER_SETTINGS_EXCLUDE_SUFFIXES = {".log", ".tmp", ".temp"}
 # Garde-fou : au-delà, une base n'est pas transférée (durée d'upload et poids
 # du volume). Les réglages qu'elle contient sont alors perdus côté worker.
 MAX_USER_DB_MB = 200
+
+# Fichier de credentials AIH : ``<user>/default/AI-Helper/config/credentials.json``
+# (nouvel emplacement) ou ``<user>/default/aih/credentials.json`` (historique).
+# Il porte ``server_url`` + ``api_key`` lus par les nodes AIH du worker.
+CREDENTIALS_FILENAME = "credentials.json"
+
+
+def _value_presence(value) -> str:
+    """« renseignée » / « vide » — JAMAIS la valeur (clé API en clair).
+
+    C'est la seule information nécessaire au diagnostic : le log ne doit
+    jamais contenir la clé elle-même (il finit dans un volume, puis dans le
+    navigateur via la fenêtre de suivi du run).
+    """
+    return "renseignée" if str(value or "").strip() else "vide"
+
+
+def _credentials_sync_report(user_dir, selected) -> list:
+    """Lignes de diagnostic de ``credentials.json`` avant l'upload.
+
+    Répond à la question qui compte quand le worker se plaint de
+    « credentials incomplets (api_key ou server_url manquant) » :
+      1. le fichier est-il DANS le périmètre poussé (``user/``) ? ;
+      2. est-il renseigné CÔTÉ LOCAL ?
+    Si (1) est oui et (2) aussi, le problème est en aval (volume périmé /
+    worker non redémarré) ; si (1) est non, la résolution du dossier ``user/``
+    locale ne voit pas le fichier que l'UI vient d'écrire.
+
+    Args:
+        user_dir: dossier ``user/`` local effectivement synchronisé.
+        selected: fichiers retenus par :func:`_select_user_setting_files`.
+
+    Retours:
+        list[str]: UNE ligne de synthèse, plus une ligne d'aide si absent.
+    """
+    user_dir = Path(user_dir)
+    creds = [p for p in selected if Path(p).name == CREDENTIALS_FILENAME]
+    if not creds:
+        return [
+            (
+                f"📁 user/ : {len(selected)} fichier(s), "
+                f"{CREDENTIALS_FILENAME} présent=non — les nodes AIH du worker "
+                f"n'auront ni server_url ni api_key (renseignez Settings ▸ "
+                f"onglet « AIH · Compte » puis relancez la sync)"
+            ),
+        ]
+
+    # Plusieurs emplacements peuvent coexister (nouveau + historique) : le
+    # worker retient le NOUVEAU s'il est présent, on cite le premier trouvé.
+    chosen = min(creds, key=lambda p: ("aih" in Path(p).parts, str(p)))
+    try:
+        with open(chosen, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            data = {}
+        read_error = ""
+    except (OSError, ValueError) as exc:
+        data = {}
+        read_error = f" (illisible : {type(exc).__name__})"
+
+    rel = Path(chosen).relative_to(user_dir) if Path(chosen).is_relative_to(user_dir) else chosen
+    lines = [
+        (
+            f"📁 user/ : {len(selected)} fichier(s), {CREDENTIALS_FILENAME} présent=oui "
+            f"({rel}), server_url={_value_presence(data.get('server_url'))}, "
+            f"api_key={_value_presence(data.get('api_key'))}{read_error}"
+        )
+    ]
+    if not str(data.get("server_url") or "").strip():
+        lines.append(
+            "   ↳ server_url VIDE en local : le worker ne pourra résoudre aucune "
+            "URL relative (Settings ▸ onglet « AIH · Compte »)"
+        )
+    if not str(data.get("api_key") or "").strip():
+        lines.append(
+            "   ↳ api_key VIDE en local : les appels AIH du worker seront refusés"
+        )
+    return lines
 
 
 def _is_sqlite_file(path: Path) -> bool:
@@ -1245,6 +1711,16 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
     With ``--sync-user-only``, only step 3 (user settings) runs.
     """
 
+    # GARDE-FOU ANTI-RETRY-INFINI : un module local importé par ce fichier mais
+    # absent de ``add_local_python_source`` fait planter CHAQUE fonction distante
+    # à l'import, et Modal relance le container indéfiniment (coût GPU, log qui
+    # tourne en boucle). Le défaut est déterministe : on échoue AVANT le premier
+    # appel distant. ``--sync-user-only`` n'appelle aucune fonction distante
+    # (upload client seulement) : pas de contrôle nécessaire.
+    if not sync_user_only:
+        _preflight_image_modules()
+
+
     def _sync_user_settings() -> None:
         """Step 3 — upload the local ``user/`` directory to its Volume.
 
@@ -1275,6 +1751,11 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         dbs = sum(1 for f in files_to_upload if _is_sqlite_file(f))
 
         print(f"📁 Dossier user/ local : {user_dir}", flush=True)
+        # Diagnostic CREDENTIALS : une seule ligne qui dit si le fichier lu par
+        # les nodes AIH du worker est bien DANS le périmètre et renseigné. Jamais
+        # la valeur de la clé (seulement « vide » / « renseignée »).
+        for line in _credentials_sync_report(user_dir, files_to_upload):
+            print(line, flush=True)
         print(
             f"📁 Uploading {len(files_to_upload)} user setting file(s)"
             f" (dont {dbs} base(s) SQLite)…",
@@ -1283,14 +1764,24 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
 
         uploaded = 0
         skipped = 0
+        skipped_names: list[str] = []
         # Dossier de travail des snapshots SQLite : nettoyé quoi qu'il
         # arrive, il ne doit jamais rester de copie de base sur disque.
         tmp_root = Path(tempfile.mkdtemp(prefix="comfych-user-sync-"))
         # Un SEUL batch_upload pour tous les fichiers : chaque
         # ``with user_vol.batch_upload()`` ouvre une session réseau, la
         # rouvrir par fichier rendait l'upload très lent.
+        #
+        # ⚠️ ``force=True`` est INDISPENSABLE. Par défaut, Modal REFUSE
+        # d'écraser un fichier déjà présent sur le volume
+        # (``batch_upload(force=False)`` → ``put_file`` lève ``FileExistsError``).
+        # L'ancien code avalait cette exception en comptant « already present » :
+        # un fichier poussé une première fois n'était donc PLUS JAMAIS mis à
+        # jour. C'est exactement le piège qui vidait les credentials du worker :
+        # ``credentials.json`` (server_url + api_key) restait sur le volume dans
+        # sa version d'origine, et le container la recopiait à chaque démarrage.
         try:
-            with user_vol.batch_upload() as batch:
+            with user_vol.batch_upload(force=True) as batch:
                 for index, f in enumerate(files_to_upload):
                     rel_path = f.relative_to(user_dir)
                     if _is_sqlite_file(f):
@@ -1305,13 +1796,34 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
                             uploaded += 1
                         except FileExistsError:
                             skipped += 1
-        except FileExistsError:
-            # Batch refusé d'emblée (ex. conflit signalé hors put_file)
+                            skipped_names.append(str(dest_rel))
+        except FileExistsError as exc:
+            # Batch refusé d'emblée (ex. conflit signalé hors put_file).
             skipped += 1
+            skipped_names.append(f"(batch) {exc}")
         finally:
             shutil.rmtree(tmp_root, ignore_errors=True)
 
-        print(f"✅ User settings synced to volume ({uploaded} uploaded, {skipped} already present)")
+        print(
+            f"✅ User settings synced to volume ({uploaded} uploaded "
+            f"(fichiers existants remplacés), {skipped} skipped)",
+            flush=True,
+        )
+        if skipped_names:
+            preview = ", ".join(skipped_names[:5])
+            more = f" (+{len(skipped_names) - 5})" if len(skipped_names) > 5 else ""
+            print(
+                f"⚠️ NON transféré(s) : {preview}{more} — si "
+                f"{CREDENTIALS_FILENAME} apparaît ici, le volume garde son "
+                f"ancienne version et le worker lira des credentials périmés",
+                flush=True,
+            )
+        print(
+            "ℹ️ Le worker ne relit le volume qu'à son DÉMARRAGE : "
+            "redémarrez-le pour que les réglages (dont credentials.json) soient "
+            "pris en compte.",
+            flush=True,
+        )
 
     # ── User settings only mode ────────────────────────────────────────
     if sync_user_only:
@@ -1347,13 +1859,23 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         print(f"📦 Packaging des custom nodes depuis {custom_nodes_dir}…", flush=True)
 
         # Sélection : le gateway lui-même et le dossier de données ``user`` ne
-        # sont pas des nodes ; les dossiers techniques/cachés non plus.
+        # sont pas des nodes ; les dossiers techniques/cachés non plus, ni ceux
+        # qui n'ont pas de ``__init__.py`` (non chargeables par ComfyUI).
         node_dirs, skipped = _select_node_dirs(custom_nodes_dir)
         for name, reason in skipped:
             print(f"  ⊘ {name} exclu ({reason})", flush=True)
         print(f"  → {len(node_dirs)} node(s) inclus", flush=True)
         if not node_dirs:
             _fail(f"Aucun custom node à synchroniser dans {custom_nodes_dir}")
+        if any(Path(d).name == PROJECT_ROOT_NAME for d in node_dirs):
+            # SOURCE DE VÉRITÉ UNIQUE (cf. docs/COMFYCH.md) : le code des nodes
+            # du pack voyage par le VOLUME (l'image ne porte que ses deps pip).
+            # Le log le dit, pour qu'on ne croie jamais que l'image le fournit.
+            print(
+                f"  ✔ {PROJECT_ROOT_NAME} inclus : son code vient du VOLUME "
+                "(l'image n'embarque que ses dépendances pip)",
+                flush=True,
+            )
 
         # Tailles calculées AVANT le packaging : sert au résumé et au diagnostic
         # en cas d'archive trop volumineuse.
@@ -1409,6 +1931,12 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         print(f"✅ Sync terminé : {len(nodes)} node(s) sur le volume", flush=True)
         for n in nodes:
             print(f"  📁 {n}", flush=True)
+        print(
+            "🗄️  Génération précédente conservée sur le volume dans "
+            f"/custom_nodes/{_BACKUP_DIR_NAME} (restaurable après un sync "
+            "douteux ; à supprimer si le volume manque d'espace).",
+            flush=True,
+        )
 
         # Le volume est la source de vérité : on en garde une copie locale dans
         # config.json pour que le backend ComfyUI puisse répondre instantanément

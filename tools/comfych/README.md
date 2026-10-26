@@ -76,6 +76,54 @@ le cloud ne sert que pour les rendus ponctuels (paiement à la seconde).
   volume `comfy-custom-nodes`. Les workers les **symlinkent au démarrage** —
   **sans redeploy** pour changer un node.
 
+### Dépendances des custom nodes (installées AU BUILD)
+
+Le build scanne le dossier **`custom_nodes` local** (celui de la machine qui lance
+`modal deploy`) et installe les `requirements.txt`, dans cet ordre :
+
+1. **`requirements.txt` du pack AI-Helper** — toujours, en priorité. Il porte les
+dépendances vitales du pack (`watchdog`, `aiohttp`, `av`, `psutil`…) : sans elles
+l'import du pack échoue ENTIER sur le worker (`ModuleNotFoundError: No module
+named 'watchdog'`) et **tous** ses nodes disparaissent de ComfyUI (« Node 'AIH
+Prompt Enhancer' not found »).
+2. `requirements.txt` de **chaque** custom node local détecté (`cv2` pour Impact
+Pack/Subpack/easy-use, `gguf` pour ComfyUI-GGUF, `pywt` pour RES4LYF, `dlib`…).
+3. Les **paquets pip supplémentaires** de la modale (voir ci-dessous).
+
+Un `requirements.txt` en échec **n'arrête jamais le build** (`|| echo`) mais laisse
+une ligne `❌ ÉCHEC des dépendances de <node>` dans le log de déploiement : le nom
+du node fautif y est lisible, ce qui évite de chercher un `ModuleNotFoundError`
+opaque dans le log du worker.
+
+Le dossier `custom_nodes` est résolu par `$COMFYCH_CUSTOM_NODES_DIR` → parent du
+pack s'il s'appelle `custom_nodes*` → ancêtre `custom_nodes*` → `<ancêtre>/custom_nodes`.
+S'il est introuvable, le build log un avertissement explicite (seules les deps du
+pack sont installées).
+
+**`workflow_api.json` est optionnel** : s'il est présent dans ce dossier, ses deps
+sont installées (`comfy node install-deps`) ; son absence n'affiche plus
+d'avertissement — les deps de tous les nodes locaux sont couvertes ci-dessus et
+l'endpoint `/prompt` reçoit le workflow dans le corps de la requête.
+
+### « Deployment skipped: no changes detected » → forcer la reconstruction
+
+`modal deploy` n'a **aucun flag `--force`** : quand la définition de l'app n'a pas
+changé, la CLI répond `✓ Deployment skipped: no changes detected! ⏭️` et l'image
+n'est **pas** reconstruite (les dépendances ajoutées ne sont donc jamais
+installées). L'image porte pour cela une **empreinte de déploiement**
+(`COMFYCH_DEPLOY_STAMP`, calculée sur le contenu des `requirements.txt`, la liste
+des nodes détectés et `extra_pip_packages`) : toute modification de dépendances
+change l'empreinte, donc l'image, donc le déploiement n'est plus sauté.
+
+Deux leviers explicites :
+
+- bouton **« 🔨 Forcer le déploiement »** (étape 1 de la modale) ;
+- `POST /api/modal/deploy` avec `{"force": true}`.
+
+Les deux passent `COMFYCH_DEPLOY_FORCE_TOKEN` au build, qui régénère l'empreinte.
+L'empreinte est posée en **dernière** couche (`ENV`) : aucune couche `pip` déjà en
+cache n'est réexécutée.
+
 ### Dépendances optionnelles des custom nodes
 
 Certains custom nodes importent une dépendance **optionnelle** qu'ils ne

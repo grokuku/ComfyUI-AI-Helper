@@ -84,6 +84,21 @@ try:
 except Exception as _user_paths_err:  # noqa: BLE001 — ne jamais casser le démarrage de ComfyUI
     print(f"🔴 [Holaf-UserPaths] Unexpected error during user data layout: {_user_paths_err}")
 
+# --- Diagnostic des credentials AIH : UNE ligne au démarrage -----------------
+# Sur le worker Modal, ce démarrage est le SEUL moment où l'on peut vérifier
+# ce que ComfyUI a réellement sous la main (le container a recopié le volume
+# /user-settings dans ComfyUI/user juste avant, voir
+# tools/comfych/workers/base_worker.py:_sync_user_settings_from_volume).
+# La ligne dit présence/valeur des DEUX champs et le chemin lu — jamais la clé :
+#   credentials: server_url=<vide|renseignée> api_key=<vide|renseignée> (source: fichier …)
+# Elle permet de trancher entre fichier absent, fichier vide (volume périmé) et
+# fichier correct (problème en aval), sans relancer un rendu pour le deviner.
+try:
+    from aih import credentials as _aih_credentials
+    print(f"🔵 [Holaf-AIH] {_aih_credentials.credentials_status_line()}")
+except Exception as _aih_credentials_err:  # noqa: BLE001 — jamais bloquant
+    print(f"🟡 [Holaf-AIH] diagnostic credentials indisponible : {_aih_credentials_err}")
+
 import server
 import asyncio
 import json
@@ -109,19 +124,45 @@ import re # Added for finalize_upload_model_route for subfolder splitting
 # simplement rien (mode de rendu forcé à « local »).
 _COMFYCH_DIR = os.path.join(_AIH_PACK_ROOT, "tools", "comfych")
 COMFYCH_AVAILABLE = False
-try:
-    # Nom de module UNIQUE (pas `tools` ni `comfych` dans sys.modules : aucune
-    # collision avec un paquet du même nom) + recherche de sous-modules pour que
-    # les imports relatifs internes (comfych_store, comfych_paths) fonctionnent.
-    _comfych_spec = importlib.util.spec_from_file_location(
-        "holaf_comfych",
-        os.path.join(_COMFYCH_DIR, "__init__.py"),
-        submodule_search_locations=[_COMFYCH_DIR],
-    )
-    _holaf_comfych = importlib.util.module_from_spec(_comfych_spec)
-    sys.modules["holaf_comfych"] = _holaf_comfych
-    _comfych_spec.loader.exec_module(_holaf_comfych)
-    COMFYCH_AVAILABLE = True
+
+
+def _load_comfych_gateway():
+    """Charge ``tools/comfych/__init__.py`` du pack (``None`` si absent/cassé).
+
+    Nom de module UNIQUE (pas ``tools`` ni ``comfych`` dans ``sys.modules`` :
+    aucune collision avec un paquet du même nom) + recherche de sous-modules
+    pour que les imports relatifs internes (``comfych_store``,
+    ``comfych_paths``) fonctionnent.
+    """
+    if not os.path.isfile(os.path.join(_COMFYCH_DIR, "__init__.py")):
+        # CAS NORMAL SUR LE WORKER MODAL : le code du gateway (tools/comfych)
+        # est embarqué dans l'IMAGE et volontairement ÉLAGUÉ de l'archive des
+        # custom nodes (source de vérité unique, cf. docs/COMFYCH.md). Sur le
+        # worker, le pack est donc présent SANS son gateway : ce n'est pas une
+        # erreur, et surtout pas un « 🔴 » qui ferait croire le pack cassé.
+        print(
+            "ℹ️ [Holaf-ComfyCH] gateway absent de cette installation (normal sur "
+            "un worker Modal : le gateway vit dans l'image, pas dans le volume)."
+        )
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "holaf_comfych",
+            os.path.join(_COMFYCH_DIR, "__init__.py"),
+            submodule_search_locations=[_COMFYCH_DIR],
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["holaf_comfych"] = module
+        spec.loader.exec_module(module)
+        return module
+    except Exception as err:  # noqa: BLE001 — ne jamais casser le démarrage
+        print(f"🔴 [Holaf-ComfyCH] chargement de tools/comfych impossible : {err}")
+        return None
+
+
+_holaf_comfych = _load_comfych_gateway()
+COMFYCH_AVAILABLE = _holaf_comfych is not None
+if COMFYCH_AVAILABLE:
     # Forçage du mode de rendu EN MÉMOIRE, à CHAQUE démarrage. Le fichier de
     # configuration N'EST PAS modifié (api_url, api_key, GPU préféré, listes
     # restent intacts) : mémoriser un choix plus tard = retirer ce forçage,
@@ -131,9 +172,6 @@ try:
         "🔵 [Holaf-ComfyCH] mode rendu forcé à « local » au démarrage "
         "(config intacte : aucun fichier modifié)."
     )
-except Exception as _comfych_err:  # noqa: BLE001 — ne jamais casser le démarrage
-    _holaf_comfych = None
-    print(f"🔴 [Holaf-ComfyCH] chargement de tools/comfych impossible : {_comfych_err}")
 
 # import atexit # Option pour le futur
 

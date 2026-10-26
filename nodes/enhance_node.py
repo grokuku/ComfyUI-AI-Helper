@@ -98,8 +98,22 @@ _FIXED_ROLE = (
 )
 
 
+def _backend_configured(api_url):
+    """Le backend AIH est-il configuré (server_url renseignée) ?
+
+    Une ``server_url`` vide donne une ``api_url`` vide : les URL relatives
+    (``"/styles"``, ``"/enhance"``…) échouent alors avec
+    ``Invalid URL '/styles': No scheme supplied``. Ce n'est PAS un bug : c'est
+    une configuration absente (Settings ▸ onglet « AIH · Compte »). On le
+    constate UNE fois, sans bruit réseau inutile.
+    """
+    return bool((api_url or "").strip())
+
+
 def _fetch_template(api_url, api_key, template_id):
     """Fetch un template par ID depuis le backend (GET /api/prompts/templates, filtre par ID)."""
+    if not _backend_configured(api_url):
+        return None
     try:
         import requests as _req
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -116,6 +130,8 @@ def _fetch_template(api_url, api_key, template_id):
 
 def _fetch_style(api_url, api_key, style_id):
     """Fetch un style par ID depuis le backend (GET /api/styles, filtre par ID)."""
+    if not _backend_configured(api_url):
+        return None
     try:
         import requests as _req
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -334,18 +350,36 @@ class AIHEnhanceNode:
         except (ValueError, TypeError):
             template_id = 0
 
-        # En mode cloud (use_llm sans llm_config local), le backend exige un
-        # template (backend/routes/enhance.py:_validate_enhance_inputs →
-        # 'template_id requis'). On échoue tôt avec un message clair plutôt
-        # qu'un 400 obscur du backend.
-        if use_llm and not llm_config and template_id == 0:
-            logging.warning(
-                "[AIH Enhance] template_id requis en mode cloud — "
-                "définissez un template (widget)"
+        # ── DÉGRADATION EXPLICITE (jamais une exception) ─────────────────
+        # Ce chemin est atteint quand le backend est INJOIGNABLE ou NON
+        # CONFIGURÉ (server_url vide → toutes les URL relatives échouent :
+        # « Invalid URL '/styles': No scheme supplied »). Lever une ValueError
+        # ici cassait TOUT le prompt du workflow — y compris la partie locale
+        # (base_prompt + éléments) qui n'a besoin d'aucun serveur. On dégrade :
+        #   - la sortie `prompt` reste UTILE (concaténation locale des éléments,
+        #     exactement le résultat de use_llm=false) ;
+        #   - la RAISON est remontée dans `ui["warning"]` (affichée comme toast
+        #     par js/aih_enhance_widget.js) et écrite dans le log ;
+        #   - une vraie erreur de configuration n'est PAS masquée : le message
+        #     dit précisément ce qu'il faut renseigner.
+        degrade_reasons = []
+        if use_llm and not llm_config:
+            if not _backend_configured(api_url):
+                degrade_reasons.append(
+                    "serveur AIH non configuré (server_url vide) — "
+                    "Settings ▸ onglet « AIH · Compte »"
+                )
+            if template_id == 0:
+                degrade_reasons.append(
+                    "template_id requis en mode cloud — définissez un template (widget)"
+                )
+        degrade_notice = ""
+        if degrade_reasons:
+            degrade_notice = (
+                "[AIH Enhance] mode dégradé : " + " ; ".join(degrade_reasons)
+                + " → concaténation locale des éléments (aucun appel LLM)."
             )
-            raise ValueError(
-                "template_id requis en mode cloud — définissez un template (widget)"
-            )
+            logging.warning(degrade_notice)
         try:
             preset_id = int(preset_id) if preset_id != "" else 0
         except (ValueError, TypeError):
@@ -363,28 +397,32 @@ class AIHEnhanceNode:
         #   - shortlist à 1 seul style → toujours lui
         #   - shortlist non vide mais IDs introuvables côté backend → fallback tous
         if style_id == -1:
-            try:
-                import requests as _req
-                resp = _req.get(
-                    f"{api_url}/styles",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=10
-                )
-                if resp.ok:
-                    styles = resp.json()
-                    selected = _parse_style_shortlist(style_shortlist)
-                    pool = styles
-                    if selected:
-                        narrowed = _filter_styles_by_shortlist(styles, selected)
-                        if narrowed:
-                            pool = narrowed
-                    if pool:
-                        import random as _rand
-                        chosen = _rand.choice(pool)
-                        style_id = chosen.get("id", 0) if isinstance(chosen, dict) else 0
-            except Exception as e:
-                logging.warning(f"[AIH Enhance] Random style fetch failed: {e}")
+            if not _backend_configured(api_url):
+                # Aucun serveur : pas de tirage aléatoire possible, pas de bruit réseau.
                 style_id = 0
+            else:
+                try:
+                    import requests as _req
+                    resp = _req.get(
+                        f"{api_url}/styles",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        timeout=10
+                    )
+                    if resp.ok:
+                        styles = resp.json()
+                        selected = _parse_style_shortlist(style_shortlist)
+                        pool = styles
+                        if selected:
+                            narrowed = _filter_styles_by_shortlist(styles, selected)
+                            if narrowed:
+                                pool = narrowed
+                        if pool:
+                            import random as _rand
+                            chosen = _rand.choice(pool)
+                            style_id = chosen.get("id", 0) if isinstance(chosen, dict) else 0
+                except Exception as e:
+                    logging.warning(f"[AIH Enhance] Random style fetch failed: {e}")
+                    style_id = 0
 
         # Parse elements JSON (soit un tableau direct, soit l'objet _elements_json complet)
         elems = []
@@ -451,16 +489,29 @@ class AIHEnhanceNode:
                 style_text = style_obj.get("style_text", "")
                 negative_prompt = style_obj.get("negative_prompt", "")
 
-        # --- Mode concaténation (use_llm = False) ---
-        # On combine directement les éléments sans passer par le LLM
-        if not use_llm:
-            raw_parts = [p for p in [base_prompt, elems_text, elems_raw, style_text] if p and p.strip()]
-            full_prompt = ", ".join(raw_parts)
-            final_prompt = _clean_output(full_prompt, output_format)
+        # --- Mode concaténation (use_llm = False) ET mode DÉGRADÉ ---
+        # On combine directement les éléments sans passer par le LLM.
+        # Le mode dégradé (backend non configuré / injoignable, voir
+        # `degrade_notice`) emprunte EXACTEMENT le même chemin : le prompt
+        # produit reste utile au workflow, seule la raison est ajoutée dans
+        # `ui["warning"]` (jamais dans la sortie `prompt`, qui part vers CLIP).
+        def _concat_result(notice=""):
+            """Résultat LOCAL (aucun LLM) : base_prompt + éléments + style."""
+            raw_parts = [
+                p for p in [base_prompt, elems_text, elems_raw, style_text]
+                if p and p.strip()
+            ]
+            local_prompt = _clean_output(", ".join(raw_parts), output_format)
+            ui = {"prompt": [local_prompt], "negative_prompt": [negative_prompt]}
+            if notice:
+                ui["warning"] = [notice]
             return {
-                "ui": {"prompt": [final_prompt], "negative_prompt": [negative_prompt]},
-                "result": (final_prompt, negative_prompt, llm_config)
+                "ui": ui,
+                "result": (local_prompt, negative_prompt, llm_config)
             }
+
+        if not use_llm or degrade_notice:
+            return _concat_result(degrade_notice)
 
         # Construire le payload pour /api/enhance
         payload = {
@@ -521,6 +572,18 @@ class AIHEnhanceNode:
             # Fallback sur le backend si le LLM local échoue
 
         # Mode cloud (defaut) : appel streaming vers /api/enhance
+        if not _backend_configured(api_url):
+            # Filet de sécurité : le LLM local (`llm_config`) a échoué alors
+            # qu'aucun serveur n'est configuré. Un POST vers "/enhance" ne
+            # peut pas aboutir (`Invalid URL`) : on rend le résultat LOCAL
+            # avec la raison, au lieu d'un prompt « Erreur API : … ».
+            notice = (
+                "[AIH Enhance] mode dégradé : serveur AIH non configuré "
+                "(server_url vide) et LLM local indisponible — "
+                "Settings ▸ onglet « AIH · Compte » → concaténation locale des éléments."
+            )
+            logging.warning(notice)
+            return _concat_result(notice)
         try:
             import requests
             r = requests.post(f"{api_url}/enhance",

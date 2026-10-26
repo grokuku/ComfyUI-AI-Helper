@@ -16,12 +16,16 @@
 //   2. pour nodeData.name = "AIHPromptEnhancer" → DOM widget « AIH_Enhance » ;
 //   3. pour nodeData.name = "AIHEnhanceNode" (alias retiré) → AUCUN widget
 //      (contrôle négatif : garantit que le test ne passe pas à vide) ;
-//   4. le widget custom apporte bien son contenu DOM (selects, bouton…).
+//   4. le widget custom apporte bien son contenu DOM (selects, bouton…) ;
+//   5. MODE DÉGRADÉ : le node Python ne plante plus et renvoie `ui.warning` ;
+//      le widget relaie cette raison en TOAST (visible) sans jamais l'écrire
+//      dans la sortie `prompt` — MUTANT : sans relais, aucun toast n'apparaît.
 //
 // Usages : node js/test_aih_enhance_widget_attach.mjs
 // Code de sortie : 0 = PASS, 1 = FAIL, 2 = SKIP (jsdom absent).
 // ─────────────────────────────────────────────────────────────────────────
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
 import { loadJsdomOrSkip } from "./test_helpers/jsdom_loader.mjs";
 
 const JSDOM = await loadJsdomOrSkip("test_aih_enhance_widget_attach");
@@ -139,5 +143,36 @@ console.log("4. Contrôle négatif : type non lié → AUCUN widget");
 const other = await attachFor("AIHKeywords");
 assert.ok(!(other.widgets || []).some((w) => w.name === "AIH_Enhance"));
 ok("un autre type de node n'est pas affecté par l'extension enhancer");
+
+console.log("5. Mode dégradé : `ui.warning` relayé en toast (jamais dans le prompt)");
+{
+    // Le node Python renvoie {prompt, warning} quand le backend AIH est
+    // injoignable : la raison doit être VISIBLE, la sortie `prompt` propre.
+    const warningText = "[AIH Enhance] mode dégradé : serveur AIH non configuré → concaténation locale";
+    const node = await attachFor("AIHPromptEnhancer");
+    assert.strictEqual(typeof node.onExecuted, "function",
+        "le widget écoute onExecuted (MUTANT : sans relais, la raison reste invisible)");
+    node.onExecuted({ prompt: ["a cat on a sofa"], warning: [warningText] });
+
+    const toasts = Array.from(document.querySelectorAll(".holaf-toast__message"))
+        .map((el) => el.textContent);
+    assert.ok(toasts.some((msg) => msg.includes("mode dégradé")),
+        `la raison du dégradé est affichée en toast (reçu : ${JSON.stringify(toasts)})`);
+    const domW = node.widgets.find((w) => w.name === "AIH_Enhance");
+    assert.ok(domW, "DOM widget présent");
+    const promptField = domW.element.querySelector("textarea");
+    assert.ok(promptField, "le textarea de résultat existe");
+    assert.strictEqual(promptField.value, "a cat on a sofa",
+        "la sortie affichée reste le PROMPT (le warning ne le pollue pas)");
+
+    // Contrôle statique : les DEUX widgets du pack relaient `ui.warning`.
+    const enhanceSrc = readFileSync(new URL("./aih_enhance_widget.js", import.meta.url), "utf8");
+    const elementsSrc = readFileSync(new URL("./aih_elements_widget.js", import.meta.url), "utf8");
+    assert.ok(/output\?\.warning/.test(enhanceSrc),
+        "aih_enhance_widget.js doit lire ui.warning");
+    assert.ok(/notifyNodeWarning\(/.test(elementsSrc),
+        "aih_elements_widget.js doit relayer ui.warning (notifyNodeWarning)");
+    ok("mode dégradé : toast affiché, prompt intact, relais présent dans les 2 widgets");
+}
 
 console.log(`\n✅ Prompt Enhancer — widget JS attaché : TOUS LES TESTS PASSENT (${n} assertions)`);

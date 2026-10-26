@@ -66,7 +66,15 @@ class _FakeResponse:
 
 @pytest.fixture
 def run_node(monkeypatch):
-    """Exécute le vrai generate() hors ligne ; renvoie (prompt, payload serveur)."""
+    """Exécute le vrai generate() hors ligne ; renvoie (prompt, payload serveur).
+
+    Le serveur AIH est SIMULÉ (credentials factices) : sans ``server_url`` le
+    node ne tente plus aucune requête (URL relative impossible) et il n'y
+    aurait aucun payload à observer — or ces tests verrouillent justement le
+    seed envoyé au backend.
+    """
+    monkeypatch.setattr(E.credentials, "get_api_url", lambda: "http://aih.test/api")
+    monkeypatch.setattr(E.credentials, "get_api_key", lambda: "test-key")
 
     posted = {}
 

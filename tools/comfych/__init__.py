@@ -25,6 +25,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
@@ -179,6 +180,25 @@ _OP_STALE_SECONDS = 2400
 # muet pendant des minutes et l'utilisateur croirait l'opération bloquée.
 _HEARTBEAT_SECONDS = 10.0
 
+# ── Anti-retry-INFINI de Modal ───────────────────────────────────────────
+# Un container qui plante À L'IMPORT (ex. ``ModuleNotFoundError: No module named
+# 'comfych_paths'`` dans ``/root/sync.py``) est relancé indéfiniment par le
+# superviseur Modal :
+#
+#     Runner failed with exception … encore un essai
+#     … toujours en cours (66s) (76s) (86s) (96s) (108s) (118s)
+#
+# L'échec est DÉTERMINISTE (le module manque dans l'image) : réessayer ne peut
+# pas réussir, et chaque essai coûte du temps GPU. On abandonne donc au bout de
+# quelques répétitions, avec un message qui dit quoi corriger.
+_RETRY_MARKER = "Runner failed with exception"
+_RETRY_ABORT_THRESHOLD = 3
+
+
+class _DeterministicContainerFailure(RuntimeError):
+    """Le container distant plante de façon RÉPÉTÉE : abandon explicite du run."""
+
+
 # Garde d'entrée anti-concurrence (M11).
 # ``_OP_LOCK.locked()`` ne peut pas servir de test d'entrée : entre le check et
 # l'acquisition réelle (faite dans la tâche de fond), deux requêtes peuvent
@@ -265,6 +285,31 @@ def _release_op() -> None:
     _op_started_at = 0.0
 
 
+_OP_FLAG_TRUE = {"1", "true", "yes", "on"}
+
+
+async def _request_flag(request, key: str) -> bool:
+    """Drapeau booléen d'un corps JSON de requête (``False`` si absent/invalide).
+
+    Tolérant par construction : corps vide, JSON invalide ou non-objet ne
+    produisent jamais d'erreur 400 — les routes Modal déclenchent des
+    opérations longues, un refus de requête opaque serait pire qu'un défaut.
+    Accepte ``true`` (booléen) et les chaînes ``1/true/yes/on``.
+    """
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 — corps absent ou non-JSON : défaut False
+        return False
+    if not isinstance(data, dict):
+        return False
+    value = data.get(key)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _OP_FLAG_TRUE
+
+
 def _on_op_task_done(task) -> None:
     """Callback de fin de tâche : oublie la tâche et libère le slot.
 
@@ -284,15 +329,19 @@ def _on_op_task_done(task) -> None:
         )
 
 
-def _spawn_op(operation: str, cmd: list[str]) -> bool:
+def _spawn_op(operation: str, cmd: list[str], env_extra: dict | None = None) -> bool:
     """Réserve le slot puis lance l'opération en tâche de fond.
+
+    *env_extra* ajoute des variables d'environnement au subprocess ``modal``
+    (seul moyen de transmettre ``COMFYCH_DEPLOY_FORCE_TOKEN`` au build : la CLI
+    ``modal deploy`` n'a pas de flag ``--force``).
 
     Returns:
         False si une opération est déjà en cours (rien n'est lancé), True sinon.
     """
     if not _try_acquire_op(operation):
         return False
-    task = asyncio.create_task(_run_async(operation, cmd))
+    task = asyncio.create_task(_run_async(operation, cmd, env_extra))
     _task_op_tokens[task] = _op_token
     _background_tasks.add(task)
     task.add_done_callback(_on_op_task_done)
@@ -315,14 +364,14 @@ def _spawn_sequence(operation: str, steps: list) -> bool:
     return True
 
 
-async def _run_async(operation: str, cmd: list[str]):
+async def _run_async(operation: str, cmd: list[str], env_extra: dict | None = None):
     """Exécute une commande modal et écrit les logs + status.
 
     Sérialisée par _OP_LOCK : une seule opération à la fois — les opérations
     partagent les mêmes fichiers de logs et le même volume.
     """
     async with _OP_LOCK:
-        await _run_sequence_inner(operation, [_cmd_step(operation, cmd)])
+        await _run_sequence_inner(operation, [_cmd_step(operation, cmd, env_extra)])
 
 
 async def _run_sequence(operation: str, steps: list):
@@ -348,10 +397,15 @@ async def _stream_process(
     attente réseau…), une ligne « … toujours en cours (Ns) » est écrite dans le
     log. Le SSE ne reste donc jamais muet et l'UI peut distinguer « ça travaille
     sans rien dire » de « c'est bloqué ».
+
+    Lève :class:`_DeterministicContainerFailure` quand le container distant
+    plante de façon RÉPÉTÉE (``_RETRY_ABORT_THRESHOLD`` marqueurs de retry) :
+    c'est un échec déterministe, insister ne sert à rien.
     """
     if started_at is None:
         started_at = time.time()
 
+    retry_markers = 0
     while True:
         try:
             line = await asyncio.wait_for(
@@ -370,6 +424,16 @@ async def _stream_process(
         decoded = line.decode(errors="replace").rstrip()
         with open(log_path, "a") as f:
             f.write(decoded + "\n")
+        if _RETRY_MARKER in decoded:
+            retry_markers += 1
+            if retry_markers >= _RETRY_ABORT_THRESHOLD:
+                raise _DeterministicContainerFailure(
+                    f"abandon après {retry_markers} redémarrages du container "
+                    "distant (le container plante à l'IMPORT : cause déterministe, "
+                    "réessayer ne peut pas réussir). Vérifiez les modules locaux "
+                    "déclarés dans add_local_python_source et la fin du log "
+                    "ci-dessus (ex. ModuleNotFoundError)."
+                )
 
 
 def _append_log(log_path: Path, line: str) -> None:
@@ -381,8 +445,10 @@ def _append_log(log_path: Path, line: str) -> None:
         pass  # log non inscriptible : ne jamais tuer l'opération
 
 
-def _cmd_step(label: str, cmd: list[str]):
+def _cmd_step(label: str, cmd: list[str], env_extra: dict | None = None):
     """Étape « lancer une commande modal et streamer sa sortie ».
+
+    *env_extra* est transmis au subprocess (voir :func:`_spawn_op`).
 
     Returns
     -------
@@ -396,17 +462,46 @@ def _cmd_step(label: str, cmd: list[str]):
         # credentials peuvent prendre plusieurs secondes pendant lesquelles le
         # SSE n'aurait rien à afficher (l'utilisateur croit que rien ne se passe).
         _append_log(log_path, f"Lancement de: {' '.join(cmd)}")
+        forced = (env_extra or {}).get("COMFYCH_DEPLOY_FORCE_TOKEN")
+        if forced:
+            _append_log(
+                log_path,
+                "🔨 Reconstruction FORCÉE : l'empreinte de déploiement est "
+                "régénérée, l'image sera donc reconstruite (plus de "
+                "« Deployment skipped: no changes detected »).",
+            )
         _append_log(log_path, "Initialisation de modal (import, résolution de l'app)…")
-        return await _run_cmd(cmd, log_path, started_at)
+        return await _run_cmd(cmd, log_path, started_at, env_extra)
 
     # Commande visible sur l'étape (diagnostic + tests d'ordre de séquence).
     _step.cmd = list(cmd)
+    _step.env_extra = dict(env_extra or {})
 
     return (label, _step)
 
 
+async def _kill_and_reap(process) -> None:
+    """Tue le subprocess puis le réapproprie (ne lève jamais, jamais de zombie).
+
+    Point unique de mise à mort : un process tué sans ``wait()`` reste zombie, et
+    le SSE attendrait un status qui n'arriverait jamais (l'UI tournerait
+    indéfiniment).
+    """
+    try:
+        process.kill()
+    except Exception:  # noqa: BLE001 — le process peut déjà être mort
+        pass
+    try:
+        await process.wait()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _run_cmd(
-    cmd: list[str], log_path: Path, started_at: float | None = None
+    cmd: list[str],
+    log_path: Path,
+    started_at: float | None = None,
+    env_extra: dict | None = None,
 ) -> int:
     """Lance UNE commande, copie sa sortie dans *log_path*, retourne son code.
 
@@ -425,6 +520,8 @@ async def _run_cmd(
     # S'assurer que le CLI modal est dans le PATH
     env = os.environ.copy()
     env["PATH"] = f"{os.path.dirname(sys.executable)}:{env.get('PATH', '')}"
+    for key, value in (env_extra or {}).items():
+        env[str(key)] = str(value)
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -446,17 +543,14 @@ async def _run_cmd(
             _stream_process(process, log_path, started_at),
             timeout=_OP_TIMEOUT_SECONDS,
         )
+    except _DeterministicContainerFailure as exc:
+        # Container qui plante à l'import en boucle : on tue le subprocess au
+        # lieu d'attendre le timeout global (30 min) et de brûler du temps GPU.
+        await _kill_and_reap(process)
+        _append_log(log_path, f"\nERROR: {exc}")
+        return 1
     except asyncio.TimeoutError:
-        try:
-            process.kill()
-        except Exception:  # noqa: BLE001 — le process peut déjà être mort
-            pass
-        # Reaper le process tué (évite un zombie) : le SSE attend un status,
-        # sans quoi l'UI tournerait indéfiniment.
-        try:
-            await process.wait()
-        except Exception:  # noqa: BLE001
-            pass
+        await _kill_and_reap(process)
         _append_log(
             log_path,
             f"\nERROR: opération interrompue après {_OP_TIMEOUT_SECONDS}s "
@@ -1130,9 +1224,30 @@ if PromptServer is not None:
 
         # ── POST /api/modal/deploy — lance le déploiement ──
         async def post_deploy(request):
-            if not _spawn_op("deploy", ["modal", "deploy", "apps/all_in_one.py"]):
+            """Déploie l'app Modal (corps optionnel : ``{"force": true}``).
+
+            La CLI ``modal deploy`` n'a AUCUN flag ``--force`` : quand la
+            définition de l'app est identique, elle répond « ✓ Deployment
+            skipped: no changes detected! ⏭️ » et l'image n'est jamais
+            reconstruite. On force donc en régénérant l'empreinte de
+            déploiement de l'image (``tools/comfych/image.py``,
+            ``COMFYCH_DEPLOY_FORCE_TOKEN`` lu au build).
+            """
+            force = await _request_flag(request, "force")
+            env_extra = {"COMFYCH_DEPLOY_FORCE_TOKEN": uuid.uuid4().hex} if force else None
+            if not _spawn_op(
+                "deploy", ["modal", "deploy", "apps/all_in_one.py"], env_extra
+            ):
                 return _op_busy_response()
-            return web.json_response({"ok": True, "message": "Déploiement lancé"})
+            return web.json_response(
+                {
+                    "ok": True,
+                    "force": force,
+                    "message": "Déploiement forcé lancé (image reconstruite)"
+                    if force
+                    else "Déploiement lancé",
+                }
+            )
 
         # ── POST /api/modal/token — enregistre le token Modal (remplace modal token set en CLI) ──
         async def post_token(request):

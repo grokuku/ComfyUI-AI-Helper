@@ -273,7 +273,13 @@ class HolafResolutionPreset:
     FUNCTION = "get_resolution"
     CATEGORY = "AIH/Image"
 
-    def IS_CHANGED(self, model_type, aspect_ratio, use_image_ratio, image=None):
+    # ⚠️ @classmethod OBLIGATOIRE : ComfyUI appelle IS_CHANGED sur la CLASSE
+    # (`class_def.IS_CHANGED(**inputs)` dans execution.py). Une méthode
+    # d'instance provoque « IS_CHANGED() missing 1 required positional
+    # argument: 'self' » : ComfyUI l'attrape, se contente d'un WARNING et perd
+    # le cache fin de la node. Verrouillé par tests/test_is_changed_signature.py.
+    @classmethod
+    def IS_CHANGED(cls, model_type, aspect_ratio, use_image_ratio, image=None):
         if aspect_ratio == "Random":
             return random.random()
 

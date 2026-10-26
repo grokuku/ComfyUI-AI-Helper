@@ -2,6 +2,8 @@ import "./aih_strings.js";
 import { remoteGet, remotePost, normalizeServerUrl } from "./aih_fetch_bridge.js";
 // Icônes d'UI : UNIQUEMENT via la façade (jamais la brique vendorisée directe).
 import { aihIconSvg } from "./aih_icons.js";
+// Notifications : point d'entrée UNIQUE du pack (brique HolafToast).
+import { showToast } from "./aih_toast_bridge.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente)
 const t = (key, params) => {
@@ -609,6 +611,14 @@ const t = (key, params) => {
                     const arr = output?.prompt;
                     if (Array.isArray(arr) && arr.length > 0) {
                         resultTextarea.value = String(arr[0]);
+                    }
+                    // MODE DÉGRADÉ (backend AIH non configuré / injoignable) :
+                    // le node ne plante plus, il renvoie `ui.warning` avec la
+                    // raison. On l'affiche en toast : la sortie `prompt` reste
+                    // PROPRE (elle part vers CLIP), la raison reste VISIBLE.
+                    const warn = output?.warning;
+                    if (Array.isArray(warn) && warn.length > 0 && warn[0]) {
+                        showToast({ message: String(warn[0]), type: "warning", duration: 9000 });
                     }
                 };
 

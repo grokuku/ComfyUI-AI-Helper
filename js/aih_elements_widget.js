@@ -1765,6 +1765,10 @@ function _parseConceptSyntax(text, defaultCount) {
                     }
                     if (text === null && typeof output === 'string') text = output;
 
+                    // Dégradé LLM (backend non configuré/injoignable) : la raison
+                    // est dans `ui.warning`, on l'affiche (jamais dans le prompt).
+                    notifyNodeWarning(output);
+
                     if (text !== null && text !== undefined) {
                         const str = Array.isArray(text) ? text.join("") : String(text);
                         console.log("[AIH] onExecuted result:", str.substring(0, 80));
@@ -1828,6 +1832,8 @@ function _parseConceptSyntax(text, defaultCount) {
                         if (/^\d+$/.test(key)) { text = output[key]; break; }
                     }
                 }
+
+                notifyNodeWarning(output);
 
                 if (text !== null && text !== undefined) {
                     const str = Array.isArray(text) ? text.join("") : String(text);
@@ -1912,4 +1918,21 @@ function showPrompt(title, msg, placeholder, cb) {
 
 function showToast(type, msg) {
     bridgeShowToast({ message: msg, type: type, duration: 4000 });
+}
+
+/**
+ * Remonte dans l'UI un `ui.warning` renvoyé par le node Python.
+ *
+ * Le node dégradé (backend AIH injoignable, LLM en échec) produit TOUJOURS un
+ * résultat, mais la raison voyage dans `ui.warning` : sans ce relais elle
+ * resterait invisible (l'utilisateur ne verrait qu'une liste vide ou un prompt
+ * local, sans savoir pourquoi).
+ *
+ * @param {object|null} output - Sortie `ui` du node (`{elements, warning}`).
+ */
+function notifyNodeWarning(output) {
+    if (!output || typeof output !== "object") return;
+    var warn = output.warning;
+    if (!Array.isArray(warn) || warn.length === 0 || !warn[0]) return;
+    showToast("warning", String(warn[0]));
 }
