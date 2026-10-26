@@ -1402,6 +1402,7 @@ import "./aih_i18n.js";
         /* ComfyCH (sous-menu du menu AIH, js/holaf_main.js) */
         "menu.comfych": "ComfyCH",
         "menu.comfychUnavailable": "Contrôles indisponibles (module non chargé)",
+        "menu.comfychOpen": "Ouvrir les réglages ComfyCH",
         "rw.title": "Réparer un workflow (niveau JSON)",
         "rw.section.sources": "1 · Sources",
         "rw.saved.title": "Workflows sauvegardés",
@@ -2831,6 +2832,7 @@ import "./aih_i18n.js";
         /* ComfyCH (AIH menu sub-entry, js/holaf_main.js) */
         "menu.comfych": "ComfyCH",
         "menu.comfychUnavailable": "Controls unavailable (module not loaded)",
+        "menu.comfychOpen": "Open ComfyCH settings",
         "rw.title": "Repair a workflow (JSON level)",
         "rw.section.sources": "1 · Sources",
         "rw.saved.title": "Saved workflows",

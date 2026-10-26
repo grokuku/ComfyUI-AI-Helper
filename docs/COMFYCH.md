@@ -136,6 +136,35 @@ refermer au passage), fermeture **Échap / clic extérieur** et navigation clavi
 identiques au reste du menu (déjà testées), et contrôles atteignables au clavier
 dans le menu. Le menu ne se ferme pas quand on manipule ces contrôles.
 
+**Clic sur le libellé « ComfyCH » = ouverture de la modale de réglages ComfyCH**
+(même action que le bouton ⚙). Décision : la ligne n'est pas une simple ligne de
+contrôles inerte — un clic sur son libellé doit faire quelque chose de visible.
+Un clic **dans** les contrôles (sélecteur GPU, ⚙, badge de file) garde son
+comportement propre et n'ouvre jamais la modale par ricochet ; le menu reste
+ouvert dans tous les cas.
+
+### Pièges corrigés dans le menu (ne pas les réintroduire)
+
+1. **`li.querySelector('div')` dans `mainButton.onclick`** (`js/holaf_main.js`) :
+   cette boucle rafraîchit l'état des cases à cocher des entrées à bascule en
+   prenant le **premier `<div>`** de chaque ligne. La ligne ComfyCH en contient
+   un (le conteneur des contrôles, `#modal-gateway-container`) : elle était donc
+   prise pour une case à cocher et **vidée** (`innerHTML = ""`) dès la première
+   ouverture du menu — sélecteur GPU et ⚙ disparaissaient. La cible est
+   désormais explicite : `.holaf-menu-check`.
+2. **Mesure du popup avant affichage** (`showDropdown()`, même fichier) :
+   `offsetWidth` vaut 0 tant que le menu est en `display:none` ; l'ancien code
+   retombait sur `min-width` (150 px) et positionnait le menu comme s'il faisait
+   150 px, si bien qu'un contenu plus large **débordait à droite de la fenêtre**
+   (bouton « AI Helper » dans la barre d'outils, à droite). Le menu est
+   maintenant mesuré après passage en `display:block` (`visibility:hidden`, donc
+   sans flash) et son bord droit est **clampé** dans la fenêtre.
+3. **Ordre de chargement** : `js/holaf_main.js` importe explicitement
+   `js/comfych_gateway.js`, pour que le pont `window.AIHComfyCHHost` soit présent
+   **avant** le premier rendu du menu (ComfyUI importe les `.js` du
+   `WEB_DIRECTORY` en parallèle). La reprise périodique du montage reste en place
+   comme filet de sécurité, avec un message explicite si le module manque.
+
 ### Note : nom de dossier `tools/`
 
 `tools/` n'a pas de `__init__.py` : c'est un **paquet d'espace de noms**

@@ -26,6 +26,14 @@ import "./holaf_wip_settings.js";
 import "./holaf_layout_tools.js";
 import "./holaf_shortcuts.js";
 import "./holaf_remote_comparer.js";
+// ComfyCH : le pont window.AIHComfyCHHost (buildControls/openSettings) doit
+// être disponible AVANT le premier rendu du menu. ComfyUI importe les .js du
+// WEB_DIRECTORY en PARALLÈLE puis appelle les setup() : sans cet import
+// explicite, la ligne « ComfyCH » pouvait être construite avant l'arrivée du
+// module et rester sans contrôles (elle ne se remplissait que si le module
+// arrivait dans la fenêtre de reprise de 4 s). L'import est dédupliqué par le
+// graphe de modules ES (ComfyUI importe aussi ce fichier de son côté).
+import "./comfych_gateway.js";
 
 // Helper i18n central : traduit via AIH.I18n (clé brute si absente).
 const t = (key, params) => {
@@ -116,7 +124,15 @@ const HolafUtilitiesMenu = {
             } else {
                 this.showDropdown(mainButton);
                 this.dropdownMenuEl.querySelectorAll('li').forEach(li => {
-                    const check = li.querySelector('div');
+                    // CIBLE EXPLICITE : la case à cocher des entrées à bascule
+                    // (classe posée à la construction). L'ancien
+                    // `li.querySelector('div')` prenait le PREMIER <div> de
+                    // chaque ligne — or la ligne ComfyCH en contient un (le
+                    // conteneur des contrôles, #modal-gateway-container) : à la
+                    // PREMIÈRE ouverture du menu, ce code l'écrasait donc par
+                    // `innerHTML = ""`, effaçant le sélecteur GPU et le bouton
+                    // ⚙ montés à la construction (et lui posait un borderColor).
+                    const check = li.querySelector('.holaf-menu-check');
                     const text = li.textContent;
                     if (check) {
                         let isActive = false;
@@ -370,6 +386,9 @@ const HolafUtilitiesMenu = {
             let checkbox = null;
             if (["toggle_layout_tools", "toggle_shortcuts", "toggle_compact_menu", "toggle_remote_comparer"].includes(itemInfo.special)) {
                 checkbox = document.createElement("div");
+                // Marqueur : seules CES cases sont rafraîchies à l'ouverture du
+                // menu (voir mainButton.onclick) — jamais un <div> de contrôle.
+                checkbox.className = "holaf-menu-check";
                 Object.assign(checkbox.style, {
                     width: "12px",
                     height: "12px",
@@ -549,6 +568,12 @@ const HolafUtilitiesMenu = {
     // Les contrôles viennent de window.AIHComfyCHHost (js/comfych/modal_gateway.js,
     // via le chargeur js/comfych_gateway.js) : il les CONSTRUIT (buildControls)
     // au lieu de les déplacer, le menu étant rebâti à chaque ouverture.
+    //
+    // CLIC SUR LA LIGNE = OUVRIR LA MODALE DE RÉGLAGES ComfyCH (même action que
+    // le bouton ⚙, décision documentée dans docs/COMFYCH.md) : sans cela, la
+    // ligne ne faisait RIEN (seul stopPropagation) et l'utilisateur croyait
+    // l'entrée inerte. Les clics DANS les contrôles (sélecteur GPU, ⚙, badge
+    // de file) gardent leur propre comportement et ne déclenchent pas la modale.
     buildComfychItem() {
         const li = document.createElement("li");
         li.id = "holaf-menu-comfych";
@@ -557,7 +582,6 @@ const HolafUtilitiesMenu = {
             justifyContent: "space-between",
             alignItems: "center",
             gap: "8px",
-            // Ligne de CONTRÔLES (et non une action) : curseur par défaut.
             cursor: "default",
         });
 
@@ -565,6 +589,9 @@ const HolafUtilitiesMenu = {
         labelSpan.style.display = "inline-flex";
         labelSpan.style.alignItems = "center";
         labelSpan.style.gap = "6px";
+        // Le libellé EST cliquable (ouvre les réglages) : on l'annonce.
+        labelSpan.style.cursor = "pointer";
+        labelSpan.title = t("menu.comfychOpen");
         const iconEl = document.createElement("span");
         iconEl.className = "aih-icon";
         iconEl.innerHTML = aihIconSvg("cloud", { size: 13 });
@@ -628,7 +655,26 @@ const HolafUtilitiesMenu = {
 
         // Le menu ne doit pas se fermer quand on manipule les contrôles : un
         // clic DANS la ligne est un geste d'usage, pas une sélection d'entrée.
-        li.addEventListener("click", (e) => e.stopPropagation());
+        // Le libellé, lui, OUVRE les réglages ComfyCH (action claire : le clic
+        // n'est plus avalé).
+        li.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const target = e.target;
+            if (target && typeof target.closest === "function"
+                && target.closest("#holaf-menu-comfych-controls")) {
+                return; // sélecteur GPU / ⚙ / badge : comportement propre
+            }
+            const host = window.AIHComfyCHHost;
+            if (host && typeof host.openSettings === "function") {
+                host.openSettings();
+                return;
+            }
+            AIH.ask({
+                title: t("menu.comfych"),
+                message: t("menu.comfychUnavailable"),
+                buttons: [{ text: t("dialog.ok"), value: true }]
+            });
+        });
         return li;
     },
 
@@ -1058,10 +1104,35 @@ const HolafUtilitiesMenu = {
         const rect = buttonElement.getBoundingClientRect();
         this.dropdownMenuEl.style.top = `${rect.bottom + 2}px`;
 
-        const computedStyle = getComputedStyle(this.dropdownMenuEl);
-        const dropdownWidth = this.dropdownMenuEl.offsetWidth || parseFloat(computedStyle.minWidth) || 140;
+        // Largeur RÉELLE du menu : `offsetWidth` vaut 0 tant que l'élément est
+        // en `display:none` (son état entre deux ouvertures). L'ancien code
+        // lisait donc 0 et retombait sur `min-width` (150 px) : le menu était
+        // positionné comme s'il faisait 150 px et TOUT contenu plus large
+        // débordait à DROITE du bouton — donc hors écran, le bouton « AI Helper »
+        // étant dans la barre d'outils à droite. C'est ce qui rendait invisibles
+        // le sélecteur GPU et le bouton ⚙ de la ligne ComfyCH. On affiche donc
+        // le menu le temps d'une mesure (display:block + visibility:hidden,
+        // aucun flash, aucun clic possible) avant de le positionner.
+        const wasHidden = this.dropdownMenuEl.style.display !== "block";
+        if (wasHidden) {
+            this.dropdownMenuEl.style.visibility = "hidden";
+            this.dropdownMenuEl.style.display = "block";
+        }
+        const measuredWidth = this.dropdownMenuEl.offsetWidth;
+        if (wasHidden) {
+            this.dropdownMenuEl.style.display = "none";
+            this.dropdownMenuEl.style.visibility = "";
+        }
+        const dropdownWidth = measuredWidth || parseFloat(getComputedStyle(this.dropdownMenuEl).minWidth) || 140;
 
         let leftPosition = rect.right - dropdownWidth;
+        // Ne JAMAIS sortir par le bord droit de la fenêtre (le clamp bas
+        // existait déjà, le clamp haut manquait).
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+        if (measuredWidth && viewportWidth) {
+            const maxLeft = viewportWidth - measuredWidth - 5;
+            if (leftPosition > maxLeft) leftPosition = maxLeft;
+        }
         if (leftPosition < 5) leftPosition = 5;
 
         this.dropdownMenuEl.style.left = `${leftPosition}px`;
