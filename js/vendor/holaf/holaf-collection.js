@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * Holaf UI — Brique HolafCollection · version 0.1.0
+ * Holaf UI — Brique HolafCollection · version 0.2.0
  * ─────────────────────────────────────────────────────────────────────────────
  * Cœur de DONNÉES PUR (sans DOM, sans CSS) pour une liste paginée
  * virtualisée : tableau creux (« sparse ») + cache de fenêtres alignées sur la
@@ -23,13 +23,28 @@
  *   - `_loading`     : Map offset → AbortController (fenêtres en vol).
  *   - `_loadingPromises` : Map offset → Promise (dédup des fetch concurrents).
  *   - `_total`       : nombre total d'items côté source (peut dépasser length).
- *   - `length`       : nombre de cases du tableau creux (images.length).
+ *   - `length`       : nombre de cases du tableau creux (images.length), TOUJOURS
+ *                      borné au dernier index défini + 1 : `length` est
+ *                      l'ÉTENDUE chargée, jamais le total serveur.
  *
  * mode « window » (défaut) : accès aléatoire par fenêtres (offset/pages) — le
  *   pack (galerie d'images) saute d'une fenêtre à l'autre au scroll et peut
  *   combler des trous.
  * mode « append » : scroll infini séquentiel (web) — on n'ajoute que vers
  *   l'avant : `missingStarts` ne remonte jamais sous la frontière déjà chargée.
+ *   La FRONTIÈRE est la fin du PRÉFIXE CONTIGU chargé (`_loadedPrefixEnd()`),
+ *   jamais `length` ni `total` : après un ajout en tête ou une suppression, le
+ *   tableau peut être creux, et une frontière calculée sur une longueur
+ *   polluée (ancien `length = total`) rendait `missingStarts` aveugle — plus
+ *   aucune page n'était demandée et les squelettes restaient à l'écran.
+ *
+ * TIMEOUT / RETRY DES FENÊTRES
+ *   Chaque tentative de `fetchPage` est bornée par `timeoutMs` (défaut 30 s,
+ *   0 = aucun) : au timeout le signal est annulé et la promesse de l'hôte est
+ *   ABANDONNÉE, même si elle ne résout jamais. Un timeout est réessayé
+ *   `retry.max` fois (défaut 4) espacées de `retry.delayMs` (défaut 3 s), puis
+ *   la fenêtre échoue ('error' + `timedOut:true`) et redevient demandable.
+ *   Règles alignées sur HolafThumbCache ; seuls les TIMEOUTS sont réessayés.
  *
  * RÉCONCILIATION INCRÉMENTALE
  *   insertTop(items)  : préfixe N items puis RÉ-ANCRE les fenêtres chargées
@@ -52,14 +67,14 @@
  * ÉVÉNEMENTS (on(evt, cb) → fonction de désabonnement)
  *   'load'  : { start, count }              fenêtre résolue.
  *   'patch' : { mode, inserted, removed }   delta appliqué en place.
- *   'error' : { start, error }              fetchPage a échoué (non annulé).
+ *   'error' : { start, error, timedOut }     fetchPage a échoué (non annulé).
  *   'total' : number                        le total a changé.
  *
  * Fichier DUAL : classe ES (export) + global window.HolafCollection — se
  * charge via <script type="module"> ou `import { HolafCollection }`.
  * ═════════════════════════════════════════════════════════════════════════ */
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 /**
  * Au-delà de ce nombre de suppressions dans un delta, ré-ancrer les index
@@ -67,6 +82,14 @@ const VERSION = "0.1.0";
  * reçoit { mode:'full-reload', reason:'mass-removal' }.
  */
 const MASS_REMOVAL_THRESHOLD = 100;
+
+/**
+ * Bornes par défaut d'une tentative de `fetchPage` (alignées sur
+ * HolafThumbCache : 30 s par tentative, 4 retries espacés de 3 s).
+ */
+const FETCH_TIMEOUT_MS = 30000;
+const RETRY_MAX = 4;
+const RETRY_DELAY_MS = 3000;
 
 class HolafCollection {
     /**
@@ -125,6 +148,10 @@ class HolafCollection {
      *        ({ since }) -> Promise<{items, removedIds, total}>.
      * @param {*} [options.filters] filtres transmis à fetchPage.
      * @param {*} [options.since] curseur initial pour fetchDelta (refresh()).
+     * @param {number} [options.timeoutMs=30000] borne d'UNE tentative de
+     *        fetchPage (0 = aucune borne). Au-delà : abort + retry borné.
+     * @param {{max:number,delayMs:number}} [options.retry] retries sur timeout
+     *        (défaut : max 4, delayMs 3000).
      */
     constructor(options) {
         const o = options || {};
@@ -137,6 +164,16 @@ class HolafCollection {
         this._fetchDelta = (typeof o.fetchDelta === 'function') ? o.fetchDelta : null;
         this._filters = (o.filters !== undefined) ? o.filters : null;
         this._since = (o.since !== undefined) ? o.since : null;
+
+        const retry = o.retry || {};
+        const rmax = Number(retry.max);
+        const rdelay = Number(retry.delayMs);
+        this._retryMax = (Number.isFinite(rmax) && rmax >= 0) ? Math.floor(rmax) : RETRY_MAX;
+        this._retryDelayMs = (Number.isFinite(rdelay) && rdelay >= 0) ? rdelay : RETRY_DELAY_MS;
+        const timeout = (o.timeoutMs === 0) ? 0 : Number(o.timeoutMs);
+        this._timeoutMs = (o.timeoutMs === 0)
+            ? 0
+            : ((Number.isFinite(timeout) && timeout > 0) ? Math.floor(timeout) : FETCH_TIMEOUT_MS);
 
         this._images = [];
         this._total = (typeof o.total === 'number' && o.total >= 0) ? o.total : 0;
@@ -156,7 +193,10 @@ class HolafCollection {
     get mode() { return this._mode; }
     /** Nombre total d'items côté source. */
     get total() { return this._total; }
-    /** Nombre de cases occupées/allouées dans le tableau creux. */
+    /**
+     * Étendue du tableau creux = dernier index défini + 1 (JAMAIS le total
+     * serveur : voir `_lastDefinedEnd`).
+     */
     get length() { return this._images.length; }
 
     // ── Lecture ─────────────────────────────────────────────────────────────
@@ -250,12 +290,47 @@ class HolafCollection {
     }
 
     // ── Planification des fenêtres ──────────────────────────────────────────
+    /**
+     * Fin du PRÉFIXE CONTIGU chargé : fin de la première plage ininterrompue
+     * d'items définis (calculée depuis le PREMIER index défini, pour rester
+     * monotone quand les données ne commencent pas à 0). C'est la SEULE
+     * frontière valable du mode « append » — `_images.length` (longueur du
+     * tableau creux) ne dit rien de l'étendue réellement chargée dès qu'il
+     * contient un trou.
+     * @returns {number} index qui suit le dernier item de la plage (0 si vide).
+     */
+    _loadedPrefixEnd() {
+        const imgs = this._images;
+        let first = 0;
+        while (first < imgs.length && imgs[first] === undefined) first++;
+        if (first >= imgs.length) return 0;
+        let end = first;
+        while (end < imgs.length && imgs[end] !== undefined) end++;
+        return end;
+    }
+
+    /**
+     * Dernier index défini + 1 (0 si le tableau est vide). Sert à BORNER la
+     * longueur du tableau creux : `length` doit rester l'étendue chargée.
+     * @param {Array} images
+     * @returns {number}
+     */
+    _lastDefinedEnd(images) {
+        for (let i = images.length - 1; i >= 0; i--) {
+            if (images[i] !== undefined) return i + 1;
+        }
+        return 0;
+    }
+
     /** Fenêtres alignées balayant [start, end] (bornées par total/append). */
     _rangeStarts(start, end) {
         const ps = this._pageSize;
         let from = this.windowStart(start);
         if (this._mode === 'append') {
-            const boundary = this.windowStart(this._images.length);
+            // Frontière = fin du préfixe contigu chargé (jamais `length`, que
+            // insertTop/removeByIds portaient au total serveur : le clamp
+            // sautait alors au-delà de toute la plage → plus aucun fetch).
+            const boundary = this.windowStart(this._loadedPrefixEnd());
             if (boundary > from) from = boundary;
         }
         const to = this.windowStart(end);
@@ -296,34 +371,136 @@ class HolafCollection {
         if (typeof this._fetchPage !== 'function') return Promise.resolve(undefined);
         if (this._total > 0 && start >= this._total) return Promise.resolve(undefined);
 
+        // `AbortController` reste l'annulation EXTERNE (reset / ré-ancrage).
         const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-        const signal = controller ? controller.signal : undefined;
-        const page = Math.floor(start / this._pageSize);
+        // Le corps de `_loadWindow` s'exécute jusqu'au premier `await` :
+        // fetchPage est donc appelé SYNCHRONEMENT (comme avant) et
+        // `registerLoading` est forcément posé avant tout `finally`.
+        const promise = this._loadWindow(start, controller);
+        this.registerLoading(start, controller, promise);
+        return promise;
+    }
 
-        const promise = (async () => {
+    /**
+     * Charge une fenêtre : tentatives bornées par `_timeoutMs`, retries sur
+     * TIMEOUT uniquement, puis abandon propre ('error' + `timedOut`). Ne
+     * rejette jamais et libère TOUJOURS l'inscription « en vol » — une
+     * promesse d'hôte qui ne résout jamais n'immobilise pas la fenêtre.
+     * @param {number} start
+     * @param {AbortController|null} controller annulation externe
+     */
+    async _loadWindow(start, controller) {
+        const page = Math.floor(start / this._pageSize);
+        let retries = 0;
+        try {
+            for (;;) {
+                const attempt = await this._attemptWindow(start, page, controller);
+                if (attempt.ok) {
+                    const items = (attempt.res && attempt.res.items) || [];
+                    this.setWindow(start, items);
+                    if (attempt.res && typeof attempt.res.total === 'number') this._setTotal(attempt.res.total);
+                    this._emit('load', { start, count: items.length });
+                    return items;
+                }
+                // Annulation externe (reset / ré-ancrage) : silence, la fenêtre
+                // redevient demandable via missingStarts.
+                if (attempt.aborted) return undefined;
+
+                const timedOut = attempt.timedOut === true;
+                if (timedOut && retries < this._retryMax) {
+                    retries++;
+                    await this._delay(this._retryDelayMs);
+                    if (controller && controller.signal && controller.signal.aborted) return undefined;
+                    continue;
+                }
+                this._emit('error', { start, error: attempt.error, timedOut });
+                return undefined;
+            }
+        } finally {
+            // Ne libère que SA propre inscription : un reset() suivi d'un
+            // nouveau fetch du même offset ne doit pas être effacé ici.
+            if (this._loading.get(start) === controller) this.unregisterLoading(start);
+        }
+    }
+
+    /** Attente bornée entre deux tentatives (l'appelant vérifie l'annulation après). */
+    _delay(ms) {
+        if (!(ms > 0)) return Promise.resolve();
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    /**
+     * UNE tentative de fetchPage, bornée par `_timeoutMs`.
+     * Au timeout : `abort()` du signal de l'hôte puis résolution — même si sa
+     * promesse ne résout JAMAIS (elle est abandonnée, pas attendue).
+     * @returns {Promise<{ok:boolean, res?:object, error?:Error, timedOut?:boolean, aborted?:boolean}>}
+     */
+    _attemptWindow(start, page, external) {
+        return new Promise((resolve) => {
+            const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+            const signal = controller ? controller.signal : undefined;
+            const externalSignal = (external && external.signal) ? external.signal : null;
+            let done = false;
+            let timer = null;
+            let timedOut = false;
+
+            const finish = (result) => {
+                if (done) return;
+                done = true;
+                if (timer !== null) { clearTimeout(timer); timer = null; }
+                if (externalSignal && typeof externalSignal.removeEventListener === 'function') {
+                    externalSignal.removeEventListener('abort', onExternalAbort);
+                }
+                resolve(result);
+            };
+
+            // Annulation externe (reset / ré-ancrage) : pas une erreur.
+            const onExternalAbort = () => {
+                try { if (controller) controller.abort('external'); } catch (e) { /* best-effort */ }
+                finish({ ok: false, aborted: true });
+            };
+
+            if (this._timeoutMs > 0) {
+                timer = setTimeout(() => {
+                    timedOut = true;
+                    try { if (controller) controller.abort('timeout'); } catch (e) { /* best-effort */ }
+                    const error = new Error('timeout');
+                    error.name = 'TimeoutError';
+                    error.timedOut = true;
+                    finish({ ok: false, error, timedOut: true });
+                }, this._timeoutMs);
+            }
+
+            if (externalSignal) {
+                if (externalSignal.aborted) { onExternalAbort(); return; }
+                if (typeof externalSignal.addEventListener === 'function') {
+                    externalSignal.addEventListener('abort', onExternalAbort);
+                }
+            }
+
+            let pending;
             try {
-                const res = await this._fetchPage({
+                pending = this._fetchPage({
                     offset: start,
                     limit: this._pageSize,
                     page,
                     filters: this._filters,
                     signal,
                 });
-                const items = (res && res.items) || [];
-                this.setWindow(start, items);
-                if (res && typeof res.total === 'number') this._setTotal(res.total);
-                this._emit('load', { start, count: items.length });
-                return items;
             } catch (error) {
-                if (!(signal && signal.aborted)) this._emit('error', { start, error });
-                return undefined;
-            } finally {
-                this.unregisterLoading(start);
+                finish({ ok: false, error });
+                return;
             }
-        })();
 
-        this.registerLoading(start, controller, promise);
-        return promise;
+            Promise.resolve(pending).then(
+                (res) => finish({ ok: true, res }),
+                (error) => {
+                    // Un rejet APRÈS le timeout est ignoré (garde `done`).
+                    const isTimeout = timedOut || (error && error.timedOut === true);
+                    finish({ ok: false, error, timedOut: isTimeout });
+                }
+            );
+        });
     }
 
     // ── Réconciliation incrémentale ─────────────────────────────────────────
@@ -411,9 +588,13 @@ class HolafCollection {
 
         this._rebuildLoadedRanges(shifted, newTotal);
 
-        // Copie EN PLACE (l'hôte garde la référence du tableau).
-        oldImages.length = newTotal;
-        for (let i = 0; i < newTotal; i++) oldImages[i] = shifted[i];
+        // Copie EN PLACE (l'hôte garde la référence du tableau). La LONGUEUR
+        // est bornée au dernier index défini + 1 : elle ne doit JAMAIS sauter
+        // au total serveur (sinon `length` ment — ids/forEachLoaded/
+        // missingStarts et la frontière 'append' héritent du mensonge).
+        const extent = this._lastDefinedEnd(shifted);
+        if (oldImages.length > extent) oldImages.length = extent;
+        for (let i = 0; i < extent; i++) oldImages[i] = shifted[i];
 
         this._setTotal(newTotal);
         return n;
@@ -461,8 +642,12 @@ class HolafCollection {
 
         this._rebuildLoadedRanges(next, newTotal);
 
-        oldImages.length = newTotal;
-        for (let i = 0; i < newTotal; i++) oldImages[i] = next[i];
+        // Même règle que insertTop : la longueur reste l'ÉTENDUE chargée (un
+        // retrait laisse des trous EN FIN de zone, il n'allonge pas le tableau
+        // jusqu'au total serveur).
+        const extent = this._lastDefinedEnd(next);
+        if (oldImages.length > extent) oldImages.length = extent;
+        for (let i = 0; i < extent; i++) oldImages[i] = next[i];
 
         this._setTotal(newTotal);
         return remove.size;

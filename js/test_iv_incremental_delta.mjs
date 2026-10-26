@@ -49,7 +49,12 @@ console.log("1. insertImagesAtTop");
     assert.strictEqual(state.images[0].path_canon, "NEW_a", "l'image la plus récente est en tête (tri mtime DESC)");
     assert.strictEqual(state.images[1].path_canon, "NEW_b");
     assert.strictEqual(state.images[2], oldFirst, "l'ancienne tête est décalée de +N, pas perdue");
-    assert.strictEqual(state.images.length, 1002, "longueur = ancienne + N");
+    // holaf-collection 0.2.0 : `length` est l'ÉTENDUE CHARGÉE (fenêtre 0 = PAGE_SIZE
+    // items + N insérés), plus le TOTAL serveur. Cette longueur portée au total
+    // était le mensonge qui aveuglait `missingStarts` en mode 'append' (la
+    // galerie web n'émettait plus aucune requête). Le total reste, lui, la
+    // vérité serveur, suivie par `totalCount` / l'événement 'total'.
+    assert.strictEqual(state.images.length, PAGE_SIZE + 2, "longueur = étendue chargée (PAGE_SIZE + N)");
 
     // PREUVE PRINCIPALE : la fenêtre 0 est toujours chargée (pas de reset).
     // Si resetWindowCache() était réintroduit dans insertImagesAtTop, ceci
