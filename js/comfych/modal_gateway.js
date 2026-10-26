@@ -759,6 +759,20 @@ import { aihIconSvg } from "../aih_icons.js";
             return currentRenderMode();
         },
 
+        /**
+         * Indicateur « il y a du contenu plus bas » d'une zone défilante.
+         *
+         * Primitive d'UI GÉNÉRIQUE (aucune dépendance à ComfyCH) : le pack peut
+         * l'utiliser sur n'importe quel conteneur `overflow-y: auto`. Idempotent
+         * — rappeler la fonction sur le même élément rend le contrôleur existant.
+         * @param {HTMLElement} el - Conteneur défilant.
+         * @param {{margin?: number}} [opts] - Marge de tolérance en px.
+         * @returns {{el: HTMLElement, update: Function, destroy: Function}|null}
+         */
+        scrollHint: function (el, opts) {
+            return attachScrollHint(el, opts);
+        },
+
         /** Callback remplaçable par le pack (appelé quand la config est chargée). */
         onReady: function () {},
     };
@@ -2055,6 +2069,10 @@ import { aihIconSvg } from "../aih_icons.js";
             '  width: min(1240px, 96vw);',
             '  height: var(--modal-panel-height, min(780px, 94vh));',
             '  display: flex; flex-direction: column;',
+            '  /* Les cadres d\'étapes gardent leur hauteur fixe : si le panneau est trop',
+            '     court (Connexion dépliée, panneau réduit à 480 px), c\'est le panneau qui',
+            '     défile au lieu de comprimer les cadres. */',
+            '  overflow-y: auto; overflow-x: hidden;',
             '  box-shadow: 0 8px 32px rgba(0,0,0,0.5);',
             '  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;',
             '  font-size: 14px; line-height: 1.5;',
@@ -2343,16 +2361,33 @@ import { aihIconSvg } from "../aih_icons.js";
             '}',
             '.modal-prereq-body input:focus { border-color: #4a4aff; }',
             '',
-            '/* Grille des 3 étapes */',
-            '/* Hauteur préférée fixe : agrandir la modale profite aux logs, pas aux étapes. */',
-            '/* flex-shrink autorisé pour rester propre sous 480 px de hauteur de panneau. */',
+            '/* Grille des 3 étapes — HAUTEUR FIXE ET IDENTIQUE pour les trois cadres. */',
+            '/* La hauteur des cadres ne dépend plus de leur contenu : elle est imposée par',
+            '   grid-auto-rows ET reprise explicitement par chaque .modal-step (valeurs à',
+            '   garder ÉGALES entre les deux règles — c\'est vérifié par les tests). */',
+            '/* Pourquoi une hauteur FIXE et pas un simple min-height : le cadre contient',
+            '   déjà un corps défilable (.modal-step-body : flex 1 + overflow-y auto) et une',
+            '   tête/pied non compressibles, donc rien ne peut être écrasé ; un min-height',
+            '   laisserait au contraire la grille se dimensionner sur le contenu (hauteurs',
+            '   différentes d\'une étape à l\'autre, mise en page qui saute). Le contenu trop',
+            '   long (aide, listes, bandeau d\'erreur, log) défile DANS le cadre au lieu de',
+            '   l\'étirer. */',
+            '/* flex: 0 0 auto : ouvrir « Connexion », agrandir les logs ou redimensionner le',
+            '   panneau ne comprime plus la zone des étapes ; c\'est le panneau qui devient',
+            '   défilable (overflow-y: auto sur .modal-settings-panel). */',
             '.modal-steps {',
-            '  flex: 0 1 auto; height: 420px; min-height: 220px;',
+            '  flex: 0 0 auto;',
+            '  grid-auto-rows: 420px;',
+            '  height: 420px;',
             '  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;',
             '  padding: 14px 18px;',
             '}',
             '.modal-step {',
             '  display: flex; flex-direction: column;',
+            '  /* Hauteur imposée À TOUS les cadres (identique) : aucun contenu ne peut la',
+            '     faire varier ; box-sizing évite que les 2 px de bordure la dépassent et',
+            '     overflow: hidden garantit que rien ne s\'échappe du cadre. */',
+            '  height: 420px; box-sizing: border-box; overflow: hidden;',
             '  min-height: 0; min-width: 0;',
             '  background: #232327; border: 1px solid #38383d; border-radius: 10px;',
             '}',
@@ -2376,10 +2411,56 @@ import { aihIconSvg } from "../aih_icons.js";
             '}',
             '.modal-step-badge.ok { color: #6fcf7f; border-color: #2f4a34; }',
             '.modal-step-badge.warn { color: #e0a94a; border-color: #4a3f2a; }',
+            '/* Corps = la SEULE zone qui absorbe le contenu : il prend la place restante',
+            '   dans la hauteur fixe du cadre et défile (overflow-y: auto). min-height: 0 est',
+            '   indispensable : sans lui, un contenu long imposerait sa hauteur au cadre et',
+            '   le ferait grandir. */',
             '.modal-step-body {',
-            '  flex: 1; min-height: 0; overflow-y: auto;',
+            '  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;',
             '  display: flex; flex-direction: column; gap: 8px;',
             '  padding: 10px 12px;',
+            '}',
+            '',
+            '/* Indicateur « il y a du contenu plus bas » (posé par attachScrollHint).',
+            '   ANCRAGE : un élément collant de HAUTEUR NULLE, dernier enfant du',
+            '   conteneur défilant. Hauteur nulle = il n\'ajoute RIEN au contenu',
+            '   défilable ; `position: sticky` le colle au bas de la zone visible et il',
+            '   devient le bloc conteneur du dégradé + du chevron (position absolue, qui',
+            '   eux ne défilent donc pas avec le contenu — contrairement à un enfant',
+            '   absolu d\'un conteneur défilant). Aucune couleur en dur : tokens du pack',
+            '   avec repli sur la palette locale. */',
+            '.modal-scroll-hint-anchor {',
+            '  position: sticky; bottom: 0; z-index: 1;',
+            '  flex: 0 0 auto; height: 0;',
+            '  pointer-events: none;',
+            '}',
+            '/* Masqué par DÉFAUT : la classe d\'état .is-visible (posée en JS d\'après',
+            '   scrollHeight/clientHeight/scrollTop) est la seule chose qui l\'affiche.',
+            '   pointer-events: none : il ne capte JAMAIS un clic (ni sélection, ni',
+            '   glisser de la poignée de redimensionnement). */',
+            '.modal-scroll-hint {',
+            '  position: absolute; left: 0; right: 0; bottom: 0; height: 26px;',
+            '  display: none; align-items: flex-end; justify-content: center;',
+            '  padding-bottom: 3px;',
+            '  pointer-events: none; user-select: none; cursor: default;',
+            '  color: var(--aih-text-secondary, #a0a0a0);',
+            '  background: linear-gradient(to bottom, var(--aih-scroll-hint-from, rgba(26, 26, 30, 0)), var(--aih-scroll-hint-to, rgba(26, 26, 30, 0.92)));',
+            '}',
+            '.modal-scroll-hint.is-visible { display: flex; }',
+            '.modal-scroll-hint svg { display: block; }',
+            '/* Mouvement (chevron qui respire) UNIQUEMENT si l\'utilisateur accepte les',
+            '   animations : avec prefers-reduced-motion: reduce, l\'indicateur reste',
+            '   purement statique (aucune animation, aucune transition). */',
+            '@media (prefers-reduced-motion: no-preference) {',
+            '  .modal-scroll-hint.is-visible svg { animation: modal-scroll-hint-bob 1.8s ease-in-out infinite; }',
+            '}',
+            '@keyframes modal-scroll-hint-bob {',
+            '  0%, 100% { transform: translateY(0); opacity: 0.7; }',
+            '  50% { transform: translateY(3px); opacity: 1; }',
+            '}',
+            '@media (prefers-reduced-motion: reduce) {',
+            '  .modal-scroll-hint,',
+            '  .modal-scroll-hint.is-visible svg { animation: none; transition: none; }',
             '}',
             '.modal-step-foot {',
             '  flex-shrink: 0; display: flex; flex-direction: column; gap: 7px;',
@@ -2531,12 +2612,15 @@ import { aihIconSvg } from "../aih_icons.js";
             '/* Écrans étroits : les étapes s\'empilent verticalement */',
             '@media (max-width: 900px) {',
             '  .modal-prereq.open .modal-prereq-body { grid-template-columns: 1fr; }',
-            '  /* Étapes empilées : hauteur bornée par la place disponible, scroll interne. */',
+            '  /* Étapes empilées : MÊME hauteur fixe pour chaque cadre (260 px), zone des',
+            '     étapes bornée par la place disponible avec scroll interne — les cadres ne',
+            '     s\'étirent donc ni sur le contenu ni les uns les autres. */',
             '  .modal-steps {',
             '    grid-template-columns: 1fr; overflow-y: auto;',
-            '    height: auto; max-height: 55vh; min-height: 200px;',
+            '    grid-auto-rows: 260px;',
+            '    height: auto; max-height: 55vh; min-height: 0;',
             '  }',
-            '  .modal-step { min-height: 260px; }',
+            '  .modal-step { height: 260px; }',
             '  .modal-logs { flex: 1 1 auto; min-height: 120px; }',
             '}',
             '',
@@ -2624,6 +2708,65 @@ import { aihIconSvg } from "../aih_icons.js";
         } else {
             el.textContent = label + ' : ' + (ok ? '✅' : '❌');
         }
+    }
+
+    /**
+     * Renseigne un badge de DATE d'opération (« ⏳ Jamais » si la valeur est
+     * absente).
+     * @param {string} id - id de l'élément (`status-sync`, `status-deploy`…).
+     * @param {string|null|undefined} value - date ISO de la dernière opération.
+     */
+    function setDateBadge(id, value) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = value ? '✅ ' + value : '⏳ Jamais';
+        el.className = 'val ' + (value ? 'ok' : 'muted');
+    }
+
+    /**
+     * Re-rend les badges de date des opérations (sync modèles / déploiement /
+     * sync user) depuis la config renvoyée par GET /api/modal/config.
+     *
+     * Extrait de la construction de la modale pour pouvoir être rappelé SEUL :
+     * seuls ces trois badges sont réécrits, donc la position de défilement et
+     * les champs en cours de saisie sont préservés (aucun re-render global).
+     *
+     * @param {object} config - config de ComfyCH (clés `last_*`).
+     */
+    function renderOperationBadges(config) {
+        var cfg = config || {};
+        setDateBadge('status-sync', cfg.last_sync);
+        setDateBadge('status-deploy', cfg.last_deploy);
+        setDateBadge('status-user-sync', cfg.last_user_sync);
+    }
+
+    /**
+     * Rafraîchit l'ÉTAT AFFICHÉ après la fin d'une opération (deploy / sync /
+     * restart / build), SANS fermer ni rouvrir la modale.
+     *
+     * Pourquoi : le serveur n'écrit la date de l'opération qu'à la FIN (code 0),
+     * donc une modale déjà ouverte gardait l'ancienne valeur (« ⏳ Jamais »)
+     * jusqu'à sa réouverture. On relit la config et on ne réécrit que les
+     * badges concernés (dates + pastilles + badges d'étapes + manifeste des
+     * nodes) : le reste du DOM n'est pas touché.
+     *
+     * Sans élément affiché (modale fermée), chaque mise à jour est un no-op.
+     *
+     * @returns {Promise<void>}
+     */
+    async function refreshOperationState() {
+        try {
+            var resp = await fetch('/api/modal/config');
+            if (resp.ok) {
+                renderOperationBadges(await resp.json());
+            }
+        } catch (e) {
+            // Réseau instable : l'état déjà affiché reste en place.
+        }
+        // Pastilles du header, badges d'étapes et bandeau d'auth.
+        refreshStatus();
+        // Badge + hint de l'étape 2 (nodes réellement présents sur le volume).
+        await fetchInstalledNodes();
     }
 
     /**
@@ -3070,8 +3213,9 @@ import { aihIconSvg } from "../aih_icons.js";
             btn.textContent = originalLabel;
             appendLogLine('ℹ️ Opération terminée (le flux de logs n\'a pas signalé la fin)');
             showNotification('ℹ️ ' + opLabel + ' terminé — voir logs', 'info');
-            setTimeout(refreshStatus, 500);
-            if (operation === 'sync-custom-nodes') fetchInstalledNodes();
+            // État affiché (dates, statut, compteurs) remis à jour SANS
+            // fermer/rouvrir la modale.
+            setTimeout(refreshOperationState, 500);
         }
 
         btn.disabled = true;
@@ -3162,19 +3306,17 @@ import { aihIconSvg } from "../aih_icons.js";
                         '✅ ' + opLabel + ' réussi !',
                         'success'
                     );
-                    // Rafraîchir le statut
-                    setTimeout(refreshStatus, 1000);
-                    // Un sync de nodes vient de réécrire le manifeste local :
-                    // rafraîchir les badges « déjà installé » (volume réel).
-                    if (operation === 'sync-custom-nodes') {
-                        fetchInstalledNodes();
-                    }
                 } else {
                     showNotification(
                         '❌ ' + opLabel + ' échoué — voir logs',
                         'error'
                     );
                 }
+                // Dans les DEUX cas : relire l'état (les dates ne changent
+                // qu'en cas de succès, mais les indicateurs — volume, nodes
+                // installés — peuvent avoir bougé). Uniquement les badges
+                // concernés : ni le scroll ni les champs ne sont touchés.
+                setTimeout(refreshOperationState, 1000);
             });
 
             eventSource.onerror = function () {
@@ -3259,6 +3401,144 @@ import { aihIconSvg } from "../aih_icons.js";
             console.warn('Modal Gateway: could not extract workflow info', e);
             return null;
         }
+    }
+
+    // ─── Indicateur « il y a du contenu plus bas » ───────────────────────────
+
+    /**
+     * Marge (px) de tolérance avant de considérer qu'on est « arrivé en bas ».
+     *
+     * Elle sert AUSSI de seuil d'affichage : un débordement plus petit que cette
+     * marge (arrondi de mise en page, gap résiduel de l'ancre) ne mérite pas un
+     * indicateur — il ferait clignoter le chevron pour trois pixels cachés.
+     * @type {number}
+     */
+    var SCROLL_HINT_MARGE = 12;
+
+    /**
+     * Ajoute à un conteneur DÉFILANT un indicateur discret « il y a du contenu
+     * plus bas » : un dégradé subtil + un chevron `chevron-down` de la façade
+     * `js/aih_icons.js` (jamais un emoji), affiché SEULEMENT s'il reste du
+     * contenu sous la zone visible.
+     *
+     * Principe : l'élément ajouté est une ANCRE de hauteur nulle, en
+     * `position: sticky; bottom: 0`, dernier enfant du conteneur. Elle ne
+     * participe pas à la hauteur du contenu défilable, se colle au bas de la
+     * zone visible et porte (en position absolue) le dégradé et le chevron —
+     * ceux-ci ne défilent donc pas avec le contenu, ce qu'un enfant absolu d'un
+     * conteneur défilant ferait. La visibilité est une CLASSE D'ÉTAT posée en JS
+     * (jamais un `background-attachment: local` ou autre bidouille CSS) : elle
+     * est donc observable et testable.
+     *
+     * Recalculs : au défilement du conteneur, au redimensionnement de la fenêtre,
+     * au changement de taille de la zone (ResizeObserver) ET au changement de
+     * contenu (MutationObserver : une opération ajoute des lignes de statut, un
+     * log arrive…). Aucune hauteur n'est mémorisée : la géométrie est relue à
+     * chaque fois, donc le zoom et le redimensionnement suivent tout seuls.
+     *
+     * L'indicateur est purement décoratif : `aria-hidden` (aucun sens porté par
+     * une icône seule) et `pointer-events: none` — il n'intercepte jamais un clic,
+     * ni la molette, ni le glisser d'une poignée placée dessous.
+     *
+     * @param {HTMLElement} scroller - Conteneur défilant (`overflow-y: auto`).
+     * @param {{margin?: number}} [opts] - Marge de tolérance en px.
+     * @returns {{el: HTMLElement, update: Function, destroy: Function}|null}
+     *   Contrôleur, ou null si le conteneur n'est pas exploitable.
+     */
+    function attachScrollHint(scroller, opts) {
+        var o = opts || {};
+        if (!scroller || typeof scroller.appendChild !== 'function') return null;
+        // Idempotent : rappeler la fonction sur le même conteneur rend le
+        // contrôleur existant (jamais deux indicateurs dans le DOM).
+        if (scroller.__aihScrollHint) return scroller.__aihScrollHint;
+
+        var margin = (typeof o.margin === 'number' && o.margin >= 0)
+            ? o.margin
+            : SCROLL_HINT_MARGE;
+
+        var anchor = document.createElement('div');
+        anchor.className = 'modal-scroll-hint-anchor';
+        anchor.setAttribute('aria-hidden', 'true');
+
+        var hint = document.createElement('div');
+        hint.className = 'modal-scroll-hint';
+        hint.setAttribute('aria-hidden', 'true');
+        hint.setAttribute('data-aih-icon', 'chevron-down');
+        // Icône de la FAÇADE du pack. Nom inconnu → chaîne vide (dégradation
+        // sûre) : le dégradé seul reste un indicateur acceptable.
+        var chevron = aihIconSvg('chevron-down', { size: 14 });
+        if (chevron) hint.innerHTML = chevron;
+
+        anchor.appendChild(hint);
+        scroller.appendChild(anchor);
+
+        /** Géométrie relue à chaque fois (aucune hauteur mémorisée). */
+        function geometry() {
+            return {
+                content: Number(scroller.scrollHeight) || 0,
+                view: Number(scroller.clientHeight) || 0,
+                top: Number(scroller.scrollTop) || 0,
+            };
+        }
+
+        /**
+         * Recalcule la visibilité de l'indicateur.
+         * @returns {boolean} true si l'indicateur est affiché.
+         */
+        function update() {
+            var g = geometry();
+            // `view > 0` : conteneur réellement mis en page. Masqué (ou pas encore
+            // mesuré), il n'y a rien à signaler.
+            var overflowing = g.view > 0 && g.content > g.view + margin;
+            var atEnd = (g.top + g.view) >= (g.content - margin);
+            var visible = overflowing && !atEnd;
+            // On ne touche au DOM que si l'état change (défilement = appel fréquent).
+            if (hint.classList.contains('is-visible') !== visible) {
+                hint.classList.toggle('is-visible', visible);
+            }
+            return visible;
+        }
+
+        function onScroll() { update(); }
+        function onResize() { update(); }
+
+        scroller.addEventListener('scroll', onScroll, { passive: true });
+        window.addEventListener('resize', onResize);
+
+        // Changement de TAILLE de la zone (fenêtre, panneau redimensionné).
+        var ro = null;
+        if (typeof ResizeObserver === 'function') {
+            try {
+                ro = new ResizeObserver(onResize);
+                ro.observe(scroller);
+            } catch (_) { ro = null; }
+        }
+        // Changement de CONTENU (statut, log, liste re-rendue) : sans lui, le
+        // chevron resterait absent alors que du contenu vient d'être ajouté.
+        var mo = null;
+        if (typeof MutationObserver === 'function') {
+            try {
+                mo = new MutationObserver(onResize);
+                mo.observe(scroller, { childList: true, subtree: true, characterData: true });
+            } catch (_) { mo = null; }
+        }
+
+        var handle = {
+            el: hint,
+            update: update,
+            /** Retire l'indicateur et TOUS ses écouteurs (fermeture de la modale). */
+            destroy: function () {
+                try { scroller.removeEventListener('scroll', onScroll); } catch (_) {}
+                try { window.removeEventListener('resize', onResize); } catch (_) {}
+                if (ro) { try { ro.disconnect(); } catch (_) {} }
+                if (mo) { try { mo.disconnect(); } catch (_) {} }
+                if (anchor.parentNode) anchor.parentNode.removeChild(anchor);
+                try { delete scroller.__aihScrollHint; } catch (_) {}
+            },
+        };
+        try { scroller.__aihScrollHint = handle; } catch (_) { /* DOM figé */ }
+        update();
+        return handle;
     }
 
     /**
@@ -3355,17 +3635,20 @@ import { aihIconSvg } from "../aih_icons.js";
             '        <div class="modal-divider"></div>',
             '        <div class="modal-row"><span>📁 User settings locaux</span><span class="val muted" id="status-user-settings">⏳ Vérification...</span></div>',
             '        <div class="modal-row"><span>🔄 Dernière sync user</span><span class="val muted" id="status-user-sync">⏳ Jamais</span></div>',
-            '        <div class="modal-hint">Les workflows, clés API et préférences UI sont copiés vers le volume. Un redémarrage du worker est nécessaire pour appliquer les changements.</div>',
-            // Le bouton de redémarrage ENCHAÎNE toujours sync → redémarrage :
-            // le worker ne recopie le volume dans user/ qu'au démarrage du
-            // container (redémarrer d'abord relirait l'ANCIEN volume).
-            '        <div class="modal-row"><span>♻️ Worker Modal</span><span class="val"><button id="cfg-run-restart-worker" class="modal-btn modal-btn--sm" title="Synchronise les fichiers locaux vers le volume, PUIS redémarre le worker (ordre imposé : le worker ne relit le volume qu\'au démarrage)">♻️ Redémarrer</button></span></div>',
-            '        <div class="modal-hint">« Redémarrer » enchaîne une sync puis l\'arrêt des containers : dans cet ordre, parce que le worker ne relit le volume <code>user/</code> qu\'au démarrage du container.</div>',
+            // Le bouton de redémarrage (dans le PIED de l'étape, toujours visible)
+            // ENCHAÎNE toujours sync → redémarrage : le worker ne recopie le volume
+            // dans user/ qu'au démarrage du container (redémarrer d'abord relirait
+            // l'ANCIEN volume). L'explication reste ici, dans le corps défilant.
+            '        <div class="modal-hint">Les workflows, clés API et préférences UI sont copiés vers le volume : « 💾 Sync user settings » les envoie, puis « ♻️ Redémarrer le worker » (en bas de l\'étape) enchaîne une sync et l\'arrêt des containers — dans cet ordre, parce que le worker ne relit le volume <code>user/</code> qu\'au démarrage du container.</div>',
             '        <div class="modal-row"><span>🖥️ Logs du worker (ComfyUI)</span><span class="val"><button id="cfg-worker-logs" class="modal-btn modal-btn--sm" title="Tracebacks d\'import des custom nodes, dépendances manquantes, erreurs réseau">🖥️ Voir</button></span></div>',
             '      </div>',
             '      <div class="modal-step-foot">',
             '        <button id="cfg-run-deploy" class="modal-btn modal-btn--primary modal-btn--wide">🚀 Déployer</button>',
             '        <button id="cfg-sync-user" class="modal-btn modal-btn--wide">👤 Sync user settings</button>',
+            // Redémarrage : action TERTIAIRE (sync puis arrêt des containers), d'où
+            // `modal-btn--sm` ; pleine largeur (`--wide`) comme ses voisines pour ne
+            // jamais déborder de la colonne, même en fenêtre étroite.
+            '        <button id="cfg-run-restart-worker" class="modal-btn modal-btn--wide modal-btn--sm" title="Synchronise les fichiers locaux vers le volume, PUIS redémarre le worker (ordre imposé : le worker ne relit le volume qu\'au démarrage)">♻️ Redémarrer le worker</button>',
             '      </div>',
             '    </div>',
             '    <div class="modal-step">',
@@ -3439,6 +3722,31 @@ import { aihIconSvg } from "../aih_icons.js";
         var isDragging = false;
         var dragOffsetX = 0;
         var dragOffsetY = 0;
+
+        // ── Indicateur « il y a du contenu plus bas » ────────────────────
+        // Posé sur CHAQUE zone défilante de la modale : les 3 corps d'étape
+        // (une colonne = un corps) et, en dernier recours, le panneau lui-même
+        // (il ne défile que si la hauteur choisie ne suffit plus). Les
+        // contrôleurs sont détruits à la fermeture : écouteurs et observateurs
+        // ne survivent pas à l'overlay.
+        var scrollHints = [];
+        var hintTargets = overlay.querySelectorAll('.modal-step-body');
+        for (var hintIdx = 0; hintIdx < hintTargets.length; hintIdx++) {
+            var hintCtl = attachScrollHint(hintTargets[hintIdx]);
+            if (hintCtl) scrollHints.push(hintCtl);
+        }
+        if (panel) {
+            var panelHintCtl = attachScrollHint(panel);
+            if (panelHintCtl) scrollHints.push(panelHintCtl);
+        }
+
+        /** Retire les indicateurs et leurs écouteurs (fermeture de la modale). */
+        function detachScrollHints() {
+            for (var i = 0; i < scrollHints.length; i++) {
+                try { scrollHints[i].destroy(); } catch (_) { /* déjà retiré */ }
+            }
+            scrollHints = [];
+        }
 
         // Handlers document nommés : ils sont retirés à la fermeture de la
         // modale, sinon chaque ouverture laisse deux listeners orphelins qui
@@ -3527,6 +3835,7 @@ import { aihIconSvg } from "../aih_icons.js";
         overlay.querySelector('.modal-settings-close').onclick = function () {
             detachModalDragListeners();
             detachPanelResizeListeners();
+            detachScrollHints();
             window._modalSettingsOpen = false;
             overlay.remove();
         };
@@ -4349,22 +4658,10 @@ import { aihIconSvg } from "../aih_icons.js";
             };
         }
 
-        // Badges de date (sync / deploy / user sync)
-        var syncBadge = document.getElementById('status-sync');
-        if (syncBadge) {
-            syncBadge.textContent = config.last_sync ? '✅ ' + config.last_sync : '⏳ Jamais';
-            syncBadge.className = 'val ' + (config.last_sync ? 'ok' : 'muted');
-        }
-        var deployBadge = document.getElementById('status-deploy');
-        if (deployBadge) {
-            deployBadge.textContent = config.last_deploy ? '✅ ' + config.last_deploy : '⏳ Jamais';
-            deployBadge.className = 'val ' + (config.last_deploy ? 'ok' : 'muted');
-        }
-        var userSyncBadge = document.getElementById('status-user-sync');
-        if (userSyncBadge) {
-            userSyncBadge.textContent = config.last_user_sync ? '✅ ' + config.last_user_sync : '⏳ Jamais';
-            userSyncBadge.className = 'val ' + (config.last_user_sync ? 'ok' : 'muted');
-        }
+        // Badges de date (sync / deploy / user sync) : rendus par une fonction
+        // dédiée afin de pouvoir être rafraîchis après une opération sans
+        // reconstruire la modale (cf. refreshOperationState).
+        renderOperationBadges(config);
 
         // Badge de l'étape 2 — custom nodes réellement présents sur le volume
         // comfy-custom-nodes (manifeste écrit par sync.py).

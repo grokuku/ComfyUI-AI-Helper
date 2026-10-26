@@ -38,6 +38,43 @@ Chemins historiques (encore lus tant que la migration n'a pas eu lieu) :
 
 ---
 
+## Résolution des dossiers ComfyUI (dont `user/`) hors ComfyUI
+
+`comfych_paths.py` est le **seul** endroit qui sait où vivent `user/`,
+`models/`, `output/` et `custom_nodes/`. Chaque dossier est résolu par une liste
+**ordonnée de candidats** dont on ne retient que le **premier qui existe
+réellement** :
+
+1. env explicite `AIH_COMFY_USER_DIR` (dossier `user/` seulement — pour une
+   disposition particulière ou un `--user-directory` exotique) ;
+2. `folder_paths` — **uniquement s'il est importable** (donc dans le processus
+   de ComfyUI) : `get_user_directory()`, `get_output_directory()`,
+   `get_folder_paths("custom_nodes")`, dossier parent de `checkpoints` ;
+3. **walk-up** depuis le dossier du code : le dossier cherché est un **frère**
+   de `custom_nodes` (`…/ComfyUI/{user,models,output}` à côté de
+   `…/ComfyUI/custom_nodes`) ;
+4. `holaf_user_paths.get_comfy_user_dir()` (même référence que le reste du
+   pack), puis `~/.config/comfyui` — **dernier recours accepté seulement s'il
+   existe**.
+
+⚠️ **Ne jamais réintroduire un repli non vérifié.** `modal run sync.py` (et tout
+script du module) tourne dans un **processus séparé** de ComfyUI, où
+`folder_paths` n'est pas importable : la version précédente y retombait sur
+`~/.config/comfyui` **sans vérifier son existence**, annonçait « local user/
+directory not found », puis affichait quand même `✅ Sync terminée !` et sortait
+en **code 0** — le gateway croyait la sync réussie et redémarrait le worker sur
+un volume inchangé.
+
+Aujourd'hui, un dossier introuvable produit un **échec bruyant** :
+`first_existing_or_raise()` lève `ComfyPathNotFound`, `sync.py` affiche le
+message (avec **tous** les chemins essayés et le remède `AIH_COMFY_USER_DIR`)
+puis `sys.exit(1)`. Le code de retour non nul est lu par le gateway
+(`_run_sequence_inner`), qui **annule** les étapes suivantes : le redémarrage du
+worker n'a donc pas lieu. Verrouillé par
+`tests/test_comfych_user_dir_resolution.py` (4 mutants).
+
+---
+
 ## Import automatique de l'ancienne configuration
 
 Au démarrage, **si la cible est absente** et qu'un ancien `config.json` de
@@ -146,6 +183,38 @@ contrôles inerte — un clic sur son libellé doit faire quelque chose de visib
 Un clic **dans** les contrôles (sélecteur GPU, ⚙, badge de file) garde son
 comportement propre et n'ouvre jamais la modale par ricochet ; le menu reste
 ouvert dans tous les cas.
+
+### Cadres d'étapes à hauteur fixe (mise en page stable)
+
+Les trois cadres d'étape de la modale de réglages (`.modal-step` : Build,
+Nodes, Modèles) ont une **hauteur fixe et identique** (420 px en disposition
+large, 260 px quand les étapes s'empilent sous 900 px de fenêtre). Le CSS est
+**injecté par le module** (`injectModalStyles()`, `js/comfych/modal_gateway.js`),
+il n'y a pas de feuille dédiée.
+
+**Ce qui faisait sauter la mise en page** : la zone des étapes était en
+`flex: 0 1 auto` et la grille se dimensionnait sur son contenu. Déplier
+« Connexion », agrandir la zone de logs ou réduire le panneau **comprimait** les
+cadres (mesuré : 385 px → 255 px), et le contenu était coupé au milieu d'une
+ligne.
+
+**Arbitrage — hauteur FIXE plutôt que `min-height`** : chaque cadre contient
+déjà une tête et un pied non compressibles (`flex-shrink: 0`) et un **corps
+défilable** (`.modal-step-body`, `flex: 1`, `min-height: 0`,
+`overflow-y: auto`) — rien ne peut donc être écrasé. Un `min-height` aurait au
+contraire laissé la grille se dimensionner sur le contenu (hauteurs différentes
+d'une étape à l'autre, exactement le défaut à corriger). Le contenu trop long
+(aide, listes, bandeau d'erreur, log) défile **dans** le cadre.
+
+**Conséquence assumée** : les cadres ne se comprimant plus, c'est le **panneau**
+qui devient défilable (`overflow-y: auto`) quand il est trop court. Agrandir la
+modale profite toujours aux logs (`flex: 1 1 auto`, plancher 150 px).
+
+**Ne pas réintroduire** : `height: auto` sur `.modal-step`, un `min-height`
+variable sur les cadres, `flex: 0 1 auto` sur `.modal-steps`, ou un corps sans
+`min-height: 0` / `overflow-y: auto`. Verrouillé par
+`js/test_comfych_step_frames.mjs` (4 états × 4 mutants) ; les valeurs de la
+grille (`grid-auto-rows`) et des cadres doivent rester **égales**.
 
 ### Pièges corrigés dans le menu (ne pas les réintroduire)
 

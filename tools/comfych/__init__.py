@@ -1513,8 +1513,22 @@ if PromptServer is not None:
         # ── GET /api/modal/user-settings/status ──
         async def get_user_settings_status(request):
             # Dossier user de ComfyUI : MÊME référence que le reste du pack
-            # (holaf_user_paths.get_comfy_user_dir, qui gère --user-directory).
-            user_dir = _paths.user_dir()
+            # (folder_paths.get_user_directory, qui gère --user-directory).
+            # ``user_dir()`` EXIGE un dossier existant : hors ComfyUI (aucun
+            # candidat réel), il lève et on renvoie le diagnostic complet —
+            # jamais un chemin inexistant présenté comme valide.
+            try:
+                user_dir = _paths.user_dir()
+            except _paths.ComfyPathNotFound as exc:
+                return web.json_response({
+                    "exists": False,
+                    "path": "",
+                    "error": str(exc),
+                    "tried": [
+                        {"source": source, "path": str(path)}
+                        for source, path in exc.candidates
+                    ],
+                })
             if not user_dir.is_dir():
                 return web.json_response({"exists": False, "path": str(user_dir)})
             total_files = 0

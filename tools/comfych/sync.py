@@ -20,12 +20,27 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
-import modal
+# Le dossier du script sur sys.path AVANT les imports frères : ``modal run``
+# importe ce fichier par chemin, et les modules du pack (helpers, models,
+# comfych_paths) doivent être résolvables de façon déterministe.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
+import modal
+from comfych_paths import (  # bootstrap sys.path ci-dessus
+    ComfyPathNotFound,
+    custom_nodes_dir_candidates,
+    first_existing,
+    first_existing_or_raise,
+    models_dir_candidates,
+    user_dir_candidates,
+)
 from helpers import (
     download_external_model,
     get_hf_secrets,
@@ -56,13 +71,30 @@ _MB = 1024 * 1024
 
 # ── Filtrage / garde-fous de l'archive des custom nodes ──────────────────
 
-# Ce script EST dans le dossier du projet ComfyCH (custom_nodes/ComfyCH) : le
-# nom est donc déduit du chemin, sans constante « ComfyCH » à maintenir.
-PROJECT_ROOT_NAME = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+# Ce script vit dans le dossier du projet ComfyCH. Deux dispositions existent :
+#   custom_nodes/ComfyCH/                → le dossier du script EST le projet ;
+#   custom_nodes/<pack>/tools/comfych/    → le projet est le GRAND-PARENT (pack).
+# Déduire le nom du seul parent du script donnait « comfych » dans le second
+# cas : le pack lui-même n'était alors plus exclu de sa propre archive.
+PROJECT_ROOT_NAME = (
+    _SCRIPT_DIR.parents[1].name if _SCRIPT_DIR.parent.name == "tools" else _SCRIPT_DIR.name
+)
 
 # Dossiers de custom_nodes/ qui ne sont PAS des nodes : le gateway lui-même et
 # le dossier de données ComfyUI.
 EXCLUDED_NODE_NAMES = {"user", PROJECT_ROOT_NAME}
+
+
+def _contains_gateway_code(entry) -> bool:
+    """True si *entry* contient le CODE de ComfyCH (donc n'est pas un node).
+
+    Indépendant de tout nom de dossier : couvre les deux dispositions (node à
+    plat ``custom_nodes/ComfyCH`` ou imbriqué ``custom_nodes/<pack>/tools``).
+    """
+    try:
+        return _SCRIPT_DIR == Path(entry).resolve() or _SCRIPT_DIR.is_relative_to(Path(entry).resolve())
+    except (OSError, ValueError):
+        return False
 
 # Dossiers techniques ignorés où qu'ils soient dans l'arbre d'un node.
 # Les noms sont comparés en minuscules (cf. :func:`_dir_exclusion_reason`).
@@ -335,16 +367,19 @@ _SKIP_MEDIA_FILE = "média de démonstration"
 _SKIP_LARGE_IMAGE = "image volumineuse"
 
 
-def _node_skip_reason(name: str) -> str | None:
+def _node_skip_reason(name: str, entry=None) -> str | None:
     """Raison d'exclure le dossier *name* de custom_nodes/, ou ``None``.
 
-    Le gateway lui-même (``PROJECT_ROOT_NAME``) et ``user`` ne sont pas des
+    Le gateway lui-même (``PROJECT_ROOT_NAME``, et tout dossier contenant son
+    code — cf. :func:`_contains_gateway_code`) et ``user`` ne sont pas des
     nodes ; les dossiers techniques (``__pycache__``, ``.git``…) et les dossiers
     cachés de bookkeeping du volume (``.staging``…) non plus. Les radicaux de
     contenu (:data:`CONTENT_DIR_STEMS`) ne s'appliquent PAS ici : un node peut
     légitimement s'appeler ``ComfyUI-Workflows``.
     """
     if name == PROJECT_ROOT_NAME:
+        return "gateway ComfyCH (code déjà présent dans l'image)"
+    if entry is not None and _contains_gateway_code(entry):
         return "gateway ComfyCH (code déjà présent dans l'image)"
     if name in EXCLUDED_NODE_NAMES:
         return "données ComfyUI, pas un custom node"
@@ -362,7 +397,7 @@ def _select_node_dirs(custom_nodes_dir) -> tuple[list, list]:
     for entry in sorted(Path(custom_nodes_dir).iterdir()):
         if not entry.is_dir():
             continue
-        reason = _node_skip_reason(entry.name)
+        reason = _node_skip_reason(entry.name, entry)
         if reason:
             skipped.append((entry.name, reason))
         else:
@@ -689,8 +724,6 @@ def _archive_exclusion_summary_lines(stats: dict) -> list[str]:
 
 # ── Read config.json for local models to sync ────────────────────────────
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-
 # Le config.json de ComfyCH ne vit PLUS dans le dossier du code : il passe par
 # holaf_user_paths (arborescence utilisateur du pack AI-Helper). Un `modal run`
 # est un PROCESSUS SÉPARÉ : il doit lire/écrire EXACTEMENT le même fichier que
@@ -739,32 +772,22 @@ if _CONFIG_PATH.exists():
 
 # ── Find local ComfyUI models directory ──────────────────────────────────
 
-def _local_models_candidates() -> list:
-    """Dossiers models/ à essayer, du plus fiable au plus historique.
+def _require_models_dir() -> Path:
+    """``models/`` local EXISTANT, ou échec explicite (code de sortie ≠ 0).
 
-    D'abord folder_paths (via comfych_paths) : correct MÊME quand ComfyCH est
-    imbriqué dans le pack (tools/comfych) ; ensuite les déductions de position
-    d'origine (repli hors ComfyUI).
+    Un dossier introuvable ne doit JAMAIS se traduire par un sync « réussi » :
+    les modèles sélectionnés ne seraient simplement pas poussés, et l'UI
+    afficherait quand même une réussite. Toute la logique de résolution vit
+    dans :func:`comfych_paths.models_dir_candidates` (folder_paths → walk-up →
+    dossier du code), et le message d'échec liste TOUS les chemins essayés.
     """
-    candidates = []
-    try:  # pragma: no cover - dépend de l'environnement d'exécution
-        from comfych_paths import models_dir as _models_dir
-
-        candidates.append(Path(_models_dir()))
-    except Exception:  # noqa: BLE001, S110 — repli sur les déductions de position
-        pass
-    candidates.extend([
-        _SCRIPT_DIR.parent.parent / "models",  # custom_nodes/ComfyCH -> ComfyUI -> models
-        _SCRIPT_DIR.parent / "models",         # if at project root
-    ])
-    return candidates
+    return first_existing_or_raise("models/", models_dir_candidates())
 
 
-local_models_dir: Path | None = None
-for candidate in _local_models_candidates():
-    if candidate.is_dir():
-        local_models_dir = candidate
-        break
+# Dossier ``models/`` local s'il EXISTE (``None`` sinon). Déterminé au
+# chargement pour l'affichage, mais l'étape 1 exige un dossier réel via
+# :func:`_require_models_dir` — un chemin inexistant n'est jamais utilisé.
+local_models_dir: Path | None = first_existing(models_dir_candidates())
 
 # ── Build image (minimal) ─────────────────────────────────────────────
 # Local models are NO LONGER baked into the image — they are uploaded in
@@ -1187,6 +1210,29 @@ def _select_user_setting_files(
     return selected
 
 
+# ── Échec explicite ───────────────────────────────────────────────────
+
+
+def _fail(message: str, error=None) -> None:
+    """Termine le script en ÉCHEC EXPLICITE (code de sortie 1).
+
+    Point unique de sortie en erreur : un dossier introuvable ne doit jamais
+    être suivi d'un « ✅ terminé » ni d'un code 0. Le gateway lit le code de
+    retour de ``modal run`` (``_run_cmd`` → ``_run_sequence_inner``), qui
+    ANNULES les étapes suivantes (le redémarrage du worker n'a donc pas lieu).
+
+    Le message liste TOUS les chemins essayés quand *error* est un
+    :class:`ComfyPathNotFound` — c'est ce qui rend le diagnostic immédiat.
+    """
+    print(f"\n{'='*60}", flush=True)
+    print(f"❌ {message}", flush=True)
+    if error is not None:
+        print(f"{error}", flush=True)
+    print(f"{'='*60}", flush=True)
+    print("Aucune autre étape n'a été exécutée.", flush=True)
+    raise SystemExit(1)
+
+
 # ── Local entrypoint: orchestrate the full sync ──────────────────────────
 
 
@@ -1200,71 +1246,77 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
     """
 
     def _sync_user_settings() -> None:
-        """Step 3 — upload the local ``user/`` directory to its Volume."""
+        """Step 3 — upload the local ``user/`` directory to its Volume.
+
+        ÉCHEC BRUYANT : un dossier ``user/`` introuvable sort en code ≠ 0 (voir
+        :func:`_fail`) — jamais un « ✅ Sync terminée ! ». Sinon le worker
+        redémarrerait en relisant un volume INCHANGÉ, et les réglages locaux
+        seraient écrasés par les anciens, en silence.
+        """
         print(f"\n{'='*60}")
         print(f"👤 Syncing user settings to volume")
         print(f"{'='*60}\n")
 
         user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
 
-        # Dossier user/ de ComfyUI : résolu comme le fait le reste du pack
-        # (folder_paths.get_user_directory, --user-directory géré), avec repli
-        # sur la déduction historique de position.
-        try:  # pragma: no cover - dépend de l'environnement d'exécution
-            from comfych_paths import user_dir as _user_dir_path
+        # Dossier user/ de ComfyUI : résolution du module (env explicite →
+        # folder_paths si importable → WALK-UP depuis le code → holaf_user_paths
+        # → ~/.config/comfyui seulement s'il existe). Hors ComfyUI (``modal
+        # run`` est un processus séparé), seul le walk-up est fiable : c'est
+        # lui qui donne ``…/ComfyUI/user``.
+        try:
+            user_dir = first_existing_or_raise("user/", user_dir_candidates())
+        except ComfyPathNotFound as exc:
+            _fail("Sync des réglages utilisateur IMPOSSIBLE", exc)
 
-            user_dir = Path(_user_dir_path())
-        except Exception:  # noqa: BLE001 — repli : disposition historique
-            user_dir = Path(__file__).resolve().parent.parent.parent / "user"
-        if user_dir.is_dir():
-            # Bases SQLite incluses (réglages des custom nodes) : elles sont
-            # copiées via l'API backup et non par une simple copie de fichier.
-            files_to_upload = _select_user_setting_files(user_dir)
-            dbs = sum(1 for f in files_to_upload if _is_sqlite_file(f))
+        # Bases SQLite incluses (réglages des custom nodes) : elles sont
+        # copiées via l'API backup et non par une simple copie de fichier.
+        files_to_upload = _select_user_setting_files(user_dir)
+        dbs = sum(1 for f in files_to_upload if _is_sqlite_file(f))
 
-            print(
-                f"📁 Uploading {len(files_to_upload)} user setting file(s)"
-                f" (dont {dbs} base(s) SQLite)…",
-                flush=True,
-            )
+        print(f"📁 Dossier user/ local : {user_dir}", flush=True)
+        print(
+            f"📁 Uploading {len(files_to_upload)} user setting file(s)"
+            f" (dont {dbs} base(s) SQLite)…",
+            flush=True,
+        )
 
-            uploaded = 0
-            skipped = 0
-            # Dossier de travail des snapshots SQLite : nettoyé quoi qu'il
-            # arrive, il ne doit jamais rester de copie de base sur disque.
-            tmp_root = Path(tempfile.mkdtemp(prefix="comfych-user-sync-"))
-            # Un SEUL batch_upload pour tous les fichiers : chaque
-            # ``with user_vol.batch_upload()`` ouvre une session réseau, la
-            # rouvrir par fichier rendait l'upload très lent.
-            try:
-                with user_vol.batch_upload() as batch:
-                    for index, f in enumerate(files_to_upload):
-                        rel_path = f.relative_to(user_dir)
-                        if _is_sqlite_file(f):
-                            entries = _prepare_sqlite_upload(
-                                f, rel_path, tmp_root / f"db{index}"
-                            )
-                        else:
-                            entries = [(f, rel_path)]
-                        for src_file, dest_rel in entries:
-                            try:
-                                batch.put_file(str(src_file), f"/{dest_rel}")
-                                uploaded += 1
-                            except FileExistsError:
-                                skipped += 1
-            except FileExistsError:
-                # Batch refusé d'emblée (ex. conflit signalé hors put_file)
-                skipped += 1
-            finally:
-                shutil.rmtree(tmp_root, ignore_errors=True)
+        uploaded = 0
+        skipped = 0
+        # Dossier de travail des snapshots SQLite : nettoyé quoi qu'il
+        # arrive, il ne doit jamais rester de copie de base sur disque.
+        tmp_root = Path(tempfile.mkdtemp(prefix="comfych-user-sync-"))
+        # Un SEUL batch_upload pour tous les fichiers : chaque
+        # ``with user_vol.batch_upload()`` ouvre une session réseau, la
+        # rouvrir par fichier rendait l'upload très lent.
+        try:
+            with user_vol.batch_upload() as batch:
+                for index, f in enumerate(files_to_upload):
+                    rel_path = f.relative_to(user_dir)
+                    if _is_sqlite_file(f):
+                        entries = _prepare_sqlite_upload(
+                            f, rel_path, tmp_root / f"db{index}"
+                        )
+                    else:
+                        entries = [(f, rel_path)]
+                    for src_file, dest_rel in entries:
+                        try:
+                            batch.put_file(str(src_file), f"/{dest_rel}")
+                            uploaded += 1
+                        except FileExistsError:
+                            skipped += 1
+        except FileExistsError:
+            # Batch refusé d'emblée (ex. conflit signalé hors put_file)
+            skipped += 1
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
-            print(f"✅ User settings synced to volume ({uploaded} uploaded, {skipped} already present)")
-        else:
-            print(f"❌ Local user/ directory not found at {user_dir}")
+        print(f"✅ User settings synced to volume ({uploaded} uploaded, {skipped} already present)")
 
     # ── User settings only mode ────────────────────────────────────────
     if sync_user_only:
         _sync_user_settings()
+        # Ce bloc n'est atteint QUE si l'étape 3 a réussi (_fail sort avant).
         print(f"\n{'='*60}")
         print("✅ Sync terminée !")
         print(f"{'='*60}")
@@ -1280,10 +1332,17 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         print("🧩 Syncing custom nodes to volume", flush=True)
         print(f"{'='*60}\n", flush=True)
 
-        custom_nodes_dir = _SCRIPT_DIR.parent  # ComfyUI/custom_nodes
-        if not custom_nodes_dir.is_dir():
-            print(f"❌ Custom nodes directory not found: {custom_nodes_dir}", flush=True)
-            return
+        # Dossier custom_nodes : résolu par comfych_paths (folder_paths →
+        # walk-up → position du pack). L'ancienne déduction
+        # ``_SCRIPT_DIR.parent`` visait ``<pack>/tools`` dans le pack : elle
+        # « trouvait » un dossier (tools/) et n'y voyait aucun node — échec
+        # silencieux.
+        try:
+            custom_nodes_dir = first_existing_or_raise(
+                "custom_nodes/", custom_nodes_dir_candidates()
+            )
+        except ComfyPathNotFound as exc:
+            _fail("Sync des custom nodes IMPOSSIBLE", exc)
 
         print(f"📦 Packaging des custom nodes depuis {custom_nodes_dir}…", flush=True)
 
@@ -1294,8 +1353,7 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
             print(f"  ⊘ {name} exclu ({reason})", flush=True)
         print(f"  → {len(node_dirs)} node(s) inclus", flush=True)
         if not node_dirs:
-            print("❌ Aucun custom node à synchroniser", flush=True)
-            return
+            _fail(f"Aucun custom node à synchroniser dans {custom_nodes_dir}")
 
         # Tailles calculées AVANT le packaging : sert au résumé et au diagnostic
         # en cas d'archive trop volumineuse.
@@ -1321,8 +1379,8 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
 
             too_big = _archive_too_big_message(size_bytes, node_sizes)
             if too_big:
-                print(too_big, flush=True)
-                return
+                # Refus explicite : l'archive n'est PAS poussée (code ≠ 0).
+                _fail(too_big)
 
             names = [Path(d).name for d in node_dirs]
             print(
@@ -1369,14 +1427,23 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         print(f"📦 Step 1: Uploading {len(models_to_sync)} local model(s) to Volume")
         print(f"{'='*60}\n")
 
+        # Dossier ``models/`` local : EXIGÉ existant. Sans lui, chaque modèle
+        # sélectionné était annoncé « not found » puis le script sortait en
+        # code 0 — l'UI affichait une réussite pour un upload inexistant.
+        try:
+            models_root = _require_models_dir()
+        except ComfyPathNotFound as exc:
+            _fail("Sync des modèles IMPOSSIBLE", exc)
+        print(f"📁 Dossier models/ local : {models_root}", flush=True)
+
         results = {}
 
         for model in models_to_sync:
             filename = model["filename"]
             model_dir = model["model_dir"]
 
-            model_path = (local_models_dir / model_dir / filename) if local_models_dir else None
-            if model_path is None or not model_path.exists():
+            model_path = models_root / model_dir / filename
+            if not model_path.exists():
                 print(f"  ❌ Local model not found: {model_path}")
                 results[filename] = {"ok": False, "error": "not found locally"}
                 continue
@@ -1431,7 +1498,9 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
                 print(f"  {status} {filename}: {error}")
 
         if fail_count > 0:
-            print(f"\n⚠️ {fail_count} file(s) failed to upload!")
+            # Échec BRUYANT : des modèles sélectionnés n'ont pas été poussés.
+            # Un code 0 ferait croire à une sync complète côté gateway.
+            _fail(f"{fail_count} fichier(s) n'ont pas pu être uploadés")
 
     else:
         print("\nℹ️ No local models selected in config.json")
@@ -1446,6 +1515,9 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
     # ── Step 3: Sync user settings to volume ───────────────────────────────
     _sync_user_settings()
 
+    # Ce bloc n'est atteint QUE si toutes les étapes ont réussi : _fail() sort
+    # en code 1 avant (étape 3 comprise), ce qui annule le redémarrage du
+    # worker côté gateway.
     print(f"\n{'='*60}")
     print("✅ Sync terminée !")
     print(f"{'='*60}")

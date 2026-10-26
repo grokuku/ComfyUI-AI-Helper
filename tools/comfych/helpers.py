@@ -115,8 +115,11 @@ def get_hf_secrets() -> list[modal.Secret]:
     2. ``HF_TOKEN`` environment variable (fallback).
     3. Empty token (public models still work, gated models will fail).
 
-    When neither a Modal Secret nor a local env var is set a warning is
-    printed to stderr.
+    When neither a Modal Secret nor a local env var is set, an INFORMATIONAL
+    note is printed (never an error): the sync works without it, only the
+    download bandwidth of public models is reduced. The wording avoids
+    ``Warning:`` on purpose — this line lands in the middle of sync logs and
+    used to look like the cause of an unrelated failure.
     """
     try:
         s = modal.Secret.from_name("huggingface-secret")
@@ -126,8 +129,11 @@ def get_hf_secrets() -> list[modal.Secret]:
         token = os.environ.get("HF_TOKEN", "")
         if not token:
             print(
-                "Warning: no Modal Secret 'huggingface-secret' and no HF_TOKEN env. "
-                "Public models will download with throttled bandwidth; "
-                "gated models will fail."
+                "ℹ️  Infos (aucune action requise) : pas de Secret Modal "
+                "'huggingface-secret' ni de HF_TOKEN — les modèles publics se "
+                "téléchargent avec un débit réduit, les modèles sous licence "
+                "(gated) nécessitent un token. Cela n'affecte NI le déploiement "
+                "NI la sync des réglages/custom nodes.",
+                flush=True,
             )
         return [modal.Secret.from_dict({"HF_TOKEN": token})]
