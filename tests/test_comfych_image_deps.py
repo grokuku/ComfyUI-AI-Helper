@@ -481,3 +481,40 @@ def test_stamp_layer_is_last_and_after_pip_installs(image_module, fake_tree, mon
         and any(str(c).startswith("pip install") for c in payload)
     )
     assert last_pip < len(kinds) - 1, "les pip doivent précéder l'empreinte"
+
+
+# ---------------------------------------------------------------------------
+# §7 ComfyUI-Manager n'est PAS cuit dans l'image (il « revenait » à chaque run)
+#
+# Bug vécu : « j'ai essayé de virer ComfyUI-Manager mais il s'est réinstallé »
+# + boucle de `manager_core.InvalidChannel: https://raw.githubusercontent.com/
+# ltdrdata/ComfyUI-Manager/main` et `Cannot connect to comfyregistry`.
+# Cause : `comfy install` installe ComfyUI-Manager PAR DÉFAUT (son option
+# inverse est `--skip-manager`), donc il était dans l'IMAGE. Supprimer le
+# dossier localement ou sur le volume `comfy-custom-nodes` n'y changeait rien :
+# chaque conteneur repartait de l'image.
+# ---------------------------------------------------------------------------
+def test_comfy_install_n_embarque_pas_le_manager(image_module, monkeypatch):
+    """MUTANT « `comfy install` sans --skip-manager » : Manager réinstallé."""
+    monkeypatch.delenv(image_module.INSTALL_MANAGER_ENV, raising=False)
+    command = image_module._comfy_install_command()
+    assert command.startswith("comfy "), command
+    assert "--skip-manager" in command, (
+        "sans --skip-manager, ComfyUI-Manager est cuit dans l'image et revient "
+        f"à chaque conteneur : {command}"
+    )
+    # Le reste de la commande (installation ComfyUI + drivers NVIDIA) est
+    # inchangé : on ne désactive QUE le Manager.
+    assert "--skip-prompt" in command and "--nvidia" in command, command
+
+
+def test_manager_reinstallable_par_variable_d_environnement(image_module, monkeypatch):
+    """Échappatoire documentée : `COMFYCH_INSTALL_MANAGER=1` (ancien comportement)."""
+    monkeypatch.setenv(image_module.INSTALL_MANAGER_ENV, "1")
+    assert image_module._install_manager() is True
+    command = image_module._comfy_install_command()
+    assert "--skip-manager" not in command, command
+    # Une valeur vide / fausse ne réactive rien (jamais de surprise au déploiement).
+    for value in ("", "0", "no", "off", "false"):
+        monkeypatch.setenv(image_module.INSTALL_MANAGER_ENV, value)
+        assert image_module._install_manager() is False, value

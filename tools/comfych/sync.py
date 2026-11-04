@@ -114,6 +114,39 @@ pas un node — il est exclu de la sélection.
 # found »).
 EXCLUDED_NODE_NAMES = {"user"}
 
+# ── Nodes volontairement ABSENTS du worker (bruit, aucun usage) ──────────
+#
+# ComfyUI-Manager : `comfy install` l'installe **par défaut** (option inverse
+# ``--skip-manager``), donc il était cuit dans l'image ET, s'il existait dans le
+# ``custom_nodes`` local, poussé sur le volume par ce sync. D'où le symptôme
+# « je l'ai viré mais il revient » : le retirer de la machine ne nettoyait ni
+# l'image ni le volume. Sur un worker Modal il n'a AUCUN usage (aucune
+# installation interactive de nodes : l'image se reconstruit) et il produit au
+# démarrage le bruit `manager_core.InvalidChannel:
+# https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main`.
+DISABLED_NODE_NAMES = {
+    "comfyui-manager",
+    "comfyui-manager-main",
+    "comfyui-manager-master",
+}
+"""Noms de dossiers (minuscules) jamais synchronisés sur le volume worker."""
+
+DISABLED_NODES_ENV = "COMFYCH_DISABLED_NODES"
+"""Liste séparée par des virgules qui REMPLACE ``DISABLED_NODE_NAMES``."""
+
+
+def disabled_node_names() -> set[str]:
+    """Noms de nodes à ne pas synchroniser (défaut : ComfyUI-Manager).
+
+    ``COMFYCH_DISABLED_NODES=`` (vide) réactive tout ; ``COMFYCH_DISABLED_NODES=
+    foo,bar`` remplace la liste par défaut — jamais de fusion, pour qu'un
+    réglage explicite soit prévisible.
+    """
+    raw = os.environ.get(DISABLED_NODES_ENV)
+    if raw is None:
+        return set(DISABLED_NODE_NAMES)
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
 
 def _is_gateway_code_dir(entry) -> bool:
     """True si *entry* EST le dossier du code du gateway (jamais un node).
@@ -445,6 +478,13 @@ def _node_skip_reason(name: str, entry=None) -> str | None:
         return "gateway ComfyCH (code du gateway : embarqué dans l'image)"
     if name in EXCLUDED_NODE_NAMES:
         return "données ComfyUI, pas un custom node"
+    if name.lower() in disabled_node_names():
+        # Retiré À LA SOURCE : c'est cette exclusion qui coupe la
+        # réapparition (image et volume), cf. ``DISABLED_NODE_NAMES``.
+        return (
+            "node désactivé pour le worker Modal (inutile au rendu ; "
+            f"réglage {DISABLED_NODES_ENV})"
+        )
     reason = _dir_exclusion_reason(name, node_root=True)
     if reason is not None:
         return reason

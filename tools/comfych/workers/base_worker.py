@@ -62,6 +62,37 @@ stdout/stderr de ComfyUI dans notre log (le wrapper ``comfy launch
 COMFY_CUSTOM_NODES_DIR = COMFY_ROOT / "custom_nodes"
 """Dossier scanné par ComfyUI — une seule fois, à son démarrage."""
 
+# ── Nodes volontairement ABSENTS du worker (même liste que ``sync.py``) ──
+#
+# ComfyUI-Manager est posé par ``comfy install`` lui-même (défaut de comfy-cli,
+# cf. ``image.py:_comfy_install_command``) : il était donc dans l'IMAGE, et
+# ressortait à chaque container même après suppression locale (« je l'ai viré
+# mais il est encore là »). Sur un worker Modal il n'a aucun usage (aucune
+# installation interactive de nodes) et il pollue le log au démarrage avec
+# ``manager_core.InvalidChannel …/ltdrdata/ComfyUI-Manager/main``.
+DISABLED_NODE_NAMES = {
+    "comfyui-manager",
+    "comfyui-manager-main",
+    "comfyui-manager-master",
+}
+"""Noms (minuscules) de custom nodes jamais chargés par le worker."""
+
+DISABLED_NODES_ENV = "COMFYCH_DISABLED_NODES"
+"""Liste séparée par des virgules qui REMPLACE ``DISABLED_NODE_NAMES``."""
+
+
+def disabled_node_names() -> set[str]:
+    """Noms de custom nodes à retirer du worker (défaut : ComfyUI-Manager).
+
+    Variable **absente** → défaut ; variable vide → plus aucun node désactivé
+    (échappatoire explicite, sans fusion surprenante avec le défaut).
+    """
+    raw = os.environ.get(DISABLED_NODES_ENV)
+    if raw is None:
+        return set(DISABLED_NODE_NAMES)
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
 USER_SETTINGS_VOLUME_PATH = Path("/user-settings")
 """Volume Modal qui porte le dossier ``user/`` local (réglages + bases SQLite)."""
 
@@ -143,6 +174,147 @@ def _compute_worker_build_id() -> str:
 WORKER_BUILD_ID = _compute_worker_build_id()
 """Empreinte du code **actuellement déployé** (voir ``WORKER_BUILD_ID_PATH``)."""
 
+JOB_API_VERSION = 2
+"""Version de l'API de rendu du worker (2 = « spawn + polling »).
+
+Le worker est le côté qui **fait vivre** le rendu : en v1 c'était le gateway
+qui polait ``/history`` depuis sa requête HTTP, donc une déconnexion du
+type client arrêtait le suivi et ``scaledown_window`` tuait ComfyUI en plein
+rendu. En v2 le rendu se suit LUI-MÊME (``run_job``) et persiste son
+résultat dans ``JOBS_VOLUME_DIR`` avant de répondre.
+
+Cette constante n'est pas décorative : associée à ``WORKER_BUILD_ID``, elle
+est imprimée au démarrage (``job_api_banner``) **et** écrite dans le manifeste de
+chaque job. C'est le seul moyen de savoir, en lisant le log ou le volume, si
+un rendu a tourné sur le bon code — sans ça, un worker encore en v1 produit
+le même message qu'un worker v2 en échec, et le diagnostic tourne en rond."""
+
+
+def job_api_banner(comfy_version: str | None = None) -> str:
+    """Ligne de version du worker, écrite à CHAQUE démarrage de conteneur.
+
+    Format volontairement grep-able (``spawn+polling: ON``) : c'est la réponse
+    à « est-ce que je teste bien le nouveau code ? ». ``ON`` = le rendu est
+    suivi par le worker (aucune dépendance à une connexion cliente) ;
+    l'absence de cette ligne signifie que le conteneur exécute un code
+    antérieur à ce marqueur, donc un ancien déploiement.
+
+    Elle porte aussi la **version de ComfyUI réellement installée** : l'image
+    installe la dernière (jamais épinglée, c'est le choix produit) donc cette
+    valeur ne peut pas être connue à l'avance — la seule façon de savoir ce qui
+    tourne est de l'imprimer.
+    """
+    version = comfy_version if comfy_version is not None else comfyui_version()
+    return (
+        f"worker build {WORKER_BUILD_ID} | ComfyUI {version or 'inconnu'} | "
+        f"spawn+polling=on | job API v{JOB_API_VERSION} | "
+        f"timeout={JOB_TIMEOUT_SECONDS:.0f}s ({'COMFYCH_JOB_TIMEOUT_S'})"
+    )
+
+
+# ── Journalisation HORODATÉE (UTC ISO 8601) et préfixée par job ─────────
+#
+# Sans horodatage, un log de worker est inexploitable : impossible de savoir si
+# une ligne vient du run en cours ou d'un run précédent (c'est exactement ce qui
+# a rendu le diagnostic du `503` à ~32 s si long). Chaque ligne ComfyCH porte
+# donc `2026-11-04T13:21:07.412Z [job 7f3a2c] …`.
+
+LOG_TAG = "[ComfyCH]"
+"""Préfixe commun à toutes les lignes produites par ComfyCH."""
+
+
+def utc_stamp(when: float | None = None) -> str:
+    """Horodatage UTC ISO 8601 à la milliseconde (``…T13:21:07.412Z``)."""
+    seconds = time.time() if when is None else float(when)
+    millis = int((seconds % 1) * 1000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{millis:03d}Z"
+
+
+def short_job_id(job_id: object) -> str:
+    """Identifiant de job COURT et stable, pour préfixer une ligne de log.
+
+    6 caractères alphanumériques des derniers caractères significatifs de
+    l'identifiant (``req-9f3a2c1b`` → ``3a2c1b``) : suffisant pour distinguer
+    deux runs côte à côte, et on retrouve l'identifiant complet dans les
+    messages de `run_job`. ``-`` quand il n'y a pas de job (démarrage, housekeeping).
+    """
+    text = "".join(c for c in str(job_id or "") if c.isalnum())
+    return text[-6:].lower() or "-"
+
+
+def comfych_log(
+    message: str,
+    job_id: object = "",
+    when: float | None = None,
+    path: Path | str | None = None,
+) -> str:
+    """Écrit une ligne ComfyCH horodatée **dans le log lisible par le pack**.
+
+    Le log du worker consultable depuis l'UI (`GET /api/modal/worker-logs`) est
+    ``COMFY_LOG_PATH`` (stdout de ComfyUI redirigée) : un ``print()`` va sur la
+    stdout du conteneur Modal et **n'y apparaît pas**. On écrit donc aux deux
+    endroits — l'un pour l'utilisateur, l'autre pour ``modal app logs``.
+
+    Returns
+    -------
+    str
+        La ligne écrite (sans le saut de ligne), utile en test.
+    """
+    line = f"{utc_stamp(when)} [job {short_job_id(job_id)}] {LOG_TAG} {message}"
+    log_path = Path(COMFY_LOG_PATH if path is None else path)
+    # Échec d'écriture ignoré : un log ne doit jamais casser un rendu.
+    _append_log_block(line + "\n", log_path)
+    print(line)
+    return line
+
+
+COMFYUI_VERSION_FILE = Path("/root/comfy/ComfyUI/comfyui_version.py")
+"""Fichier de version livré par ComfyUI (source de vérité dans l'image)."""
+
+COMFYUI_ROOT = Path("/root/comfy/ComfyUI")
+"""Racine de l'installation ComfyUI dans l'image du worker."""
+
+
+def comfyui_version(
+    version_file: Path | str | None = None,
+    root: Path | str | None = None,
+) -> str:
+    """Version de ComfyUI **réellement installée** dans l'image, ``inconnu`` sinon.
+
+    L'image n'épingle aucun tag (choix produit : toujours la dernière version),
+    donc la version n'est déterministe qu'à l'exécution. On la lit dans
+    ``comfyui_version.py`` (``__version__ = "0.3.x"``), avec repli sur le commit
+    git du checkout. Jamais d'exception : une version inconnue ne doit pas
+    empêcher un démarrage.
+    """
+    candidates = [Path(COMFYUI_VERSION_FILE if version_file is None else version_file)]
+    repo = Path(COMFYUI_ROOT if root is None else root)
+    candidates.append(repo / "comfyui_version.py")
+    for candidate in candidates:
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        match = re.search(r"__version__\s*=\s*[\"']([^\"']+)[\"']", text)
+        if match:
+            return match.group(1)
+
+    # Repli : commit du checkout (l'image est construite par ``comfy install``).
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            commit = (result.stdout or b"").decode(errors="replace").strip()
+            if commit:
+                return f"git {commit}"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "inconnu"
+
+
 COMFY_CLI_LOG_CANDIDATES = (
     Path("/root/comfy/ComfyUI/user/comfyui.log"),
     Path("/root/comfy/ComfyUI/comfyui.log"),
@@ -193,6 +365,33 @@ conteneur vivant même si plus aucun client n'écoute."""
 
 JOB_POLL_INTERVAL_SECONDS = float(os.environ.get("COMFYCH_JOB_POLL_S") or 2)
 """Intervalle (s) entre deux lectures de l'historique ComfyUI par le job."""
+
+def _env_seconds(name: str, default: float, minimum: float) -> float:
+    """Durée lue dans l'environnement, bornée (jamais 0 → pas de boucle folle)."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        print(f"[ComfyWorker] ⚠️ {name}={raw!r} invalide — valeur par défaut {default}")
+        return float(default)
+    return max(minimum, value)
+
+
+JOB_WATCHDOG_INTERVAL_SECONDS = _env_seconds("COMFYCH_JOB_WATCHDOG_S", 5, 0.05)
+"""Intervalle (s) de lecture de la progression ComfyUI par le chien de garde.
+
+C'est lui qui transforme un log qui « s'arrête net » en diagnostic : il écrit
+« aucune progression depuis N s (dernière étape X/Y) » **pendant** le rendu, avec
+horodatage, au lieu de laisser le lecteur deviner quand le silence a commencé."""
+
+JOB_STALL_WARN_SECONDS = _env_seconds("COMFYCH_JOB_STALL_S", 60, 0.1)
+"""Silence (s) au-delà duquel le chien de garde signale l'absence de progression.
+
+60 s couvre largement le chargement d'un modèle / VAE lent tout en restant
+utile : au-delà, c'est un blocage (VRAM, node figé, process mort) — et non plus
+un rendu qui travaille."""
 
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 """Forme d'un ``job_id`` utilisable comme nom de dossier (jamais de ``..``)."""
@@ -939,6 +1138,9 @@ class ComfyWorker:
         # ── 0. Graver l'empreinte du code dans le snapshot ──
         write_worker_build_id()
         print(f"[ComfyWorker] build id: {WORKER_BUILD_ID}")
+        # Marqueur de version lisible : « spawn+polling: ON » répond à « est-ce
+        # que ce conteneur exécute bien le code déployé ? » (voir job_api_banner).
+        comfych_log(job_api_banner())
         # Commit explicite : l'empreinte doit être durable sur le volume, c'est
         # elle que ``start_restore`` relira après restauration du snapshot.
         commit_log_volume()
@@ -1259,6 +1461,21 @@ class ComfyWorker:
             print("[ComfyWorker] /custom_nodes est vide — aucun node à lier")
             return 0
 
+        # ── Nettoyage IDEMPOTENT des nodes « à supprimer » ──────────────
+        # Deux sources possibles, toutes deux traitées ici :
+        #  1. le VOLUME (le sync les exclut désormais de l'archive, donc ils
+        #     disparaîssent au swap — mais un volume plus ancien peut encore
+        #     les porter) ;
+        #  2. l'IMAGE (``comfy install`` posait ComfyUI-Manager par défaut : il
+        #     est dans ``COMFY_CUSTOM_NODES_DIR``, pas sur le volume).
+        # Sans ce nettoyage, « node marqué à supprimer » ne se traduisait par
+        # AUCUNE suppression : c'était le bug rapporté.
+        disabled = disabled_node_names()
+        names = self._remove_disabled_nodes(names, comfy_path, disabled)
+        if not names:
+            print("[ComfyWorker] plus aucun custom node à lier")
+            return 0
+
         print(f"[ComfyWorker] Nodes trouvés sur le volume : {names}")
         if not INSTALL_NODE_DEPS_AT_STARTUP:
             print(
@@ -1300,6 +1517,55 @@ class ComfyWorker:
         except Exception as e:  # noqa: BLE001 — la mesure ne casse jamais le démarrage
             print(f"[ComfyWorker] ⚠️ top des nodes lents indisponible : {e}")
         return linked
+
+    def _remove_disabled_nodes(
+        self, names: list[str], comfy_path: Path, disabled: set[str]
+    ) -> list[str]:
+        """Supprime les nodes « à supprimer » (volume ET image), rend les restants.
+
+        Idempotent : ne fait rien si le node est absent, et loggue **une** ligne
+        par node réellement supprimé (horodatée), ce qui permet de vérifier
+        depuis l'UI que l'intention utilisateur a bien été appliquée.
+
+        Returns
+        -------
+        list[str]
+            Les noms restants (les nodes désactivés sont retirés de la liste).
+        """
+        if not disabled:
+            return names
+
+        kept: list[str] = []
+        for name in names:
+            if name.lower() not in disabled:
+                kept.append(name)
+                continue
+            # Dossier venu du volume : on ne le lie pas (et on retire un lien
+            # éventuel d'un démarrage précédent dans l'image).
+            self._remove_node_path(comfy_path / name, name)
+
+        # Copie ou lien laissé dans l'IMAGE par un ancien build/``comfy install``.
+        if comfy_path.is_dir():
+            for entry in sorted(comfy_path.iterdir()):
+                if entry.name.lower() in disabled:
+                    self._remove_node_path(entry, entry.name)
+        return kept
+
+    def _remove_node_path(self, path: Path, name: str) -> None:
+        """Retire *path* (lien ou dossier) s'il existe, en le logguant UNE fois."""
+        try:
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_dir():
+                import shutil
+
+                shutil.rmtree(path)
+            else:
+                return
+        except OSError as exc:
+            print(f"[ComfyWorker] ⚠️ suppression de {name} impossible : {exc}")
+            return
+        comfych_log(f"removed residual custom node: {name}")
 
     def _install_node_requirements(self, node_dir: Path) -> None:
         """Install a custom node's pip dependencies from its requirements.txt.
@@ -1369,6 +1635,10 @@ class ComfyWorker:
         # ── 1. Détecter un redéploiement (empreinte du snapshot vs actuelle) ──
         snapshot_build_id = read_worker_build_id()
         code_changed = snapshot_build_id != WORKER_BUILD_ID
+        # Le marqueur de version est écrit AVANT la comparaison : un conteneur
+        # restauré depuis un snapshot doit aussi dire quelle API il sert (c'est
+        # cette ligne qu'on cherche dans le log pour vérifier le déploiement).
+        comfych_log(job_api_banner())
         if code_changed:
             print(
                 f"[ComfyWorker] ⚠️ Code du worker modifié depuis le snapshot "
@@ -1607,12 +1877,21 @@ class ComfyWorker:
                 "started_at": started_at,
                 "budget": JOB_TIMEOUT_SECONDS + 60,
                 "worker_build_id": WORKER_BUILD_ID,
+                # Version d'API qui a produit ce job : un manifeste dit ainsi
+                # lui-même s'il vient du code « spawn + polling ».
+                "job_api_version": JOB_API_VERSION,
             },
         )
         commit_log_volume()
-        print(f"[ComfyWorker] Job {job} : démarrage du rendu")
+        comfych_log(
+            f"run DÉMARRÉ — prompt en préparation (build {WORKER_BUILD_ID}, "
+            f"budget {JOB_TIMEOUT_SECONDS:.0f}s)",
+            job,
+            when=started_at,
+        )
 
         prompt_id = ""
+        watchdog = None
         try:
             submitted = await self._submit_prompt(workflow)
             if submitted.get("error"):
@@ -1621,6 +1900,10 @@ class ComfyWorker:
             if not prompt_id:
                 raise RuntimeError("ComfyUI n'a renvoyé aucun prompt_id")
             write_job_state(job, {"status": "running", "prompt_id": prompt_id})
+            comfych_log(f"prompt accepté par ComfyUI : {prompt_id}", job)
+            # Chien de garde : c'est lui qui empêche le log de « s'arrêter net »
+            # sans explication (progression + raison de la mort du run).
+            watchdog = asyncio.create_task(self._watch_progress(job, prompt_id))
 
             entry = await self._wait_for_prompt(prompt_id, started_at)
             images = await self._collect_outputs(entry.get("outputs") or {})
@@ -1650,16 +1933,44 @@ class ComfyWorker:
                 },
             )
             commit_log_volume()
-            print(
-                f"[ComfyWorker] Job {job} : terminé en {elapsed:.1f}s — "
-                f"{len(images)} fichier(s), {persisted.get('bytes', 0)} octet(s) "
-                f"persistés dans {job_dir(job)}"
+            comfych_log(
+                f"run TERMINÉ en {elapsed:.1f}s — {len(images)} fichier(s), "
+                f"{persisted.get('bytes', 0)} octet(s) persistés dans {job_dir(job)}",
+                job,
             )
             return result
+        except asyncio.CancelledError:
+            # `CancelledError` n'est PAS une exception (BaseException) : sans ce
+            # bloc, le log s'arrêtait net et le manifeste restait « running » à
+            # vie — impossible de distinguer un conteneur arrêté d'un rendu
+            # planté. C'est la « raison exacte de la mort du run ».
+            elapsed = time.time() - started_at
+            comfych_log(
+                f"run ANNULÉ après {elapsed:.1f}s — entrée Modal annulée "
+                "(conteneur arrêté, préemption ou redéploiement) ; "
+                f"prompt {prompt_id or 'inconnu'}",
+                job,
+            )
+            try:
+                write_job_state(
+                    job,
+                    {
+                        "status": "failed",
+                        "prompt_id": prompt_id,
+                        "finished_at": time.time(),
+                        "elapsed": elapsed,
+                        "error": "run annulé (entrée Modal annulée : conteneur arrêté, "
+                        "préemption ou redéploiement)",
+                    },
+                )
+                commit_log_volume()
+            except Exception as state_exc:  # noqa: BLE001 — jamais masquer l'annulation
+                print(f"{LOG_TAG} manifeste non écrit après annulation : {state_exc}")
+            raise
         except Exception as exc:  # noqa: BLE001 — l'échec est un RÉSULTAT du job
             elapsed = time.time() - started_at
             message = f"{type(exc).__name__}: {exc}"
-            print(f"[ComfyWorker] Job {job} : échec après {elapsed:.1f}s — {message}")
+            comfych_log(f"run ÉCHOUÉ après {elapsed:.1f}s — {message}", job)
             write_job_state(
                 job,
                 {
@@ -1682,7 +1993,77 @@ class ComfyWorker:
                 "elapsed": elapsed,
                 "error": message,
             }
+        finally:
+            # Le chien de garde ne doit jamais survivre au run (sinon il
+            # continuerait à logger la progression d'un run terminé).
+            if watchdog is not None:
+                watchdog.cancel()
 
+    async def _read_progress(self, client) -> tuple[str, str]:
+        """``(libellé lisible, signature)`` de l'avancement ComfyUI courant.
+
+        Vide quand ComfyUI ne répond pas (process mort, conteneur arrêté) :
+        c'est une information en soi, pas une erreur silencieuse.
+        """
+        try:
+            resp = await client.get("http://127.0.0.1:8000/progress")
+            if resp.status_code != 200:
+                return (f"ComfyUI HTTP {resp.status_code}", f"http-{resp.status_code}")
+            data = resp.json() or {}
+        except (httpx.HTTPError, ValueError) as exc:
+            return (f"ComfyUI injoignable ({type(exc).__name__})", "")
+
+        value = data.get("value")
+        maximum = data.get("max")
+        node = data.get("node")
+        if maximum in (None, 0) or value is None:
+            return ("", "")
+        label = f"{value}/{maximum}"
+        if node is not None:
+            label += f" (node {node})"
+        return (label, f"{value}/{maximum}:{node}")
+
+    async def _watch_progress(self, job: str, prompt_id: str) -> None:
+        """Chien de garde du rendu : progression horodatée, jamais de silence.
+
+        Sans lui, un rendu qui se fige (VRAM saturée, node bloqué, process
+        ComfyUI tué) produit un log qui **s'arrête simplement** : impossible de
+        savoir *quand* le silence a commencé ni *à quelle étape*. Il écrit donc
+        une ligne d'absence de progression toutes les ``JOB_STALL_WARN_SECONDS``,
+        avec l'étape atteinte et l'état de ComfyUI.
+
+        Il est annulé par `run_job` (`finally`) dès que le rendu conclut.
+        """
+        # Bornes déjà appliquées à la définition (``_env_seconds``) : on les
+        # relit ici pour rester patchable en test sans boucle serrée.
+        interval = max(0.01, JOB_WATCHDOG_INTERVAL_SECONDS)
+        stall = max(0.01, JOB_STALL_WARN_SECONDS)
+        signature = None
+        changed_at = time.time()
+        warned_at = 0.0
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                while True:
+                    await asyncio.sleep(interval)
+                    label, value = await self._read_progress(client)
+                    now = time.time()
+                    if value != signature:
+                        signature = value
+                        changed_at = now
+                        continue
+                    silent = now - changed_at
+                    if silent >= stall and now - warned_at >= stall:
+                        warned_at = now
+                        state = label or "ComfyUI ne répond pas"
+                        comfych_log(
+                            f"aucune progression depuis {int(silent)}s "
+                            f"(dernière étape {state}) — prompt {prompt_id}",
+                            job,
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — le chien de garde ne casse rien
+            comfych_log(f"chien de garde arrêté ({type(exc).__name__}: {exc})", job)
     async def _wait_for_prompt(self, prompt_id: str, started_at: float) -> dict:
         """Attend la fin du prompt en interrogeant ComfyUI **en local**.
 

@@ -45,6 +45,48 @@ if _CONFIG_PATH.exists():
         pass
 
 
+# ── ComfyUI-Manager dans l'image ? (défaut : NON) ────────────────────────
+
+INSTALL_MANAGER_ENV = "COMFYCH_INSTALL_MANAGER"
+"""``1`` réinstalle ComfyUI-Manager dans l'image (défaut : absent)."""
+
+
+def _install_manager() -> bool:
+    """Faut-il laisser ``comfy install`` poser ComfyUI-Manager dans l'image ?
+
+    **Par défaut NON**, et c'est un correctif : ``comfy install`` installe
+    ComfyUI-Manager automatiquement (son option inverse est ``--skip-manager``).
+    Le worker embarquait donc le Manager DANS L'IMAGE, à
+    ``/root/comfy/ComfyUI/custom_nodes/ComfyUI-Manager``. Comme l'image est
+    réutilisée à chaque conteneur, supprimer le Manager **côté machine** ou
+    **du volume** ``comfy-custom-nodes`` n'avait aucun effet : il « revenait »
+    à chaque run (symptôme rapporté : « j'ai essayé de le virer mais il s'est
+    réinstallé »).
+
+    Ce qu'on perd en le retirant : rien pour un rendu — les nodes viennent du
+    volume (``base_worker._sync_custom_nodes_from_volume``) et leurs dépendances
+    pip sont cuites au build (``_requirements_entries``). Ce qu'on gagne : plus
+    de ``InvalidChannel https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main``
+    ni de ``Cannot connect to comfyregistry`` au démarrage (le conteneur Modal
+    n'a pas d'accès Internet sortant), donc un démarrage plus court et un log
+    lisible.
+
+    ``COMFYCH_INSTALL_MANAGER=1`` rétablit l'ancien comportement.
+    """
+    return (os.environ.get(INSTALL_MANAGER_ENV, "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _comfy_install_command() -> str:
+    """Commande d'installation de ComfyUI (avec ou sans ComfyUI-Manager)."""
+    flag = "" if _install_manager() else " --skip-manager"
+    return f"comfy --skip-prompt install --nvidia{flag}"
+
+
 # ── Paquets pip supplémentaires (dépendances optionnelles des nodes) ────
 
 # Même liste blanche que __init__.py (défense en profondeur : ``config.json``
@@ -366,7 +408,10 @@ def _build_image() -> modal.Image:
         # --nvidia`` (plusieurs minutes de build) à chaque déploiement.
         .apt_install("git", "git-lfs", "libgl1-mesa-dev", "libglib2.0-0", "aria2")
         .pip_install_from_requirements(str(root_dir / "requirements_comfy.txt"))
-        .run_commands("comfy --skip-prompt install --nvidia")
+        # ``comfy install`` installe ComfyUI-Manager PAR DÉFAUT : sans
+        # ``--skip-manager`` il est cuit dans l'image et « revient » à chaque
+        # conteneur, quoi qu'on supprime localement (voir ``_install_manager``).
+        .run_commands(_comfy_install_command())
         .run_commands("git lfs install")
     )
 

@@ -452,6 +452,13 @@ l'utilisateur** (`confirm: true`) ; sans confirmation, le serveur refuse (`409`,
 l'opération s'affichent dans le panneau de logs **existant** (SSE
 `/api/modal/logs/stream`).
 
+**Ce qu'un redémarrage ne fait PAS** : il ne publie pas de nouveau code. Le
+conteneur neuf exécute la **même définition d'application** (`gateway_router.py`,
+`base_worker.py` inchangés). Après une mise à jour du pack, il faut
+**« 🚀 Déployer »** ; sinon le worker loggue l'ancienne version (pas de ligne
+`spawn+polling: ON`) et l'extension refuse désormais de lancer un rendu long
+(voir la section 503 ci-dessous).
+
 ---
 
 ## Dépendances des custom nodes et « Deployment skipped »
@@ -542,12 +549,54 @@ endroit, ou il a été ajouté après la dernière sync).
 
 ### `ComfyUI-Manager: InvalidChannel https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main`
 
-**Bruit.** ComfyUI-Manager publie ses catalogues depuis une branche qui n'existe
-plus sous ce nom ; la version embarquée dans l'image tente l'ancienne URL et
-affiche cette erreur **une fois par tentative de rafraîchissement**. Cela
-n'affecte ni le chargement des nodes ni le rendu. Rien à corriger côté pack :
-mettre à jour `ComfyUI-Manager` dans `custom_nodes_ext` fait disparaître le
-message.
+**Bruit**, et désormais **supprimé à la source**. Ce n'est **pas** un problème
+réseau : sur le worker, `FETCH ComfyRegistry Data [DONE]` puis `default cache
+updated: https://api.comfy.org/nodes` montrent que le container a bien accès à
+Internet. L'erreur vient de ComfyUI-Manager V3.42 lui-même, qui **refuse ce
+format de `channel_url`** (`https://raw.githubusercontent.com/ltdrdata/
+ComfyUI-Manager/main`) : sa validation de *channel* attend le format actuel
+donc l'ancienne URL est déclarée `InvalidChannel`.
+
+**Pourquoi il « revenait » après suppression** (le vrai bug) : `comfy install`
+installe ComfyUI-Manager **par défaut** — son option inverse est
+`--skip-manager` (`tools/comfych/image.py:_comfy_install_command`). Il était donc
+cuit dans l'**IMAGE** (`/root/comfy/ComfyUI/custom_nodes/ComfyUI-Manager`) ; et
+si le dossier existait aussi dans le `custom_nodes` local, le **sync** l'envoyait
+sur le volume. Le supprimer à la main ne nettoyait donc ni l'image, ni le volume.
+
+**Réglage (et c'est le défaut maintenant)** :
+
+1. l'image est construite avec `--skip-manager` — le Manager n'est plus recréé ;
+2. le sync exclut les nodes marqués « à supprimer »
+   (`custom_nodes_disabled`, défaut `["ComfyUI-Manager"]`, transmis par
+   `COMFYCH_DISABLED_NODES`) : absents de l'archive, ils disparaissent du volume
+   au swap suivant ;
+3. au démarrage, le worker supprime ce qui resterait (volume **ou** image) et
+   logue une fois `[ComfyCH] removed residual custom node: ComfyUI-Manager`.
+
+Pour le réinstaller volontairement : `COMFYCH_INSTALL_MANAGER=1` au `modal
+deploy`, puis **« Déployer »** (un redémarrage ne reconstruit pas l'image).
+
+### `HTTP 503: Job interrompu (déconnexion client ou redéploiement)`
+
+Ce message n'existe **plus** dans le code (ni côté gateway, ni côté client) :
+s'il apparaît encore, le code déployé est **ancien**. Vérification en une
+requête, sans lancer de rendu :
+
+```bash
+curl -s https://<ton-gateway>.modal.run/health
+# v2 : {"status":"ok","api_version":2,"features":["spawn",…],"build":"…"}
+# v1 : {"status":"ok"}          ← ancien déploiement
+```
+
+Même information dans les logs : `[ComfyCH] gateway build … — spawn+polling: ON`
+(gateway) et `[ComfyCH] worker build … — spawn+polling: ON` (worker).
+
+**Piège** : « ♻️ Redémarrer le worker » fait `modal container stop` — il relance
+les conteneurs de l'application **déjà déployée** et ne publie donc **pas** le
+nouveau code. Seul **« 🚀 Déployer »** (`modal deploy`) le fait. Depuis ce
+correctif, l'extension sonde `/health` avant chaque rendu et **refuse** de
+lancer sur un gateway v1, en affichant « cliquez sur Déployer ».
 
 ### `base_path '…' resolves outside allowed directory '…'. Falling back.`
 

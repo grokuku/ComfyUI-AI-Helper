@@ -355,3 +355,57 @@ def test_manifeste_ecrit_de_facon_atomique(worker_module, jobs_root):
     assert first["status"] == "running"
     assert second["status"] == "done"
     assert not list((jobs_root / "job-atomic").glob("*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# §6 — la version du worker est LISIBLE (log + manifeste), donc vérifiable
+#
+# Bug vécu : après le correctif spawn+polling, le MÊME `503 Job interrompu`
+# est revenu à ~32 s. Le conteneur exécutait l'ancien code (« ♻️ Redémarrer le
+# worker » = `modal container stop`, qui ne publie PAS un nouveau code : seul
+# `modal deploy` le fait) et rien dans le log ne permettait de le voir.
+# ---------------------------------------------------------------------------
+def test_marqueur_de_version_spawn_polling(worker_module):
+    """Le log de démarrage doit dire « spawn+polling=on » (grep-able)."""
+    banner = worker_module.job_api_banner("0.3.60")
+    # MUTANT « marqueur retiré » : sans lui, impossible de distinguer « le
+    # correctif ne marche pas » de « le correctif n'est pas déployé ».
+    assert "spawn+polling=on" in banner, banner
+    assert worker_module.WORKER_BUILD_ID in banner, banner
+    assert f"job API v{worker_module.JOB_API_VERSION}" in banner, banner
+    # ComfyUI n'est JAMAIS épinglé (choix produit) : la version réellement
+    # installée doit donc être imprimée, sinon elle est invérifiable.
+    assert "ComfyUI 0.3.60" in banner, banner
+    assert "timeout=" in banner, banner
+    assert worker_module.JOB_API_VERSION >= 2
+
+
+def test_version_de_comfyui_lue_dans_l_image(worker_module, tmp_path):
+    """`comfyui_version()` lit la version livrée par ComfyUI (jamais épinglée)."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    version_file = tree / "comfyui_version.py"
+    version_file.write_text('__version__ = "0.3.61"\n')
+    assert worker_module.comfyui_version(version_file=version_file, root=tree) == "0.3.61"
+    # Absente ET pas de dépôt git → « inconnu » (jamais d'exception, jamais de
+    # démarrage cassé par un log de version).
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert worker_module.comfyui_version(
+        version_file=empty / "absent.py", root=empty
+    ) == "inconnu"
+
+
+def test_le_manifeste_d_un_job_dit_quelle_api_l_a_produit(
+    worker_module, jobs_root, monkeypatch
+):
+    """Traçabilité : un manifeste porte l'empreinte ET la version d'API."""
+    monkeypatch.setattr(_FakeAsyncClient, "handler", staticmethod(_handler_factory()))
+    monkeypatch.setattr(worker_module, "JOB_POLL_INTERVAL_SECONDS", 0.01)
+
+    asyncio.run(worker_module.ComfyWorker().run_job(WORKFLOW, "job-version"))
+    manifest = json.loads((jobs_root / "job-version" / "manifest.json").read_text())
+    assert manifest["worker_build_id"], "l'empreinte du worker doit être tracée"
+    # MUTANT « version non écrite » : on ne peut plus prouver, après coup, quel
+    # code a produit un résultat.
+    assert manifest["job_api_version"] == worker_module.JOB_API_VERSION

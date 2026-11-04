@@ -38,6 +38,8 @@ import types
 from pathlib import Path
 from typing import ClassVar
 
+import re
+
 import pytest
 
 PACKAGE_DIR = Path(__file__).resolve().parent.parent
@@ -504,3 +506,75 @@ def test_resolve_job_id(gateway):
     assert "/" not in resolve("../../etc/passwd")
     generated = resolve("")
     assert generated.startswith("job-") and len(generated) > 8
+
+
+# ---------------------------------------------------------------------------
+# §7 — la version déployée est VÉRIFIABLE sans lancer de rendu
+#
+# Bug vécu : après le correctif, le même `503 Job interrompu` est revenu —
+# parce que « ♻️ Redémarrer le worker » (`modal container stop`) relance les
+# conteneurs de l'application DÉJÀ déployée et ne publie donc pas le nouveau
+# code (`modal deploy` seul le fait). Rien ne permettait de voir laquelle des
+# deux versions répondait : ces tests verrouillent le marqueur.
+# ---------------------------------------------------------------------------
+def test_health_publie_la_version_d_api(gateway):
+    """`GET /health` dit `api_version` ≥ 2 : un gateway v1 n'a pas ce champ."""
+    body = body_of(asyncio.run(gateway.app.routes[("GET", "/health")]()))
+    assert body["status"] == "ok"
+    # MUTANT « /health reste {"status": "ok"} » : impossible de distinguer un
+    # gateway v1 d'un gateway v2 → le client relance des rendus condamnés.
+    assert body["api_version"] >= 2, body
+    assert "spawn" in body["features"]
+    assert "job-polling" in body["features"]
+    assert body["build"], "l'empreinte du build doit être publiée"
+
+
+def test_build_id_lu_dans_l_environnement(router_module, monkeypatch):
+    """Empreinte du code déployé : CI (`COMFYCH_BUILD_ID`) puis image (stamp)."""
+    monkeypatch.delenv("COMFYCH_BUILD_ID", raising=False)
+    monkeypatch.delenv("COMFYCH_DEPLOY_STAMP", raising=False)
+    assert router_module.gateway_build_id() == "dev"
+    monkeypatch.setenv("COMFYCH_DEPLOY_STAMP", "stamp-image-123")
+    assert router_module.gateway_build_id() == "stamp-image-123"
+    monkeypatch.setenv("COMFYCH_BUILD_ID", "ci-42")
+    assert router_module.gateway_build_id() == "ci-42", (
+        "un identifiant injecté par la CI doit primer sur l'empreinte d'image"
+    )
+
+
+def test_marqueur_de_version_imprime_au_demarrage(router_module, capsys):
+    """Le log du conteneur gateway dit QUELLE API il sert (grep-able)."""
+    router_module.build_router(
+        worker_map={"L4": FakeWorker}, cors_origins=["*"], title="t"
+    )
+    out = capsys.readouterr().out
+    # MUTANT « marqueur retiré » : plus aucun moyen de savoir, en lisant le
+    # log, si le conteneur exécute le code déployé ou un ancien.
+    assert "[ComfyCH] gateway build" in out, out
+    assert "spawn+polling=on" in out, out
+    assert f"API v{router_module.GATEWAY_API_VERSION}" in out, out
+    assert "timeout=" in out, out
+    # La ligne est HORODATÉE et préfixée par job : sans ça, impossible de
+    # savoir de quel run parle une ligne du log Modal.
+    line = [ln for ln in out.splitlines() if "[ComfyCH] gateway build" in ln][0]
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[job -\] \[Gateway\] ", line), line
+
+
+def test_aucune_route_ne_repond_503_job_interrompu():
+    """Le message du faux échec ne doit JAMAIS revenir dans le routeur.
+
+    C'était la signature du bug : `except asyncio.CancelledError` →
+    `JSONResponse({"error": "Job interrompu (déconnexion client ou
+    redéploiement)"}, status_code=503)`. Le rendu vit maintenant dans le
+    worker, aucune annulation de requête ne peut plus le décrire comme
+    interrompu.
+    """
+    source = ROUTER_FILE.read_text()
+    assert "status_code=503" not in source
+    # Le TEXTE peut apparaître dans la documentation (il raconte le bug) mais
+    # jamais dans un corps de réponse : c'est le payload qui compte.
+    assert '{"error": "Job interrompu' not in source
+    assert "'error': 'Job interrompu" not in source
+    assert "asyncio.CancelledError" not in source, (
+        "une annulation de requête ne doit plus être traduite en échec du job"
+    )

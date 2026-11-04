@@ -115,6 +115,9 @@ import { aihIconSvg } from "../aih_icons.js";
         /** Budget de la dernière tentative de récupération après coupure. */
         RECOVER_TIMEOUT_MS: 30000,
 
+        /** Budget du sondage `GET /health` (version d'API réellement déployée). */
+        HEALTH_TIMEOUT_MS: 8000,
+
         /** Intervalle entre les tentatives d'interception de l'API (en ms). */
         RETRY_INTERVAL: 800,
 
@@ -122,6 +125,80 @@ import { aihIconSvg } from "../aih_icons.js";
         MAX_RETRIES: 20,
 
     };
+
+    /* ─── Version d'API du gateway : refuser un rendu condamné ──────────────
+     *
+     * Le gateway publie `api_version` sur `GET /health` (v2 = « spawn +
+     * polling »). Le bouton « ♻️ Redémarrer le worker » exécute
+     * `modal container stop` : il relance les conteneurs de l'application
+     * DÉJÀ DÉPLOYÉE et ne peut donc pas mettre le code à jour.
+     *
+     * Conséquence vécue : un gateway resté en v1 lance le rendu dans la
+     * requête HTTP ; quand la requête (ou son suivi) disparaît,
+     * `scaledown_window` (30 s sur L4) arrête le conteneur GPU en plein
+     * rendu et le client reçoit un
+     * `503 « Job interrompu (déconnexion client ou redéploiement) »`
+     * impossible à interpréter — un rendu perdu plus tard. Sur un gateway v1
+     * on REFUSE donc de lancer, en donnant la marche à suivre (« Déployer »),
+     * au lieu de brûler du GPU sur un rendu qui sera coupé.
+     */
+    var GATEWAY_MIN_API_VERSION = 2;
+
+    /**
+     * Interroge `GET /health` pour connaître la version d'API déployée.
+     *
+     * Sondage **par rendu** (pas de cache de module) : un rendu dure des
+     * minutes, un aller-retour de quelques dizaines de millisecondes est
+     * négligeable, et cela évite qu'une valeur périmée survive à un
+     * redéploiement (le seul cas où la version change).
+     *
+     * @returns {Promise<{apiVersion: number, build: string, features: string[]}|null>}
+     *   ``null`` quand la version est INDÉTERMINABLE (route absente sur un
+     *   gateway ancien, CORS, réseau) : on ne bloque alors RIEN, le rendu se
+     *   comporte comme avant. On ne refuse que sur une version *connue* < 2.
+     */
+    async function probeGatewayApi() {
+        try {
+            var data = await modalJson('/health', null, CONFIG.HEALTH_TIMEOUT_MS);
+            var httpStatus = Number(data && data.__httpStatus) || 0;
+            // Un gateway v1 répond exactement `{"status": "ok"}` : `status`
+            // présent SANS `api_version` = v1. Toute autre forme inattendue
+            // reste « inconnue » (on ne bloque pas sur une supposition).
+            if (data && httpStatus < 400 && typeof data.status === 'string') {
+                var declared = Number(data.api_version);
+                return {
+                    apiVersion: isFinite(declared) && declared > 0 ? declared : 1,
+                    build: String(data.build || ''),
+                    features: Array.isArray(data.features) ? data.features : [],
+                };
+            }
+        } catch (err) {
+            console.warn('Modal Gateway: /health indisponible (' + (err && err.message) + ')');
+        }
+        return null;
+    }
+
+    /**
+     * Erreur « gateway déployé obsolète » : nomme la CAUSE et l'ACTION.
+     *
+     * @param {{apiVersion: number}|null} api - Résultat de ``probeGatewayApi``.
+     * @returns {Error} erreur marquée ``staleGateway`` + ``noRetry``.
+     */
+    function staleGatewayError(api) {
+        var err = new Error(
+            t(
+                'comfych.run.staleGateway',
+                'Gateway Modal obsolète (API v{version}) : ce rendu long serait coupé '
+                    + 'au bout de ~30 s (scaledown_window) et son résultat perdu. '
+                    + 'Cliquez sur « Déployer » dans ComfyCH — « ♻️ Redémarrer le worker » '
+                    + 'ne met PAS le code à jour.',
+                { version: (api && api.apiVersion) || 1 }
+            )
+        );
+        err.staleGateway = true;
+        err.noRetry = true;
+        return err;
+    }
 
     // ─── Mode de rendu : ÉTAT EN MÉMOIRE (jamais forcé dans un fichier) ────
     // Valeur effective lue par l'interception de queuePrompt. Elle démarre
@@ -882,6 +959,22 @@ import { aihIconSvg } from "../aih_icons.js";
             t('comfych.run.uploading', 'Transfert des fichiers vers {gpu}…', { gpu: gpu })
         );
         try {
+            // Gateway v1 ? Le rendu serait attaché à la requête HTTP et coupé
+            // par scaledown_window : on refuse AVANT d'engager du GPU, avec la
+            // marche à suivre (« Déployer »). Indéterminé (null) = on continue.
+            var api = await probeGatewayApi();
+            if (api && api.apiVersion < GATEWAY_MIN_API_VERSION) {
+                RunMonitor.appendLines([
+                    t(
+                        'comfych.run.staleGatewayLog',
+                        '✖ Gateway déployé = API v{version} (build {build}) : le découplage '
+                            + 'spawn+polling est ABSENT. Rendu non lancé — cliquez sur '
+                            + '« Déployer » (le redémarrage du worker ne recharge pas le code).',
+                        { version: api.apiVersion, build: api.build || 'inconnu' }
+                    )
+                ]);
+                throw staleGatewayError(api);
+            }
             var enrichedWorkflow = await encodeLocalImages(item.workflow);
 
             // Extract API-format prompt from new ComfyUI format
@@ -1197,6 +1290,9 @@ import { aihIconSvg } from "../aih_icons.js";
     async function recoverCloudResult(item, err) {
         if (!item || (!item.jobId && !item.requestId)) return null;
         if (err && err.jobFailed) return null; // échec RÉEL : ne rien masquer
+        // Gateway obsolète : il n'a NI `/job/<id>` NI résultat persisté, donc
+        // aucune reprise possible (et le job n'a même pas été lancé).
+        if (err && err.staleGateway) return null;
         var jobId = item.jobId || item.requestId;
         try {
             var state = await modalJson('/job/' + encodeURIComponent(jobId), null, CONFIG.RECOVER_TIMEOUT_MS);

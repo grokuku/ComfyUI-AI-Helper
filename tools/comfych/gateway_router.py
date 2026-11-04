@@ -41,6 +41,90 @@ from pydantic import BaseModel
 
 import auth
 
+# ─── Version de l'API exposée (vérifiable SANS rendu) ───────────────────────
+
+GATEWAY_API_VERSION = 2
+"""Version de l'API du gateway — **publiée par ``GET /health``**.
+
+Historique :
+
+- **v1** : ``POST /generate`` attendait la fin du rendu dans la requête HTTP.
+  Un rendu de plusieurs minutes y était structurellement impossible (Modal
+  annule l'entrée à 300 s faute de ``timeout=``) et toute déconnexion
+  arrêtait le suivi, donc ``scaledown_window`` (30 s sur L4) arrêtait le
+  conteneur GPU **en plein rendu**. Le symptôme était un
+  ``503 « Job interrompu (déconnexion client ou redéploiement) »``
+  indéchiffrable, plusieurs minutes (et plusieurs euros) plus tard.
+- **v2** : ``POST /generate`` rend la main (202) après un ``.spawn()``
+  détaché ; le client suit ``GET /job/<id>`` et le résultat est persisté sur
+  le volume (``/cache/jobs/<id>/``).
+
+Pourquoi cette constante existe : ``modal container stop`` (bouton « ♻️
+Redémarrer le worker ») relance les conteneurs de l'application **déjà
+déployée**. Il ne peut donc PAS mettre le code à jour — seul ``modal deploy``
+le fait. Sans marqueur de version, un gateway resté en v1 est indiscernable
+d'un gateway v2 : le client relançait des rendus longs condamnés et
+l'utilisateur voyait le même 503, run après run."""
+
+GATEWAY_API_FEATURES = ("spawn", "job-polling", "volume-results", "detached-render")
+"""Capacités annoncées par ``GET /health`` (le client teste ``api_version``)."""
+
+GATEWAY_MIN_API_VERSION = GATEWAY_API_VERSION
+"""Version qu'un client doit exiger pour lancer un rendu long."""
+
+
+def gateway_build_id() -> str:
+    """Empreinte du code **réellement déployé** (image Modal), ``dev`` sinon.
+
+    ``COMFYCH_DEPLOY_STAMP`` est posée dans l'image par ``image.py``
+    (empreinte des dépendances) et ``COMFYCH_BUILD_ID`` peut être injectée par
+    la CI. La valeur est renvoyée telle quelle par ``GET /health`` : c'est ce
+    qui permet de vérifier en UNE requête que le worker/gateway exécute bien
+    le dernier code, sans lancer de rendu.
+    """
+    for name in ("COMFYCH_BUILD_ID", "COMFYCH_DEPLOY_STAMP"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return "dev"
+
+
+def gateway_version_payload() -> dict:
+    """Corps de ``GET /health`` : version + capacités + empreinte du build."""
+    return {
+        "status": "ok",
+        "api_version": GATEWAY_API_VERSION,
+        "features": list(GATEWAY_API_FEATURES),
+        "build": gateway_build_id(),
+    }
+
+
+# ─── Journalisation HORODATÉE (UTC ISO 8601) + identifiant de job ───────────
+
+
+def utc_stamp(when: float | None = None) -> str:
+    """Horodatage UTC ISO 8601 à la milliseconde (``…T13:21:07.412Z``)."""
+    seconds = time.time() if when is None else float(when)
+    millis = int((seconds % 1) * 1000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{millis:03d}Z"
+
+
+def short_job_id(job_id: object) -> str:
+    """Identifiant de job court (6 car.) pour préfixer une ligne de log."""
+    text = "".join(c for c in str(job_id or "") if c.isalnum())
+    return text[-6:].lower() or "-"
+
+
+def log(message: str, job_id: object = "") -> None:
+    """Ligne de log du gateway : horodatée et préfixée par le job.
+
+    Sans horodatage, les logs Modal ne permettent pas de savoir si une ligne
+    vient du run en cours ou d'un run précédent — c'est exactement ce qui a
+    rendu le diagnostic du ``503`` à ~32 s interminable.
+    """
+    print(f"{utc_stamp()} [job {short_job_id(job_id)}] [Gateway] {message}")
+
+
 # ─── Budgets et délais (configurables par variables d'environnement) ─────────
 
 GATEWAY_TIMEOUT_ENV = "COMFYCH_GATEWAY_TIMEOUT_S"
@@ -113,7 +197,7 @@ def _env_number(name: str, default: float, minimum: float = 1.0) -> float:
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        print(f"[Gateway] ⚠️ {name}={raw!r} invalide — valeur par défaut {default}")
+        log(f"⚠️ {name}={raw!r} invalide — valeur par défaut {default}")
         return float(default)
     if math.isnan(value) or value < minimum:
         return float(default)
@@ -235,6 +319,17 @@ def build_router(
     """
     web_app = FastAPI(title=title)
 
+    # Marqueur lisible au démarrage du conteneur gateway : c'est la seule ligne
+    # qui dit immédiatement QUELLE version d'API répond (voir
+    # ``GATEWAY_API_VERSION``). « spawn+polling: ON » = le rendu n'est plus
+    # attaché à une requête HTTP.
+    log(
+        f"[ComfyCH] gateway build {gateway_build_id()} | "
+        f"spawn+polling=on | API v{GATEWAY_API_VERSION} | "
+        f"résultats={'volume' if job_reader is not None else 'mémoire'} | "
+        f"timeout={gateway_timeout_seconds()}s ({GATEWAY_TIMEOUT_ENV})"
+    )
+
     web_app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
@@ -260,7 +355,7 @@ def build_router(
         try:
             state = await job_reader.remote.aio(job_id)
         except Exception as exc:  # noqa: BLE001 — le repli mémoire reste possible
-            print(f"[Gateway] Job {job_id}: lecture volume impossible ({exc})")
+            log(f"lecture volume impossible ({exc})", job_id)
             return None
         return state if isinstance(state, dict) else None
 
@@ -313,7 +408,7 @@ def build_router(
             except asyncio.TimeoutError:
                 result = None
             except Exception as exc:  # noqa: BLE001 — input disparu (préemption…)
-                print(f"[Gateway] Job {job_id}: handle indisponible ({exc})")
+                log(f"handle indisponible ({exc})", job_id)
                 result = None
             if isinstance(result, dict) and result.get("status") == "done":
                 payload = _public_result(result, record.get("gpu", "L4"))
@@ -394,16 +489,16 @@ def build_router(
         # ── 1. Le job existe-t-il déjà (cache, volume, handle en mémoire) ? ──
         payload, _ = await _job_status(job_id)
         if payload.get("status") == "done":
-            print(f"[Gateway] Job {job_id}: déjà terminé — résultat réutilisé")
+            log("déjà terminé — résultat réutilisé", job_id)
             return payload
         if payload.get("status") == "failed":
             # Un échec n'est pas mis en cache : le client peut relancer.
-            print(f"[Gateway] Job {job_id}: échec précédent — {payload.get('error')}")
+            log(f"échec précédent — {payload.get('error')}", job_id)
             if req.async_mode:
                 return JSONResponse(payload, status_code=200)
             return JSONResponse(payload, status_code=500)
         if payload.get("status") in {"running"}:
-            print(f"[Gateway] Job {job_id}: déjà en cours — rattachement (aucune relance)")
+            log("déjà en cours — rattachement (aucune relance)", job_id)
             if req.async_mode:
                 return JSONResponse(payload, status_code=202)
             return await _wait_for_job(job_id, req)
@@ -416,7 +511,7 @@ def build_router(
             worker = worker_cls()
             call = await worker.run_job.spawn.aio(req.workflow, job_id)
         except Exception as exc:  # noqa: BLE001 — jamais de 503 trompeur
-            print(f"[Gateway] Job {job_id}: lancement impossible ({exc})")
+            log(f"lancement impossible ({exc})", job_id)
             return JSONResponse(
                 {"status": "failed", "job_id": job_id, "error": f"lancement impossible : {exc}"},
                 status_code=500,
@@ -428,7 +523,7 @@ def build_router(
                 "started_at": time.time(),
                 "gpu": req.gpu,
             }
-        print(f"[Gateway] Job {job_id}: lancé sur {req.gpu} (async_mode={req.async_mode})")
+        log(f"lancé sur {req.gpu} (async_mode={req.async_mode})", job_id)
 
         if req.async_mode:
             return JSONResponse(
@@ -463,7 +558,7 @@ def build_router(
                 return JSONResponse(payload, status_code=404)
             await asyncio.sleep(interval)
         elapsed = int(budget)
-        print(f"[Gateway] Job {job_id}: budget d'attente épuisé ({elapsed}s) — le job continue")
+        log(f"budget d'attente épuisé ({elapsed}s) — le job continue", job_id)
         return JSONResponse(
             {
                 "status": "running",
@@ -614,6 +709,19 @@ def build_router(
 
     @web_app.get("/health")
     async def health():
-        return {"status": "ok"}
+        """État + **version de l'API** du gateway (route publique, sans clé).
+
+        Deux usages :
+
+        - ``curl https://<gateway>/health`` → ``api_version`` et ``build`` :
+          vérifier en une requête que le code réellement déployé est bien la
+          version « spawn + polling » (un ``api_version`` absent ou < 2
+          signifie que le déploiement n'a pas été mis à jour — « ♻️ Redémarrer
+          le worker » ne suffit pas, il faut « Déployer ») ;
+        - l'extension lit ce champ AVANT de lancer un rendu : sur un gateway
+          v1 elle refuse le lancement et donne la marche à suivre, au lieu de
+          laisser le rendu être coupé puis d'afficher un 503 trompeur.
+        """
+        return gateway_version_payload()
 
     return web_app

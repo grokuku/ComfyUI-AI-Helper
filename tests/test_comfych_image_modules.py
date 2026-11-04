@@ -471,8 +471,15 @@ class TestWorkerImageSources:
         """Éditer un module du gateway ne doit pas rejouer apt/pip/torch."""
         source = IMAGE_FILE.read_text(encoding="utf-8")
         function_source = source[source.index("def _build_image()"):]
+        sources_at = function_source.index("add_local_python_source(*IMAGE_LOCAL_PYTHON_SOURCES")
 
-        assert function_source.index("pip_install_from_requirements") < \
-            function_source.index("add_local_python_source(*IMAGE_LOCAL_PYTHON_SOURCES")
-        assert function_source.index('run_commands("comfy --skip-prompt install --nvidia")') < \
-            function_source.index("add_local_python_source(*IMAGE_LOCAL_PYTHON_SOURCES")
+        assert function_source.index("pip_install_from_requirements") < sources_at
+        # L'installation de ComfyUI passe par ``_comfy_install_command()`` (qui
+        # ajoute ``--skip-manager``) : ce qui compte ici est l'ORDRE, pas le
+        # texte littéral de la commande.
+        install_at = function_source.index("run_commands(_comfy_install_command())")
+        assert install_at < sources_at
+        assert "--skip-manager" in source, (
+            "ComfyUI-Manager ne doit pas être cuit dans l'image (il y revenait "
+            "à chaque run et polluait le log de l'InvalidChannel)"
+        )

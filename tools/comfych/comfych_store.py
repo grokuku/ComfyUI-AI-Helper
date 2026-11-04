@@ -61,6 +61,16 @@ DEFAULT_CONFIG = {
     "custom_nodes": [],
     "custom_nodes_ext": [],
     "custom_nodes_local": [],
+    # Nodes marqués « à supprimer » par l'utilisateur (noms de DOSSIERS, ex.
+    # ``ComfyUI-Manager``). Cette liste est APPLIQUÉE par le sync : les nodes
+    # absents de l'archive sont retirés du volume ``comfy-custom-nodes`` par le
+    # swap non destructif (tools/comfych/sync.py, ``_swap_volume_content``).
+    #
+    # Pourquoi une clé dédiée : la sélection de l'UI (``custom_nodes_ext`` /
+    # ``custom_nodes_local``) n'était lue par PERSONNE dans le pipeline de sync,
+    # donc un node décoché continuait d'être embarqué — « je l'ai marqué à
+    # supprimer, il est toujours là ».
+    "custom_nodes_disabled": ["ComfyUI-Manager"],
     # Paquets pip supplémentaires installés au build de l'image (dépendances
     # OPTIONNELLES des custom nodes, souvent absentes de leur requirements.txt :
     # ex. ``sageattention`` requis par comfyui-kjnodes, ``mediapipe`` pour

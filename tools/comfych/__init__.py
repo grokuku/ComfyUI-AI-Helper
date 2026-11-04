@@ -736,10 +736,23 @@ def _worker_restart_step(app_name: str | None = None):
     (donc le ``user/`` fraîchement synchronisé). Aucun container actif n'est un
     succès (« rien à arrêter »), mais une CLI incapable de LISTER les containers
     est un ÉCHEC explicite : on n'affiche jamais un faux « redémarré ».
+
+    ATTENTION : ``modal container stop`` ne touche PAS au code déployé. Le
+    conteneur neuf exécute **la même définition d'application**, donc le même
+    ``gateway_router.py`` / ``base_worker.py`` que la fois précédente. Seul
+    ``modal deploy`` (bouton « Déployer ») reconstruit l'image et publie le
+    nouveau code. C'est la cause du faux diagnostic « le correctif ne marche
+    pas » : un redémarrage sur un déploiement v1 continuait à produire le
+    ``503 Job interrompu``, alors que le code du dépôt était déjà corrigé.
     """
 
     async def _step(log_path: Path, started_at: float) -> int:
         name = app_name or worker_app_name()
+        _append_log(
+            log_path,
+            "ℹ️ Un redémarrage ne recharge PAS le code : si le pack a été mis à "
+            "jour, utilisez « Déployer » (le worker logguera alors « spawn+polling: ON »).",
+        )
         _append_log(log_path, f"Recherche des containers actifs de l'app « {name} »…")
 
         code, output = await _modal_cli_output(
@@ -804,6 +817,41 @@ def _worker_restart_step(app_name: str | None = None):
     return ("Redémarrage du worker", _step)
 
 
+DISABLED_NODES_ENV = "COMFYCH_DISABLED_NODES"
+"""Variable d'env. lue par ``sync.py`` (et le worker) : nodes à ne pas embarquer.
+
+Elle porte la liste « à supprimer » de la config ComfyCH. **Absente**, c'est
+``sync.py`` qui décide de son défaut (ComfyUI-Manager) : on ne veut pas qu'un
+``config.json`` ancien (sans la clé) réactive silencieusement le Manager.
+"""
+
+
+def _disabled_nodes_env(config: dict | None = None) -> dict:
+    """Variables d'environnement transmises au sync pour les nodes « à supprimer ».
+
+    L'état « à supprimer » est enregistré par l'UI (``POST /api/modal/plugins``,
+    clé ``custom_nodes_disabled``) mais n'était lu par **personne** dans le
+    pipeline : le sync embarquait tout le dossier ``custom_nodes`` local, donc un
+    node décoché revenait à chaque run (« je l'ai marqué à supprimer, il est
+    toujours là »). Cette fonction fait le lien config → sync.
+
+    Clé **absente** de la config → aucune variable posée : ``sync.py`` applique
+    son défaut. Liste vide → ``COMFYCH_DISABLED_NODES=""`` → plus rien n'est exclu.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:  # noqa: BLE001 — config illisible ≠ sync cassé
+            return {}
+    if not isinstance(config, dict) or "custom_nodes_disabled" not in config:
+        return {}
+    names = config.get("custom_nodes_disabled") or []
+    if not isinstance(names, list):
+        return {}
+    cleaned = [str(name).strip() for name in names if str(name).strip()]
+    return {DISABLED_NODES_ENV: ",".join(cleaned)}
+
+
 def _worker_restart_steps(app_name: str | None = None) -> list:
     """Séquence du bouton « Redémarrer le worker ».
 
@@ -814,7 +862,9 @@ def _worker_restart_steps(app_name: str | None = None) -> list:
     """
     return [
         _cmd_step(
-            "Sync des fichiers vers le volume Modal", ["modal", "run", "sync.py"]
+            "Sync des fichiers vers le volume Modal",
+            ["modal", "run", "sync.py"],
+            _disabled_nodes_env(),
         ),
         _worker_restart_step(app_name),
     ]
@@ -1496,6 +1546,7 @@ if PromptServer is not None:
                 "custom_nodes": config.get("custom_nodes", []),
                 "custom_nodes_ext": config.get("custom_nodes_ext", []),
                 "custom_nodes_local": config.get("custom_nodes_local", []),
+                "custom_nodes_disabled": config.get("custom_nodes_disabled", []),
             })
 
         async def post_plugins(request):
@@ -1508,6 +1559,12 @@ if PromptServer is not None:
             custom_nodes = data.get("custom_nodes", [])
             custom_nodes_ext = data.get("custom_nodes_ext", [])
             custom_nodes_local = data.get("custom_nodes_local", [])
+            # « À supprimer » : noms de DOSSIERS à retirer du worker. Listés
+            # explicitement, ils sont transmis au sync (env
+            # COMFYCH_DISABLED_NODES) qui les exclut de l'archive — donc les
+            # retire du volume — et le worker les supprime aussi à son
+            # démarrage s'ils viennent de l'image.
+            custom_nodes_disabled = data.get("custom_nodes_disabled")
             if not isinstance(custom_nodes, list):
                 return web.json_response(
                     {"ok": False, "error": "custom_nodes must be a list"}, status=400
@@ -1520,17 +1577,23 @@ if PromptServer is not None:
                 return web.json_response(
                     {"ok": False, "error": "custom_nodes_local must be a list"}, status=400
                 )
-            save_config({
+            if custom_nodes_disabled is not None and not isinstance(
+                custom_nodes_disabled, list
+            ):
+                return web.json_response(
+                    {"ok": False, "error": "custom_nodes_disabled must be a list"},
+                    status=400,
+                )
+            payload = {
                 "custom_nodes": custom_nodes,
                 "custom_nodes_ext": custom_nodes_ext,
                 "custom_nodes_local": custom_nodes_local,
-            })
-            return web.json_response({
-                "ok": True,
-                "custom_nodes": custom_nodes,
-                "custom_nodes_ext": custom_nodes_ext,
-                "custom_nodes_local": custom_nodes_local,
-            })
+            }
+            if custom_nodes_disabled is not None:
+                payload["custom_nodes_disabled"] = custom_nodes_disabled
+            save_config(payload)
+            payload["ok"] = True
+            return web.json_response(payload)
 
         # ── GET /api/modal/models/detect — scan local models ──
         async def get_models_detect(request):
@@ -1670,7 +1733,9 @@ if PromptServer is not None:
         # ── POST /api/modal/sync-custom-nodes ──
         async def post_sync_custom_nodes(request):
             if not _spawn_op(
-                "sync_custom_nodes", ["modal", "run", "sync.py", "--sync-custom-nodes"]
+                "sync_custom_nodes",
+                ["modal", "run", "sync.py", "--sync-custom-nodes"],
+                _disabled_nodes_env(),
             ):
                 return _op_busy_response()
             return web.json_response({"ok": True, "message": "Sync custom nodes lancée"})
