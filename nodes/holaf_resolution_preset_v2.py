@@ -135,7 +135,13 @@ class HolafResolutionPresetV2:
             "required": {
                 "model_type": (MODEL_OPTIONS, {"default": "SDXL"}),
                 "use_hd": ("BOOLEAN", {"default": False}),
-                "megapixels": ("FLOAT", {"default": 2.50, "min": 0.25, "max": 16.00, "step": 0.01, "round": 0.01}),
+                # Plafond HAUTE RÉSOLUTION : 64 MP (et non 16) pour laisser passer
+                # 8K UHD (7680x4320 = 33,2 Mpx) et au-delà. L'arrondi au multiple
+                # et le budget « on ne dépasse pas » rendent ~31,9 Mpx quand on
+                # demande PILE 32 MP : c'est pour cela que le plafond n'est pas
+                # 32, mais 64 (marge de demande). Garde-fou de sécurité inchangé,
+                # côté dimensions : 16384 px par côté dans _megapixels_resolution.
+                "megapixels": ("FLOAT", {"default": 2.50, "min": 0.25, "max": 64.00, "step": 0.01, "round": 0.01}),
                 "multiple_of": ([8, 16, 32, 64], {"default": DEFAULT_MULTIPLE}),
                 "aspect_ratio": (FIVE_RATIOS + ["Random"], {"default": "3:4"}),
                 # False = Portrait, True = Landscape.

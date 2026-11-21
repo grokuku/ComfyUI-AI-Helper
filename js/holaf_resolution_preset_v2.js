@@ -193,7 +193,11 @@ app.registerExtension({
             megapixelsInput.type = "number";
             megapixelsInput.step = "0.01";
             megapixelsInput.min = "0.25";
-            megapixelsInput.max = "16";
+            // Plafond ALIGNÉ sur le widget FLOAT du backend (`max` de
+            // "megapixels" dans holaf_resolution_preset_v2.py) : 64 MP, sinon le
+            // champ DOM refuse une valeur que le node accepte (8K = 33,2 Mpx).
+            // Verrouillé par tests/test_resolution_preset_highres.py.
+            megapixelsInput.max = "64";
             megapixelsInput.value = String(DEFAULT_MEGAPIXELS);
             Object.assign(megapixelsInput.style, {
                 width: "52px",
